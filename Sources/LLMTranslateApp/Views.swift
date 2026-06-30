@@ -7,46 +7,46 @@ struct SelectionActionView: View {
     @ObservedObject var appState: AppState
     var onSelect: (TaskKind) -> Void
 
+    private let actionBarWidth: CGFloat = 244
+    private let actionBarHeight: CGFloat = 48
+    private let inlinePanelWidth: CGFloat = 218
+    private let inlinePanelHeight: CGFloat = 112
+    private let inlinePanelOverlap: CGFloat = 3
+
     private var language: AppLanguage {
         appState.preferences.appLanguage
     }
 
-    private var displayedOutputText: String {
-        appState.displayedOutputText
+    private var translationOutputText: String {
+        guard appState.selectedTask == .translate else {
+            return ""
+        }
+        return appState.outputText
     }
 
     private var shouldShowInlineResult: Bool {
-        appState.inputOrigin == .selection && appState.selectionInlineResultVisible
+        appState.inputOrigin == .selection
+            && appState.selectionInlineResultVisible
+            && appState.selectedTask == .translate
+    }
+
+    private var contentHeight: CGFloat {
+        shouldShowInlineResult
+            ? actionBarHeight + inlinePanelHeight - inlinePanelOverlap
+            : actionBarHeight
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            HStack(spacing: 10) {
-                ForEach(TaskKind.allCases) { task in
-                    Button {
-                        onSelect(task)
-                    } label: {
-                        Image(systemName: iconName(for: task))
-                            .font(.system(size: 18, weight: .medium))
-                            .frame(width: 34, height: 30)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.primary)
-                    .help(task.title(language: language))
-                    .disabled(appState.isRunning)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.96), in: Capsule())
-            .overlay(Capsule().stroke(Color.secondary.opacity(0.18)))
-            .compositingGroup()
-
+        ZStack(alignment: .top) {
             if shouldShowInlineResult {
                 inlineResultPanel
+                    .offset(y: actionBarHeight - inlinePanelOverlap)
             }
+
+            actionBar
         }
-        .padding(8)
+        .frame(width: 260, height: contentHeight, alignment: .top)
+        .padding(.vertical, 5)
     }
 
     private func iconName(for task: TaskKind) -> String {
@@ -57,6 +57,50 @@ struct SelectionActionView: View {
         case .explain: return "questionmark.circle"
         case .extractTodos: return "list.bullet.clipboard"
         }
+    }
+
+    private var actionBar: some View {
+        HStack(spacing: 8) {
+            ForEach(TaskKind.allCases) { task in
+                Button {
+                    onSelect(task)
+                } label: {
+                    Image(systemName: iconName(for: task))
+                        .font(.system(size: 17, weight: .medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .frame(width: 34, height: 32)
+                        .background(actionBackground(for: task))
+                        .contentShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(actionForeground(for: task))
+                .help(task.title(language: language))
+                .disabled(appState.isRunning)
+            }
+        }
+        .padding(.horizontal, 11)
+        .frame(width: actionBarWidth, height: actionBarHeight)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.98), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.16), lineWidth: 0.8)
+        )
+        .shadow(color: .black.opacity(0.13), radius: 8, y: 3)
+        .compositingGroup()
+    }
+
+    @ViewBuilder
+    private func actionBackground(for task: TaskKind) -> some View {
+        if task == .translate && shouldShowInlineResult {
+            RoundedRectangle(cornerRadius: 9, style: .continuous)
+                .fill(Color.accentColor.opacity(0.14))
+        } else {
+            Color.clear
+        }
+    }
+
+    private func actionForeground(for task: TaskKind) -> Color {
+        task == .translate && shouldShowInlineResult ? .accentColor : .primary
     }
 
     private var inlineResultPanel: some View {
@@ -72,7 +116,7 @@ struct SelectionActionView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 9)
             } else if let error = appState.validationError,
-                      displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                      translationOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(error)
                     .font(.system(size: 14))
                     .foregroundStyle(.red)
@@ -81,19 +125,47 @@ struct SelectionActionView: View {
                     .padding(.vertical, 9)
             } else {
                 ScrollView {
-                    Text(displayedOutputText)
-                        .font(.system(size: 15))
+                    Text(translationOutputText)
+                        .font(.system(size: 15, weight: .regular))
+                        .lineSpacing(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 9)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 12)
+                        .padding(.bottom, 10)
                 }
             }
         }
-        .frame(minWidth: 206, idealWidth: 206, maxWidth: 206, minHeight: 48, maxHeight: 108, alignment: .topLeading)
-        .background(Color(NSColor.textBackgroundColor).opacity(0.98))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.16)))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .padding(.leading, 18)
+        .frame(width: inlinePanelWidth, height: inlinePanelHeight, alignment: .topLeading)
+        .background(
+            Color(NSColor.textBackgroundColor).opacity(0.98),
+            in: UnevenRoundedRectangle(
+                topLeadingRadius: 0,
+                bottomLeadingRadius: 8,
+                bottomTrailingRadius: 8,
+                topTrailingRadius: 0,
+                style: .continuous
+            )
+        )
+        .overlay(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 0,
+                bottomLeadingRadius: 8,
+                bottomTrailingRadius: 8,
+                topTrailingRadius: 0,
+                style: .continuous
+            )
+            .strokeBorder(Color.primary.opacity(0.16), lineWidth: 0.8)
+        )
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 0,
+                bottomLeadingRadius: 8,
+                bottomTrailingRadius: 8,
+                topTrailingRadius: 0,
+                style: .continuous
+            )
+        )
+        .shadow(color: .black.opacity(0.08), radius: 5, y: 2)
     }
 }
 

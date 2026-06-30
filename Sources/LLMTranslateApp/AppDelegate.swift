@@ -5,8 +5,8 @@ import LLMTranslateCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate, SelectionActionServiceDelegate, NSMenuDelegate {
-    private let selectionActionCompactSize = NSSize(width: 254, height: 68)
-    private let selectionActionExpandedSize = NSSize(width: 254, height: 170)
+    private let selectionActionCompactSize = NSSize(width: 260, height: 58)
+    private let selectionActionExpandedSize = NSSize(width: 260, height: 167)
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
@@ -229,10 +229,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func performSelectionAction(_ task: TaskKind) {
+        let selectedText = appState.inputText
+        appState.setInputText(selectedText, origin: .selection)
         appState.selectedTask = task
-        appState.showSelectionInlineResult()
-        refreshSelectionActionWindowLayout(animated: false)
-        appState.runCurrentTask()
+        appState.selectionInlineResultVisible = false
+        openQuickActionWindow(nearSelection: true)
+        closeSelectionAction()
     }
 
     private func closeSelectionAction() {
