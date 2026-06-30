@@ -20,6 +20,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var settingsWindowController: WindowController?
     private var selectionDismissMonitors: [Any] = []
     private var lastSelectionScreenPoint: NSPoint?
+    private var isSelectionActionEnabled = false
+    private var isSelectionActionVisible = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         hotKeyService.delegate = self
@@ -143,13 +145,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     func selectionActionService(_ service: SelectionActionService, didFinishSelectionAt screenPoint: NSPoint) {
-        guard appState.preferences.selectionActionEnabled else {
+        guard isSelectionActionEnabled else {
             return
         }
 
-        guard let selectedText = SelectedTextService.captureSelectedText() else {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            await self.handleSelectionActionTrigger(at: screenPoint)
+        }
+    }
+
+    private func handleSelectionActionTrigger(at screenPoint: NSPoint) async {
+        guard isSelectionActionEnabled else {
+            return
+        }
+
+        guard let selectedText = await captureSelectedTextForSelectionAction() else {
             if !SelectedTextService.isAccessibilityTrusted {
                 appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
+            } else {
+                appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
             }
             return
         }
@@ -161,6 +178,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         lastSelectionScreenPoint = screenPoint
         showSelectionAction(at: screenPoint)
         appState.runCurrentTask()
+    }
+
+    private func captureSelectedTextForSelectionAction() async -> String? {
+        let retryDelays: [UInt64] = [0, 180_000_000, 320_000_000]
+        for delay in retryDelays {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: delay)
+            }
+            guard isSelectionActionEnabled else {
+                return nil
+            }
+            if let selectedText = SelectedTextService.captureSelectedText() {
+                return selectedText
+            }
+        }
+        return nil
     }
 
     private func populateSelectedTextIfAvailable() {
@@ -177,7 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func showSelectionAction(at screenPoint: NSPoint) {
-        guard appState.preferences.selectionActionEnabled else {
+        guard isSelectionActionEnabled else {
             return
         }
         guard let window = selectionActionWindowController?.window else {
@@ -190,6 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             windowSize: targetSize
         )
         window.setFrame(NSRect(origin: origin, size: targetSize), display: true)
+        isSelectionActionVisible = true
         window.orderFrontRegardless()
         installSelectionDismissMonitors()
     }
@@ -202,8 +236,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func closeSelectionAction() {
+        isSelectionActionVisible = false
         removeSelectionDismissMonitors()
-        selectionActionWindowController?.close()
+        selectionActionWindowController?.window?.orderOut(nil)
     }
 
     private func installSelectionDismissMonitors() {
@@ -247,9 +282,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private func observeAppState() {
         appState.$preferences
             .dropFirst()
-            .sink { [weak self] _ in
-                self?.applyWindowPreferences()
-                self?.applySelectionActionPreference()
+            .sink { [weak self] preferences in
+                self?.applyWindowPreferences(preferences)
+                self?.applySelectionActionPreference(preferences)
                 self?.refreshStatusMenuItem()
             }
             .store(in: &cancellables)
@@ -297,21 +332,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .store(in: &cancellables)
     }
 
-    private func applyWindowPreferences() {
+    private func applyWindowPreferences(_ preferences: AppPreferences? = nil) {
         guard let window = floatingWindowController?.window as? FloatingWindow else {
             return
         }
-        window.autoCollapseAtScreenEdge = appState.preferences.autoCollapseWidget
-        if appState.preferences.widgetVisibleOnAllSpaces {
+        let preferences = preferences ?? appState.preferences
+        window.autoCollapseAtScreenEdge = preferences.autoCollapseWidget
+        if preferences.widgetVisibleOnAllSpaces {
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .managed]
         } else {
             window.collectionBehavior = [.fullScreenAuxiliary, .managed]
         }
     }
 
-    private func applySelectionActionPreference() {
-        selectionActionService.setEnabled(appState.preferences.selectionActionEnabled)
-        if !appState.preferences.selectionActionEnabled {
+    private func applySelectionActionPreference(_ preferences: AppPreferences? = nil) {
+        let isEnabled = (preferences ?? appState.preferences).selectionActionEnabled
+        isSelectionActionEnabled = isEnabled
+        selectionActionService.setEnabled(isEnabled)
+        if !isEnabled {
             closeSelectionAction()
         }
     }
@@ -392,6 +430,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     private func refreshSelectionActionWindowLayout(animated: Bool = false) {
         guard let window = selectionActionWindowController?.window else {
+            return
+        }
+
+        guard isSelectionActionEnabled else {
+            closeSelectionAction()
+            return
+        }
+
+        guard isSelectionActionVisible else {
             return
         }
 

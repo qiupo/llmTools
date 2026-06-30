@@ -21,38 +21,47 @@ final class SelectionActionService {
 
     func setEnabled(_ enabled: Bool) {
         if enabled {
-            start()
+            installFreshMonitors()
+            isEnabled = true
         } else {
-            stop()
+            isEnabled = false
+            removeMonitors()
         }
+        resetGestureState()
+        lastTriggerDate = .distantPast
     }
 
     func start() {
+        installFreshMonitors()
         isEnabled = true
         resetGestureState()
         lastTriggerDate = .distantPast
-
-        guard monitors.isEmpty else {
-            return
-        }
-
-        addMonitor(for: .leftMouseDown) { [weak self] event in
-            self?.handleMouseDown(event)
-        }
-        addMonitor(for: .leftMouseDragged) { [weak self] event in
-            self?.handleMouseDragged(event)
-        }
-        addMonitor(for: .leftMouseUp) { [weak self] event in
-            self?.handleMouseUp(event)
-        }
     }
 
     func stop() {
         isEnabled = false
-        monitors.forEach(NSEvent.removeMonitor)
-        monitors.removeAll()
+        removeMonitors()
         resetGestureState()
         lastTriggerDate = .distantPast
+    }
+
+    private func installFreshMonitors() {
+        removeMonitors()
+
+        addMonitor(for: .leftMouseDown) { [weak self] event, screenPoint in
+            self?.handleMouseDown(event, at: screenPoint)
+        }
+        addMonitor(for: .leftMouseDragged) { [weak self] _, screenPoint in
+            self?.handleMouseDragged(at: screenPoint)
+        }
+        addMonitor(for: .leftMouseUp) { [weak self] event, screenPoint in
+            self?.handleMouseUp(event, at: screenPoint)
+        }
+    }
+
+    private func removeMonitors() {
+        monitors.forEach(NSEvent.removeMonitor)
+        monitors.removeAll()
     }
 
     private func resetGestureState() {
@@ -61,10 +70,11 @@ final class SelectionActionService {
         mouseDownClickCount = 0
     }
 
-    private func addMonitor(for mask: NSEvent.EventTypeMask, handler: @escaping @MainActor (NSEvent) -> Void) {
+    private func addMonitor(for mask: NSEvent.EventTypeMask, handler: @escaping @MainActor (NSEvent, NSPoint) -> Void) {
         guard let monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { event in
+            let screenPoint = NSEvent.mouseLocation
             Task { @MainActor in
-                handler(event)
+                handler(event, screenPoint)
             }
         }) else {
             return
@@ -72,30 +82,29 @@ final class SelectionActionService {
         monitors.append(monitor)
     }
 
-    private func handleMouseDown(_ event: NSEvent) {
+    private func handleMouseDown(_ event: NSEvent, at screenPoint: NSPoint) {
         guard isEnabled else {
             resetGestureState()
             return
         }
 
-        dragStartPoint = NSEvent.mouseLocation
+        dragStartPoint = screenPoint
         hasDragged = false
         mouseDownClickCount = event.clickCount
     }
 
-    private func handleMouseDragged(_ event: NSEvent) {
+    private func handleMouseDragged(at screenPoint: NSPoint) {
         guard isEnabled, let dragStartPoint else {
             return
         }
 
-        let currentPoint = NSEvent.mouseLocation
-        let distance = hypot(currentPoint.x - dragStartPoint.x, currentPoint.y - dragStartPoint.y)
+        let distance = hypot(screenPoint.x - dragStartPoint.x, screenPoint.y - dragStartPoint.y)
         if distance >= minimumDragDistance {
             hasDragged = true
         }
     }
 
-    private func handleMouseUp(_ event: NSEvent) {
+    private func handleMouseUp(_ event: NSEvent, at screenPoint: NSPoint) {
         defer {
             dragStartPoint = nil
             hasDragged = false
@@ -117,7 +126,6 @@ final class SelectionActionService {
         }
         lastTriggerDate = now
 
-        let point = NSEvent.mouseLocation
         Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -126,7 +134,7 @@ final class SelectionActionService {
             guard isEnabled else {
                 return
             }
-            delegate?.selectionActionService(self, didFinishSelectionAt: point)
+            delegate?.selectionActionService(self, didFinishSelectionAt: screenPoint)
         }
     }
 }
