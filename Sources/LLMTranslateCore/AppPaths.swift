@@ -15,4 +15,8 @@ public enum AppPaths {
     public static var historyFileURL: URL {
         applicationSupportDirectory.appendingPathComponent("history.json", isDirectory: false)
     }
+
+    public static var webPageBridgeStateFileURL: URL {
+        applicationSupportDirectory.appendingPathComponent("web-page-bridge.json", isDirectory: false)
+    }
 }

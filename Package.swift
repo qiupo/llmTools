@@ -19,6 +19,10 @@ let package = Package(
         .executable(
             name: "LLMTranslateSmoke",
             targets: ["LLMTranslateSmoke"]
+        ),
+        .executable(
+            name: "LLMTranslateNativeHost",
+            targets: ["LLMTranslateNativeHost"]
         )
     ],
     dependencies: [
@@ -53,6 +57,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "LLMTranslateSmoke",
+            dependencies: [
+                "LLMTranslateCore"
+            ]
+        ),
+        .executableTarget(
+            name: "LLMTranslateNativeHost",
             dependencies: [
                 "LLMTranslateCore"
             ]

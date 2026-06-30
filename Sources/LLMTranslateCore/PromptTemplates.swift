@@ -5,6 +5,13 @@ public enum PromptTemplates {
         switch task {
         case .translate:
             return "You are a translation engine. Preserve meaning, formatting, numbers, code, and names. Output only the translated text."
+        case .webPageTranslate:
+            return """
+            You are a webpage translation engine. Translate English webpage text to Simplified Chinese.
+            Preserve meaning, numbers, names, URLs, product names, code-like tokens, and UI intent.
+            Return only valid JSON that follows the requested schema.
+            Do not explain.
+            """
         case .polish:
             return "You are a rewriting engine. Preserve meaning, facts, formatting, numbers, code, and names. Output only the rewritten text."
         case .summarize:
@@ -25,6 +32,8 @@ public enum PromptTemplates {
                 target: target,
                 isRetry: true
             )
+        case .webPageTranslate:
+            return webPageTranslationPrompt(inputText: request.inputText, isRetry: true)
         case .polish:
             return polishPrompt(
                 inputText: request.inputText,
@@ -49,6 +58,8 @@ public enum PromptTemplates {
                 target: target,
                 isRetry: false
             )
+        case .webPageTranslate:
+            return webPageTranslationPrompt(inputText: request.inputText, isRetry: false)
         case .polish:
             return polishPrompt(
                 inputText: request.inputText,
@@ -78,6 +89,46 @@ public enum PromptTemplates {
 
         return """
         Translate to \(targetLanguage). Output only the translation.
+        \(inputText)
+        """
+    }
+
+    public static func webPageBatchPrompt(
+        segments: [WebPageTranslationSegment],
+        targetLanguage: String,
+        isRetry: Bool
+    ) throws -> String {
+        let items = segments.map { WebPagePromptItem(id: $0.segmentID, text: $0.text) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(items)
+        let json = String(decoding: data, as: UTF8.self)
+        let target = targetLanguageName(for: targetLanguage)
+        let retryLine = isRetry
+            ? "This is a retry. Return only the JSON array, with no Markdown fences and no prose."
+            : "Return only the JSON array, with no Markdown fences and no prose."
+
+        return """
+        Translate each item to \(target).
+        \(retryLine)
+        Return a JSON array with objects in the same order:
+        [{"id":"...","translation":"..."}]
+
+        Rules:
+        - Preserve links, numbers, product names, keyboard shortcuts, and code-like tokens.
+        - For buttons and short UI labels, use concise Chinese.
+        - For paragraphs, use natural Chinese.
+        - Do not add commentary.
+
+        Items:
+        \(json)
+        """
+    }
+
+    private static func webPageTranslationPrompt(inputText: String, isRetry: Bool) -> String {
+        let retryLine = isRetry ? "Return only the translated text." : "Output only the translation."
+        return """
+        Translate this webpage text to Simplified Chinese. \(retryLine)
         \(inputText)
         """
     }
@@ -145,13 +196,20 @@ public enum PromptTemplates {
         """
     }
 
-    private static func targetLanguageName(for target: String) -> String {
+    public static func targetLanguageName(for target: String) -> String {
         switch target {
+        case "zh-Hans": return "Simplified Chinese"
+        case "en": return "English"
         case "Chinese": return "Simplified Chinese"
         case "English": return "English"
         case "Japanese": return "Japanese"
         case "Korean": return "Korean"
         default: return target
         }
+    }
+
+    private struct WebPagePromptItem: Encodable {
+        var id: String
+        var text: String
     }
 }

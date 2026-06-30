@@ -99,7 +99,7 @@ public actor TaskEngine {
         }
     }
 
-    public func run(request: TaskRequest, modelID: UUID? = nil) async throws -> TaskResult {
+    public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
         let model = try resolveModel(for: modelID)
         try validateInputSize(request, for: model)
         let runner = try runner(for: model)
@@ -108,8 +108,107 @@ public actor TaskEngine {
             try await runner.load(model: model)
         }
         let result = try await runner.generate(request: request, preferences: snapshot.preferences)
-        appendHistory(model: model, result: result, request: request)
+        if persistHistory {
+            appendHistory(model: model, result: result, request: request)
+        }
         return result
+    }
+
+    public func translateWebPageSegments(
+        payload: WebPageTranslateSegmentsPayload,
+        modelID: UUID? = nil
+    ) async throws -> WebPageTranslateSegmentsResult {
+        try validateWebPagePayload(payload)
+        let model = try resolveModel(for: modelID)
+        let request = TaskRequest(
+            task: .webPageTranslate,
+            inputText: try PromptTemplates.webPageBatchPrompt(
+                segments: payload.segments,
+                targetLanguage: payload.targetLanguage,
+                isRetry: false
+            ),
+            sourceLanguage: payload.sourceLanguage,
+            targetLanguage: payload.targetLanguage
+        )
+        try validateInputSize(request, for: model)
+        let batchResult = try await run(
+            request: request,
+            modelID: model.id,
+            persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
+        )
+        if let translations = parseWebPageTranslations(from: batchResult.text, segments: payload.segments) {
+            return webPageResult(
+                jobID: payload.jobID,
+                modelName: batchResult.modelName,
+                segments: payload.segments,
+                translations: translations
+            )
+        }
+
+        let retryRequest = TaskRequest(
+            task: .webPageTranslate,
+            inputText: try PromptTemplates.webPageBatchPrompt(
+                segments: payload.segments,
+                targetLanguage: payload.targetLanguage,
+                isRetry: true
+            ),
+            sourceLanguage: payload.sourceLanguage,
+            targetLanguage: payload.targetLanguage
+        )
+        let retryResult = try await run(
+            request: retryRequest,
+            modelID: model.id,
+            persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
+        )
+        if let translations = parseWebPageTranslations(from: retryResult.text, segments: payload.segments) {
+            return webPageResult(
+                jobID: payload.jobID,
+                modelName: retryResult.modelName,
+                segments: payload.segments,
+                translations: translations
+            )
+        }
+
+        var fallbackTranslations: [WebPageSegmentTranslation] = []
+        var fallbackModelName = retryResult.modelName
+        for segment in payload.segments {
+            try Task.checkCancellation()
+            do {
+                let result = try await run(
+                    request: TaskRequest(
+                        task: .translate,
+                        inputText: segment.text,
+                        targetLanguage: payload.targetLanguage
+                    ),
+                    modelID: model.id,
+                    persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
+                )
+                fallbackModelName = result.modelName
+                fallbackTranslations.append(
+                    WebPageSegmentTranslation(
+                        segmentID: segment.segmentID,
+                        translation: result.text,
+                        status: .translated
+                    )
+                )
+            } catch {
+                fallbackTranslations.append(
+                    WebPageSegmentTranslation(
+                        segmentID: segment.segmentID,
+                        translation: "",
+                        status: .failed,
+                        errorMessage: error.localizedDescription
+                    )
+                )
+            }
+        }
+
+        return webPageResult(
+            jobID: payload.jobID,
+            modelName: fallbackModelName,
+            segments: payload.segments,
+            translations: fallbackTranslations
+        )
     }
 
     public func clearHistory() async throws {
@@ -144,6 +243,105 @@ public actor TaskEngine {
         guard current <= limit else {
             throw RunnerError.inputTooLong(current: current, limit: limit)
         }
+    }
+
+    private func validateWebPagePayload(_ payload: WebPageTranslateSegmentsPayload) throws {
+        guard snapshot.preferences.webPageTranslation.enabled else {
+            throw WebPageTranslationError(
+                code: .permissionMissing,
+                message: "网页翻译已关闭。",
+                repairAction: "在 llmTranslate 设置中启用网页翻译。"
+            )
+        }
+        guard !payload.segments.isEmpty else {
+            throw WebPageTranslationError(
+                code: .payloadTooLarge,
+                message: "没有可翻译的网页文本。"
+            )
+        }
+        let maxSegments = max(snapshot.preferences.webPageTranslation.maxSegmentsPerBatch, 1)
+        guard payload.segments.count <= maxSegments else {
+            throw WebPageTranslationError(
+                code: .payloadTooLarge,
+                message: "单次网页翻译段落过多。",
+                diagnostic: "\(payload.segments.count)/\(maxSegments)"
+            )
+        }
+        let maxCharacters = max(snapshot.preferences.webPageTranslation.maxCharactersPerBatch, 1)
+        let sourceCharacters = payload.segments.reduce(0) { $0 + $1.text.count }
+        guard sourceCharacters <= maxCharacters else {
+            throw WebPageTranslationError(
+                code: .payloadTooLarge,
+                message: "单次网页翻译内容过长。",
+                diagnostic: "\(sourceCharacters)/\(maxCharacters)"
+            )
+        }
+    }
+
+    private func parseWebPageTranslations(
+        from output: String,
+        segments: [WebPageTranslationSegment]
+    ) -> [WebPageSegmentTranslation]? {
+        let jsonText = extractJSONArray(from: output)
+        guard let data = jsonText.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([WebPageTranslationJSONItem].self, from: data) else {
+            return nil
+        }
+
+        let expectedIDs = Set(segments.map(\.segmentID))
+        let mapped = decoded.compactMap { item -> WebPageSegmentTranslation? in
+            guard expectedIDs.contains(item.id) else {
+                return nil
+            }
+            let translation = item.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !translation.isEmpty else {
+                return WebPageSegmentTranslation(
+                    segmentID: item.id,
+                    translation: "",
+                    status: .failed,
+                    errorMessage: "Empty translation"
+                )
+            }
+            return WebPageSegmentTranslation(
+                segmentID: item.id,
+                translation: translation,
+                status: .translated
+            )
+        }
+
+        guard mapped.count == segments.count else {
+            return nil
+        }
+        return mapped
+    }
+
+    private func extractJSONArray(from output: String) -> String {
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = trimmed.firstIndex(of: "["),
+              let end = trimmed.lastIndex(of: "]"),
+              start <= end else {
+            return trimmed
+        }
+        return String(trimmed[start...end])
+    }
+
+    private func webPageResult(
+        jobID: String,
+        modelName: String,
+        segments: [WebPageTranslationSegment],
+        translations: [WebPageSegmentTranslation]
+    ) -> WebPageTranslateSegmentsResult {
+        let sourceCharacters = segments.reduce(0) { $0 + $1.text.count }
+        let targetCharacters = translations.reduce(0) { $0 + $1.translation.count }
+        return WebPageTranslateSegmentsResult(
+            jobID: jobID,
+            modelName: modelName,
+            translations: translations,
+            usage: WebPageTranslationUsage(
+                sourceCharacters: sourceCharacters,
+                targetCharacters: targetCharacters
+            )
+        )
     }
 
     private func runner(for model: ModelDescriptor) throws -> any ModelRunner {
@@ -208,5 +406,10 @@ public actor TaskEngine {
             return url.lastPathComponent
         }
         return url.deletingPathExtension().lastPathComponent
+    }
+
+    private struct WebPageTranslationJSONItem: Decodable {
+        var id: String
+        var translation: String
     }
 }

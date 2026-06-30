@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "llmTranslate",
+  "description": "Translate the current webpage with the local llmTranslate app.",
+  "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3AmaIpk1giQIyBpz0sSE1yB8RMlKgqlvPVNL2MKbwTn3uBmRn09ZpYqQ3oYt3OtLAIM/CnjNcOI1VfOL/G4mJvS5wQIooCcWhf3nM3NF6tZUrLnw1HjqvLBBfdQxVM8n9fh73WGoICzkJg60vQtqk+h7dXDqoCzsbDNwd6EcNLRM4pRhGprd/BqSeP8f/HjN+V/Z+H3iZCRtUK29rOH5adXI3BPDWCaA1Wq5ucsUQATHNajX+zGerE59VzuVqxv1hmAX4mb9nMB6HSNdUxJ8oiqevow+Gru6XsCUbxMBlWVttwo/auIo5ics4d0T2cYTkvM/3Oh2AwJiVWSZO2HrrwIDAQAB",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "nativeMessaging",
+    "contextMenus"
+  ],
+  "host_permissions": [],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "llmTranslate"
+  },
+  "commands": {
+    "_execute_action": {
+      "suggested_key": {
+        "default": "Alt+Shift+L",
+        "mac": "Alt+Shift+L"
+      },
+      "description": "Open llmTranslate"
+    }
+  }
+}

@@ -52,6 +52,7 @@ struct SelectionActionView: View {
     private func iconName(for task: TaskKind) -> String {
         switch task {
         case .translate: return "character.book.closed"
+        case .webPageTranslate: return "safari"
         case .polish: return "wand.and.stars"
         case .summarize: return "doc.text"
         case .explain: return "questionmark.circle"
@@ -61,7 +62,7 @@ struct SelectionActionView: View {
 
     private var actionBar: some View {
         HStack(spacing: 8) {
-            ForEach(TaskKind.allCases) { task in
+            ForEach(TaskKind.interactiveCases) { task in
                 Button {
                     onSelect(task)
                 } label: {
@@ -206,7 +207,7 @@ struct QuickActionView: View {
     private var controlsBar: some View {
         HStack(spacing: 10) {
             Picker("", selection: $appState.selectedTask) {
-                ForEach(TaskKind.allCases) { task in
+                ForEach(TaskKind.interactiveCases) { task in
                     Text(task.title(language: language)).tag(task)
                 }
             }
@@ -293,6 +294,8 @@ struct QuickActionView: View {
             modeBadge("Plain explanation", systemImage: "questionmark.circle")
         case .extractTodos:
             modeBadge("Action items", systemImage: "checklist")
+        case .webPageTranslate:
+            EmptyView()
         }
     }
 
@@ -442,6 +445,8 @@ struct QuickActionView: View {
         switch appState.selectedTask {
         case .translate:
             return L10n.text("Paste text to translate.", language: language)
+        case .webPageTranslate:
+            return L10n.text("Paste text to translate.", language: language)
         case .polish:
             return L10n.text("Paste text to polish.", language: language)
         case .summarize:
@@ -456,6 +461,8 @@ struct QuickActionView: View {
     private var resultPlaceholder: String {
         switch appState.selectedTask {
         case .translate:
+            return L10n.text("Translation will appear here.", language: language)
+        case .webPageTranslate:
             return L10n.text("Translation will appear here.", language: language)
         case .polish:
             return L10n.text("Polished text will appear here.", language: language)
@@ -729,7 +736,7 @@ struct FloatingWidgetView: View {
             }
 
             Picker(L10n.text("Task", language: language), selection: $appState.selectedTask) {
-                ForEach(TaskKind.allCases) { task in
+                ForEach(TaskKind.interactiveCases) { task in
                     Text(task.title(language: language)).tag(task)
                 }
             }
@@ -909,6 +916,8 @@ struct TaskOptionsView: View {
             }
             .pickerStyle(.menu)
             .disabled(appState.isRunning)
+        case .webPageTranslate:
+            EmptyView()
         default:
             EmptyView()
         }
@@ -918,6 +927,7 @@ struct TaskOptionsView: View {
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var showImporter = false
+    @State private var chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -930,6 +940,7 @@ struct SettingsView: View {
             HStack(alignment: .top, spacing: 16) {
                 VStack(spacing: 14) {
                     preferencesSection
+                    webPageTranslationSection
                     defaultsSection
                 }
                 .frame(width: 326, alignment: .top)
@@ -947,6 +958,9 @@ struct SettingsView: View {
             if case let .success(urls) = result, let url = urls.first {
                 appState.addModel(from: url)
             }
+        }
+        .onAppear {
+            chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
         }
     }
 
@@ -1121,6 +1135,72 @@ struct SettingsView: View {
                 }
 
                 historyLimitRow
+            }
+        }
+    }
+
+    private var webPageTranslationSection: some View {
+        settingsPanel(title: L10n.text("Web Page Translation", language: language), systemImage: "safari", fillsVertical: false) {
+            VStack(alignment: .leading, spacing: 9) {
+                toggleRow(
+                    title: L10n.text("Enable webpage translation", language: language),
+                    systemImage: "globe.badge.chevron.backward",
+                    isOn: Binding(
+                        get: { appState.preferences.webPageTranslation.enabled },
+                        set: { newValue in
+                            appState.updatePreferences { $0.webPageTranslation.enabled = newValue }
+                        }
+                    )
+                )
+
+                Divider()
+
+                HStack(alignment: .top, spacing: 10) {
+                    settingIcon("globe")
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 8) {
+                            Text(chromeIntegrationState.name)
+                                .font(.subheadline.weight(.medium))
+                            statusBadge(browserStatusName(chromeIntegrationState.status), systemImage: browserStatusIcon(chromeIntegrationState.status))
+                        }
+                        if let message = chromeIntegrationState.lastErrorMessage {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Text(BrowserIntegrationService.shared.extensionFolderPath())
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .help(BrowserIntegrationService.shared.extensionFolderPath())
+                    }
+                    Spacer(minLength: 8)
+                }
+
+                HStack(spacing: 8) {
+                    Button {
+                        do {
+                            chromeIntegrationState = try BrowserIntegrationService.shared.installOrRepairChromeDevelopmentHost()
+                            BrowserIntegrationService.shared.openChromeExtensionsPage()
+                            appState.statusMessage = L10n.text("Chrome bridge repaired", language: language)
+                        } catch {
+                            appState.validationError = error.localizedDescription
+                            chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+                        }
+                    } label: {
+                        Label(L10n.text("Repair Chrome Bridge", language: language), systemImage: "wrench.and.screwdriver")
+                    }
+                    .controlSize(.small)
+
+                    Button {
+                        BrowserIntegrationService.shared.openChromeExtensionsPage()
+                    } label: {
+                        Label(L10n.text("Open Chrome Extensions", language: language), systemImage: "arrow.up.forward.app")
+                    }
+                    .controlSize(.small)
+                }
             }
         }
     }
@@ -1497,6 +1577,46 @@ struct SettingsView: View {
             return "clock"
         case .unknown:
             return "questionmark.circle"
+        }
+    }
+
+    private func browserStatusName(_ status: BrowserIntegrationStatus) -> String {
+        switch (language, status) {
+        case (.chinese, .notInstalled):
+            return "未安装"
+        case (.chinese, .extensionMissing):
+            return "待加载扩展"
+        case (.chinese, .extensionInstalledDisabled):
+            return "扩展已关闭"
+        case (.chinese, .permissionMissing):
+            return "缺少权限"
+        case (.chinese, .nativeHostMissing):
+            return "桥接缺失"
+        case (.chinese, .nativeHostInvalid):
+            return "桥接无效"
+        case (.chinese, .appNotRunning):
+            return "应用未运行"
+        case (.chinese, .pairingRequired):
+            return "需要配对"
+        case (.chinese, .ready):
+            return "可用"
+        case (.chinese, .failed):
+            return "失败"
+        case (.english, _):
+            return status.rawValue
+        }
+    }
+
+    private func browserStatusIcon(_ status: BrowserIntegrationStatus) -> String {
+        switch status {
+        case .ready:
+            return "checkmark.circle.fill"
+        case .extensionMissing, .nativeHostMissing, .pairingRequired:
+            return "exclamationmark.triangle.fill"
+        case .failed, .nativeHostInvalid, .notInstalled:
+            return "xmark.octagon.fill"
+        default:
+            return "circle.dashed"
         }
     }
 }

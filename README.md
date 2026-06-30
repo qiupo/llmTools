@@ -34,6 +34,12 @@ Fast core checks:
 fish -lc 'setproxy >/dev/null; swift run LLMTranslateChecks'
 ```
 
+Chrome extension DOM and batching checks:
+
+```sh
+node scripts/check-browser-extension-dom.mjs
+```
+
 Prepare MLX runtime resources before running MLX smoke tests from SwiftPM:
 
 ```sh
@@ -66,3 +72,22 @@ The packaged app is written to:
 ```text
 dist/llmTranslate.app
 ```
+
+## Phase 2 Web Page Translation MVP
+
+The Chrome MVP uses a local-only bridge:
+
+- Chrome extension: `browser-extension/chromium`
+- Native messaging host: `LLMTranslateNativeHost`
+- App bridge state: `~/Library/Application Support/llmTranslate/web-page-bridge.json`
+- Development Chrome extension ID: `jednddlgkkohaebgoejcidfppddjegij`
+
+Development setup:
+
+1. Package and launch `dist/llmTranslate.app`.
+2. Open Settings -> `网页翻译`.
+3. Click `修复 Chrome 桥接`; the app writes Chrome's native messaging manifest and opens `chrome://extensions`.
+4. In Chrome, enable Developer Mode and load the unpacked extension folder shown in Settings.
+
+The app cannot silently install or enable browser extensions. Chrome still owns the final extension loading and permission confirmation.
+Current Google Chrome also ignores command-line unpacked extension loading in this local setup, so end-to-end browser verification must use Chrome's `Load unpacked` confirmation flow or a separate Chrome for Testing/Chromium build that permits extension automation.

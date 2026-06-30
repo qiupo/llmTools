@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
     private let selectionActionService = SelectionActionService()
+    private lazy var localAppBridgeServer = LocalAppBridgeServer(appState: appState)
     private var cancellables: Set<AnyCancellable> = []
     private var statusItem: NSStatusItem?
     private var statusMenuItem: NSMenuItem?
@@ -33,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         observeAppState()
         Task {
             await appState.bootstrap()
+            localAppBridgeServer.start()
             applyWindowPreferences()
             applySelectionActionPreference()
             refreshStatusMenuItem()
@@ -47,6 +49,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         hotKeyService.unregister()
         appState.cancelCurrentTask(unloadModel: true)
         selectionActionService.stop()
+        localAppBridgeServer.stop()
     }
 
     private func configureStatusItem() {

@@ -10,6 +10,8 @@ struct LLMTranslateChecks {
         try await checkHistoryLimit()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
         try await checkTaskEngineReturnsRawModelOutput()
+        try await checkWebPageTranslationBatchSkipsHistoryByDefault()
+        try await checkWebPageTranslationBatchFallback()
         try checkVisibleOutputHidesThinkBlock()
         try checkPromptsStayCompact()
         print("LLMTranslateChecks passed")
@@ -123,9 +125,88 @@ struct LLMTranslateChecks {
         try require(preferences.selectionActionTriggerMouseDrag, "Expected mouse-drag selection trigger to default on.")
         try require(preferences.selectionActionTriggerDoubleClick, "Expected double-click selection trigger to default on.")
         try require(preferences.selectionActionTriggerSelectAll, "Expected Command-A selection trigger to default on.")
+        try require(preferences.webPageTranslation.enabled, "Expected webpage translation to default on.")
+        try require(preferences.webPageTranslation.defaultTargetLanguage == "zh-Hans", "Expected webpage translation target to default to Simplified Chinese.")
+        try require(!preferences.webPageTranslation.persistWebHistory, "Expected webpage translation history to default off.")
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
+    }
+
+    private static func checkWebPageTranslationBatchSkipsHistoryByDefault() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubRunner(output: """
+        [
+          {"id":"s1","translation":"你好。"},
+          {"id":"s2","translation":"世界。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        _ = try await engine.addModel(from: modelDirectory)
+        let result = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "job-1",
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "Hello."),
+                    WebPageTranslationSegment(segmentID: "s2", text: "World.")
+                ]
+            )
+        )
+        try require(result.translations.count == 2, "Expected two webpage translations.")
+        try require(result.translations.first?.translation == "你好。", "Expected parsed JSON translation.")
+        let history = await engine.recentHistory()
+        try require(history.isEmpty, "Expected webpage translation to skip recent history by default.")
+    }
+
+    private static func checkWebPageTranslationBatchFallback() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubRunner(outputs: [
+            "not json",
+            "still not json",
+            "你好。"
+        ])
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        _ = try await engine.addModel(from: modelDirectory)
+        let result = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "job-2",
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "Hello.")
+                ]
+            )
+        )
+        try require(result.translations.first?.translation == "你好。", "Expected single-segment fallback translation.")
+        try require(result.translations.first?.status == .translated, "Expected fallback segment to be marked translated.")
     }
 
     private static func checkPromptsStayCompact() throws {
@@ -221,10 +302,18 @@ private struct CheckError: Error, CustomStringConvertible {
 
 private actor StubRunner: ModelRunner {
     private var loadedID: UUID?
-    private let output: String?
+    private var outputs: [String]
 
     init(output: String? = nil) {
-        self.output = output
+        if let output {
+            self.outputs = [output]
+        } else {
+            self.outputs = []
+        }
+    }
+
+    init(outputs: [String]) {
+        self.outputs = outputs
     }
 
     func modelFormat() async -> ModelFormat {
@@ -248,7 +337,8 @@ private actor StubRunner: ModelRunner {
     }
 
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
-        TaskResult(text: output ?? "result \(request.inputText)", modelName: "Stub", task: request.task)
+        let output = outputs.isEmpty ? "result \(request.inputText)" : outputs.removeFirst()
+        return TaskResult(text: output, modelName: "Stub", task: request.task)
     }
 
     func unload() async {

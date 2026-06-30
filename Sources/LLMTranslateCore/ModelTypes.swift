@@ -93,6 +93,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultTranslationTarget: String
     public var defaultPolishStyle: String
     public var recentHistoryLimit: Int
+    public var webPageTranslation: WebPageTranslationPreferences
 
     public init(
         defaultModelID: UUID? = nil,
@@ -103,11 +104,12 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionEnabled: Bool = true,
         selectionActionTriggerMouseDrag: Bool = true,
         selectionActionTriggerDoubleClick: Bool = true,
-        selectionActionTriggerSelectAll: Bool = false,
+        selectionActionTriggerSelectAll: Bool = true,
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
         defaultPolishStyle: String = "natural",
-        recentHistoryLimit: Int = 20
+        recentHistoryLimit: Int = 20,
+        webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences()
     ) {
         self.defaultModelID = defaultModelID
         self.autoCollapseWidget = autoCollapseWidget
@@ -122,6 +124,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.defaultTranslationTarget = defaultTranslationTarget
         self.defaultPolishStyle = defaultPolishStyle
         self.recentHistoryLimit = recentHistoryLimit
+        self.webPageTranslation = webPageTranslation
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -138,6 +141,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case defaultTranslationTarget
         case defaultPolishStyle
         case recentHistoryLimit
+        case webPageTranslation
     }
 
     public init(from decoder: Decoder) throws {
@@ -150,11 +154,12 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionEnabled = try container.decodeIfPresent(Bool.self, forKey: .selectionActionEnabled) ?? true
         selectionActionTriggerMouseDrag = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerMouseDrag) ?? true
         selectionActionTriggerDoubleClick = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerDoubleClick) ?? true
-        selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? false
+        selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? true
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
         recentHistoryLimit = try container.decodeIfPresent(Int.self, forKey: .recentHistoryLimit) ?? 20
+        webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
     }
 }
 
@@ -185,6 +190,7 @@ public struct HistoryItem: Codable, Identifiable, Hashable, Sendable {
 
 public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
     case translate
+    case webPageTranslate
     case polish
     case summarize
     case explain
@@ -192,9 +198,14 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
 
     public var id: String { rawValue }
 
+    public static var interactiveCases: [TaskKind] {
+        [.translate, .polish, .summarize, .explain, .extractTodos]
+    }
+
     public var title: String {
         switch self {
         case .translate: return "Translate"
+        case .webPageTranslate: return "Web Page Translate"
         case .polish: return "Polish"
         case .summarize: return "Summarize"
         case .explain: return "Explain"
@@ -207,6 +218,7 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
         case .chinese:
             switch self {
             case .translate: return "翻译"
+            case .webPageTranslate: return "网页翻译"
             case .polish: return "润色"
             case .summarize: return "总结"
             case .explain: return "解释"

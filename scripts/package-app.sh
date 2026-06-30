@@ -17,13 +17,18 @@ swift build -c "$CONFIGURATION"
 
 BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
 EXECUTABLE_PATH="$BIN_DIR/llmTranslate"
+NATIVE_HOST_PATH="$BIN_DIR/LLMTranslateNativeHost"
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
 cp "$EXECUTABLE_PATH" "$MACOS_DIR/$APP_NAME"
+cp "$NATIVE_HOST_PATH" "$MACOS_DIR/LLMTranslateNativeHost"
 if [ -d "$BIN_DIR/llama.framework" ]; then
     cp -R "$BIN_DIR/llama.framework" "$MACOS_DIR/llama.framework"
+fi
+if [ -d "$ROOT_DIR/browser-extension" ]; then
+    cp -R "$ROOT_DIR/browser-extension" "$RESOURCES_DIR/browser-extension"
 fi
 
 MLX_METALLIB_SOURCE="${MLX_METALLIB_PATH:-}"

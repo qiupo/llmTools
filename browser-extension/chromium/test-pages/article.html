@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTranslate Test Article</title>
+  <style>
+    body {
+      max-width: 720px;
+      margin: 40px auto;
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    code,
+    pre,
+    input {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Local web page translation smoke test</h1>
+    <p>The quick brown fox jumps over the lazy dog.</p>
+    <p data-duplicate>Repeated label for duplicate translation.</p>
+    <p data-duplicate>Repeated label for duplicate translation.</p>
+    <p>Links should remain clickable after translation, including <a href="https://example.com">this example link</a>.</p>
+    <button>Start reading</button>
+    <pre><code>const message = "Code blocks should not be translated";</code></pre>
+    <label>Form text should stay untouched <input value="Do not translate input values"></label>
+  </main>
+</body>
+</html>
