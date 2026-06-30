@@ -201,11 +201,6 @@ struct QuickActionView: View {
         .onDrop(of: [.fileURL, .plainText, .text], isTargeted: nil) { providers in
             handleDrop(providers)
         }
-        .onChange(of: appState.outputText) { _, newValue in
-            if !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                showInput = false
-            }
-        }
     }
 
     private var controlsBar: some View {
@@ -341,7 +336,12 @@ struct QuickActionView: View {
                 set: { newValue in
                     appState.setInputText(newValue, origin: .manual)
                 }
-            ))
+            ), onSubmit: {
+                guard !appState.isRunning else {
+                    return
+                }
+                appState.runCurrentTask()
+            })
             .frame(minHeight: appState.outputText.isEmpty ? 155 : 88)
         }
         .background(Color(NSColor.textBackgroundColor))
@@ -505,9 +505,10 @@ struct QuickActionView: View {
 
 struct EditableTextView: NSViewRepresentable {
     @Binding var text: String
+    var onSubmit: (() -> Void)? = nil
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text)
+        Coordinator(text: $text, onSubmit: onSubmit)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -518,6 +519,7 @@ struct EditableTextView: NSViewRepresentable {
 
         let textView = CommandFriendlyTextView()
         textView.delegate = context.coordinator
+        textView.onSubmit = onSubmit
         textView.string = text
         textView.font = .systemFont(ofSize: NSFont.systemFontSize)
         textView.textColor = .labelColor
@@ -547,6 +549,10 @@ struct EditableTextView: NSViewRepresentable {
         guard let textView = scrollView.documentView as? NSTextView else {
             return
         }
+        context.coordinator.onSubmit = onSubmit
+        if let textView = textView as? CommandFriendlyTextView {
+            textView.onSubmit = onSubmit
+        }
         if textView.string != text {
             let selectedRanges = textView.selectedRanges
             textView.string = text
@@ -557,9 +563,11 @@ struct EditableTextView: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding var text: String
         weak var textView: NSTextView?
+        var onSubmit: (() -> Void)?
 
-        init(text: Binding<String>) {
+        init(text: Binding<String>, onSubmit: (() -> Void)?) {
             _text = text
+            self.onSubmit = onSubmit
         }
 
         func textDidChange(_ notification: Notification) {
@@ -646,6 +654,19 @@ private struct CompactSwitch: View {
 }
 
 final class CommandFriendlyTextView: NSTextView {
+    var onSubmit: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        if let onSubmit,
+           event.keyCode == 36 || event.keyCode == 76,
+           !event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift) {
+            onSubmit()
+            return
+        }
+
+        super.keyDown(with: event)
+    }
+
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
               let characters = event.charactersIgnoringModifiers?.lowercased() else {
@@ -991,7 +1012,7 @@ struct SettingsView: View {
                 )
 
                 toggleRow(
-                    title: L10n.text("Show action panel after mouse selection", language: language),
+                    title: L10n.text("Show selection action panel", language: language),
                     systemImage: "cursorarrow.click.2",
                     isOn: Binding(
                         get: { appState.preferences.selectionActionEnabled },
@@ -1000,6 +1021,43 @@ struct SettingsView: View {
                         }
                     )
                 )
+
+                VStack(spacing: 7) {
+                    triggerToggleRow(
+                        title: L10n.text("Trigger after mouse drag selection", language: language),
+                        systemImage: "text.cursor",
+                        isOn: Binding(
+                            get: { appState.preferences.selectionActionTriggerMouseDrag },
+                            set: { newValue in
+                                appState.updatePreferences { $0.selectionActionTriggerMouseDrag = newValue }
+                            }
+                        )
+                    )
+
+                    triggerToggleRow(
+                        title: L10n.text("Trigger after double-click selection", language: language),
+                        systemImage: "cursorarrow.click.2",
+                        isOn: Binding(
+                            get: { appState.preferences.selectionActionTriggerDoubleClick },
+                            set: { newValue in
+                                appState.updatePreferences { $0.selectionActionTriggerDoubleClick = newValue }
+                            }
+                        )
+                    )
+
+                    triggerToggleRow(
+                        title: L10n.text("Trigger after Command-A selection", language: language),
+                        systemImage: "command",
+                        isOn: Binding(
+                            get: { appState.preferences.selectionActionTriggerSelectAll },
+                            set: { newValue in
+                                appState.updatePreferences { $0.selectionActionTriggerSelectAll = newValue }
+                            }
+                        )
+                    )
+                }
+                .disabled(!appState.preferences.selectionActionEnabled)
+                .opacity(appState.preferences.selectionActionEnabled ? 1 : 0.45)
             }
         }
     }
@@ -1216,6 +1274,26 @@ struct SettingsView: View {
             if let trailing {
                 trailing
             }
+            CompactSwitch(isOn: isOn)
+        }
+    }
+
+    private func triggerToggleRow(
+        title: String,
+        systemImage: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        HStack(spacing: 8) {
+            Spacer()
+                .frame(width: 18)
+            settingIcon(systemImage)
+                .opacity(0.78)
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
             CompactSwitch(isOn: isOn)
         }
     }

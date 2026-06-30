@@ -2,7 +2,17 @@ import AppKit
 
 @MainActor
 protocol SelectionActionServiceDelegate: AnyObject {
-    func selectionActionService(_ service: SelectionActionService, didFinishSelectionAt screenPoint: NSPoint)
+    func selectionActionService(
+        _ service: SelectionActionService,
+        didTriggerSelectionAt screenPoint: NSPoint,
+        source: SelectionActionTriggerSource
+    )
+}
+
+enum SelectionActionTriggerSource {
+    case mouseDrag
+    case doubleClick
+    case selectAllShortcut
 }
 
 @MainActor
@@ -10,7 +20,9 @@ final class SelectionActionService {
     weak var delegate: SelectionActionServiceDelegate?
 
     private var isEnabled = false
+    private var enabledTriggerSources: Set<SelectionActionTriggerSource> = [.mouseDrag, .doubleClick, .selectAllShortcut]
     private var monitors: [Any] = []
+    private var pendingTriggerTask: Task<Void, Never>?
     private var dragStartPoint: NSPoint?
     private var hasDragged = false
     private var mouseDownClickCount = 0
@@ -18,6 +30,10 @@ final class SelectionActionService {
     private let minimumDragDistance: CGFloat = 8
     private let minimumTriggerInterval: TimeInterval = 0.8
     private let selectionSettlingDelay: TimeInterval = 0.18
+
+    func setEnabledTriggerSources(_ sources: Set<SelectionActionTriggerSource>) {
+        enabledTriggerSources = sources
+    }
 
     func setEnabled(_ enabled: Bool) {
         if enabled {
@@ -57,9 +73,13 @@ final class SelectionActionService {
         addMonitor(for: .leftMouseUp) { [weak self] event, screenPoint in
             self?.handleMouseUp(event, at: screenPoint)
         }
+        addMonitor(for: .keyDown) { [weak self] event, screenPoint in
+            self?.handleKeyDown(event, at: screenPoint)
+        }
     }
 
     private func removeMonitors() {
+        cancelPendingTrigger(resetThrottle: false)
         monitors.forEach(NSEvent.removeMonitor)
         monitors.removeAll()
     }
@@ -104,6 +124,41 @@ final class SelectionActionService {
         }
     }
 
+    private func handleKeyDown(_ event: NSEvent, at screenPoint: NSPoint) {
+        guard isEnabled,
+              !SelectedTextService.isSyntheticShortcutEvent(event),
+              let characters = event.charactersIgnoringModifiers?.lowercased() else {
+            return
+        }
+
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command) else {
+            return
+        }
+
+        switch characters {
+        case "a":
+            let disallowedModifiers: NSEvent.ModifierFlags = [.control, .option, .shift]
+            guard flags.intersection(disallowedModifiers).isEmpty,
+                  !event.isARepeat else {
+                return
+            }
+            guard enabledTriggerSources.contains(.selectAllShortcut) else {
+                return
+            }
+            scheduleTrigger(source: .selectAllShortcut, at: screenPoint)
+        case "c":
+            let disallowedModifiers: NSEvent.ModifierFlags = [.control, .option, .shift]
+            guard flags.intersection(disallowedModifiers).isEmpty else {
+                return
+            }
+            SelectedTextService.noteUserCopyShortcut()
+            cancelPendingTrigger(resetThrottle: true)
+        default:
+            break
+        }
+    }
+
     private func handleMouseUp(_ event: NSEvent, at screenPoint: NSPoint) {
         defer {
             dragStartPoint = nil
@@ -115,26 +170,49 @@ final class SelectionActionService {
             return
         }
 
-        let triggeredBySelectionGesture = hasDragged || event.clickCount >= 2 || mouseDownClickCount >= 2
-        guard triggeredBySelectionGesture else {
+        let source: SelectionActionTriggerSource?
+        if event.clickCount >= 2 || mouseDownClickCount >= 2 {
+            source = .doubleClick
+        } else if hasDragged {
+            source = .mouseDrag
+        } else {
+            source = nil
+        }
+
+        guard let source,
+              enabledTriggerSources.contains(source) else {
             return
         }
 
+        scheduleTrigger(source: source, at: screenPoint)
+    }
+
+    private func scheduleTrigger(source: SelectionActionTriggerSource, at screenPoint: NSPoint) {
         let now = Date()
         guard now.timeIntervalSince(lastTriggerDate) >= minimumTriggerInterval else {
             return
         }
         lastTriggerDate = now
 
-        Task { @MainActor [weak self] in
+        cancelPendingTrigger(resetThrottle: false)
+        pendingTriggerTask = Task { @MainActor [weak self] in
             guard let self else {
                 return
             }
             try? await Task.sleep(nanoseconds: UInt64(selectionSettlingDelay * 1_000_000_000))
-            guard isEnabled else {
+            guard !Task.isCancelled, isEnabled else {
                 return
             }
-            delegate?.selectionActionService(self, didFinishSelectionAt: screenPoint)
+            delegate?.selectionActionService(self, didTriggerSelectionAt: screenPoint, source: source)
+            pendingTriggerTask = nil
+        }
+    }
+
+    private func cancelPendingTrigger(resetThrottle: Bool) {
+        pendingTriggerTask?.cancel()
+        pendingTriggerTask = nil
+        if resetThrottle {
+            lastTriggerDate = .distantPast
         }
     }
 }

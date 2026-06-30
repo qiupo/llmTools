@@ -86,6 +86,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var launchAtLogin: Bool
     public var replaceOriginalText: Bool
     public var selectionActionEnabled: Bool
+    public var selectionActionTriggerMouseDrag: Bool
+    public var selectionActionTriggerDoubleClick: Bool
+    public var selectionActionTriggerSelectAll: Bool
     public var appLanguage: AppLanguage
     public var defaultTranslationTarget: String
     public var defaultPolishStyle: String
@@ -98,6 +101,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         launchAtLogin: Bool = false,
         replaceOriginalText: Bool = false,
         selectionActionEnabled: Bool = true,
+        selectionActionTriggerMouseDrag: Bool = true,
+        selectionActionTriggerDoubleClick: Bool = true,
+        selectionActionTriggerSelectAll: Bool = true,
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
         defaultPolishStyle: String = "natural",
@@ -109,6 +115,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.launchAtLogin = launchAtLogin
         self.replaceOriginalText = replaceOriginalText
         self.selectionActionEnabled = selectionActionEnabled
+        self.selectionActionTriggerMouseDrag = selectionActionTriggerMouseDrag
+        self.selectionActionTriggerDoubleClick = selectionActionTriggerDoubleClick
+        self.selectionActionTriggerSelectAll = selectionActionTriggerSelectAll
         self.appLanguage = appLanguage
         self.defaultTranslationTarget = defaultTranslationTarget
         self.defaultPolishStyle = defaultPolishStyle
@@ -122,6 +131,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case launchAtLogin
         case replaceOriginalText
         case selectionActionEnabled
+        case selectionActionTriggerMouseDrag
+        case selectionActionTriggerDoubleClick
+        case selectionActionTriggerSelectAll
         case appLanguage
         case defaultTranslationTarget
         case defaultPolishStyle
@@ -136,6 +148,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         replaceOriginalText = try container.decodeIfPresent(Bool.self, forKey: .replaceOriginalText) ?? false
         selectionActionEnabled = try container.decodeIfPresent(Bool.self, forKey: .selectionActionEnabled) ?? true
+        selectionActionTriggerMouseDrag = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerMouseDrag) ?? true
+        selectionActionTriggerDoubleClick = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerDoubleClick) ?? true
+        selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? true
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"

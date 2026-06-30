@@ -5,6 +5,8 @@ import Carbon.HIToolbox
 @MainActor
 enum SelectedTextService {
     private static var lastCapturedSourceProcessIdentifier: pid_t?
+    private static var lastUserCopyShortcutDate = Date.distantPast
+    private static let syntheticShortcutEventMarker: Int64 = 0x4C4C_4D54
 
     static var isAccessibilityTrusted: Bool {
         AXIsProcessTrusted()
@@ -15,7 +17,7 @@ enum SelectedTextService {
         AXIsProcessTrustedWithOptions(options)
     }
 
-    static func captureSelectedText() -> String? {
+    static func captureSelectedText() async -> String? {
         guard isAccessibilityTrusted else {
             requestAccessibilityPermission()
             return nil
@@ -26,18 +28,21 @@ enum SelectedTextService {
         let pasteboard = NSPasteboard.general
         let originalString = pasteboard.string(forType: .string)
         let marker = "llmTranslate-\(UUID().uuidString)"
+        let captureStartedAt = Date()
 
         pasteboard.clearContents()
         pasteboard.setString(marker, forType: .string)
         sendCopyShortcut()
-        Thread.sleep(forTimeInterval: 0.12)
+        try? await Task.sleep(nanoseconds: 120_000_000)
 
         let copied = pasteboard.string(forType: .string)
-        if let originalString {
-            pasteboard.clearContents()
-            pasteboard.setString(originalString, forType: .string)
-        } else {
-            pasteboard.clearContents()
+        if lastUserCopyShortcutDate < captureStartedAt {
+            if let originalString {
+                pasteboard.clearContents()
+                pasteboard.setString(originalString, forType: .string)
+            } else {
+                pasteboard.clearContents()
+            }
         }
 
         let trimmed = copied?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -50,6 +55,14 @@ enum SelectedTextService {
 
     static func clearCapturedSelectionSource() {
         lastCapturedSourceProcessIdentifier = nil
+    }
+
+    static func isSyntheticShortcutEvent(_ event: NSEvent) -> Bool {
+        event.cgEvent?.getIntegerValueField(.eventSourceUserData) == syntheticShortcutEventMarker
+    }
+
+    static func noteUserCopyShortcut() {
+        lastUserCopyShortcutDate = Date()
     }
 
     static func replaceSelectedText(with text: String) async -> Bool {
@@ -92,6 +105,8 @@ enum SelectedTextService {
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: UInt16(kVK_ANSI_C), keyDown: false)
         keyDown?.flags = .maskCommand
         keyUp?.flags = .maskCommand
+        keyDown?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
+        keyUp?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
         keyDown?.post(tap: .cghidEventTap)
         keyUp?.post(tap: .cghidEventTap)
     }
@@ -102,6 +117,8 @@ enum SelectedTextService {
         let keyUp = CGEvent(keyboardEventSource: source, virtualKey: UInt16(kVK_ANSI_V), keyDown: false)
         keyDown?.flags = .maskCommand
         keyUp?.flags = .maskCommand
+        keyDown?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
+        keyUp?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
         keyDown?.post(tap: .cghidEventTap)
         keyUp?.post(tap: .cghidEventTap)
     }

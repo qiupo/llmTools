@@ -20,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var settingsWindowController: WindowController?
     private var selectionDismissMonitors: [Any] = []
     private var lastSelectionScreenPoint: NSPoint?
+    private var selectionActionShownAt = Date.distantPast
     private var isSelectionActionEnabled = false
     private var isSelectionActionVisible = false
 
@@ -144,7 +145,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         openQuickAction()
     }
 
-    func selectionActionService(_ service: SelectionActionService, didFinishSelectionAt screenPoint: NSPoint) {
+    func selectionActionService(
+        _ service: SelectionActionService,
+        didTriggerSelectionAt screenPoint: NSPoint,
+        source: SelectionActionTriggerSource
+    ) {
         guard isSelectionActionEnabled else {
             return
         }
@@ -153,16 +158,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             guard let self else {
                 return
             }
-            await self.handleSelectionActionTrigger(at: screenPoint)
+            await self.handleSelectionActionTrigger(at: screenPoint, source: source)
         }
     }
 
-    private func handleSelectionActionTrigger(at screenPoint: NSPoint) async {
+    private func handleSelectionActionTrigger(at screenPoint: NSPoint, source: SelectionActionTriggerSource) async {
         guard isSelectionActionEnabled else {
             return
         }
 
-        guard let selectedText = await captureSelectedTextForSelectionAction() else {
+        guard let selectedText = await captureSelectedTextForSelectionAction(source: source, at: screenPoint) else {
             if !SelectedTextService.isAccessibilityTrusted {
                 appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
             } else {
@@ -180,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         appState.runCurrentTask()
     }
 
-    private func captureSelectedTextForSelectionAction() async -> String? {
+    private func captureSelectedTextForSelectionAction(source: SelectionActionTriggerSource, at screenPoint: NSPoint) async -> String? {
         let retryDelays: [UInt64] = [0, 180_000_000, 320_000_000]
         for delay in retryDelays {
             if delay > 0 {
@@ -189,7 +194,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             guard isSelectionActionEnabled else {
                 return nil
             }
-            if let selectedText = SelectedTextService.captureSelectedText() {
+            if let selectedText = await SelectedTextService.captureSelectedText() {
                 return selectedText
             }
         }
@@ -197,15 +202,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func populateSelectedTextIfAvailable() {
-        if let selectedText = SelectedTextService.captureSelectedText() {
-            appState.setInputText(selectedText, origin: .selection)
-            appState.statusMessage = L10n.text("Captured selected text", language: appState.preferences.appLanguage)
-        } else if !SelectedTextService.isAccessibilityTrusted {
-            SelectedTextService.clearCapturedSelectionSource()
-            appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
-        } else if appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            appState.setInputText("", origin: .manual)
-            appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+
+            if let selectedText = await SelectedTextService.captureSelectedText() {
+                appState.setInputText(selectedText, origin: .selection)
+                appState.statusMessage = L10n.text("Captured selected text", language: appState.preferences.appLanguage)
+            } else if !SelectedTextService.isAccessibilityTrusted {
+                SelectedTextService.clearCapturedSelectionSource()
+                appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
+            } else if appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                appState.setInputText("", origin: .manual)
+                appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
+            }
         }
     }
 
@@ -224,6 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         )
         window.setFrame(NSRect(origin: origin, size: targetSize), display: true)
         isSelectionActionVisible = true
+        selectionActionShownAt = Date()
         window.orderFrontRegardless()
         installSelectionDismissMonitors()
     }
@@ -261,9 +273,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             selectionDismissMonitors.append(localMonitor)
         }
 
-        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
             Task { @MainActor in
                 guard let self else {
+                    return
+                }
+                guard !SelectedTextService.isSyntheticShortcutEvent(event),
+                      self.shouldDismissSelectionAction(for: event) else {
                     return
                 }
                 guard !self.isMouseInsideSelectionActionWindow() else {
@@ -279,6 +295,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private func removeSelectionDismissMonitors() {
         selectionDismissMonitors.forEach(NSEvent.removeMonitor)
         selectionDismissMonitors.removeAll()
+    }
+
+    private func shouldDismissSelectionAction(for event: NSEvent) -> Bool {
+        switch event.type {
+        case .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel:
+            return true
+        default:
+            return Date().timeIntervalSince(selectionActionShownAt) > 0.2
+        }
     }
 
     private func observeAppState() {
@@ -349,11 +374,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     private func applySelectionActionPreference(_ preferences: AppPreferences? = nil) {
         let isEnabled = (preferences ?? appState.preferences).selectionActionEnabled
+        let preferences = preferences ?? appState.preferences
         isSelectionActionEnabled = isEnabled
+        selectionActionService.setEnabledTriggerSources(selectionActionTriggerSources(for: preferences))
         selectionActionService.setEnabled(isEnabled)
         if !isEnabled {
             closeSelectionAction()
         }
+    }
+
+    private func selectionActionTriggerSources(for preferences: AppPreferences) -> Set<SelectionActionTriggerSource> {
+        var sources = Set<SelectionActionTriggerSource>()
+        if preferences.selectionActionTriggerMouseDrag {
+            sources.insert(.mouseDrag)
+        }
+        if preferences.selectionActionTriggerDoubleClick {
+            sources.insert(.doubleClick)
+        }
+        if preferences.selectionActionTriggerSelectAll {
+            sources.insert(.selectAllShortcut)
+        }
+        return sources
     }
 
     private func refreshStatusMenuItem() {
@@ -564,7 +605,7 @@ final class WindowController: NSWindowController {
         let hosting = NSHostingView(rootView: contentView)
         hosting.wantsLayer = true
         hosting.layer?.backgroundColor = NSColor.clear.cgColor
-        let window: FloatingWindow
+        let window: NSWindow
         switch windowKind {
         case .regular:
             window = FloatingWindow(
@@ -582,7 +623,9 @@ final class WindowController: NSWindowController {
             )
         }
         window.title = title
-        window.autoCollapseAtScreenEdge = autoCollapseAtScreenEdge
+        if let floatingWindow = window as? FloatingWindow {
+            floatingWindow.autoCollapseAtScreenEdge = autoCollapseAtScreenEdge
+        }
         window.center()
         window.contentView = hosting
         window.isReleasedWhenClosed = false
@@ -597,9 +640,21 @@ final class WindowController: NSWindowController {
     }
 }
 
-final class SelectionActionWindow: FloatingWindow {
+final class SelectionActionWindow: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    override init(
+        contentRect: NSRect,
+        styleMask style: NSWindow.StyleMask,
+        backing backingStoreType: NSWindow.BackingStoreType,
+        defer flag: Bool
+    ) {
+        super.init(contentRect: contentRect, styleMask: style, backing: backingStoreType, defer: flag)
+        hidesOnDeactivate = false
+        becomesKeyOnlyIfNeeded = false
+        isFloatingPanel = true
+    }
 }
 
 class FloatingWindow: NSWindow {
