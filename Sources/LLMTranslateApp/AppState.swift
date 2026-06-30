@@ -28,6 +28,8 @@ final class AppState: ObservableObject {
 
     let engine: TaskEngine
     private var preferenceSaveRevision = 0
+    private var currentRunTask: Task<Void, Never>?
+    private var runRevision = 0
 
     init(engine: TaskEngine = TaskEngine()) {
         self.engine = engine
@@ -178,6 +180,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    func prepareAutomaticSelectionText(_ text: String) -> Bool {
+        let characterCount = text.count
+        let limit = automaticSelectionCharacterLimit
+        guard characterCount <= limit else {
+            inputText = ""
+            inputOrigin = .selection
+            outputText = ""
+            rawOutputText = ""
+            showsRawOutput = false
+            selectionInlineResultVisible = true
+            validationError = "\(t("Selected text is too long for automatic translation.")) \(characterCount)/\(limit)"
+            statusMessage = t("Selection too long")
+            SelectedTextService.clearCapturedSelectionSource()
+            return false
+        }
+        return true
+    }
+
     func showSelectionInlineResult() {
         selectionInlineResultVisible = true
     }
@@ -235,32 +255,57 @@ final class AppState: ObservableObject {
             validationError = t("Please paste or type some text first.")
             return
         }
+        guard validateInputLength(text) else {
+            return
+        }
 
+        currentRunTask?.cancel()
+        runRevision += 1
+        let revision = runRevision
+        let request = TaskRequest(
+            task: selectedTask,
+            inputText: text,
+            targetLanguage: preferences.defaultTranslationTarget,
+            polishStyle: preferences.defaultPolishStyle
+        )
+        let modelID = selectedModelID
         isRunning = true
         validationError = nil
         statusMessage = "\(t("Running")) \(selectedTask.title(language: preferences.appLanguage))..."
-        Task {
+        currentRunTask = Task {
             do {
                 let result = try await engine.run(
-                    request: TaskRequest(
-                        task: selectedTask,
-                        inputText: text,
-                        targetLanguage: preferences.defaultTranslationTarget,
-                        polishStyle: preferences.defaultPolishStyle
-                    ),
-                    modelID: selectedModelID
+                    request: request,
+                    modelID: modelID
                 )
+                try Task.checkCancellation()
                 await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
                     outputText = result.text
                     rawOutputText = result.rawText
                     showsRawOutput = false
                     statusMessage = t("Finished")
                     isRunning = false
+                    currentRunTask = nil
                 }
                 await replaceOriginalTextIfNeeded(result.text)
                 await reloadSnapshot()
+            } catch is CancellationError {
+                await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
+                    statusMessage = t("Cancelled")
+                    isRunning = false
+                    currentRunTask = nil
+                }
             } catch {
                 await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
                     if let runnerError = error as? RunnerError, case .emptyResult = runnerError {
                         validationError = nil
                         outputText = t("The model returned an empty result. Try regenerate.")
@@ -271,7 +316,23 @@ final class AppState: ObservableObject {
                     }
                     statusMessage = t("Failed")
                     isRunning = false
+                    currentRunTask = nil
                 }
+            }
+        }
+    }
+
+    func cancelCurrentTask(unloadModel: Bool = false) {
+        currentRunTask?.cancel()
+        currentRunTask = nil
+        runRevision += 1
+        if isRunning {
+            isRunning = false
+            statusMessage = t("Cancelled")
+        }
+        if unloadModel {
+            Task {
+                await engine.unloadAll()
             }
         }
     }
@@ -323,6 +384,43 @@ final class AppState: ObservableObject {
 
     private func t(_ key: String) -> String {
         L10n.text(key, language: preferences.appLanguage)
+    }
+
+    private var selectedModelContextLength: Int? {
+        if let selectedModelID,
+           let model = models.first(where: { $0.id == selectedModelID && $0.enabled }) {
+            return model.contextLength
+        }
+        if let defaultModelID = preferences.defaultModelID,
+           let model = models.first(where: { $0.id == defaultModelID && $0.enabled }) {
+            return model.contextLength
+        }
+        return models.first(where: { $0.enabled })?.contextLength
+    }
+
+    private var inputCharacterLimit: Int {
+        InputSizePolicy.maximumInputCharacters(forContextLength: selectedModelContextLength)
+    }
+
+    private var automaticSelectionCharacterLimit: Int {
+        InputSizePolicy.maximumAutomaticSelectionCharacters(forContextLength: selectedModelContextLength)
+    }
+
+    private func validateInputLength(_ text: String) -> Bool {
+        let characterCount = text.count
+        let limit = inputCharacterLimit
+        guard characterCount <= limit else {
+            outputText = ""
+            rawOutputText = ""
+            showsRawOutput = false
+            validationError = "\(t("Input is too long for the selected model.")) \(characterCount)/\(limit)"
+            statusMessage = t("Failed")
+            if inputOrigin == .selection {
+                selectionInlineResultVisible = true
+            }
+            return false
+        }
+        return true
     }
 
     func selectedModelDisplayName(limit: Int = 18) -> String {

@@ -67,12 +67,14 @@ public actor GGUFRunner: ModelRunner {
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
         let fullPrompt = chatPrompt(systemPrompt: systemPrompt, userPrompt: userPrompt)
 
+        try Task.checkCancellation()
         let output = try generateText(
             prompt: fullPrompt,
             model: model,
             context: context,
             maxNewTokens: defaultMaxNewTokens
         )
+        try Task.checkCancellation()
         let rawOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
         let visibleOutput = VisibleOutput.from(rawText: rawOutput)
         guard !visibleOutput.isEmpty || !rawOutput.isEmpty else {
@@ -109,6 +111,7 @@ public actor GGUFRunner: ModelRunner {
         context: OpaquePointer,
         maxNewTokens: Int
     ) throws -> String {
+        try Task.checkCancellation()
         llama_memory_clear(llama_get_memory(context), true)
 
         guard let vocab = llama_model_get_vocab(model) else {
@@ -139,6 +142,7 @@ public actor GGUFRunner: ModelRunner {
 
         var promptOffset = 0
         while promptOffset < promptSlice.count {
+            try Task.checkCancellation()
             let chunk = promptSlice[promptOffset..<min(promptOffset + batchSize, promptSlice.count)]
             batch.n_tokens = Int32(chunk.count)
             for (localIndex, token) in chunk.enumerated() {
@@ -164,6 +168,7 @@ public actor GGUFRunner: ModelRunner {
         let remainingContext = max(contextLength - promptSlice.count, 0)
         let generationLimit = min(maxNewTokens, remainingContext)
         for _ in 0..<generationLimit {
+            try Task.checkCancellation()
             guard let logits = llama_get_logits_ith(context, batch.n_tokens - 1) else {
                 throw RunnerError.unsupportedConfiguration("Failed to read GGUF logits.")
             }

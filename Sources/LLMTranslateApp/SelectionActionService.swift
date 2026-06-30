@@ -20,7 +20,7 @@ final class SelectionActionService {
     weak var delegate: SelectionActionServiceDelegate?
 
     private var isEnabled = false
-    private var enabledTriggerSources: Set<SelectionActionTriggerSource> = [.mouseDrag, .doubleClick, .selectAllShortcut]
+    private var enabledTriggerSources: Set<SelectionActionTriggerSource> = [.mouseDrag, .doubleClick]
     private var monitors: [Any] = []
     private var pendingTriggerTask: Task<Void, Never>?
     private var dragStartPoint: NSPoint?

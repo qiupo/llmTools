@@ -101,6 +101,7 @@ public actor TaskEngine {
 
     public func run(request: TaskRequest, modelID: UUID? = nil) async throws -> TaskResult {
         let model = try resolveModel(for: modelID)
+        try validateInputSize(request, for: model)
         let runner = try runner(for: model)
         if await runner.loadedModelID() != model.id {
             await runner.unload()
@@ -135,6 +136,14 @@ public actor TaskEngine {
             return firstEnabled
         }
         throw RunnerError.unsupportedConfiguration("No enabled model is registered.")
+    }
+
+    private func validateInputSize(_ request: TaskRequest, for model: ModelDescriptor) throws {
+        let limit = InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength)
+        let current = request.inputText.count
+        guard current <= limit else {
+            throw RunnerError.inputTooLong(current: current, limit: limit)
+        }
     }
 
     private func runner(for model: ModelDescriptor) throws -> any ModelRunner {

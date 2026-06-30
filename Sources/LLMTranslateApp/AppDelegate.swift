@@ -45,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         hotKeyService.unregister()
+        appState.cancelCurrentTask(unloadModel: true)
         selectionActionService.stop()
     }
 
@@ -173,6 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             } else {
                 appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
             }
+            return
+        }
+
+        guard appState.prepareAutomaticSelectionText(selectedText) else {
+            lastSelectionScreenPoint = screenPoint
+            showSelectionAction(at: screenPoint)
             return
         }
 
@@ -390,9 +397,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
         if preferences.selectionActionTriggerDoubleClick {
             sources.insert(.doubleClick)
-        }
-        if preferences.selectionActionTriggerSelectAll {
-            sources.insert(.selectAllShortcut)
         }
         return sources
     }

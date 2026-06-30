@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXLLM
 import MLXLMCommon
 import MLXHuggingFace
@@ -54,6 +55,7 @@ public actor MLXRunner: ModelRunner {
             throw RunnerError.notLoaded
         }
 
+        try Task.checkCancellation()
         let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
         let session = ChatSession(
@@ -63,6 +65,7 @@ public actor MLXRunner: ModelRunner {
             additionalContext: ["enable_thinking": false]
         )
         let response = try await session.respond(to: userPrompt)
+        try Task.checkCancellation()
 
         let rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
         let output = VisibleOutput.from(rawText: rawOutput)
@@ -82,5 +85,6 @@ public actor MLXRunner: ModelRunner {
         isLoaded = false
         modelID = nil
         modelName = nil
+        Memory.clearCache()
     }
 }

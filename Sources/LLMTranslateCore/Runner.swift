@@ -4,6 +4,7 @@ public enum RunnerError: Error, LocalizedError, Sendable {
     case notLoaded
     case unsupportedFormat(ModelFormat)
     case emptyResult
+    case inputTooLong(current: Int, limit: Int)
     case unsupportedConfiguration(String)
 
     public var errorDescription: String? {
@@ -14,6 +15,8 @@ public enum RunnerError: Error, LocalizedError, Sendable {
             return "Unsupported model format: \(format.rawValue)"
         case .emptyResult:
             return "模型返回了空结果，请重新生成。"
+        case .inputTooLong(let current, let limit):
+            return "Input is too long for the selected model. Shorten it to \(limit) characters or less. Current length: \(current)."
         case .unsupportedConfiguration(let message):
             return message
         }

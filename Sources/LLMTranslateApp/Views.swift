@@ -382,11 +382,18 @@ struct QuickActionView: View {
             }
 
             Button {
-                appState.runCurrentTask()
+                if appState.isRunning {
+                    appState.cancelCurrentTask(unloadModel: true)
+                } else {
+                    appState.runCurrentTask()
+                }
             } label: {
-                Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
+                if appState.isRunning {
+                    Label(L10n.text("Cancel", language: language), systemImage: "stop.fill")
+                } else {
+                    Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
+                }
             }
-            .disabled(appState.isRunning)
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -743,11 +750,17 @@ struct FloatingWidgetView: View {
 
             HStack {
                 Button {
-                    appState.runCurrentTask()
+                    if appState.isRunning {
+                        appState.cancelCurrentTask(unloadModel: true)
+                    } else {
+                        appState.runCurrentTask()
+                    }
                 } label: {
-                    Label(L10n.text("Run", language: language), systemImage: "play.fill")
+                    Label(
+                        L10n.text(appState.isRunning ? "Cancel" : "Run", language: language),
+                        systemImage: appState.isRunning ? "stop.fill" : "play.fill"
+                    )
                 }
-                .disabled(appState.isRunning)
 
                 Button {
                     NSPasteboard.general.clearContents()
@@ -1045,16 +1058,6 @@ struct SettingsView: View {
                         )
                     )
 
-                    triggerToggleRow(
-                        title: L10n.text("Trigger after Command-A selection", language: language),
-                        systemImage: "command",
-                        isOn: Binding(
-                            get: { appState.preferences.selectionActionTriggerSelectAll },
-                            set: { newValue in
-                                appState.updatePreferences { $0.selectionActionTriggerSelectAll = newValue }
-                            }
-                        )
-                    )
                 }
                 .disabled(!appState.preferences.selectionActionEnabled)
                 .opacity(appState.preferences.selectionActionEnabled ? 1 : 0.45)
