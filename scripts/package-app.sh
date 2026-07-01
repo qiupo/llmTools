@@ -10,6 +10,7 @@ APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
+APP_ICON_NAME="AppIcon"
 DEFAULT_OMLX_METALLIB="/Applications/oMLX.app/Contents/Python/framework-mlx-framework/lib/python3.11/site-packages/mlx/lib/mlx.metallib"
 
 cd "$ROOT_DIR"
@@ -30,6 +31,11 @@ fi
 if [ -d "$ROOT_DIR/browser-extension" ]; then
     cp -R "$ROOT_DIR/browser-extension" "$RESOURCES_DIR/browser-extension"
 fi
+if [ ! -f "$ROOT_DIR/Resources/$APP_ICON_NAME.icns" ]; then
+    echo "error: missing app icon at Resources/$APP_ICON_NAME.icns; run ./scripts/generate-app-icon.sh first." >&2
+    exit 1
+fi
+cp "$ROOT_DIR/Resources/$APP_ICON_NAME.icns" "$RESOURCES_DIR/$APP_ICON_NAME.icns"
 
 MLX_METALLIB_SOURCE="${MLX_METALLIB_PATH:-}"
 if [ -z "$MLX_METALLIB_SOURCE" ] && [ -f "$DEFAULT_OMLX_METALLIB" ]; then
@@ -54,6 +60,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <string>local.llmtools.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleName</key>
     <string>llmTools</string>
     <key>CFBundlePackageType</key>
