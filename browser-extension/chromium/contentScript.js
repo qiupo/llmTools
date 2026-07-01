@@ -1,11 +1,42 @@
 (() => {
-  if (window.__llmTranslateContentLoaded) {
+  if (window.__llmToolsContentLoaded) {
     return;
   }
-  window.__llmTranslateContentLoaded = true;
+  window.__llmToolsContentLoaded = true;
+
+  const DEFAULT_APP_LANGUAGE = "zh-Hans";
+  const CONTENT_TEXT = {
+    "zh-Hans": {
+      cancelled: "已取消",
+      discoveringText: "正在发现文本...",
+      foundSegments: ({ count }) => `找到 ${count} 个片段`,
+      appliedTranslations: ({ count }) => `已应用 ${count} 条译文`,
+      discoveryPaused: "发现已暂停",
+      queuedNewSegments: ({ count }) => `已加入 ${count} 个新片段`,
+      failedProgress: ({ failed }) => `，${failed} 个失败`,
+      translatingAria: "正在翻译",
+      minimize: "最小化",
+      cancel: "取消",
+      restore: "恢复原文"
+    },
+    en: {
+      cancelled: "Cancelled",
+      discoveringText: "Discovering text...",
+      foundSegments: ({ count }) => `Found ${count} segments`,
+      appliedTranslations: ({ count }) => `Applied ${count} translations`,
+      discoveryPaused: "Discovery paused",
+      queuedNewSegments: ({ count }) => `Queued ${count} new segments`,
+      failedProgress: ({ failed }) => `, ${failed} failed`,
+      translatingAria: "Translating",
+      minimize: "Minimize",
+      cancel: "Cancel",
+      restore: "Restore"
+    }
+  };
 
   const state = {
     pageSessionID: null,
+    appLanguage: DEFAULT_APP_LANGUAGE,
     nodeByID: new Map(),
     originalByID: new Map(),
     translatedByID: new Map(),
@@ -17,9 +48,6 @@
     overlay: null,
     overlayMinimized: false,
     pendingIndicatorStyle: "loading",
-    segmentBudget: 320,
-    maxInlinePendingIndicators: 80,
-    maxAnimatedSegments: 48,
     animatedSegmentIDs: new Set(),
     segmentSpinnerStyleInstalled: false,
     intersectionObserver: null,
@@ -27,6 +55,22 @@
     discoveryTimer: null,
     staleIndicatorCleanupTimer: null
   };
+
+  function normalizeAppLanguage(language) {
+    return language === "en" ? "en" : DEFAULT_APP_LANGUAGE;
+  }
+
+  function setAppLanguage(language) {
+    state.appLanguage = normalizeAppLanguage(language);
+    return state.appLanguage;
+  }
+
+  function t(key, values = {}, language = state.appLanguage) {
+    const normalizedLanguage = normalizeAppLanguage(language);
+    const catalog = CONTENT_TEXT[normalizedLanguage] || CONTENT_TEXT[DEFAULT_APP_LANGUAGE];
+    const entry = catalog[key] ?? CONTENT_TEXT.en[key] ?? key;
+    return typeof entry === "function" ? entry(values) : entry;
+  }
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     Promise.resolve(handleMessage(message)).then(sendResponse).catch((error) => {
@@ -45,6 +89,7 @@
         applyTranslations(message.translations || []);
         return { ok: true, applied: state.translatedByID.size };
       case "translationState":
+        setAppLanguage(message.state?.appLanguage);
         updateOverlayFromState(message.state || {});
         return { ok: true };
       case "getPageTranslationState":
@@ -57,10 +102,10 @@
         state.discoveryPaused = true;
         state.pendingNodes.clear();
         removeAllSegmentSpinners();
-        updateOverlay("Cancelled");
+        updateOverlay(t("cancelled"));
         return { ok: true };
       case "setDiscoveryPaused":
-        setDiscoveryPaused(Boolean(message.paused), message.reason, message.segmentBudget);
+        setDiscoveryPaused(Boolean(message.paused));
         return { ok: true };
       default:
         return { ok: true };
@@ -69,10 +114,8 @@
 
   function startSession(pageSessionID, pendingIndicatorStyle, options = {}) {
     state.pageSessionID = pageSessionID || crypto.randomUUID();
+    setAppLanguage(options.appLanguage);
     state.pendingIndicatorStyle = normalizePendingIndicatorStyle(pendingIndicatorStyle);
-    state.segmentBudget = Math.max(Number(options.segmentBudget) || 320, 1);
-    state.maxInlinePendingIndicators = Math.max(Number(options.maxInlinePendingIndicators) || 80, 0);
-    state.maxAnimatedSegments = Math.max(Number(options.maxAnimatedSegments) || 48, 0);
     state.cancelled = false;
     state.discoveryPaused = false;
     state.overlayMinimized = false;
@@ -85,10 +128,10 @@
     clearTimeout(state.staleIndicatorCleanupTimer);
     state.staleIndicatorCleanupTimer = null;
     removeAllSegmentSpinners();
-    showOverlay("Discovering text...");
+    showOverlay(t("discoveringText"));
     installObservers();
-    const segments = discoverSegments(document.body, state.segmentBudget);
-    updateOverlay(`Found ${segments.length} segments`);
+    const segments = discoverSegments(document.body);
+    updateOverlay(t("foundSegments", { count: segments.length }));
     return {
       ok: true,
       url: location.href,
@@ -109,16 +152,13 @@
     };
   }
 
-  function remainingSegmentBudget() {
-    return Math.max(state.segmentBudget - state.originalByID.size, 0);
-  }
-
   function discoverSegments(root = document.body, limit = 200) {
-    if (!root || state.cancelled || state.discoveryPaused || remainingSegmentBudget() <= 0) {
+    if (!root || state.cancelled || state.discoveryPaused) {
       return [];
     }
     const segments = [];
-    const maxSegments = Math.min(Math.max(limit, 0), 200, remainingSegmentBudget());
+    const requestedLimit = Number.isFinite(Number(limit)) ? Math.max(Number(limit), 0) : Number.POSITIVE_INFINITY;
+    const maxSegments = Math.min(requestedLimit, 200);
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (!candidateNode(node)) return NodeFilter.FILTER_REJECT;
@@ -142,9 +182,6 @@
   }
 
   function registerNode(node) {
-    if (remainingSegmentBudget() <= 0) {
-      return null;
-    }
     const text = normalizeText(node.nodeValue || "");
     const textHash = stableHash(text);
     if (state.processedNodes.has(node)) {
@@ -206,7 +243,7 @@
         removeSegmentSpinner(item.segmentID);
       }
     }
-    updateOverlay(`Applied ${state.translatedByID.size} translations`, {
+    updateOverlay(t("appliedTranslations", { count: state.translatedByID.size }), {
       canRestore: state.translatedByID.size > 0
     });
   }
@@ -272,22 +309,19 @@
     observeElement(document.body);
   }
 
-  function setDiscoveryPaused(paused, reason, segmentBudget) {
+  function setDiscoveryPaused(paused) {
     state.discoveryPaused = paused;
-    if (Number(segmentBudget) > 0) {
-      state.segmentBudget = Number(segmentBudget);
-    }
     if (paused) {
       state.pendingNodes.clear();
       clearTimeout(state.discoveryTimer);
       state.discoveryTimer = null;
-      updateOverlay(reason === "budget" ? `Queued ${state.originalByID.size} segments` : "Translation queue is full", {
+      updateOverlay(t("discoveryPaused"), {
         canCancel: true,
         canRestore: state.translatedByID.size > 0
       });
       return;
     }
-    if (!state.cancelled && state.pageSessionID && remainingSegmentBudget() > 0) {
+    if (!state.cancelled && state.pageSessionID) {
       queueDiscovery(document.body);
     }
   }
@@ -308,7 +342,7 @@
   }
 
   function queueDiscovery(root) {
-    if (!state.pageSessionID || state.cancelled || state.discoveryPaused || !root || remainingSegmentBudget() <= 0) {
+    if (!state.pageSessionID || state.cancelled || state.discoveryPaused || !root) {
       return;
     }
     state.pendingNodes.add(root);
@@ -317,7 +351,7 @@
   }
 
   function flushPendingDiscovery() {
-    if (!state.pageSessionID || state.cancelled || state.discoveryPaused || remainingSegmentBudget() <= 0) {
+    if (!state.pageSessionID || state.cancelled || state.discoveryPaused) {
       return;
     }
     const pending = Array.from(state.pendingNodes);
@@ -329,12 +363,11 @@
         const segment = candidateNode(root) ? registerNode(root) : null;
         if (segment) segments.push(segment);
       } else if (root.nodeType === Node.ELEMENT_NODE) {
-        segments.push(...discoverSegments(root, remainingSegmentBudget()));
+        segments.push(...discoverSegments(root));
       }
-      if (segments.length >= 200 || remainingSegmentBudget() <= 0) break;
     }
     if (segments.length) {
-      updateOverlay(`Queued ${segments.length} new segments`, {
+      updateOverlay(t("queuedNewSegments", { count: segments.length }), {
         canCancel: true,
         canRestore: state.translatedByID.size > 0
       });
@@ -367,8 +400,8 @@
     const skipped = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEMPLATE", "SVG", "CANVAS", "CODE", "PRE", "KBD", "SAMP", "TEXTAREA", "INPUT", "SELECT", "OPTION"]);
     for (let current = element; current && current !== document.body; current = current.parentElement) {
       if (skipped.has(current.tagName)) return true;
-      if (current.dataset?.llmTranslateSpinner === "true") return true;
-      if (current.dataset?.llmTranslateIndicator === "true") return true;
+      if (current.dataset?.llmToolsSpinner === "true") return true;
+      if (current.dataset?.llmToolsIndicator === "true") return true;
       if (current.isContentEditable) return true;
       if (current.getAttribute("aria-hidden") === "true") return true;
     }
@@ -427,12 +460,12 @@
     }
     installSegmentSpinnerStyle();
     const spinner = document.createElement("span");
-    spinner.className = "llmtranslate-segment-spinner";
-    spinner.dataset.llmTranslateSpinner = "true";
-    spinner.dataset.llmTranslateIndicator = "true";
-    spinner.dataset.llmTranslateIndicatorKind = "loading";
-    spinner.dataset.llmTranslateCreatedAt = String(Date.now());
-    spinner.setAttribute("aria-label", "Translating");
+    spinner.className = "llmtools-segment-spinner";
+    spinner.dataset.llmToolsSpinner = "true";
+    spinner.dataset.llmToolsIndicator = "true";
+    spinner.dataset.llmToolsIndicatorKind = "loading";
+    spinner.dataset.llmToolsCreatedAt = String(Date.now());
+    spinner.setAttribute("aria-label", t("translatingAria"));
     spinner.setAttribute("aria-live", "polite");
     spinner.setAttribute("contenteditable", "false");
     spinner.style.cssText = segmentSpinnerStyle();
@@ -442,20 +475,11 @@
   }
 
   function effectivePendingIndicatorStyle() {
-    if (state.originalByID.size >= state.maxInlinePendingIndicators) {
-      return "none";
-    }
     return state.pendingIndicatorStyle;
   }
 
   function shouldAnimateTranslation(segmentID) {
-    if (state.pendingIndicatorStyle !== "flipText") {
-      return false;
-    }
-    if (state.animatedSegmentIDs.has(segmentID)) {
-      return true;
-    }
-    return state.animatedSegmentIDs.size < state.maxAnimatedSegments;
+    return state.pendingIndicatorStyle === "flipText";
   }
 
   function removeSegmentSpinner(segmentID) {
@@ -495,7 +519,7 @@
       return;
     }
     for (const [segmentID, indicator] of Array.from(state.spinnerByID.entries())) {
-      const createdAt = Number(indicator?.dataset?.llmTranslateCreatedAt || 0);
+      const createdAt = Number(indicator?.dataset?.llmToolsCreatedAt || 0);
       if (!indicator?.isConnected || createdAt > createdBefore) {
         continue;
       }
@@ -512,82 +536,82 @@
       return;
     }
     const style = document.createElement("style");
-    style.dataset.llmTranslateSpinnerStyle = "true";
+    style.dataset.llmToolsSpinnerStyle = "true";
     style.textContent = `
-      @keyframes llmtranslate-segment-spin {
+      @keyframes llmtools-segment-spin {
         to { transform: rotate(360deg); }
       }
-      .llmtranslate-segment-flip {
+      .llmtools-segment-flip {
         display: inline;
         perspective: 700px;
         transform-style: preserve-3d;
         pointer-events: none;
         user-select: none;
       }
-      .llmtranslate-segment-flip-tile {
+      .llmtools-segment-flip-tile {
         display: inline-grid;
-        grid-template-areas: "llmtranslate-flip-stack";
+        grid-template-areas: "llmtools-flip-stack";
         transform-origin: 50% 55%;
         transform-style: preserve-3d;
         vertical-align: baseline;
         will-change: transform;
       }
-      .llmtranslate-segment-flip-face {
+      .llmtools-segment-flip-face {
         display: inline-block;
-        grid-area: llmtranslate-flip-stack;
+        grid-area: llmtools-flip-stack;
         white-space: pre-wrap;
       }
-      .llmtranslate-segment-flip-pending .llmtranslate-segment-flip-tile {
-        animation: llmtranslate-segment-sway 1.35s ease-in-out infinite;
-        animation-delay: var(--llmtranslate-delay, 0ms);
+      .llmtools-segment-flip-pending .llmtools-segment-flip-tile {
+        animation: llmtools-segment-sway 1.35s ease-in-out infinite;
+        animation-delay: var(--llmtools-delay, 0ms);
       }
-      .llmtranslate-segment-flip-pending .llmtranslate-segment-flip-back {
+      .llmtools-segment-flip-pending .llmtools-segment-flip-back {
         display: none;
       }
-      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-tile {
-        animation: llmtranslate-segment-complete-flip .78s cubic-bezier(.22,.9,.18,1) forwards;
-        animation-delay: var(--llmtranslate-delay, 0ms);
+      .llmtools-segment-flip-complete .llmtools-segment-flip-tile {
+        animation: llmtools-segment-complete-flip .78s cubic-bezier(.22,.9,.18,1) forwards;
+        animation-delay: var(--llmtools-delay, 0ms);
       }
-      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-front {
-        animation: llmtranslate-segment-front-out .78s linear forwards;
-        animation-delay: var(--llmtranslate-delay, 0ms);
+      .llmtools-segment-flip-complete .llmtools-segment-flip-front {
+        animation: llmtools-segment-front-out .78s linear forwards;
+        animation-delay: var(--llmtools-delay, 0ms);
       }
-      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-back {
+      .llmtools-segment-flip-complete .llmtools-segment-flip-back {
         color: #2563eb;
         opacity: 0;
-        animation: llmtranslate-segment-back-in .78s linear forwards;
-        animation-delay: var(--llmtranslate-delay, 0ms);
+        animation: llmtools-segment-back-in .78s linear forwards;
+        animation-delay: var(--llmtools-delay, 0ms);
       }
-      @keyframes llmtranslate-segment-sway {
+      @keyframes llmtools-segment-sway {
         0%, 100% { transform: rotateX(0deg); }
         24% { transform: rotateX(-18deg); }
         54% { transform: rotateX(16deg); }
         76% { transform: rotateX(-6deg); }
       }
-      @keyframes llmtranslate-segment-complete-flip {
+      @keyframes llmtools-segment-complete-flip {
         0% { transform: rotateX(0deg); }
         48% { transform: rotateX(172deg); }
         52% { transform: rotateX(188deg); }
         100% { transform: rotateX(360deg); }
       }
-      @keyframes llmtranslate-segment-front-out {
+      @keyframes llmtools-segment-front-out {
         0%, 48% { opacity: 1; }
         49%, 100% { opacity: 0; }
       }
-      @keyframes llmtranslate-segment-back-in {
+      @keyframes llmtools-segment-back-in {
         0%, 48% { opacity: 0; color: #2563eb; }
         49%, 100% { opacity: 1; color: inherit; }
       }
       @media (prefers-reduced-motion: reduce) {
-        .llmtranslate-segment-flip-tile,
-        .llmtranslate-segment-flip-face {
+        .llmtools-segment-flip-tile,
+        .llmtools-segment-flip-face {
           animation: none !important;
           transform: none !important;
         }
-        .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-front {
+        .llmtools-segment-flip-complete .llmtools-segment-flip-front {
           display: none;
         }
-        .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-back {
+        .llmtools-segment-flip-complete .llmtools-segment-flip-back {
           opacity: 1;
           color: inherit;
         }
@@ -603,10 +627,10 @@
       return;
     }
     installSegmentSpinnerStyle();
-    const wrapper = node.nodeType === Node.ELEMENT_NODE && node.dataset?.llmTranslateIndicatorKind === "flipText"
+    const wrapper = node.nodeType === Node.ELEMENT_NODE && node.dataset?.llmToolsIndicatorKind === "flipText"
       ? node
       : createFlipTextIndicator(original, "", "pending");
-    wrapper.dataset.llmTranslateFinalText = finalText;
+    wrapper.dataset.llmToolsFinalText = finalText;
     wrapper.setAttribute("aria-label", finalText);
     wrapper.setAttribute("aria-live", "polite");
     wrapper.setAttribute("contenteditable", "false");
@@ -634,12 +658,12 @@
 
   function createFlipTextIndicator(originalText, finalText, phase) {
     const wrapper = document.createElement("span");
-    wrapper.className = "llmtranslate-segment-flip";
-    wrapper.dataset.llmTranslateIndicator = "true";
-    wrapper.dataset.llmTranslateIndicatorKind = "flipText";
-    wrapper.dataset.llmTranslateOriginalText = originalText;
-    wrapper.dataset.llmTranslateFinalText = finalText;
-    wrapper.dataset.llmTranslateCreatedAt = String(Date.now());
+    wrapper.className = "llmtools-segment-flip";
+    wrapper.dataset.llmToolsIndicator = "true";
+    wrapper.dataset.llmToolsIndicatorKind = "flipText";
+    wrapper.dataset.llmToolsOriginalText = originalText;
+    wrapper.dataset.llmToolsFinalText = finalText;
+    wrapper.dataset.llmToolsCreatedAt = String(Date.now());
     wrapper.setAttribute("aria-live", "polite");
     wrapper.setAttribute("contenteditable", "false");
     renderFlipTextBlocks(wrapper, originalText, finalText, phase);
@@ -652,21 +676,21 @@
     const blockCount = phase === "complete"
       ? Math.max(originalChunks.length, finalChunks.length, 1)
       : Math.max(originalChunks.length, 1);
-    wrapper.classList.toggle("llmtranslate-segment-flip-pending", phase === "pending");
-    wrapper.classList.toggle("llmtranslate-segment-flip-complete", phase === "complete");
+    wrapper.classList.toggle("llmtools-segment-flip-pending", phase === "pending");
+    wrapper.classList.toggle("llmtools-segment-flip-complete", phase === "complete");
     wrapper.replaceChildren();
     for (let index = 0; index < blockCount; index += 1) {
       const tile = document.createElement("span");
-      tile.className = "llmtranslate-segment-flip-tile";
-      tile.style.setProperty("--llmtranslate-delay", `${flipBlockDelay(index, phase)}ms`);
+      tile.className = "llmtools-segment-flip-tile";
+      tile.style.setProperty("--llmtools-delay", `${flipBlockDelay(index, phase)}ms`);
 
       const front = document.createElement("span");
-      front.className = "llmtranslate-segment-flip-face llmtranslate-segment-flip-front";
+      front.className = "llmtools-segment-flip-face llmtools-segment-flip-front";
       front.textContent = originalChunks[index] || "";
       tile.appendChild(front);
 
       const back = document.createElement("span");
-      back.className = "llmtranslate-segment-flip-face llmtranslate-segment-flip-back";
+      back.className = "llmtools-segment-flip-face llmtools-segment-flip-back";
       back.textContent = finalChunks[index] || "";
       tile.appendChild(back);
 
@@ -723,8 +747,8 @@
     if (!element?.isConnected) {
       return null;
     }
-    if (element.dataset?.llmTranslateIndicatorKind === "flipText") {
-      const textNode = document.createTextNode(element.dataset.llmTranslateFinalText || element.textContent || "");
+    if (element.dataset?.llmToolsIndicatorKind === "flipText") {
+      const textNode = document.createTextNode(element.dataset.llmToolsFinalText || element.textContent || "");
       state.processedNodes.add(textNode);
       element.replaceWith(textNode);
       return textNode;
@@ -750,7 +774,7 @@
       "border:1.5px solid rgba(37,99,235,.24)",
       "border-top-color:#2563eb",
       "border-radius:50%",
-      "animation:llmtranslate-segment-spin .8s linear infinite",
+      "animation:llmtools-segment-spin .8s linear infinite",
       "pointer-events:none",
       "user-select:none"
     ].join(";");
@@ -792,7 +816,7 @@
     const total = translationState.total || 0;
     const done = translationState.done || 0;
     const failedCount = translationState.failed || 0;
-    const progress = total > 0 ? `${done}/${total}${failedCount ? `, ${failedCount} failed` : ""}` : "";
+    const progress = total > 0 ? `${done}/${total}${failedCount ? t("failedProgress", { failed: failedCount }) : ""}` : "";
     const message = translationState.message || progress || translationState.status;
     if (active) {
       clearTimeout(state.staleIndicatorCleanupTimer);
@@ -819,7 +843,7 @@
       const text = document.createElement("div");
       text.style.cssText = "flex:1;line-height:1.35;";
       const title = document.createElement("div");
-      title.textContent = "llmTranslate";
+      title.textContent = "llmTools";
       title.style.cssText = "font-weight:650;";
       const detail = document.createElement("div");
       detail.style.cssText = "color:rgba(255,255,255,.78);";
@@ -827,18 +851,18 @@
       const minimize = document.createElement("button");
       minimize.type = "button";
       minimize.textContent = "-";
-      minimize.title = "Minimize";
+      minimize.title = t("minimize");
       minimize.style.cssText = overlayButtonStyle();
       header.append(text, minimize);
       const actions = document.createElement("div");
       actions.style.cssText = "display:flex;gap:6px;margin-top:8px;";
       const cancel = document.createElement("button");
       cancel.type = "button";
-      cancel.textContent = "Cancel";
+      cancel.textContent = t("cancel");
       cancel.style.cssText = overlayButtonStyle();
       const restore = document.createElement("button");
       restore.type = "button";
-      restore.textContent = "Restore";
+      restore.textContent = t("restore");
       restore.style.cssText = overlayButtonStyle();
       actions.append(cancel, restore);
       minimize.addEventListener("click", () => {
@@ -885,9 +909,12 @@
     if (!state.overlay) return;
     state.overlay.detail.textContent = state.overlayMinimized ? "" : state.overlay.message;
     state.overlay.title.textContent = state.overlayMinimized
-      ? `llmTranslate${state.overlay.progress ? ` ${state.overlay.progress}` : ""}`
-      : "llmTranslate";
+      ? `llmTools${state.overlay.progress ? ` ${state.overlay.progress}` : ""}`
+      : "llmTools";
     state.overlay.actions.style.display = state.overlayMinimized ? "none" : "flex";
+    state.overlay.minimize.title = t("minimize");
+    state.overlay.cancel.textContent = t("cancel");
+    state.overlay.restore.textContent = t("restore");
     state.overlay.cancel.style.display = state.overlay.canCancel ? "" : "none";
     state.overlay.restore.style.display = state.overlay.canRestore ? "" : "none";
     state.overlay.minimize.textContent = state.overlayMinimized ? "+" : "-";

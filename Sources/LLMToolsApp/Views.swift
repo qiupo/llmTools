@@ -2,7 +2,7 @@ import AppKit
 import Carbon.HIToolbox
 import SwiftUI
 import UniformTypeIdentifiers
-import LLMTranslateCore
+import LLMToolsCore
 
 struct SelectionActionView: View {
     @ObservedObject var appState: AppState
@@ -1115,7 +1115,7 @@ struct SettingsView: View {
             contentArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 600, maxWidth: 700, minHeight: 380)
+        .frame(minWidth: 700, maxWidth: 700, minHeight: 380)
         .background(Color(NSColor.windowBackgroundColor))
         .background {
             ShortcutCaptureBridge(
@@ -1504,24 +1504,19 @@ struct SettingsView: View {
     private var webPageTranslationPage: some View {
         settingsForm(maxWidth: 620) {
             settingRow(title: L10n.text("Webpage", language: language)) {
-                VStack(alignment: .leading, spacing: 8) {
-                    checkboxLine(
-                        title: L10n.text("Enable webpage translation", language: language),
-                        isOn: Binding(
-                            get: { appState.preferences.webPageTranslation.enabled },
-                            set: { newValue in
-                                appState.updatePreferences { $0.webPageTranslation.enabled = newValue }
-                            }
-                        )
+                checkboxLine(
+                    title: L10n.text("Enable webpage translation", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.webPageTranslation.enabled },
+                        set: { newValue in
+                            appState.updatePreferences { $0.webPageTranslation.enabled = newValue }
+                        }
                     )
+                )
+            }
 
-                    HStack(spacing: 10) {
-                        Text(L10n.text("Pending translation style", language: language))
-                            .font(.subheadline)
-                        Spacer(minLength: 8)
-                        pendingIndicatorStylePicker
-                    }
-                }
+            settingRow(title: L10n.text("Pending translation style", language: language)) {
+                pendingIndicatorStylePicker
             }
 
             settingRow(title: L10n.text("Translation model", language: language)) {
@@ -1600,7 +1595,7 @@ struct SettingsView: View {
         settingsForm(maxWidth: 560) {
             settingRow(title: L10n.text("Application", language: language)) {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("llmTranslate")
+                    Text("llmTools")
                         .font(.subheadline.weight(.medium))
                     Text("\(L10n.text("Version", language: language)): \(appVersionText)")
                         .font(.caption)
@@ -1636,7 +1631,7 @@ struct SettingsView: View {
                 Button {
                     NSApp.terminate(nil)
                 } label: {
-                    Text(L10n.text("Quit llmTranslate", language: language))
+                    Text(L10n.text("Quit llmTools", language: language))
                 }
                 .controlSize(.small)
             }
@@ -1677,7 +1672,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 230)
+        .frame(width: 230, alignment: .leading)
         .disabled(appState.models.isEmpty)
     }
 
@@ -1748,7 +1743,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.segmented)
-        .frame(width: 210)
+        .frame(width: 210, alignment: .leading)
     }
 
     private var historyLimitControl: some View {
@@ -2139,6 +2134,7 @@ struct SettingsView: View {
 
     private func modelCard(_ model: ModelDescriptor) -> some View {
         let isDefault = model.id == appState.preferences.defaultModelID
+        let isTestingThisProvider = appState.providerTestModelID == model.id
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
@@ -2185,7 +2181,7 @@ struct SettingsView: View {
                 }
                 metaChip("\(L10n.text("Ctx", language: language)): \(model.contextLength)", systemImage: "text.alignleft")
                 Spacer(minLength: 8)
-                statusBadge(validationName(model.validationState), systemImage: validationIcon(model.validationState))
+                statusBadge(modelValidationBadgeText(model), systemImage: validationIcon(model.validationState))
             }
 
             if let message = model.lastErrorMessage, !message.isEmpty {
@@ -2201,17 +2197,17 @@ struct SettingsView: View {
                     iconToolButton(
                         systemImage: "square.and.pencil",
                         help: L10n.text("Edit", language: language),
-                        isDisabled: appState.providerTestModelID != nil
+                        isDisabled: isTestingThisProvider
                     ) {
                         editProviderDraft(model)
                     }
 
                     iconToolButton(
-                        systemImage: appState.providerTestModelID == model.id ? "clock" : "network",
-                        help: appState.providerTestModelID == model.id
+                        systemImage: isTestingThisProvider ? "clock" : "network",
+                        help: isTestingThisProvider
                             ? L10n.text("Testing", language: language)
                             : L10n.text("Test", language: language),
-                        isDisabled: appState.providerTestModelID != nil
+                        isDisabled: isTestingThisProvider
                     ) {
                         appState.testProviderModel(id: model.id)
                     }
@@ -2229,7 +2225,7 @@ struct SettingsView: View {
                 iconToolButton(
                     systemImage: "trash",
                     help: L10n.text("Remove", language: language),
-                    isDisabled: appState.providerTestModelID == model.id,
+                    isDisabled: isTestingThisProvider,
                     role: .destructive
                 ) {
                     appState.removeModel(id: model.id)
@@ -2337,6 +2333,13 @@ struct SettingsView: View {
         }
     }
 
+    private func modelValidationBadgeText(_ model: ModelDescriptor) -> String {
+        if model.isRemoteProvider && model.validationState == .ready {
+            return L10n.text("Provider test succeeded", language: language)
+        }
+        return validationName(model.validationState)
+    }
+
     private func validationIcon(_ state: ModelValidationState) -> String {
         switch state {
         case .valid, .ready:
@@ -2380,9 +2383,9 @@ struct SettingsView: View {
     private var chromeExtensionManualInstallText: String {
         switch language {
         case .chinese:
-            return "如果 Chrome 扩展页里没有 llmTranslate：打开 Chrome 扩展，开启“开发者模式”，点击“加载已解压的扩展程序”，选择下方扩展文件夹。"
+            return "如果 Chrome 扩展页里没有 llmTools：打开 Chrome 扩展，开启“开发者模式”，点击“加载已解压的扩展程序”，选择下方扩展文件夹。"
         case .english:
-            return "If llmTranslate is not listed in Chrome Extensions: open Chrome Extensions, enable Developer mode, choose Load unpacked, then select the extension folder below."
+            return "If llmTools is not listed in Chrome Extensions: open Chrome Extensions, enable Developer mode, choose Load unpacked, then select the extension folder below."
         }
     }
 

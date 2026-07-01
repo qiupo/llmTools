@@ -1,10 +1,12 @@
 import Foundation
 import ServiceManagement
 import SwiftUI
-import LLMTranslateCore
+import LLMToolsCore
 
 @MainActor
 final class AppState: ObservableObject {
+    private static let modelIdleUnloadDelayNanoseconds: UInt64 = 30 * 1_000_000_000
+
     enum InputOrigin: Equatable {
         case selection
         case manual
@@ -31,6 +33,8 @@ final class AppState: ObservableObject {
     private var preferenceSaveRevision = 0
     private var currentRunTask: Task<Void, Never>?
     private var runRevision = 0
+    private var activeExternalModelUseCount = 0
+    private var scheduledModelUnloadTask: Task<Void, Never>?
 
     init(engine: TaskEngine = TaskEngine()) {
         self.engine = engine
@@ -178,12 +182,12 @@ final class AppState: ObservableObject {
 
         Task {
             do {
-                let result = try await engine.testProviderModel(id: id)
+                _ = try await engine.testProviderModel(id: id)
                 await reloadSnapshot()
                 await MainActor.run {
                     providerTestModelID = nil
                     validationError = nil
-                    statusMessage = result.message
+                    statusMessage = t("Provider test succeeded")
                 }
             } catch {
                 await reloadSnapshot()
@@ -359,6 +363,7 @@ final class AppState: ObservableObject {
         }
 
         currentRunTask?.cancel()
+        cancelScheduledModelUnload()
         runRevision += 1
         let revision = runRevision
         let request = TaskRequest(
@@ -388,6 +393,7 @@ final class AppState: ObservableObject {
                     statusMessage = t("Finished")
                     isRunning = false
                     currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
                 }
                 await replaceOriginalTextIfNeeded(result.text)
                 await reloadSnapshot()
@@ -399,6 +405,7 @@ final class AppState: ObservableObject {
                     statusMessage = t("Cancelled")
                     isRunning = false
                     currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
                 }
             } catch {
                 await MainActor.run {
@@ -416,6 +423,7 @@ final class AppState: ObservableObject {
                     statusMessage = t("Failed")
                     isRunning = false
                     currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
                 }
             }
         }
@@ -430,10 +438,51 @@ final class AppState: ObservableObject {
             statusMessage = t("Cancelled")
         }
         if unloadModel {
+            cancelScheduledModelUnload()
             Task {
                 await engine.unloadAll()
             }
+        } else {
+            scheduleModelUnloadIfIdle()
         }
+    }
+
+    func beginExternalModelUse() {
+        activeExternalModelUseCount += 1
+        cancelScheduledModelUnload()
+    }
+
+    func endExternalModelUse() {
+        activeExternalModelUseCount = max(activeExternalModelUseCount - 1, 0)
+        scheduleModelUnloadIfIdle()
+    }
+
+    private func scheduleModelUnloadIfIdle() {
+        guard !isRunning, activeExternalModelUseCount == 0 else {
+            return
+        }
+        cancelScheduledModelUnload()
+        scheduledModelUnloadTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: Self.modelIdleUnloadDelayNanoseconds)
+            } catch {
+                return
+            }
+            guard let self else {
+                return
+            }
+            guard !self.isRunning, self.activeExternalModelUseCount == 0 else {
+                self.scheduleModelUnloadIfIdle()
+                return
+            }
+            self.scheduledModelUnloadTask = nil
+            await self.engine.unloadAll()
+        }
+    }
+
+    private func cancelScheduledModelUnload() {
+        scheduledModelUnloadTask?.cancel()
+        scheduledModelUnloadTask = nil
     }
 
     var displayedOutputText: String {
@@ -542,13 +591,34 @@ final class AppState: ObservableObject {
     }
 
     var webPageTranslationModelID: UUID? {
-        if let modelID = preferences.webPageTranslation.modelID,
-           models.contains(where: { $0.id == modelID && $0.enabled }) {
-            return modelID
+        webPageTranslationModel?.id
+    }
+
+    var webPageTranslationModelIsRemote: Bool {
+        webPageTranslationModel?.isRemoteProvider ?? false
+    }
+
+    var webPageTranslationConcurrencyLimit: Int {
+        if webPageTranslationModelIsRemote {
+            return 4
         }
-        return selectedModelID
-            ?? preferences.defaultModelID
-            ?? models.first(where: { $0.enabled })?.id
+        return 1
+    }
+
+    private var webPageTranslationModel: ModelDescriptor? {
+        if let modelID = preferences.webPageTranslation.modelID,
+           let model = models.first(where: { $0.id == modelID && $0.enabled }) {
+            return model
+        }
+        if let selectedModelID,
+           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.enabled }) {
+            return selectedModel
+        }
+        if let defaultModelID = preferences.defaultModelID,
+           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.enabled }) {
+            return defaultModel
+        }
+        return models.first(where: { $0.enabled })
     }
 
     func webPageTranslationModelDisplayName(limit: Int = 18) -> String {

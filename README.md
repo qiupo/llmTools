@@ -1,4 +1,4 @@
-# llmTranslate
+# llmTools
 
 Native macOS local-model assistant for quick text translation, polishing, summary, explanation, and TODO extraction.
 
@@ -31,7 +31,7 @@ MLX_METALLIB_PATH=/path/to/mlx.metallib ./scripts/prepare-mlx-metallib.sh
 Fast core checks:
 
 ```sh
-fish -lc 'setproxy >/dev/null; swift run LLMTranslateChecks'
+fish -lc 'setproxy >/dev/null; swift run LLMToolsChecks'
 ```
 
 Chrome extension DOM and batching checks:
@@ -49,9 +49,9 @@ Prepare MLX runtime resources before running MLX smoke tests from SwiftPM:
 Real model smoke:
 
 ```sh
-swift run LLMTranslateSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-0.8B-GGUF "Reply with OK only."
-swift run LLMTranslateSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-4B-MLX-4bit "Reply with OK only."
-swift run LLMTranslateSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-9B-MLX-4bit "Reply with OK only."
+swift run LLMToolsSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-0.8B-GGUF "Reply with OK only."
+swift run LLMToolsSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-4B-MLX-4bit "Reply with OK only."
+swift run LLMToolsSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-9B-MLX-4bit "Reply with OK only."
 ```
 
 ## Shortcuts
@@ -80,7 +80,7 @@ fish -lc 'setproxy >/dev/null; ./scripts/package-app.sh'
 The packaged app is written to:
 
 ```text
-dist/llmTranslate.app
+dist/llmTools.app
 ```
 
 ## Phase 2 Web Page Translation MVP
@@ -88,13 +88,13 @@ dist/llmTranslate.app
 The Chrome MVP uses a local-only bridge:
 
 - Chrome extension: `browser-extension/chromium`
-- Native messaging host: `LLMTranslateNativeHost`
-- App bridge state: `~/Library/Application Support/llmTranslate/web-page-bridge.json`
+- Native messaging host: `LLMToolsNativeHost`
+- App bridge state: `~/Library/Application Support/llmTools/web-page-bridge.json`
 - Development Chrome extension ID: `jednddlgkkohaebgoejcidfppddjegij`
 
 Development setup:
 
-1. Package and launch `dist/llmTranslate.app`.
+1. Package and launch `dist/llmTools.app`.
 2. Open Settings -> `网页翻译`.
 3. Click `修复 Chrome 桥接`; the app writes Chrome's native messaging manifest and opens `chrome://extensions`.
 4. In Chrome, enable Developer Mode and load the unpacked extension folder shown in Settings.

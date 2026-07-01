@@ -1,5 +1,5 @@
 import Foundation
-import LLMTranslateCore
+import LLMToolsCore
 
 enum L10n {
     static func text(_ key: String, language: AppLanguage) -> String {
@@ -92,7 +92,7 @@ enum L10n {
         "Version": "版本",
         "Data": "数据",
         "Open Data Folder": "打开数据文件夹",
-        "Quit llmTranslate": "退出 llmTranslate",
+        "Quit llmTools": "退出 llmTools",
         "Models": "模型",
         "Models & Settings": "模型与设置",
         "Settings": "设置",
@@ -139,6 +139,7 @@ enum L10n {
         "Updated provider": "已更新 Provider",
         "Failed to update provider": "更新 Provider 失败",
         "Testing provider": "正在测试 Provider",
+        "Provider test succeeded": "Provider 测试成功",
         "Provider test failed": "Provider 测试失败",
         "Edit": "编辑",
         "Save Provider": "保存 Provider",

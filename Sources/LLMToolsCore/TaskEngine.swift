@@ -398,7 +398,7 @@ public actor TaskEngine {
             throw WebPageTranslationError(
                 code: .permissionMissing,
                 message: "网页翻译已关闭。",
-                repairAction: "在 llmTranslate 设置中启用网页翻译。"
+                repairAction: "在 llmTools 设置中启用网页翻译。"
             )
         }
         guard !payload.segments.isEmpty else {

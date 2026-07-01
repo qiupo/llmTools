@@ -42,7 +42,7 @@ async function runBackgroundBatchCheck() {
       return {
         requestID: message.requestID,
         status: "ok",
-        payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText" }
+        payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText", appLanguage: "en" }
       };
     }
     if (message.type === "translateSegments") {
@@ -112,7 +112,7 @@ async function runBackgroundBatchCheck() {
       },
       sendNativeMessage(_hostName, message) {
         if (message.type === "getStatus") {
-          return Promise.resolve({ status: "ok", payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText" } });
+          return Promise.resolve({ status: "ok", payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText", appLanguage: "en" } });
         }
         if (message.type === "translateSegments") {
           nativeTranslatePayloads.push(message.payload);
@@ -263,11 +263,11 @@ async function runBackgroundBatchCheck() {
   assert(contextMenuShownListener, "context menu shown listener was not registered");
   assert(nativePortDisconnectListener === null, "native port should not connect before a native request");
   assert(contextMenuItems.size === 1, `expected one top-level context menu item, got ${contextMenuItems.size}`);
-  assert(contextMenuItems.has("llmtranslate-toggle-page"), "toggle context menu was not created");
-  assert(contextMenuItems.get("llmtranslate-toggle-page").title === "翻译/原文", "toggle context menu should use the requested label");
-  assert(contextMenuItems.get("llmtranslate-toggle-page").enabled !== false, "toggle context menu should start enabled");
+  assert(contextMenuItems.has("llmtools-toggle-page"), "toggle context menu was not created");
+  assert(contextMenuItems.get("llmtools-toggle-page").title === "翻译/原文", "toggle context menu should use the requested label");
+  assert(contextMenuItems.get("llmtools-toggle-page").enabled !== false, "toggle context menu should start enabled");
 
-  contextMenuClickListener({ menuItemId: "llmtranslate-toggle-page" }, { id: 7 });
+  contextMenuClickListener({ menuItemId: "llmtools-toggle-page" }, { id: 7 });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not apply all translations");
   const finalState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
 
@@ -277,16 +277,21 @@ async function runBackgroundBatchCheck() {
   assert(!nativeTranslatePayloads[0].segments.some((segment) => segment.segmentID === "s2"), "expected duplicate repeated segment to reuse the first translation");
   assert(appliedTranslations.some((item) => item.segmentID === "s2" && item.translation === "重复标签"), "expected duplicate node to receive reused translation");
   assert(startSessionMessages[0]?.pendingIndicatorStyle === "flipText", "expected background to pass configured pending indicator style to content script");
+  assert(startSessionMessages[0]?.appLanguage === "en", "expected background to pass app language to content script");
   assert(finalState.status === "translated", `expected translated state, got ${finalState.status}`);
   assert(finalState.done === 3 && finalState.total === 3, `expected 3/3 final progress, got ${finalState.done}/${finalState.total}`);
+  assert(finalState.appLanguage === "en", `expected app language to follow native status, got ${finalState.appLanguage}`);
+  assert(finalState.message === "Translated 3/3 segments.", `expected English translated message, got ${finalState.message}`);
   assert(popupStates.some((message) => message.state?.modelName === "stub-model"), "expected model name to be published to popup state");
-  assert(contextMenuItems.get("llmtranslate-toggle-page").enabled === true, "toggle context menu should be enabled after translation");
+  assert(popupStates.some((message) => message.state?.appLanguage === "en"), "expected app language to be published to popup state");
+  assert(contextMenuItems.get("llmtools-toggle-page").enabled === true, "toggle context menu should be enabled after translation");
+  assert(contextMenuItems.get("llmtools-toggle-page").title === "Translate/Original", "toggle context menu should follow app language after status check");
 
-  contextMenuClickListener({ menuItemId: "llmtranslate-toggle-page" }, { id: 7 });
+  contextMenuClickListener({ menuItemId: "llmtools-toggle-page" }, { id: 7 });
   await waitUntil(() => appliedTranslations.length === 0, 2_000, "context menu toggle restore did not clear translations");
   const restoredState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(restoredState.hasTranslations === false, "context menu toggle should clear translated state");
-  assert(contextMenuItems.get("llmtranslate-toggle-page").enabled === true, "toggle context menu should stay enabled after restore");
+  assert(contextMenuItems.get("llmtools-toggle-page").enabled === true, "toggle context menu should stay enabled after restore");
 
   const nativeCallsAfterFirstTranslate = nativeTranslatePayloads.length;
   await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
@@ -309,12 +314,12 @@ async function runBackgroundBatchCheck() {
   const reloadedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(reloadedState.status === "idle", `expected idle state after reload, got ${reloadedState.status}`);
   assert(reloadedState.hasTranslations === false, "reload should clear translated state");
-  assert(contextMenuItems.get("llmtranslate-toggle-page").enabled === true, "toggle context menu should stay enabled after reload");
+  assert(contextMenuItems.get("llmtools-toggle-page").enabled === true, "toggle context menu should stay enabled after reload");
 }
 
 async function runContentScriptDomCheck() {
   await fs.access(chromePath);
-  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "llmtranslate-extension-dom-"));
+  const profileDir = await fs.mkdtemp(path.join(os.tmpdir(), "llmtools-extension-dom-"));
   const chrome = spawn(chromePath, [
     "--headless=new",
     "--disable-gpu",
@@ -344,17 +349,17 @@ async function runContentScriptDomCheck() {
 
     await evaluate(client, `
       (() => {
-        window.__llmTranslateMessages = [];
-        window.__llmTranslateListener = null;
+        window.__llmToolsMessages = [];
+        window.__llmToolsListener = null;
         window.chrome = {
           runtime: {
             onMessage: {
               addListener(listener) {
-                window.__llmTranslateListener = listener;
+                window.__llmToolsListener = listener;
               }
             },
             sendMessage(message) {
-              window.__llmTranslateMessages.push(message);
+              window.__llmToolsMessages.push(message);
               return Promise.resolve({ ok: true });
             }
           }
@@ -376,14 +381,16 @@ async function runContentScriptDomCheck() {
     assert(!startResult.segments.some((segment) => segment.text.includes("Do not translate input values")), "input value text should be skipped");
     const initialSpinnerState = await evaluate(client, `
       (() => ({
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
-        styleCount: document.querySelectorAll("style[data-llm-translate-spinner-style='true']").length,
-        spinnerText: Array.from(document.querySelectorAll(".llmtranslate-segment-spinner")).map((node) => node.textContent).join("")
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
+        styleCount: document.querySelectorAll("style[data-llm-tools-spinner-style='true']").length,
+        spinnerText: Array.from(document.querySelectorAll(".llmtools-segment-spinner")).map((node) => node.textContent).join(""),
+        spinnerLabels: Array.from(document.querySelectorAll(".llmtools-segment-spinner")).map((node) => node.getAttribute("aria-label"))
       }))()
     `);
     assert(initialSpinnerState.spinnerCount === startResult.segments.length, `expected one spinner per segment, got ${initialSpinnerState.spinnerCount}/${startResult.segments.length}`);
     assert(initialSpinnerState.styleCount === 1, "expected one shared spinner style tag");
     assert(initialSpinnerState.spinnerText === "", "segment spinners should not add visible text content");
+    assert(initialSpinnerState.spinnerLabels.every((label) => label === "正在翻译"), "default content-script spinner label should use Chinese app language");
 
     const translations = startResult.segments.map((segment, index) => ({
       segmentID: segment.segmentID,
@@ -401,7 +408,7 @@ async function runContentScriptDomCheck() {
         inputValue: document.querySelector("input").value,
         linkHref: document.querySelector("a").href,
         overlayText: document.documentElement.textContent,
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length
       }))()
     `);
     assert(translatedState.duplicates.every((text) => text === "重复标签"), "expected all duplicate nodes to be translated");
@@ -433,15 +440,15 @@ async function runContentScriptDomCheck() {
       })()
     `);
     await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 700))");
-    const messages = await evaluate(client, "window.__llmTranslateMessages");
+    const messages = await evaluate(client, "window.__llmToolsMessages");
     assert(
       messages.some((message) => message.type === "segmentsDiscovered" && message.segments?.some((segment) => segment.text === incrementalText)),
       "expected incremental visible text to be reported"
     );
     const incrementalSpinnerState = await evaluate(client, `
       (() => ({
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
-        incrementalHasSpinner: Boolean(document.querySelector("[data-incremental] .llmtranslate-segment-spinner"))
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
+        incrementalHasSpinner: Boolean(document.querySelector("[data-incremental] .llmtools-segment-spinner"))
       }))()
     `);
     assert(incrementalSpinnerState.spinnerCount > 0, "incremental discovered text should show a pending spinner");
@@ -456,7 +463,7 @@ async function runContentScriptDomCheck() {
         duplicates: Array.from(document.querySelectorAll("[data-duplicate]")).map((node) => node.textContent.trim()),
         code: document.querySelector("code").textContent,
         inputValue: document.querySelector("input").value,
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length
       }))()
     `);
     assert(restoredState.duplicates.every((text) => text === "Repeated label for duplicate translation."), "restore should return duplicate nodes to original text");
@@ -464,7 +471,7 @@ async function runContentScriptDomCheck() {
     assert(restoredState.inputValue === "Do not translate input values", "restore should leave input value unchanged");
     assert(restoredState.spinnerCount === 0, "restore should remove pending segment spinners");
 
-    await evaluate(client, "window.__llmTranslateMessages = []");
+    await evaluate(client, "window.__llmToolsMessages = []");
     const flipStartResult = await sendContentMessage(client, {
       type: "startSession",
       pageSessionID: "flip-style-check",
@@ -472,11 +479,11 @@ async function runContentScriptDomCheck() {
     });
     const flipInitialState = await evaluate(client, `
       (() => ({
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
-        pendingCount: document.querySelectorAll(".llmtranslate-segment-flip-pending").length,
-        completeCount: document.querySelectorAll(".llmtranslate-segment-flip-complete").length,
-        tileCount: document.querySelectorAll(".llmtranslate-segment-flip-tile").length
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length,
+        pendingCount: document.querySelectorAll(".llmtools-segment-flip-pending").length,
+        completeCount: document.querySelectorAll(".llmtools-segment-flip-complete").length,
+        tileCount: document.querySelectorAll(".llmtools-segment-flip-tile").length
       }))()
     `);
     assert(flipInitialState.spinnerCount === 0, "flip text style should not show segment spinners while pending");
@@ -494,13 +501,13 @@ async function runContentScriptDomCheck() {
     });
     const flipAnimatingState = await evaluate(client, `
       (() => ({
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
-        pendingCount: document.querySelectorAll(".llmtranslate-segment-flip-pending").length,
-        completeCount: document.querySelectorAll(".llmtranslate-segment-flip-complete").length,
-        tileCount: document.querySelectorAll(".llmtranslate-segment-flip-tile").length,
-        flipTexts: Array.from(document.querySelectorAll(".llmtranslate-segment-flip")).map((node) => node.textContent || ""),
-        flipFinalTexts: Array.from(document.querySelectorAll(".llmtranslate-segment-flip")).map((node) => node.dataset.llmTranslateFinalText || ""),
-        styleCount: document.querySelectorAll("style[data-llm-translate-spinner-style='true']").length
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length,
+        pendingCount: document.querySelectorAll(".llmtools-segment-flip-pending").length,
+        completeCount: document.querySelectorAll(".llmtools-segment-flip-complete").length,
+        tileCount: document.querySelectorAll(".llmtools-segment-flip-tile").length,
+        flipTexts: Array.from(document.querySelectorAll(".llmtools-segment-flip")).map((node) => node.textContent || ""),
+        flipFinalTexts: Array.from(document.querySelectorAll(".llmtools-segment-flip")).map((node) => node.dataset.llmToolsFinalText || ""),
+        styleCount: document.querySelectorAll("style[data-llm-tools-spinner-style='true']").length
       }))()
     `);
     assert(flipAnimatingState.flipCount === flipStartResult.segments.length, `expected all flip text indicators while animating, got ${flipAnimatingState.flipCount}`);
@@ -512,27 +519,27 @@ async function runContentScriptDomCheck() {
     await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 1900))");
     const flipSettledState = await evaluate(client, `
       (() => ({
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length,
         pageText: document.documentElement.textContent
       }))()
     `);
     assert(flipSettledState.flipCount === 0, "flip text indicator should settle back to a plain text node");
     assert(flipSettledState.pageText.includes("README.md yesterday 1"), "settled flip text translation should remain visible");
     await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 700))");
-    const postFlipMessages = await evaluate(client, "window.__llmTranslateMessages");
+    const postFlipMessages = await evaluate(client, "window.__llmToolsMessages");
     assert(
       !postFlipMessages.some((message) => message.type === "segmentsDiscovered" && message.segments?.some((segment) => segment.text.includes("README.md yesterday"))),
       "settled flip text that still contains English should not be rediscovered as new segments"
     );
     await sendContentMessage(client, { type: "restore" });
 
-    await evaluate(client, "window.__llmTranslateMessages = []");
+    await evaluate(client, "window.__llmToolsMessages = []");
     await sendContentMessage(client, {
       type: "startSession",
       pageSessionID: "flip-stale-cleanup-check",
       pendingIndicatorStyle: "flipText"
     });
-    const stalePendingBefore = await evaluate(client, "document.querySelectorAll('.llmtranslate-segment-flip-pending').length");
+    const stalePendingBefore = await evaluate(client, "document.querySelectorAll('.llmtools-segment-flip-pending').length");
     assert(stalePendingBefore > 0, "stale cleanup check should start with pending flip indicators");
     await sendContentMessage(client, {
       type: "translationState",
@@ -548,8 +555,8 @@ async function runContentScriptDomCheck() {
     await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 3300))");
     const stalePendingAfter = await evaluate(client, `
       (() => ({
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
-        messages: window.__llmTranslateMessages
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length,
+        messages: window.__llmToolsMessages
       }))()
     `);
     assert(stalePendingAfter.flipCount === 0, "terminal translation state should clear stale pending flip indicators");
@@ -566,8 +573,8 @@ async function runContentScriptDomCheck() {
     });
     const noneInitialState = await evaluate(client, `
       (() => ({
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length
       }))()
     `);
     assert(noneStartResult.segments.length > 0, "none style session should still discover segments");
@@ -583,8 +590,8 @@ async function runContentScriptDomCheck() {
     });
     const noneTranslatedState = await evaluate(client, `
       (() => ({
-        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
-        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtools-segment-flip").length,
         pageText: document.documentElement.textContent
       }))()
     `);
@@ -607,12 +614,12 @@ async function runContentScriptDomCheck() {
     });
     const invalidatedResult = await evaluate(client, `
       (async () => {
-        window.__llmTranslateSendMessageMode = "throw";
+        window.__llmToolsSendMessageMode = "throw";
         window.chrome.runtime.sendMessage = () => {
           throw new Error("Extension context invalidated.");
         };
         const before = {
-          spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+          spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
           overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
         };
         try {
@@ -628,7 +635,7 @@ async function runContentScriptDomCheck() {
           threw: false,
           before,
           after: {
-            spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+            spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
             overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
           }
         };
@@ -643,12 +650,12 @@ async function runContentScriptDomCheck() {
     await sendContentMessage(client, { type: "startSession", pageSessionID: "invalidated-context-reject-check" });
     const rejectedResult = await evaluate(client, `
       (async () => {
-        window.__llmTranslateSendMessageMode = "reject";
+        window.__llmToolsSendMessageMode = "reject";
         window.chrome.runtime.sendMessage = (_message) => {
           return Promise.reject(new Error("Extension context invalidated."));
         };
         const before = {
-          spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+          spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
           overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
         };
         try {
@@ -664,7 +671,7 @@ async function runContentScriptDomCheck() {
           threw: false,
           before,
           after: {
-            spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+            spinnerCount: document.querySelectorAll(".llmtools-segment-spinner").length,
             overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
           }
         };
@@ -704,11 +711,11 @@ function sendBackgroundMessage(listener, message) {
 async function sendContentMessage(client, message) {
   return evaluate(client, `
     new Promise((resolve, reject) => {
-      if (!window.__llmTranslateListener) {
+      if (!window.__llmToolsListener) {
         reject(new Error("content script listener is not installed"));
         return;
       }
-      window.__llmTranslateListener(${JSON.stringify(message)}, {}, resolve);
+      window.__llmToolsListener(${JSON.stringify(message)}, {}, resolve);
     })
   `);
 }

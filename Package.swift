@@ -3,26 +3,26 @@
 import PackageDescription
 
 let package = Package(
-    name: "llmTranslate",
+    name: "llmTools",
     platforms: [
         .macOS(.v14)
     ],
     products: [
         .executable(
-            name: "llmTranslate",
-            targets: ["LLMTranslateApp"]
+            name: "llmTools",
+            targets: ["LLMToolsApp"]
         ),
         .executable(
-            name: "LLMTranslateChecks",
-            targets: ["LLMTranslateChecks"]
+            name: "LLMToolsChecks",
+            targets: ["LLMToolsChecks"]
         ),
         .executable(
-            name: "LLMTranslateSmoke",
-            targets: ["LLMTranslateSmoke"]
+            name: "LLMToolsSmoke",
+            targets: ["LLMToolsSmoke"]
         ),
         .executable(
-            name: "LLMTranslateNativeHost",
-            targets: ["LLMTranslateNativeHost"]
+            name: "LLMToolsNativeHost",
+            targets: ["LLMToolsNativeHost"]
         )
     ],
     dependencies: [
@@ -33,7 +33,7 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "LLMTranslateCore",
+            name: "LLMToolsCore",
             dependencies: [
                 .product(name: "LlamaSwift", package: "llama.swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
@@ -44,27 +44,27 @@ let package = Package(
             ]
         ),
         .executableTarget(
-            name: "LLMTranslateApp",
+            name: "LLMToolsApp",
             dependencies: [
-                "LLMTranslateCore"
+                "LLMToolsCore"
             ]
         ),
         .executableTarget(
-            name: "LLMTranslateChecks",
+            name: "LLMToolsChecks",
             dependencies: [
-                "LLMTranslateCore"
+                "LLMToolsCore"
             ]
         ),
         .executableTarget(
-            name: "LLMTranslateSmoke",
+            name: "LLMToolsSmoke",
             dependencies: [
-                "LLMTranslateCore"
+                "LLMToolsCore"
             ]
         ),
         .executableTarget(
-            name: "LLMTranslateNativeHost",
+            name: "LLMToolsNativeHost",
             dependencies: [
-                "LLMTranslateCore"
+                "LLMToolsCore"
             ]
         )
     ]

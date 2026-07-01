@@ -1,7 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
-import LLMTranslateCore
+import LLMToolsCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate, SelectionActionServiceDelegate, NSMenuDelegate {
@@ -56,7 +56,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private func configureStatusItem() {
         let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: "llmTranslate")
+            button.image = NSImage(systemSymbolName: "sparkles.rectangle.stack", accessibilityDescription: "llmTools")
             button.action = #selector(toggleMenu)
             button.target = self
         }

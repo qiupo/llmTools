@@ -1,9 +1,9 @@
 import Foundation
 import Darwin
-import LLMTranslateCore
+import LLMToolsCore
 
 @main
-struct LLMTranslateChecks {
+struct LLMToolsChecks {
     static func main() async throws {
         try checkGGUFDetectionChoosesPrimaryModel()
         try checkMLXDetection()
@@ -20,7 +20,7 @@ struct LLMTranslateChecks {
         try await checkWebPageTranslationBatchRetriesOnlyMissingSegments()
         try checkVisibleOutputHidesThinkBlock()
         try checkPromptsStayCompact()
-        print("LLMTranslateChecks passed")
+        print("LLMToolsChecks passed")
     }
 
     private static func checkGGUFDetectionChoosesPrimaryModel() throws {
@@ -226,6 +226,7 @@ struct LLMTranslateChecks {
         try require(preferences.webPageTranslation.modelID == nil, "Expected webpage translation model to follow the default model.")
         try require(preferences.webPageTranslation.pendingIndicatorStyle == .loading, "Expected webpage pending indicator to default to loading.")
         try require(!preferences.webPageTranslation.persistWebHistory, "Expected webpage translation history to default off.")
+        try require(preferences.webPageTranslation.localConcurrentTranslationRequests == 1, "Expected local webpage concurrency to default to 1.")
         try require(preferences.quickActionShortcut == .optionSpace, "Expected quick action shortcut to default to Option-Space.")
         try require(preferences.quickActionWithoutSelectionShortcut == .optionShiftSpace, "Expected no-selection quick action shortcut to default to Option-Shift-Space.")
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
@@ -240,6 +241,14 @@ struct LLMTranslateChecks {
         """.utf8))
         try require(webPagePreferences.pendingIndicatorStyle == .loading, "Expected older webpage preferences to default pending indicator to loading.")
         try require(webPagePreferences.modelID == nil, "Expected older webpage preferences to default modelID to nil.")
+        try require(webPagePreferences.localConcurrentTranslationRequests == 1, "Expected older webpage preferences to default local concurrency to 1.")
+
+        let clampedWebPagePreferences = try JSONDecoder().decode(WebPageTranslationPreferences.self, from: Data("""
+        {
+          "localConcurrentTranslationRequests": 99
+        }
+        """.utf8))
+        try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
     }
 
     private static func checkWebPageTranslationBatchSkipsHistoryByDefault() async throws {
@@ -454,6 +463,10 @@ struct LLMTranslateChecks {
     }
 
     private static func checkProviderConnectivityTest() async throws {
+        final class RequestCounter: @unchecked Sendable {
+            var chatRequestCount = 0
+        }
+        let counter = RequestCounter()
         let server = try await HTTPStubServer.start { request in
             if request.path == "/v1/models" {
                 return """
@@ -464,6 +477,7 @@ struct LLMTranslateChecks {
                 }
                 """
             }
+            counter.chatRequestCount += 1
             try require(request.path == "/v1/chat/completions", "Expected /v1/chat/completions, got \(request.path).")
             return """
             {
@@ -491,8 +505,9 @@ struct LLMTranslateChecks {
 
         let result = try await engine.testProviderModel(id: descriptor.id)
         try require(result.ok, "Expected provider connectivity test to pass.")
-        try require(result.stage == .chat, "Expected connectivity test to reach chat stage.")
-        try require(result.message.contains("OK"), "Expected connectivity message to include chat response.")
+        try require(result.stage == .models, "Expected connectivity test to use the fast model-list check.")
+        try require(result.message.contains("stub-model"), "Expected connectivity message to include the provider model ID.")
+        try require(counter.chatRequestCount == 0, "Expected model-list success to skip slow chat generation.")
         let updated = await engine.registry().models.first { $0.id == descriptor.id }
         try require(updated?.validationState == .ready, "Expected successful provider test to mark model ready.")
     }
@@ -512,7 +527,7 @@ struct LLMTranslateChecks {
 
     private static func makeTemporaryDirectory(name: String = UUID().uuidString) throws -> URL {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("llmTranslate-checks", isDirectory: true)
+            .appendingPathComponent("llmTools-checks", isDirectory: true)
             .appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
@@ -622,7 +637,7 @@ private final class HTTPStubServer {
 private final class TCPListener: @unchecked Sendable {
     private let socketFD: Int32
     private let handler: HTTPStubServer.Handler
-    private let queue = DispatchQueue(label: "llmTranslate.checks.http-stub")
+    private let queue = DispatchQueue(label: "llmTools.checks.http-stub")
     private var stopped = false
 
     let port: UInt16

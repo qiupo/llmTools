@@ -1,13 +1,13 @@
 import AppKit
 import Foundation
-import LLMTranslateCore
+import LLMToolsCore
 
 @MainActor
 final class BrowserIntegrationService {
     static let shared = BrowserIntegrationService()
 
     let chromeExtensionDevelopmentID = "jednddlgkkohaebgoejcidfppddjegij"
-    private let nativeHostName = "com.llmtranslate.native_host"
+    private let nativeHostName = "com.llmtools.native_host"
 
     private init() {}
 
@@ -61,7 +61,7 @@ final class BrowserIntegrationService {
 
         let manifest = ChromeNativeHostManifest(
             name: nativeHostName,
-            description: "llmTranslate native messaging host",
+            description: "llmTools native messaging host",
             path: hostPath,
             type: "stdio",
             allowed_origins: [
@@ -107,13 +107,13 @@ final class BrowserIntegrationService {
 
     private func nativeHostExecutablePath() -> String {
         if let bundlePath = Bundle.main.executableURL?.deletingLastPathComponent()
-            .appendingPathComponent("LLMTranslateNativeHost")
+            .appendingPathComponent("LLMToolsNativeHost")
             .path,
            FileManager.default.fileExists(atPath: bundlePath) {
             return bundlePath
         }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent(".build/debug/LLMTranslateNativeHost")
+            .appendingPathComponent(".build/debug/LLMToolsNativeHost")
             .path
     }
 }

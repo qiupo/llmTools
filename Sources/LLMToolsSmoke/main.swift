@@ -1,19 +1,19 @@
 import Foundation
-import LLMTranslateCore
+import LLMToolsCore
 
 @main
-struct LLMTranslateSmoke {
+struct LLMToolsSmoke {
     static func main() async throws {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let path = args.first else {
-            print("Usage: LLMTranslateSmoke <model-path> [prompt]")
+            print("Usage: LLMToolsSmoke <model-path> [prompt]")
             throw SmokeError("Missing model path.")
         }
 
         let prompt = args.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
         let input = prompt.isEmpty ? "Reply with one short sentence: local model smoke test passed." : prompt
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("llmTranslate-smoke", isDirectory: true)
+            .appendingPathComponent("llmTools-smoke", isDirectory: true)
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }

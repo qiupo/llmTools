@@ -27,7 +27,7 @@ enum SelectedTextService {
 
         let pasteboard = NSPasteboard.general
         let originalString = pasteboard.string(forType: .string)
-        let marker = "llmTranslate-\(UUID().uuidString)"
+        let marker = "llmTools-\(UUID().uuidString)"
         let captureStartedAt = Date()
 
         pasteboard.clearContents()

@@ -61,7 +61,7 @@ public enum ProviderConnectivityError: Error, LocalizedError, Sendable {
 }
 
 public enum ProviderConnectivity {
-    public static func test(model descriptor: ModelDescriptor, timeout: TimeInterval = 45) async throws -> ProviderTestResult {
+    public static func test(model descriptor: ModelDescriptor, timeout: TimeInterval = 30) async throws -> ProviderTestResult {
         guard let configuration = descriptor.providerConfiguration, configuration.isRemote else {
             throw ProviderConnectivityError.notRemoteProvider
         }
@@ -111,15 +111,25 @@ public enum ProviderConnectivity {
         timeout: TimeInterval
     ) async throws -> ProviderTestResult {
         let modelsURL = baseURL.appendingPathComponent("models")
-        let modelsData = try await performRequest(
+        let modelsData = try? await performRequest(
             url: modelsURL,
             apiKey: configuration.apiKey,
             customHeaders: configuration.customHeaders,
-            timeout: timeout
+            timeout: min(timeout, 10)
         )
-        let availableModels = decodeModelIDs(from: modelsData)
-        if !availableModels.isEmpty && !availableModels.contains(configuration.modelID) {
-            throw ProviderConnectivityError.modelNotFound(configuration.modelID)
+        let availableModels = modelsData.map(decodeModelIDs(from:)) ?? []
+        if !availableModels.isEmpty {
+            guard availableModels.contains(configuration.modelID) else {
+                throw ProviderConnectivityError.modelNotFound(configuration.modelID)
+            }
+            return ProviderTestResult(
+                modelID: descriptor.id,
+                providerName: providerName,
+                modelName: descriptor.name,
+                ok: true,
+                stage: .models,
+                message: "Provider connected. Model is available: \(configuration.modelID)"
+            )
         }
 
         let chatURL = baseURL

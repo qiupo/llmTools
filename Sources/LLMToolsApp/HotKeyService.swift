@@ -1,6 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
-import LLMTranslateCore
+import LLMToolsCore
 
 @MainActor
 protocol HotKeyServiceDelegate: AnyObject {

@@ -1,10 +1,10 @@
-# llmTranslate Roadmap
+# llmTools Roadmap
 
 Last updated: 2026-06-30
 
 ## Product Direction
 
-llmTranslate is a native macOS local-model assistant. It is not primarily a chat app. Its core value is to connect small local models to high-frequency desktop workflows:
+llmTools is a native macOS local-model assistant. It is not primarily a chat app. Its core value is to connect small local models to high-frequency desktop workflows:
 
 - selected-text translation, polishing, summarization, explanation, and TODO extraction
 - direct web-page translation, where English text in a page can be translated into Chinese in place
@@ -76,7 +76,7 @@ Core capabilities:
 - browser extension MVP connected to the native app
 - Settings-page browser integration panel
 - guided extension installer for supported browsers
-- local bridge between the extension and llmTranslate
+- local bridge between the extension and llmTools
 - one-click "translate this page" action for the current tab
 - visible-text extraction from the page DOM
 - English-to-Chinese translation in place
@@ -130,7 +130,7 @@ Suggested scope:
 
 Primary acceptance:
 
-- A user can open an English article or documentation page, trigger llmTranslate, and see the English text replaced by readable Chinese in the page.
+- A user can open an English article or documentation page, trigger llmTools, and see the English text replaced by readable Chinese in the page.
 - The page remains usable: links still work, layout does not collapse, and buttons/forms are not corrupted.
 - The user can restore the original English text without reloading the page.
 - The user can cancel a long translation and see a clear partial/failed state.

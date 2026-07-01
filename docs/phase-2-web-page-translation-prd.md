@@ -4,15 +4,15 @@ Last updated: 2026-06-30
 
 ## 1. Objective
 
-Phase 2 adds browser web-page translation to llmTranslate.
+Phase 2 adds browser web-page translation to llmTools.
 
-The user should be able to open an English webpage, trigger llmTranslate from the browser, and see the visible English text translated into Simplified Chinese directly inside the page. The page must remain usable, translation must be reversible, and page text must stay local by default.
+The user should be able to open an English webpage, trigger llmTools from the browser, and see the visible English text translated into Simplified Chinese directly inside the page. The page must remain usable, translation must be reversible, and page text must stay local by default.
 
 This phase is not a separate chat product and not a cloud translation feature. It extends the existing local-model translation engine to browser pages.
 
 ## 2. Product Principles
 
-- Local-first: webpage text is processed by the local llmTranslate app and local model runners by default.
+- Local-first: webpage text is processed by the local llmTools app and local model runners by default.
 - Reversible: every page translation must be restorable without reloading the page.
 - Permissioned: browser extension installation, enablement, and site access must follow browser-controlled permission flows.
 - Visible-first: translate what the user is reading first, then continue as more text becomes visible.
@@ -24,7 +24,7 @@ This phase is not a separate chat product and not a cloud translation feature. I
 
 Primary user:
 
-- macOS user running llmTranslate locally.
+- macOS user running llmTools locally.
 - Has local Qwen models already configured from Phase 1.
 - Frequently reads English documentation, articles, product pages, technical blogs, and dashboards.
 - Wants page content translated in place instead of copying text into a separate app.
@@ -34,7 +34,7 @@ Primary jobs:
 - Read English article/documentation in Chinese without losing page navigation.
 - Translate a long page gradually while scrolling.
 - Restore the original English text when translation quality or layout is not acceptable.
-- Install or repair the browser extension from llmTranslate Settings with minimal manual work.
+- Install or repair the browser extension from llmTools Settings with minimal manual work.
 
 ## 4. Platform Scope
 
@@ -92,7 +92,7 @@ These constraints are product requirements, not implementation preferences.
 - Browser integration state in preferences/registry.
 - Native messaging host installer for Chrome MVP.
 - Native messaging helper executable.
-- Local app bridge from native helper to the running llmTranslate app.
+- Local app bridge from native helper to the running llmTools app.
 - New webpage translation task path.
 - Translation batching and cancellation support.
 - Redacted diagnostics for setup and translation failures.
@@ -140,7 +140,7 @@ Phase 2 is successful when:
 
 ### 9.1 Browser Setup
 
-As a user, I can open llmTranslate Settings and see which supported browsers are installed and whether webpage translation is ready for each browser.
+As a user, I can open llmTools Settings and see which supported browsers are installed and whether webpage translation is ready for each browser.
 
 Acceptance:
 
@@ -169,7 +169,7 @@ Acceptance:
 
 - Popup shows `Translate Page` when page is translatable and bridge is ready.
 - Content script extracts visible English-dominant text nodes.
-- Extension sends batches to llmTranslate through native messaging.
+- Extension sends batches to llmTools through native messaging.
 - Translated text replaces original text nodes in the page.
 - Popup and in-page overlay show progress.
 - Links and page controls remain clickable.
@@ -182,7 +182,7 @@ Acceptance:
 
 - `Restore Original` appears after at least one successful replacement.
 - Restore uses in-memory original text mapping and does not require a page reload.
-- Restore removes llmTranslate markers and stops incremental translation.
+- Restore removes llmTools markers and stops incremental translation.
 
 ### 9.5 Cancel
 
@@ -259,7 +259,7 @@ Popup controls:
 - `恢复原文`
 - `重新翻译`
 - Domain toggle: `此网站自动翻译` off by default.
-- Link/button to open llmTranslate Settings.
+- Link/button to open llmTools Settings.
 
 ### 10.3 In-Page Overlay
 
@@ -286,9 +286,9 @@ flowchart LR
   Popup["Extension Popup"]
   Content["Content Script"]
   SW["Extension Service Worker"]
-  Host["LLMTranslateNativeHost"]
+  Host["LLMToolsNativeHost"]
   AppBridge["Local App Bridge"]
-  App["llmTranslate App"]
+  App["llmTools App"]
   Engine["TaskEngine"]
   Runner["GGUF / MLX Runner"]
 
@@ -310,8 +310,8 @@ flowchart LR
 - `BrowserIntegrationView`: Settings UI section.
 - `WebPageTranslationService`: app-side queue, batching, cancellation, and bridge requests.
 - `WebPageTranslationTypes`: shared request/response models.
-- `LLMTranslateNativeHost`: executable target launched by the browser through native messaging.
-- `LocalAppBridge`: local-only IPC between `LLMTranslateNativeHost` and the running app.
+- `LLMToolsNativeHost`: executable target launched by the browser through native messaging.
+- `LocalAppBridge`: local-only IPC between `LLMToolsNativeHost` and the running app.
 
 ### 11.3 Required Extension Components
 
@@ -329,8 +329,8 @@ flowchart LR
 
 Preferred MVP path:
 
-1. Browser extension talks to `LLMTranslateNativeHost` through native messaging.
-2. `LLMTranslateNativeHost` talks to the running app through a local-only app bridge.
+1. Browser extension talks to `LLMToolsNativeHost` through native messaging.
+2. `LLMToolsNativeHost` talks to the running app through a local-only app bridge.
 3. The app bridge can be implemented as loopback HTTP on `127.0.0.1` with a random port and bearer token, or as Unix domain socket if implementation cost is acceptable.
 
 Phase 2.0 recommendation:
@@ -359,7 +359,7 @@ Chrome MVP detection:
 - Verify bundle id `com.google.Chrome` when possible.
 - Determine if Chrome is running.
 - Determine expected user native host manifest path:
-  `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtranslate.native_host.json`
+  `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtools.native_host.json`
 
 Future browser configs should be data-driven:
 
@@ -369,7 +369,7 @@ Future browser configs should be data-driven:
   "name": "Google Chrome",
   "bundleID": "com.google.Chrome",
   "appPaths": ["/Applications/Google Chrome.app"],
-  "nativeHostManifestPath": "~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtranslate.native_host.json",
+  "nativeHostManifestPath": "~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtools.native_host.json",
   "extensionInstallURL": "https://chromewebstore.google.com/detail/<extension-id>",
   "extensionSettingsURL": "chrome://extensions/?id=<extension-id>"
 }
@@ -380,22 +380,22 @@ Future browser configs should be data-driven:
 Manifest name:
 
 ```text
-com.llmtranslate.native_host
+com.llmtools.native_host
 ```
 
 Chrome user-specific manifest path:
 
 ```text
-~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtranslate.native_host.json
+~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.llmtools.native_host.json
 ```
 
 Manifest shape:
 
 ```json
 {
-  "name": "com.llmtranslate.native_host",
-  "description": "llmTranslate native messaging host",
-  "path": "/absolute/path/to/LLMTranslateNativeHost",
+  "name": "com.llmtools.native_host",
+  "description": "llmTools native messaging host",
+  "path": "/absolute/path/to/LLMToolsNativeHost",
   "type": "stdio",
   "allowed_origins": [
     "chrome-extension://<chrome-extension-id>/"
@@ -415,7 +415,7 @@ Rules:
 
 Production Chrome flow:
 
-1. User clicks `安装扩展` in llmTranslate Settings.
+1. User clicks `安装扩展` in llmTools Settings.
 2. App writes/repairs native host manifest.
 3. App opens Chrome Web Store listing.
 4. User clicks `Add to Chrome` and accepts permissions in Chrome.
@@ -458,7 +458,7 @@ Chrome MVP manifest permissions:
 ```json
 {
   "manifest_version": 3,
-  "name": "llmTranslate",
+  "name": "llmTools",
   "permissions": [
     "activeTab",
     "scripting",
@@ -586,7 +586,7 @@ Replacement rules:
 Restore rules:
 
 - Store original `nodeValue` in memory before first replacement.
-- Restore only nodes replaced by llmTranslate.
+- Restore only nodes replaced by llmTools.
 - If node no longer exists, ignore.
 - If page has changed a translated node after replacement, do not overwrite by default. Mark as `changedAfterTranslation`.
 - Clear observers, pending queue, and in-page overlay after restore.
@@ -619,7 +619,7 @@ Implementation options:
 
 Recommended:
 
-- Add explicit webpage request/response types in `LLMTranslateCore`.
+- Add explicit webpage request/response types in `LLMToolsCore`.
 - Internally reuse prompt generation and runner execution.
 - Keep webpage translation out of normal recent history unless user opts in.
 
@@ -998,7 +998,7 @@ Expected behavior:
 
 - Add PRD.
 - Add `browser-extension/chromium` folder.
-- Add `LLMTranslateNativeHost` executable target.
+- Add `LLMToolsNativeHost` executable target.
 - Add shared protocol models.
 - Add browser integration status enums.
 
@@ -1177,7 +1177,7 @@ Phase 2.0 is done when:
 - No page text is persisted by default.
 - Logs are redacted.
 - Automated tests cover DOM skip rules, protocol, native host manifest generation, and core E2E flows.
-- Packaged app verification uses `./scripts/package-app.sh`, launches `dist/llmTranslate.app`, and verifies the running app path before final acceptance.
+- Packaged app verification uses `./scripts/package-app.sh`, launches `dist/llmTools.app`, and verifies the running app path before final acceptance.
 
 ## 26. Open Decisions
 

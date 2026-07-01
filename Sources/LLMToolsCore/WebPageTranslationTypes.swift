@@ -9,6 +9,9 @@ public enum WebPagePendingIndicatorStyle: String, Codable, Sendable, Hashable, C
 }
 
 public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
+    public static let minimumLocalConcurrentTranslationRequests = 1
+    public static let maximumLocalConcurrentTranslationRequests = 1
+
     public var enabled: Bool
     public var defaultTargetLanguage: String
     public var modelID: UUID?
@@ -19,6 +22,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public var persistWebHistory: Bool
     public var maxSegmentsPerBatch: Int
     public var maxCharactersPerBatch: Int
+    public var localConcurrentTranslationRequests: Int
 
     public init(
         enabled: Bool = true,
@@ -30,7 +34,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         disabledDomains: [String] = [],
         persistWebHistory: Bool = false,
         maxSegmentsPerBatch: Int = 20,
-        maxCharactersPerBatch: Int = 2_000
+        maxCharactersPerBatch: Int = 2_000,
+        localConcurrentTranslationRequests: Int = 1
     ) {
         self.enabled = enabled
         self.defaultTargetLanguage = defaultTargetLanguage
@@ -42,6 +47,14 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         self.persistWebHistory = persistWebHistory
         self.maxSegmentsPerBatch = maxSegmentsPerBatch
         self.maxCharactersPerBatch = maxCharactersPerBatch
+        self.localConcurrentTranslationRequests = Self.clampedLocalConcurrentTranslationRequests(localConcurrentTranslationRequests)
+    }
+
+    public static func clampedLocalConcurrentTranslationRequests(_ value: Int) -> Int {
+        min(
+            max(value, minimumLocalConcurrentTranslationRequests),
+            maximumLocalConcurrentTranslationRequests
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -55,6 +68,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         case persistWebHistory
         case maxSegmentsPerBatch
         case maxCharactersPerBatch
+        case localConcurrentTranslationRequests
     }
 
     public init(from decoder: Decoder) throws {
@@ -69,6 +83,9 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         persistWebHistory = try container.decodeIfPresent(Bool.self, forKey: .persistWebHistory) ?? false
         maxSegmentsPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxSegmentsPerBatch) ?? 20
         maxCharactersPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxCharactersPerBatch) ?? 2_000
+        localConcurrentTranslationRequests = Self.clampedLocalConcurrentTranslationRequests(
+            try container.decodeIfPresent(Int.self, forKey: .localConcurrentTranslationRequests) ?? 1
+        )
     }
 }
 

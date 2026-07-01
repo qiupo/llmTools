@@ -1,24 +1,115 @@
-const HOST_NAME = "com.llmtranslate.native_host";
+const HOST_NAME = "com.llmtools.native_host";
 const VERSION = "0.1.0";
-const MAX_SEGMENTS_PER_BATCH = 20;
-const MAX_CHARS_PER_BATCH = 2000;
-const MAX_SEGMENTS_PER_JOB = 320;
-const MAX_QUEUE_BACKLOG = 80;
-const RESUME_QUEUE_BACKLOG = 36;
-const MAX_INLINE_PENDING_INDICATORS = 80;
-const MAX_ANIMATED_SEGMENTS = 48;
-const MENU_TOGGLE_ID = "llmtranslate-toggle-page";
+const LOCAL_SEGMENTS_PER_BATCH = 5;
+const LOCAL_CHARS_PER_BATCH = 800;
+const REMOTE_SEGMENTS_PER_BATCH = 5;
+const REMOTE_CHARS_PER_BATCH = 900;
+const MENU_TOGGLE_ID = "llmtools-toggle-page";
 const TARGET_LANGUAGE = "zh-Hans";
 const TRANSLATION_CACHE_KEY = "webPageTranslationCacheV1";
 const TRANSLATION_CACHE_MAX_ENTRIES = 2000;
 const DEFAULT_PENDING_INDICATOR_STYLE = "loading";
 const NATIVE_REQUEST_TIMEOUT_MS = 130000;
+const LOCAL_MODEL_CONCURRENCY = 1;
+const REMOTE_MODEL_CONCURRENCY = 4;
+const DEFAULT_APP_LANGUAGE = "zh-Hans";
+
+const EXTENSION_TEXT = {
+  "zh-Hans": {
+    ready: "就绪",
+    pageChangedReady: "页面已变化。就绪。",
+    translated: "已翻译。",
+    localAppConnected: "本地应用已连接。",
+    discoveringVisibleEnglish: "正在发现可见英文文本...",
+    noVisibleEnglishText: "没有找到可见英文文本。",
+    translationCancelled: "翻译已取消。",
+    translatingSegments: ({ done, total }) => `正在翻译 ${done}/${total} 个片段...`,
+    translatedSegments: ({ done, total }) => `已翻译 ${done}/${total} 个片段。`,
+    translatedSegmentsWithFailures: ({ done, total, failed }) => `已翻译 ${done}/${total} 个片段，${failed} 个失败。`,
+    originalTextRestored: "已恢复原文。",
+    cancelling: "正在取消...",
+    openWebpageBeforeClearingCache: "请先打开网页标签页再清除缓存。",
+    cachePageUnknown: "无法识别当前页面缓存。已恢复页面翻译。",
+    cacheCleared: ({ removed }) => `已清除 ${removed} 条缓存译文。点击“翻译页面”重新翻译。`,
+    cacheEmpty: "当前页面没有缓存译文。点击“翻译页面”重新翻译。",
+    contextMenuToggle: "翻译/原文",
+    nativeHostRequestFailed: "Native host 请求失败。",
+    nativeHostRequestTimedOut: "Native host 请求超时。",
+    nativeHostDisconnected: "Native host 已断开连接。"
+  },
+  en: {
+    ready: "Ready",
+    pageChangedReady: "Page changed. Ready.",
+    translated: "Translated.",
+    localAppConnected: "Local app connected.",
+    discoveringVisibleEnglish: "Discovering visible English text...",
+    noVisibleEnglishText: "No visible English text found.",
+    translationCancelled: "Translation cancelled.",
+    translatingSegments: ({ done, total }) => `Translating ${done}/${total} segments...`,
+    translatedSegments: ({ done, total }) => `Translated ${done}/${total} segments.`,
+    translatedSegmentsWithFailures: ({ done, total, failed }) => `Translated ${done}/${total}; ${failed} failed.`,
+    originalTextRestored: "Original text restored.",
+    cancelling: "Cancelling...",
+    openWebpageBeforeClearingCache: "Open a webpage tab before clearing cache.",
+    cachePageUnknown: "Could not identify the current page cache. Page translations were restored.",
+    cacheCleared: ({ removed }) => `Cleared ${removed} cached translations. Click Translate Page to translate again.`,
+    cacheEmpty: "No cached translations found for this page. Click Translate Page to translate again.",
+    contextMenuToggle: "Translate/Original",
+    nativeHostRequestFailed: "Native host request failed.",
+    nativeHostRequestTimedOut: "Native host request timed out.",
+    nativeHostDisconnected: "Native host disconnected."
+  }
+};
 
 const tabStates = new Map();
 const tabJobs = new Map();
 const pendingNativeRequests = new Map();
 let pendingIndicatorStyle = DEFAULT_PENDING_INDICATOR_STYLE;
+let currentAppLanguage = DEFAULT_APP_LANGUAGE;
 let nativePort = null;
+
+function normalizeAppLanguage(language) {
+  return language === "en" ? "en" : DEFAULT_APP_LANGUAGE;
+}
+
+function setCurrentAppLanguage(language) {
+  currentAppLanguage = normalizeAppLanguage(language);
+  return currentAppLanguage;
+}
+
+function t(key, values = {}, language = currentAppLanguage) {
+  const normalizedLanguage = normalizeAppLanguage(language);
+  const catalog = EXTENSION_TEXT[normalizedLanguage] || EXTENSION_TEXT[DEFAULT_APP_LANGUAGE];
+  const entry = catalog[key] ?? EXTENSION_TEXT.en[key] ?? key;
+  return typeof entry === "function" ? entry(values) : entry;
+}
+
+function localizedMessageForState(state, language = currentAppLanguage) {
+  if (!state?.status) {
+    return t("ready", {}, language);
+  }
+  const done = state.done || 0;
+  const total = state.total || 0;
+  const failed = state.failed || 0;
+  switch (state.status) {
+    case "discovering":
+      return t("discoveringVisibleEnglish", {}, language);
+    case "translating":
+      return t("translatingSegments", { done, total }, language);
+    case "translated":
+      return total > 0 ? t("translatedSegments", { done, total }, language) : t("translated", {}, language);
+    case "partiallyTranslated":
+      return t("translatedSegmentsWithFailures", { done, total, failed }, language);
+    case "cancelled":
+      return t("translationCancelled", {}, language);
+    case "restored":
+      return t("originalTextRestored", {}, language);
+    case "idle":
+      return state.message || t("ready", {}, language);
+    default:
+      return state.message || state.status;
+  }
+}
 
 setupContextMenus();
 
@@ -33,7 +124,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 if (chrome.tabs?.onUpdated) {
   chrome.tabs.onUpdated.addListener((tabID, changeInfo) => {
     if (changeInfo.status === "loading" || changeInfo.url) {
-      resetTabState(tabID, "Page changed. Ready.");
+      resetTabState(tabID, t("pageChangedReady", {}, getState(tabID).appLanguage));
     }
   });
 }
@@ -81,12 +172,15 @@ function getState(tabID) {
   if (!tabStates.has(tabID)) {
     tabStates.set(tabID, {
       status: "idle",
-      message: "Ready",
+      message: t("ready"),
+      appLanguage: currentAppLanguage,
       total: 0,
       done: 0,
       failed: 0,
       hasTranslations: false,
       modelName: "",
+      modelIsRemoteProvider: false,
+      maxConcurrentTranslationRequests: LOCAL_MODEL_CONCURRENCY,
       pageSessionID: null,
       jobID: null,
       pageStateInvalidated: false
@@ -96,7 +190,9 @@ function getState(tabID) {
 }
 
 function stateFor(tabID, status, message, patch = {}) {
-  const next = { ...getState(tabID), ...patch, status, message };
+  const current = getState(tabID);
+  const appLanguage = normalizeAppLanguage(patch.appLanguage || current.appLanguage || currentAppLanguage);
+  const next = { ...current, ...patch, appLanguage, status, message };
   tabStates.set(tabID, next);
   refreshContextMenu(tabID, next);
   chrome.runtime.sendMessage({ type: "popupState", state: next }).catch(() => {});
@@ -106,7 +202,7 @@ function stateFor(tabID, status, message, patch = {}) {
   return next;
 }
 
-function resetTabState(tabID, message = "Ready") {
+function resetTabState(tabID, message = t("ready")) {
   if (!tabID) {
     return getState(tabID);
   }
@@ -143,6 +239,11 @@ function getJob(tabID) {
       done: 0,
       failed: 0,
       modelName: "",
+      appLanguage: currentAppLanguage,
+      modelIsRemoteProvider: false,
+      maxConcurrentTranslationRequests: LOCAL_MODEL_CONCURRENCY,
+      maxSegmentsPerBatch: LOCAL_SEGMENTS_PER_BATCH,
+      maxCharsPerBatch: LOCAL_CHARS_PER_BATCH,
       storageCache: null,
       pendingCacheEntries: [],
       discoveryPaused: false
@@ -153,14 +254,28 @@ function getJob(tabID) {
 
 async function checkStatus(tabID) {
   const response = await nativeRequest("getStatus", {});
+  const appLanguage = setCurrentAppLanguage(response?.payload?.appLanguage);
   const modelName = response?.payload?.modelName || "";
+  const modelIsRemoteProvider = Boolean(response?.payload?.modelIsRemoteProvider);
+  const maxConcurrentTranslationRequests = normalizeTranslationConcurrency(
+    response?.payload?.maxConcurrentTranslationRequests,
+    modelIsRemoteProvider
+  );
   pendingIndicatorStyle = normalizePendingIndicatorStyle(response?.payload?.pendingIndicatorStyle);
   const current = await getSyncedState(tabID).catch(() => getState(tabID));
   if (current.hasTranslations) {
-    return stateFor(tabID, current.status || "translated", current.message || "Translated.", { modelName });
+    return stateFor(tabID, current.status || "translated", localizedMessageForState(current, appLanguage), {
+      appLanguage,
+      modelName,
+      modelIsRemoteProvider,
+      maxConcurrentTranslationRequests
+    });
   }
-  return stateFor(tabID, "idle", "Local app connected.", {
+  return stateFor(tabID, "idle", t("localAppConnected", {}, appLanguage), {
+    appLanguage,
     modelName,
+    modelIsRemoteProvider,
+    maxConcurrentTranslationRequests,
     hasTranslations: false,
     done: 0,
     failed: 0,
@@ -189,7 +304,7 @@ async function getSyncedState(tabID) {
       const status = current.hasTranslations && current.status ? current.status : "translated";
       const message = current.hasTranslations && current.message
         ? current.message
-        : `Translated ${done}/${total} segments.`;
+        : t("translatedSegments", { done, total }, current.appLanguage);
       return stateFor(tabID, status, message, {
         hasTranslations: true,
         done,
@@ -198,7 +313,7 @@ async function getSyncedState(tabID) {
         pageStateInvalidated: false
       });
     }
-    return stateFor(tabID, "idle", "Ready", {
+    return stateFor(tabID, "idle", t("ready", {}, current.appLanguage), {
       hasTranslations: false,
       done: 0,
       failed: 0,
@@ -209,7 +324,7 @@ async function getSyncedState(tabID) {
     });
   } catch {
     if (current.hasTranslations || current.status === "translated" || current.status === "partiallyTranslated" || current.status === "restored") {
-      return resetTabState(tabID, "Ready");
+      return resetTabState(tabID, t("ready", {}, current.appLanguage));
     }
     refreshContextMenu(tabID, current);
     return current;
@@ -219,6 +334,7 @@ async function getSyncedState(tabID) {
 async function translatePage(tabID) {
   await ensureContentScript(tabID);
   const status = await checkStatus(tabID);
+  const batchLimits = batchLimitsForModel(Boolean(status.modelIsRemoteProvider));
   const job = {
     pageSessionID: crypto.randomUUID(),
     jobID: crypto.randomUUID(),
@@ -234,14 +350,22 @@ async function translatePage(tabID) {
     done: 0,
     failed: 0,
     modelName: status.modelName || "",
+    appLanguage: status.appLanguage || currentAppLanguage,
+    modelIsRemoteProvider: Boolean(status.modelIsRemoteProvider),
+    maxConcurrentTranslationRequests: status.maxConcurrentTranslationRequests || LOCAL_MODEL_CONCURRENCY,
+    maxSegmentsPerBatch: batchLimits.maxSegmentsPerBatch,
+    maxCharsPerBatch: batchLimits.maxCharsPerBatch,
     storageCache: null,
     pendingCacheEntries: [],
     discoveryPaused: false
   };
   tabJobs.set(tabID, job);
 
-  stateFor(tabID, "discovering", "Discovering visible English text...", {
+  stateFor(tabID, "discovering", t("discoveringVisibleEnglish", {}, job.appLanguage), {
+    appLanguage: job.appLanguage,
     modelName: job.modelName,
+    modelIsRemoteProvider: job.modelIsRemoteProvider,
+    maxConcurrentTranslationRequests: job.maxConcurrentTranslationRequests,
     done: 0,
     failed: 0,
     total: 0,
@@ -255,17 +379,15 @@ async function translatePage(tabID) {
     type: "startSession",
     pageSessionID: job.pageSessionID,
     pendingIndicatorStyle,
-    segmentBudget: MAX_SEGMENTS_PER_JOB,
-    maxInlinePendingIndicators: MAX_INLINE_PENDING_INDICATORS,
-    maxAnimatedSegments: MAX_ANIMATED_SEGMENTS
+    appLanguage: job.appLanguage
   });
   job.urlHash = await sha256(discovered?.url || "");
   job.title = discovered?.title || "";
   await hydrateJobCache(job, discovered?.segments || []);
   enqueueSegments(job, discovered?.segments || []);
-  await syncDiscoveryPressure(tabID, job);
   if (!job.queue.length) {
-    return stateFor(tabID, "idle", "No visible English text found.", {
+    return stateFor(tabID, "idle", t("noVisibleEnglishText", {}, job.appLanguage), {
+      appLanguage: job.appLanguage,
       total: 0,
       done: 0,
       failed: 0,
@@ -290,7 +412,6 @@ async function enqueueDiscoveredSegments(tabID, message) {
   const segments = message?.segments || [];
   await hydrateJobCache(job, segments);
   enqueueSegments(job, segments);
-  await syncDiscoveryPressure(tabID, job);
   if (!job.running && job.queue.length) {
     drainQueue(tabID).catch((error) => {
       stateFor(tabID, "failed", error?.message || String(error));
@@ -301,9 +422,6 @@ async function enqueueDiscoveredSegments(tabID, message) {
 
 function enqueueSegments(job, segments) {
   for (const segment of segments) {
-    if (job.discovered >= MAX_SEGMENTS_PER_JOB) {
-      break;
-    }
     if (!segment?.segmentID || !segment?.textHash || job.queuedIDs.has(segment.segmentID)) {
       continue;
     }
@@ -318,30 +436,6 @@ function enqueueSegments(job, segments) {
   }
 }
 
-async function syncDiscoveryPressure(tabID, job) {
-  if (!tabID || !job) {
-    return;
-  }
-  let shouldPause;
-  if (job.cancelled || job.discovered >= MAX_SEGMENTS_PER_JOB) {
-    shouldPause = true;
-  } else if (job.discoveryPaused) {
-    shouldPause = job.queue.length > RESUME_QUEUE_BACKLOG;
-  } else {
-    shouldPause = job.queue.length >= MAX_QUEUE_BACKLOG;
-  }
-  if (job.discoveryPaused === shouldPause) {
-    return;
-  }
-  job.discoveryPaused = shouldPause;
-  await sendContent(tabID, {
-    type: "setDiscoveryPaused",
-    paused: shouldPause,
-    reason: job.discovered >= MAX_SEGMENTS_PER_JOB ? "budget" : "backlog",
-    segmentBudget: MAX_SEGMENTS_PER_JOB
-  }).catch(() => {});
-}
-
 async function drainQueue(tabID) {
   const job = getJob(tabID);
   if (job.running) {
@@ -349,156 +443,201 @@ async function drainQueue(tabID) {
   }
   job.running = true;
   try {
-    while (job.queue.length && !job.cancelled) {
-      const cached = [];
-      const toTranslate = [];
-      const duplicateByHash = new Map();
-      let selectedCount = 0;
-      let charsInBatch = 0;
-      while (job.queue.length && selectedCount < MAX_SEGMENTS_PER_BATCH) {
-        const next = job.queue.shift();
-        const cachedTranslation = next.cachedTranslation || getCachedTranslation(job, next);
-        if (cachedTranslation) {
-          cached.push({
-            segmentID: next.segmentID,
-            translation: cachedTranslation,
-            status: "translated"
-          });
-          selectedCount += 1;
-          continue;
-        }
-        if (duplicateByHash.has(next.textHash)) {
-          duplicateByHash.get(next.textHash).push(next);
-          selectedCount += 1;
-          continue;
-        }
-        const nextChars = charsInBatch + next.text.length;
-        if (toTranslate.length && nextChars > MAX_CHARS_PER_BATCH) {
-          job.queue.unshift(next);
-          break;
-        }
-        toTranslate.push(next);
-        duplicateByHash.set(next.textHash, []);
-        charsInBatch = nextChars;
-        selectedCount += 1;
-      }
+    const workerCount = queueWorkerCount(job);
+    await Promise.all(Array.from({ length: workerCount }, () => drainQueueWorker(tabID, job)));
 
-      if (cached.length) {
-        await sendContent(tabID, { type: "applyTranslations", translations: cached });
-        if (job.cancelled) {
-          break;
-        }
-        job.done += cached.length;
-        await syncDiscoveryPressure(tabID, job);
-      }
-
-      if (toTranslate.length) {
-        stateFor(tabID, "translating", `Translating ${job.done}/${job.discovered} segments...`, {
-          done: job.done,
-          failed: job.failed,
-          total: job.discovered,
-          hasTranslations: job.done > 0,
-          modelName: job.modelName,
-          pageSessionID: job.pageSessionID,
-          jobID: job.jobID,
-          pageStateInvalidated: false
-        });
-        const result = await nativeRequest("translateSegments", {
-          jobID: job.jobID,
-          sourceLanguage: "en",
-          targetLanguage: TARGET_LANGUAGE,
-          urlHash: job.urlHash,
-          title: job.title,
-          segments: toTranslate.map((segment) => ({
-            segmentID: segment.segmentID,
-            text: segment.text,
-            tagName: segment.tagName,
-            blockContext: segment.blockContext,
-            priority: segment.priority,
-            textHash: segment.textHash
-          }))
-        }, { tabID, pageSessionID: job.pageSessionID });
-        if (job.cancelled) {
-          break;
-        }
-
-        const translations = result?.payload?.translations || [];
-        const translationsByHash = new Map();
-        const cacheEntries = [];
-        job.modelName = result?.payload?.modelName || job.modelName;
-        for (const translation of translations) {
-          const source = toTranslate.find((segment) => segment.segmentID === translation.segmentID);
-          if (source) {
-            translationsByHash.set(source.textHash, translation);
-          }
-          if (source && translation.status === "translated" && translation.translation) {
-            setCachedTranslation(job, source, translation.translation);
-            cacheEntries.push(cacheEntryForSegment(job, source, translation.translation));
-          }
-        }
-        queueTranslationCacheEntries(job, cacheEntries);
-        const duplicatedTranslations = [];
-        for (const [textHash, duplicateSegments] of duplicateByHash.entries()) {
-          const sourceTranslation = translationsByHash.get(textHash);
-          if (!sourceTranslation) {
-            continue;
-          }
-          for (const duplicateSegment of duplicateSegments) {
-            duplicatedTranslations.push({
-              ...sourceTranslation,
-              segmentID: duplicateSegment.segmentID
-            });
-          }
-        }
-        const translationsToApply = translations.concat(duplicatedTranslations);
-        await sendContent(tabID, { type: "applyTranslations", translations: translationsToApply });
-        if (job.cancelled) {
-          break;
-        }
-        job.done += translationsToApply.filter((item) => item.status === "translated").length;
-        job.failed += translationsToApply.filter((item) => item.status === "failed").length;
-        await syncDiscoveryPressure(tabID, job);
-      }
-
-      stateFor(tabID, "translating", `Translating ${job.done}/${job.discovered} segments...`, {
+    if (job.cancelled) {
+      stateFor(tabID, "cancelled", t("translationCancelled", {}, job.appLanguage), {
+        appLanguage: job.appLanguage,
         done: job.done,
         failed: job.failed,
         total: job.discovered,
         hasTranslations: job.done > 0,
         modelName: job.modelName,
-        pageStateInvalidated: false
-      });
-    }
-
-    if (job.cancelled) {
-      stateFor(tabID, "cancelled", "Translation cancelled.", {
-        done: job.done,
-        failed: job.failed,
-        total: job.discovered,
-        hasTranslations: job.done > 0,
+        modelIsRemoteProvider: job.modelIsRemoteProvider,
+        maxConcurrentTranslationRequests: job.maxConcurrentTranslationRequests,
         pageStateInvalidated: false
       });
     } else {
       const status = job.failed > 0 ? "partiallyTranslated" : "translated";
       const message = job.failed > 0
-        ? `Translated ${job.done}/${job.discovered}; ${job.failed} failed.`
-        : `Translated ${job.done}/${job.discovered} segments.`;
+        ? t("translatedSegmentsWithFailures", { done: job.done, total: job.discovered, failed: job.failed }, job.appLanguage)
+        : t("translatedSegments", { done: job.done, total: job.discovered }, job.appLanguage);
       stateFor(tabID, status, message, {
+        appLanguage: job.appLanguage,
         done: job.done,
         failed: job.failed,
         total: job.discovered,
         hasTranslations: job.done > 0,
         modelName: job.modelName,
+        modelIsRemoteProvider: job.modelIsRemoteProvider,
+        maxConcurrentTranslationRequests: job.maxConcurrentTranslationRequests,
         pageStateInvalidated: false
       });
     }
   } finally {
     await flushTranslationCache(job).catch(() => {});
     job.running = false;
+    if (job.queue.length && !job.cancelled) {
+      drainQueue(tabID).catch((error) => {
+        stateFor(tabID, "failed", error?.message || String(error));
+      });
+    }
   }
 }
 
+async function drainQueueWorker(tabID, job) {
+  while (job.queue.length && !job.cancelled) {
+    const batch = takeNextBatch(job);
+    if (!batch.cached.length && !batch.toTranslate.length) {
+      break;
+    }
+    await applyCachedTranslations(tabID, job, batch.cached);
+    if (job.cancelled) {
+      break;
+    }
+    if (batch.toTranslate.length) {
+      await translateAndApplyBatch(tabID, job, batch);
+    }
+    if (!job.cancelled) {
+      updateTranslatingState(tabID, job);
+    }
+  }
+}
+
+function takeNextBatch(job) {
+  const cached = [];
+  const toTranslate = [];
+  const duplicateByHash = new Map();
+  const maxSegments = job.maxSegmentsPerBatch || LOCAL_SEGMENTS_PER_BATCH;
+  const maxChars = job.maxCharsPerBatch || LOCAL_CHARS_PER_BATCH;
+  let selectedCount = 0;
+  let charsInBatch = 0;
+  while (job.queue.length && selectedCount < maxSegments) {
+    const next = job.queue.shift();
+    const cachedTranslation = next.cachedTranslation || getCachedTranslation(job, next);
+    if (cachedTranslation) {
+      cached.push({
+        segmentID: next.segmentID,
+        translation: cachedTranslation,
+        status: "translated"
+      });
+      selectedCount += 1;
+      continue;
+    }
+    if (duplicateByHash.has(next.textHash)) {
+      duplicateByHash.get(next.textHash).push(next);
+      selectedCount += 1;
+      continue;
+    }
+    const nextChars = charsInBatch + next.text.length;
+    if (toTranslate.length && nextChars > maxChars) {
+      job.queue.unshift(next);
+      break;
+    }
+    toTranslate.push(next);
+    duplicateByHash.set(next.textHash, []);
+    charsInBatch = nextChars;
+    selectedCount += 1;
+  }
+  return { cached, toTranslate, duplicateByHash };
+}
+
+async function applyCachedTranslations(tabID, job, cached) {
+  if (!cached.length) {
+    return;
+  }
+  await sendContent(tabID, { type: "applyTranslations", translations: cached });
+  if (job.cancelled) {
+    return;
+  }
+  job.done += cached.length;
+}
+
+async function translateAndApplyBatch(tabID, job, batch) {
+  updateTranslatingState(tabID, job);
+  const result = await nativeRequest("translateSegments", {
+    jobID: job.jobID,
+    sourceLanguage: "en",
+    targetLanguage: TARGET_LANGUAGE,
+    urlHash: job.urlHash,
+    title: job.title,
+    segments: batch.toTranslate.map((segment) => ({
+      segmentID: segment.segmentID,
+      text: segment.text,
+      tagName: segment.tagName,
+      blockContext: segment.blockContext,
+      priority: segment.priority,
+      textHash: segment.textHash
+    }))
+  }, { tabID, pageSessionID: job.pageSessionID });
+  if (job.cancelled) {
+    return;
+  }
+
+  const translations = result?.payload?.translations || [];
+  const translationsByHash = new Map();
+  const cacheEntries = [];
+  job.modelName = result?.payload?.modelName || job.modelName;
+  for (const translation of translations) {
+    const source = batch.toTranslate.find((segment) => segment.segmentID === translation.segmentID);
+    if (source) {
+      translationsByHash.set(source.textHash, translation);
+    }
+    if (source && translation.status === "translated" && translation.translation) {
+      setCachedTranslation(job, source, translation.translation);
+      cacheEntries.push(cacheEntryForSegment(job, source, translation.translation));
+    }
+  }
+  queueTranslationCacheEntries(job, cacheEntries);
+  const duplicatedTranslations = [];
+  for (const [textHash, duplicateSegments] of batch.duplicateByHash.entries()) {
+    const sourceTranslation = translationsByHash.get(textHash);
+    if (!sourceTranslation) {
+      continue;
+    }
+    for (const duplicateSegment of duplicateSegments) {
+      duplicatedTranslations.push({
+        ...sourceTranslation,
+        segmentID: duplicateSegment.segmentID
+      });
+    }
+  }
+  const translationsToApply = translations.concat(duplicatedTranslations);
+  await sendContent(tabID, { type: "applyTranslations", translations: translationsToApply });
+  if (job.cancelled) {
+    return;
+  }
+  job.done += translationsToApply.filter((item) => item.status === "translated").length;
+  job.failed += translationsToApply.filter((item) => item.status === "failed").length;
+}
+
+function updateTranslatingState(tabID, job) {
+  stateFor(tabID, "translating", t("translatingSegments", { done: job.done, total: job.discovered }, job.appLanguage), {
+    appLanguage: job.appLanguage,
+    done: job.done,
+    failed: job.failed,
+    total: job.discovered,
+    hasTranslations: job.done > 0,
+    modelName: job.modelName,
+    modelIsRemoteProvider: job.modelIsRemoteProvider,
+    maxConcurrentTranslationRequests: job.maxConcurrentTranslationRequests,
+    pageSessionID: job.pageSessionID,
+    jobID: job.jobID,
+    pageStateInvalidated: false
+  });
+}
+
+function queueWorkerCount(job) {
+  const concurrency = normalizeTranslationConcurrency(
+    job.maxConcurrentTranslationRequests,
+    Boolean(job.modelIsRemoteProvider)
+  );
+  return Math.max(1, Math.min(concurrency, job.queue.length || 1));
+}
+
 async function restorePage(tabID) {
+  const language = getState(tabID).appLanguage;
   const job = tabJobs.get(tabID);
   if (job) {
     job.cancelled = true;
@@ -506,7 +645,8 @@ async function restorePage(tabID) {
   }
   await sendContent(tabID, { type: "restore" }).catch(() => {});
   tabJobs.delete(tabID);
-  return stateFor(tabID, "restored", "Original text restored.", {
+  return stateFor(tabID, "restored", t("originalTextRestored", {}, language), {
+    appLanguage: language,
     hasTranslations: false,
     done: 0,
     failed: 0,
@@ -518,8 +658,9 @@ async function restorePage(tabID) {
 }
 
 async function cancelTranslation(tabID) {
+  const language = getState(tabID).appLanguage;
   const job = tabJobs.get(tabID);
-  stateFor(tabID, "cancelled", "Cancelling...");
+  stateFor(tabID, "cancelled", t("cancelling", {}, language), { appLanguage: language });
   if (job) {
     job.cancelled = true;
     job.queue = [];
@@ -529,7 +670,8 @@ async function cancelTranslation(tabID) {
     }
   }
   await sendContent(tabID, { type: "cancel" }).catch(() => {});
-  return stateFor(tabID, "cancelled", "Translation cancelled.", {
+  return stateFor(tabID, "cancelled", t("translationCancelled", {}, language), {
+    appLanguage: language,
     hasTranslations: getState(tabID).hasTranslations,
     jobID: null,
     pageStateInvalidated: false
@@ -537,8 +679,10 @@ async function cancelTranslation(tabID) {
 }
 
 async function clearCurrentPageCache(tabID, tabURL = "") {
+  const language = getState(tabID).appLanguage;
   if (!tabID) {
-    return stateFor(tabID, "unsupportedPage", "Open a webpage tab before clearing cache.", {
+    return stateFor(tabID, "unsupportedPage", t("openWebpageBeforeClearingCache", {}, language), {
+      appLanguage: language,
       canClearCache: false,
       hasTranslations: false,
       done: 0,
@@ -569,7 +713,8 @@ async function clearCurrentPageCache(tabID, tabURL = "") {
 
   await sendContent(tabID, { type: "restore" }).catch(() => {});
   tabJobs.delete(tabID);
-  return stateFor(tabID, "idle", cacheClearedMessage(removed, Boolean(urlHash)), {
+  return stateFor(tabID, "idle", cacheClearedMessage(removed, Boolean(urlHash), language), {
+    appLanguage: language,
     hasTranslations: false,
     done: 0,
     failed: 0,
@@ -700,14 +845,14 @@ function removeCachedEntriesForURL(cache, urlHash, targetLanguage = TARGET_LANGU
   return removed;
 }
 
-function cacheClearedMessage(removed, hadURLHash) {
+function cacheClearedMessage(removed, hadURLHash, language = currentAppLanguage) {
   if (!hadURLHash) {
-    return "Could not identify the current page cache. Page translations were restored.";
+    return t("cachePageUnknown", {}, language);
   }
   if (removed > 0) {
-    return `Cleared ${removed} cached translations. Click Translate Page to translate again.`;
+    return t("cacheCleared", { removed }, language);
   }
-  return "No cached translations found for this page. Click Translate Page to translate again.";
+  return t("cacheEmpty", {}, language);
 }
 
 function queueTranslationCacheEntries(job, entries) {
@@ -758,7 +903,7 @@ function setupContextMenus() {
       ignoreLastError();
       chrome.contextMenus.create({
         id: MENU_TOGGLE_ID,
-        title: "翻译/原文",
+        title: t("contextMenuToggle"),
         contexts: ["page"]
       }, ignoreLastError);
     });
@@ -781,7 +926,7 @@ function setupContextMenus() {
     if (!tabID) {
       return;
     }
-    getSyncedState(tabID).finally(() => {
+    checkStatus(tabID).catch(() => getSyncedState(tabID)).finally(() => {
       chrome.contextMenus.refresh?.();
     });
   });
@@ -793,7 +938,10 @@ function refreshContextMenu(tabID, state = getState(tabID)) {
     return;
   }
   const active = state.status === "discovering" || state.status === "translating";
-  chrome.contextMenus.update(MENU_TOGGLE_ID, { enabled: !active, title: "翻译/原文" }, ignoreLastError);
+  chrome.contextMenus.update(MENU_TOGGLE_ID, {
+    enabled: !active,
+    title: t("contextMenuToggle", {}, state.appLanguage)
+  }, ignoreLastError);
 }
 
 function ignoreLastError() {
@@ -823,7 +971,7 @@ async function nativeRequest(type, payload, context = {}) {
   };
   const response = await postNativeMessage(message);
   if (!response || response.status === "error") {
-    throw new Error(response?.error?.message || "Native host request failed.");
+    throw new Error(response?.error?.message || t("nativeHostRequestFailed"));
   }
   return response;
 }
@@ -840,7 +988,7 @@ function postNativeMessage(message) {
 
     const timeout = setTimeout(() => {
       pendingNativeRequests.delete(message.requestID);
-      reject(new Error("Native host request timed out."));
+      reject(new Error(t("nativeHostRequestTimedOut")));
     }, NATIVE_REQUEST_TIMEOUT_MS);
 
     pendingNativeRequests.set(message.requestID, { resolve, reject, timeout });
@@ -870,7 +1018,7 @@ function ensureNativePort() {
     pending.resolve(response);
   });
   nativePort.onDisconnect.addListener(() => {
-    const message = chrome.runtime.lastError?.message || "Native host disconnected.";
+    const message = chrome.runtime.lastError?.message || t("nativeHostDisconnected");
     nativePort = null;
     for (const [requestID, pending] of pendingNativeRequests.entries()) {
       clearTimeout(pending.timeout);
@@ -886,6 +1034,29 @@ function normalizePendingIndicatorStyle(style) {
     return style;
   }
   return DEFAULT_PENDING_INDICATOR_STYLE;
+}
+
+function normalizeTranslationConcurrency(value, isRemoteProvider) {
+  const fallback = isRemoteProvider ? REMOTE_MODEL_CONCURRENCY : LOCAL_MODEL_CONCURRENCY;
+  const maxAllowed = isRemoteProvider ? REMOTE_MODEL_CONCURRENCY : LOCAL_MODEL_CONCURRENCY;
+  const numericValue = Number(value);
+  if (!Number.isFinite(numericValue) || numericValue < 1) {
+    return fallback;
+  }
+  return Math.max(LOCAL_MODEL_CONCURRENCY, Math.min(Math.floor(numericValue), maxAllowed));
+}
+
+function batchLimitsForModel(isRemoteProvider) {
+  if (isRemoteProvider) {
+    return {
+      maxSegmentsPerBatch: REMOTE_SEGMENTS_PER_BATCH,
+      maxCharsPerBatch: REMOTE_CHARS_PER_BATCH
+    };
+  }
+  return {
+    maxSegmentsPerBatch: LOCAL_SEGMENTS_PER_BATCH,
+    maxCharsPerBatch: LOCAL_CHARS_PER_BATCH
+  };
 }
 
 async function sha256(text) {

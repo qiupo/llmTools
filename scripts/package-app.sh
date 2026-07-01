@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIGURATION="${CONFIGURATION:-release}"
-APP_NAME="llmTranslate"
-BUNDLE_ID="local.llmTranslate.app"
+APP_NAME="llmTools"
+BUNDLE_ID="local.llmtools.app"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_DIR="$APP_DIR/Contents"
@@ -16,14 +16,14 @@ cd "$ROOT_DIR"
 swift build -c "$CONFIGURATION"
 
 BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
-EXECUTABLE_PATH="$BIN_DIR/llmTranslate"
-NATIVE_HOST_PATH="$BIN_DIR/LLMTranslateNativeHost"
+EXECUTABLE_PATH="$BIN_DIR/llmTools"
+NATIVE_HOST_PATH="$BIN_DIR/LLMToolsNativeHost"
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR"
 mkdir -p "$RESOURCES_DIR"
 cp "$EXECUTABLE_PATH" "$MACOS_DIR/$APP_NAME"
-cp "$NATIVE_HOST_PATH" "$MACOS_DIR/LLMTranslateNativeHost"
+cp "$NATIVE_HOST_PATH" "$MACOS_DIR/LLMToolsNativeHost"
 if [ -d "$BIN_DIR/llama.framework" ]; then
     cp -R "$BIN_DIR/llama.framework" "$MACOS_DIR/llama.framework"
 fi
@@ -49,13 +49,13 @@ cat > "$CONTENTS_DIR/Info.plist" <<'PLIST'
     <key>CFBundleDevelopmentRegion</key>
     <string>zh_CN</string>
     <key>CFBundleExecutable</key>
-    <string>llmTranslate</string>
+    <string>llmTools</string>
     <key>CFBundleIdentifier</key>
-    <string>local.llmTranslate.app</string>
+    <string>local.llmtools.app</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>llmTranslate</string>
+    <string>llmTools</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -1,8 +1,8 @@
 import Foundation
-import LLMTranslateCore
+import LLMToolsCore
 
 @main
-struct LLMTranslateNativeHost {
+struct LLMToolsNativeHost {
     static func main() {
         let host = NativeMessagingHost()
         host.run()
@@ -74,7 +74,7 @@ final class NativeMessagingHost: @unchecked Sendable {
                 requestID: request.requestID,
                 type: "\(request.type).result",
                 code: .appNotRunning,
-                message: "llmTranslate 未运行，请先启动应用。"
+                message: "llmTools 未运行，请先启动应用。"
             )
         }
         let data = try httpRequest(state: state, method: "GET", path: "/status", body: nil)
@@ -94,7 +94,7 @@ final class NativeMessagingHost: @unchecked Sendable {
                 requestID: request.requestID,
                 type: "\(request.type).result",
                 code: .appNotRunning,
-                message: "llmTranslate 未运行，请先启动应用。"
+                message: "llmTools 未运行，请先启动应用。"
             )
         }
         let body = request.payload ?? Data("{}".utf8)

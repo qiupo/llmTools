@@ -4,7 +4,7 @@ Last updated: 2026-06-26
 
 ## 1. Objective
 
-Phase 1 delivers the first usable native macOS version of llmTranslate.
+Phase 1 delivers the first usable native macOS version of llmTools.
 
 The app should let a user:
 

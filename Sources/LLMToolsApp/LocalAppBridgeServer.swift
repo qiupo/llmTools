@@ -1,6 +1,6 @@
 import Foundation
 import Network
-import LLMTranslateCore
+import LLMToolsCore
 
 @MainActor
 final class LocalAppBridgeServer {
@@ -8,7 +8,7 @@ final class LocalAppBridgeServer {
     private var listener: NWListener?
     private var token = UUID().uuidString + UUID().uuidString
     private var runningPort: UInt16?
-    private var activeJobs: [String: Task<WebPageTranslateSegmentsResult, Error>] = [:]
+    private var activeJobs: [String: [UUID: Task<WebPageTranslateSegmentsResult, Error>]] = [:]
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
 
@@ -56,7 +56,7 @@ final class LocalAppBridgeServer {
         listener?.cancel()
         listener = nil
         runningPort = nil
-        activeJobs.values.forEach { $0.cancel() }
+        activeJobs.values.flatMap(\.values).forEach { $0.cancel() }
         activeJobs.removeAll()
         try? FileManager.default.removeItem(at: AppPaths.webPageBridgeStateFileURL)
     }
@@ -138,40 +138,45 @@ final class LocalAppBridgeServer {
                     connection: connection,
                     statusCode: 200,
                     payload: BridgeStatusPayload(
-                        appName: "llmTranslate",
+                        appName: "llmTools",
                         protocolVersion: 1,
                         bridgeReady: true,
                         modelName: appState.webPageTranslationModelDisplayName(limit: 48),
+                        modelIsRemoteProvider: appState.webPageTranslationModelIsRemote,
+                        maxConcurrentTranslationRequests: appState.webPageTranslationConcurrencyLimit,
+                        appLanguage: appState.preferences.appLanguage.rawValue,
                         webPageTranslationEnabled: appState.preferences.webPageTranslation.enabled,
                         pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue
                     )
                 )
             case ("POST", "/translateSegments"):
                 let payload = try decoder.decode(WebPageTranslateSegmentsPayload.self, from: request.body)
+                let taskID = UUID()
+                appState.beginExternalModelUse()
                 let task = Task {
                     try await appState.engine.translateWebPageSegments(
                         payload: payload,
                         modelID: appState.webPageTranslationModelID
                     )
                 }
-                activeJobs[payload.jobID] = task
+                activeJobs[payload.jobID, default: [:]][taskID] = task
                 do {
                     let result = try await task.value
-                    activeJobs[payload.jobID] = nil
+                    finishActiveJob(jobID: payload.jobID, taskID: taskID)
                     sendResponse(connection: connection, statusCode: 200, payload: result)
                 } catch is CancellationError {
-                    activeJobs[payload.jobID] = nil
+                    finishActiveJob(jobID: payload.jobID, taskID: taskID)
                     sendResponse(connection: connection, statusCode: 499, payload: errorPayload(code: .cancelled, message: "网页翻译已取消。"))
                 } catch let error as WebPageTranslationError {
-                    activeJobs[payload.jobID] = nil
+                    finishActiveJob(jobID: payload.jobID, taskID: taskID)
                     sendResponse(connection: connection, statusCode: 400, payload: ["error": error])
                 } catch {
-                    activeJobs[payload.jobID] = nil
+                    finishActiveJob(jobID: payload.jobID, taskID: taskID)
                     sendResponse(connection: connection, statusCode: 500, payload: errorPayload(code: .translationFailed, message: error.localizedDescription))
                 }
             case ("POST", "/cancelJob"):
                 let payload = try decoder.decode(CancelJobPayload.self, from: request.body)
-                activeJobs[payload.jobID]?.cancel()
+                activeJobs[payload.jobID]?.values.forEach { $0.cancel() }
                 activeJobs[payload.jobID] = nil
                 sendResponse(connection: connection, statusCode: 200, payload: ["cancelled": true])
             default:
@@ -209,6 +214,18 @@ final class LocalAppBridgeServer {
         let bodyStart = headersEnd + 4
         let body = bodyStart <= data.count ? Data(data[bodyStart...]) : Data()
         return HTTPRequest(method: requestParts[0], path: requestParts[1], headers: headers, body: body)
+    }
+
+    private func finishActiveJob(jobID: String, taskID: UUID) {
+        removeActiveJob(jobID: jobID, taskID: taskID)
+        appState.endExternalModelUse()
+    }
+
+    private func removeActiveJob(jobID: String, taskID: UUID) {
+        activeJobs[jobID]?[taskID] = nil
+        if activeJobs[jobID]?.isEmpty == true {
+            activeJobs[jobID] = nil
+        }
     }
 
     private func requestHeadersEnd(in data: Data) -> Data.Index? {
@@ -283,6 +300,9 @@ private struct BridgeStatusPayload: Codable {
     var protocolVersion: Int
     var bridgeReady: Bool
     var modelName: String
+    var modelIsRemoteProvider: Bool
+    var maxConcurrentTranslationRequests: Int
+    var appLanguage: String
     var webPageTranslationEnabled: Bool
     var pendingIndicatorStyle: String
 }

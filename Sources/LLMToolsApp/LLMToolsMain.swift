@@ -1,7 +1,7 @@
 import AppKit
 
 @main
-struct llmTranslateApp {
+struct llmToolsApp {
     @MainActor
     static func main() {
         let app = NSApplication.shared
