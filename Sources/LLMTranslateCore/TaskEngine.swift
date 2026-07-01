@@ -66,6 +66,165 @@ public actor TaskEngine {
         return descriptor
     }
 
+    public func addProviderModel(
+        providerID: ModelProviderID,
+        name: String? = nil,
+        modelID: String,
+        apiKey: String,
+        baseURL: String? = nil,
+        contextLength: Int? = nil
+    ) async throws -> ModelDescriptor {
+        guard let preset = ModelProviderCatalog.preset(for: providerID), preset.apiStyle != .local else {
+            throw RunnerError.unsupportedConfiguration("Choose a remote provider.")
+        }
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModelID.isEmpty else {
+            throw RunnerError.unsupportedConfiguration("Provider model ID is required.")
+        }
+        let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if preset.requiresAPIKey && trimmedAPIKey.isEmpty {
+            throw RunnerError.unsupportedConfiguration("\(preset.name) API key is required.")
+        }
+
+        let baseURLString = (baseURL?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? preset.defaultBaseURL
+        guard let resolvedBaseURL = URL(string: baseURLString), resolvedBaseURL.scheme != nil, resolvedBaseURL.host != nil else {
+            throw RunnerError.unsupportedConfiguration("Provider base URL is invalid.")
+        }
+
+        let configuration = ProviderConfiguration(
+            providerID: providerID,
+            apiStyle: preset.apiStyle,
+            baseURL: resolvedBaseURL,
+            apiKey: trimmedAPIKey,
+            apiKeyKeychainAccount: nil,
+            modelID: trimmedModelID,
+            maxOutputTokens: preset.defaultMaxOutputTokens
+        )
+        let descriptorID = UUID()
+        let displayName = (name?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
+            ?? "\(preset.name) · \(trimmedModelID)"
+        let descriptor = ModelDescriptor(
+            id: descriptorID,
+            name: displayName,
+            sourcePath: resolvedBaseURL,
+            resolvedPath: nil,
+            format: ModelProviderCatalog.format(for: preset.apiStyle),
+            sizeClass: "remote",
+            role: .default,
+            contextLength: contextLength ?? preset.defaultContextLength,
+            enabled: true,
+            validationState: .valid,
+            lastErrorMessage: nil,
+            providerConfiguration: configuration
+        )
+        snapshot.models.append(descriptor)
+        if snapshot.preferences.defaultModelID == nil {
+            snapshot.preferences.defaultModelID = descriptor.id
+        }
+        try await registryStore.save(snapshot)
+        return descriptor
+    }
+
+    public func updateProviderModel(
+        id: UUID,
+        providerID: ModelProviderID,
+        name: String,
+        modelID: String,
+        apiKey: String,
+        baseURL: String,
+        contextLength: Int
+    ) async throws -> ModelDescriptor {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        guard snapshot.models[index].providerConfiguration?.isRemote == true else {
+            throw RunnerError.unsupportedConfiguration("Only provider models can be edited here.")
+        }
+        guard let preset = ModelProviderCatalog.preset(for: providerID), preset.apiStyle != .local else {
+            throw RunnerError.unsupportedConfiguration("Choose a remote provider.")
+        }
+
+        let trimmedModelID = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedModelID.isEmpty else {
+            throw RunnerError.unsupportedConfiguration("Provider model ID is required.")
+        }
+        let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existingConfiguration = snapshot.models[index].providerConfiguration
+        let existingInlineAPIKey = existingConfiguration?.apiKey.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let previousProviderID = snapshot.models[index].providerID
+        let effectiveAPIKey: String
+        if preset.requiresAPIKey {
+            if !trimmedAPIKey.isEmpty {
+                effectiveAPIKey = trimmedAPIKey
+            } else if providerID == previousProviderID {
+                effectiveAPIKey = existingInlineAPIKey
+            } else {
+                effectiveAPIKey = ""
+            }
+        } else {
+            effectiveAPIKey = ""
+        }
+        if preset.requiresAPIKey && effectiveAPIKey.isEmpty {
+            throw RunnerError.unsupportedConfiguration("\(preset.name) API key is required.")
+        }
+
+        let baseURLString = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let resolvedBaseURL = URL(string: baseURLString), resolvedBaseURL.scheme != nil, resolvedBaseURL.host != nil else {
+            throw RunnerError.unsupportedConfiguration("Provider base URL is invalid.")
+        }
+
+        let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "\(preset.name) · \(trimmedModelID)"
+            : name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let configuration = ProviderConfiguration(
+            providerID: providerID,
+            apiStyle: preset.apiStyle,
+            baseURL: resolvedBaseURL,
+            apiKey: effectiveAPIKey,
+            apiKeyKeychainAccount: nil,
+            modelID: trimmedModelID,
+            customHeaders: existingConfiguration?.customHeaders ?? [:],
+            maxOutputTokens: preset.defaultMaxOutputTokens
+        )
+
+        await unloadModel(id: id)
+        snapshot.models[index].name = displayName
+        snapshot.models[index].sourcePath = resolvedBaseURL
+        snapshot.models[index].resolvedPath = nil
+        snapshot.models[index].format = ModelProviderCatalog.format(for: preset.apiStyle)
+        snapshot.models[index].sizeClass = "remote"
+        snapshot.models[index].role = .default
+        snapshot.models[index].contextLength = max(contextLength, 1024)
+        snapshot.models[index].validationState = .valid
+        snapshot.models[index].lastErrorMessage = nil
+        snapshot.models[index].providerConfiguration = configuration
+        try await registryStore.save(snapshot)
+        return snapshot.models[index]
+    }
+
+    public func testProviderModel(id: UUID) async throws -> ProviderTestResult {
+        guard let model = snapshot.models.first(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        do {
+            let result = try await ProviderConnectivity.test(model: model)
+            if let index = snapshot.models.firstIndex(where: { $0.id == id }) {
+                snapshot.models[index].validationState = .ready
+                snapshot.models[index].lastErrorMessage = nil
+                try await registryStore.save(snapshot)
+            }
+            return result
+        } catch {
+            if let index = snapshot.models.firstIndex(where: { $0.id == id }) {
+                snapshot.models[index].validationState = .failed
+                snapshot.models[index].lastErrorMessage = error.localizedDescription
+                try? await registryStore.save(snapshot)
+            }
+            throw error
+        }
+    }
+
     public func removeModel(id: UUID) async throws {
         snapshot.models.removeAll { $0.id == id }
         if snapshot.preferences.defaultModelID == id {
@@ -202,6 +361,14 @@ public actor TaskEngine {
             await runner.unload()
         }
         runners.removeAll()
+    }
+
+    private func unloadModel(id: UUID) async {
+        for runner in runners.values {
+            if await runner.loadedModelID() == id {
+                await runner.unload()
+            }
+        }
     }
 
     private func resolveModel(for modelID: UUID?) throws -> ModelDescriptor {
@@ -533,6 +700,14 @@ public actor TaskEngine {
             let runner = MLXRunner()
             runners[.mlx] = runner
             return runner
+        case .openAICompatible:
+            let runner = OpenAICompatibleRunner()
+            runners[.openAICompatible] = runner
+            return runner
+        case .anthropicMessages:
+            let runner = AnthropicMessagesRunner()
+            runners[.anthropicMessages] = runner
+            return runner
         case .unknown:
             throw RunnerError.unsupportedFormat(model.format)
         }
@@ -572,6 +747,9 @@ public actor TaskEngine {
     private func inferContextLength(format: ModelFormat, sizeClass: String) -> Int {
         if format == .gguf && (sizeClass == "0.8b" || sizeClass == "1.5b") {
             return 4096
+        }
+        if format == .openAICompatible || format == .anthropicMessages {
+            return 32768
         }
         return 8192
     }

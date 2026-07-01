@@ -32,8 +32,8 @@ final class BrowserIntegrationService {
             status = .nativeHostMissing
             errorMessage = "尚未安装 Chrome 本地桥接清单。"
         } else {
-            status = .extensionMissing
-            errorMessage = "请在 Chrome 扩展页面加载开发版扩展。"
+            status = .ready
+            errorMessage = nil
         }
 
         return BrowserIntegrationState(
@@ -44,7 +44,7 @@ final class BrowserIntegrationService {
             extensionID: chromeExtensionDevelopmentID,
             nativeHostManifestPath: manifestPath,
             status: status,
-            lastErrorCode: status == .extensionMissing ? nil : status.rawValue,
+            lastErrorCode: errorMessage == nil ? nil : status.rawValue,
             lastErrorMessage: errorMessage
         )
     }

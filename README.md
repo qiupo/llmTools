@@ -61,6 +61,16 @@ swift run LLMTranslateSmoke /Users/po/code/models/lmstudio-community/Qwen3.5-9B-
 
 Selected-text capture may require macOS Accessibility permission. If capture fails, paste text manually or grant the permission in System Settings.
 
+## Providers
+
+The Models settings page supports both local models and remote providers:
+
+- Local models: GGUF files and MLX model folders.
+- OpenAI-compatible providers: SiliconFlow, OpenAI, DeepSeek, Google Gemini, OpenRouter, Ollama, LM Studio, Together AI, Mistral AI, DeepInfra, and custom OpenAI-compatible endpoints.
+- Native providers: Anthropic Messages API.
+
+Remote provider entries are saved in the same model registry as local models, so the default model picker, quick action panel, and webpage translation model picker all use one shared model list.
+
 ## Package Local App
 
 ```sh

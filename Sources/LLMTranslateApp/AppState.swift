@@ -25,6 +25,7 @@ final class AppState: ObservableObject {
     @Published var selectedModelID: UUID?
     @Published var isRunning: Bool = false
     @Published var validationError: String?
+    @Published var providerTestModelID: UUID?
 
     let engine: TaskEngine
     private var preferenceSaveRevision = 0
@@ -96,6 +97,100 @@ final class AppState: ObservableObject {
                 await MainActor.run {
                     validationError = error.localizedDescription
                     statusMessage = t("Failed to add model")
+                }
+            }
+        }
+    }
+
+    func addProviderModel(
+        providerID: ModelProviderID,
+        name: String,
+        modelID: String,
+        apiKey: String,
+        baseURL: String,
+        contextLength: Int
+    ) {
+        Task {
+            do {
+                _ = try await engine.addProviderModel(
+                    providerID: providerID,
+                    name: name,
+                    modelID: modelID,
+                    apiKey: apiKey,
+                    baseURL: baseURL,
+                    contextLength: contextLength
+                )
+                await reloadSnapshot()
+                await MainActor.run {
+                    validationError = nil
+                    statusMessage = t("Added provider")
+                }
+            } catch {
+                await MainActor.run {
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed to add provider")
+                }
+            }
+        }
+    }
+
+    func updateProviderModel(
+        id: UUID,
+        providerID: ModelProviderID,
+        name: String,
+        modelID: String,
+        apiKey: String,
+        baseURL: String,
+        contextLength: Int
+    ) {
+        Task {
+            do {
+                _ = try await engine.updateProviderModel(
+                    id: id,
+                    providerID: providerID,
+                    name: name,
+                    modelID: modelID,
+                    apiKey: apiKey,
+                    baseURL: baseURL,
+                    contextLength: contextLength
+                )
+                await reloadSnapshot()
+                await MainActor.run {
+                    validationError = nil
+                    statusMessage = t("Updated provider")
+                }
+            } catch {
+                await MainActor.run {
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed to update provider")
+                }
+            }
+        }
+    }
+
+    func testProviderModel(id: UUID) {
+        guard providerTestModelID == nil else {
+            return
+        }
+        providerTestModelID = id
+        validationError = nil
+        statusMessage = t("Testing provider")
+
+        Task {
+            do {
+                let result = try await engine.testProviderModel(id: id)
+                await reloadSnapshot()
+                await MainActor.run {
+                    providerTestModelID = nil
+                    validationError = nil
+                    statusMessage = result.message
+                }
+            } catch {
+                await reloadSnapshot()
+                await MainActor.run {
+                    providerTestModelID = nil
+                    validationError = error.localizedDescription
+                    statusMessage = t("Provider test failed")
                 }
             }
         }

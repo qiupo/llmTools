@@ -68,6 +68,8 @@ async function handleMessage(message, sender) {
       return restorePage(tabID);
     case "cancelTranslation":
       return cancelTranslation(tabID);
+    case "clearCurrentPageCache":
+      return clearCurrentPageCache(tabID, message?.tabURL || sender?.tab?.url || "");
     case "segmentsDiscovered":
       return enqueueDiscoveredSegments(sender?.tab?.id, message);
     default:
@@ -383,6 +385,9 @@ async function drainQueue(tabID) {
 
       if (cached.length) {
         await sendContent(tabID, { type: "applyTranslations", translations: cached });
+        if (job.cancelled) {
+          break;
+        }
         job.done += cached.length;
         await syncDiscoveryPressure(tabID, job);
       }
@@ -413,6 +418,9 @@ async function drainQueue(tabID) {
             textHash: segment.textHash
           }))
         }, { tabID, pageSessionID: job.pageSessionID });
+        if (job.cancelled) {
+          break;
+        }
 
         const translations = result?.payload?.translations || [];
         const translationsByHash = new Map();
@@ -444,6 +452,9 @@ async function drainQueue(tabID) {
         }
         const translationsToApply = translations.concat(duplicatedTranslations);
         await sendContent(tabID, { type: "applyTranslations", translations: translationsToApply });
+        if (job.cancelled) {
+          break;
+        }
         job.done += translationsToApply.filter((item) => item.status === "translated").length;
         job.failed += translationsToApply.filter((item) => item.status === "failed").length;
         await syncDiscoveryPressure(tabID, job);
@@ -525,6 +536,51 @@ async function cancelTranslation(tabID) {
   });
 }
 
+async function clearCurrentPageCache(tabID, tabURL = "") {
+  if (!tabID) {
+    return stateFor(tabID, "unsupportedPage", "Open a webpage tab before clearing cache.", {
+      canClearCache: false,
+      hasTranslations: false,
+      done: 0,
+      failed: 0,
+      total: 0
+    });
+  }
+
+  const job = tabJobs.get(tabID);
+  if (job) {
+    job.cancelled = true;
+    job.queue = [];
+    job.cache.clear();
+    job.pendingCacheEntries = [];
+    if (job.jobID) {
+      await nativeRequest("cancelJob", { jobID: job.jobID }, { tabID, pageSessionID: job.pageSessionID }).catch(() => {});
+    }
+  }
+
+  const urlHash = job?.urlHash || await currentTabURLHash(tabID, tabURL);
+  let removed = 0;
+  if (urlHash) {
+    removed += await clearStoredTranslationsForURL(urlHash, TARGET_LANGUAGE);
+    if (job?.storageCache) {
+      removeCachedEntriesForURL(job.storageCache, urlHash, TARGET_LANGUAGE);
+    }
+  }
+
+  await sendContent(tabID, { type: "restore" }).catch(() => {});
+  tabJobs.delete(tabID);
+  return stateFor(tabID, "idle", cacheClearedMessage(removed, Boolean(urlHash)), {
+    hasTranslations: false,
+    done: 0,
+    failed: 0,
+    total: 0,
+    jobID: null,
+    pageSessionID: null,
+    pageStateInvalidated: false,
+    canClearCache: true
+  });
+}
+
 async function ensureContentScript(tabID) {
   try {
     await sendContent(tabID, { type: "ping" });
@@ -585,6 +641,25 @@ function cacheEntryForSegment(job, segment, translation) {
   };
 }
 
+async function currentTabURLHash(tabID, fallbackURL = "") {
+  if (fallbackURL) {
+    return sha256(fallbackURL);
+  }
+  try {
+    const pageState = await sendContent(tabID, { type: "getPageTranslationState" });
+    if (pageState?.url) {
+      return sha256(pageState.url);
+    }
+  } catch {}
+  try {
+    const tab = await chrome.tabs.get(tabID);
+    if (tab?.url) {
+      return sha256(tab.url);
+    }
+  } catch {}
+  return "";
+}
+
 async function loadTranslationCache() {
   if (!chrome.storage?.local) {
     return {};
@@ -596,6 +671,43 @@ async function loadTranslationCache() {
   } catch {
     return {};
   }
+}
+
+async function clearStoredTranslationsForURL(urlHash, targetLanguage = TARGET_LANGUAGE) {
+  if (!chrome.storage?.local || !urlHash) {
+    return 0;
+  }
+  const cache = await loadTranslationCache();
+  const removed = removeCachedEntriesForURL(cache, urlHash, targetLanguage);
+  if (removed > 0) {
+    await chrome.storage.local.set({ [TRANSLATION_CACHE_KEY]: cache }).catch(() => {});
+  }
+  return removed;
+}
+
+function removeCachedEntriesForURL(cache, urlHash, targetLanguage = TARGET_LANGUAGE) {
+  if (!cache || !urlHash) {
+    return 0;
+  }
+  let removed = 0;
+  for (const key of Object.keys(cache)) {
+    const entry = cache[key];
+    if (entry?.urlHash === urlHash && (!targetLanguage || entry.targetLanguage === targetLanguage)) {
+      delete cache[key];
+      removed += 1;
+    }
+  }
+  return removed;
+}
+
+function cacheClearedMessage(removed, hadURLHash) {
+  if (!hadURLHash) {
+    return "Could not identify the current page cache. Page translations were restored.";
+  }
+  if (removed > 0) {
+    return `Cleared ${removed} cached translations. Click Translate Page to translate again.`;
+  }
+  return "No cached translations found for this page. Click Translate Page to translate again.";
 }
 
 function queueTranslationCacheEntries(job, entries) {

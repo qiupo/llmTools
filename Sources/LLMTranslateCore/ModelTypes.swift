@@ -3,6 +3,8 @@ import Foundation
 public enum ModelFormat: String, Codable, Sendable, CaseIterable {
     case gguf
     case mlx
+    case openAICompatible = "openai-compatible"
+    case anthropicMessages = "anthropic-messages"
     case unknown
 }
 
@@ -33,6 +35,7 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var enabled: Bool
     public var validationState: ModelValidationState
     public var lastErrorMessage: String?
+    public var providerConfiguration: ProviderConfiguration?
 
     public init(
         id: UUID = UUID(),
@@ -45,7 +48,8 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         contextLength: Int,
         enabled: Bool = true,
         validationState: ModelValidationState = .unknown,
-        lastErrorMessage: String? = nil
+        lastErrorMessage: String? = nil,
+        providerConfiguration: ProviderConfiguration? = nil
     ) {
         self.id = id
         self.name = name
@@ -58,10 +62,30 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         self.enabled = enabled
         self.validationState = validationState
         self.lastErrorMessage = lastErrorMessage
+        self.providerConfiguration = providerConfiguration
     }
 
     public var displayPath: String {
-        resolvedPath?.path ?? sourcePath.path
+        if let providerConfiguration, providerConfiguration.isRemote {
+            return providerConfiguration.baseURL?.absoluteString ?? ModelProviderCatalog.displayName(for: providerConfiguration.providerID)
+        }
+        return resolvedPath?.path ?? sourcePath.path
+    }
+
+    public var providerID: ModelProviderID {
+        providerConfiguration?.providerID ?? .local
+    }
+
+    public var providerDisplayName: String {
+        ModelProviderCatalog.displayName(for: providerID)
+    }
+
+    public var apiModelID: String? {
+        providerConfiguration?.modelID
+    }
+
+    public var isRemoteProvider: Bool {
+        providerConfiguration?.isRemote ?? false
     }
 }
 

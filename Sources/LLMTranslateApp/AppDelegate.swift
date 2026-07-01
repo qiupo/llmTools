@@ -7,6 +7,7 @@ import LLMTranslateCore
 final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate, SelectionActionServiceDelegate, NSMenuDelegate {
     private let selectionActionCompactSize = NSSize(width: 260, height: 58)
     private let selectionActionExpandedSize = NSSize(width: 260, height: 167)
+    private let settingsWindowContentSize = NSSize(width: 700, height: 640)
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
@@ -107,9 +108,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         )
         settingsWindowController = WindowController(
             title: "设置",
-            frame: NSRect(x: 0, y: 0, width: 680, height: 420),
+            frame: NSRect(origin: .zero, size: settingsWindowContentSize),
             contentView: AnyView(SettingsView(appState: appState))
         )
+        if let settingsWindow = settingsWindowController?.window {
+            settingsWindow.contentMinSize = NSSize(width: settingsWindowContentSize.width, height: 380)
+            settingsWindow.contentMaxSize = NSSize(width: settingsWindowContentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        }
     }
 
     @objc private func toggleMenu() {

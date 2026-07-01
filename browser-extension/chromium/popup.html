@@ -57,6 +57,9 @@
       grid-template-columns: 1fr 1fr;
       gap: 8px;
     }
+    button.wide {
+      grid-column: 1 / -1;
+    }
     button {
       border: 1px solid #dadce0;
       border-radius: 6px;
@@ -93,6 +96,7 @@
       <button id="restore">Restore</button>
       <button id="cancel">Cancel</button>
       <button id="statusBtn">Test</button>
+      <button id="clearCache" class="wide" title="Clear cached translations for the current page">清除缓存</button>
     </div>
   </div>
   <script src="popup.js"></script>

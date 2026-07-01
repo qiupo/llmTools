@@ -5,19 +5,23 @@ const translateBtn = document.getElementById("translate");
 const restoreBtn = document.getElementById("restore");
 const cancelBtn = document.getElementById("cancel");
 const statusBtn = document.getElementById("statusBtn");
+const clearCacheBtn = document.getElementById("clearCache");
 
 async function send(type) {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id && type !== "checkStatus" && type !== "getPopupState") {
     return {
       status: "unsupportedPage",
-      message: "Open a webpage tab before translating.",
+      message: type === "clearCurrentPageCache"
+        ? "Open a webpage tab before clearing cache."
+        : "Open a webpage tab before translating.",
       done: 0,
       total: 0,
-      hasTranslations: false
+      hasTranslations: false,
+      canClearCache: false
     };
   }
-  return chrome.runtime.sendMessage({ type, tabID: tab?.id });
+  return chrome.runtime.sendMessage({ type, tabID: tab?.id, tabURL: tab?.url });
 }
 
 function render(state) {
@@ -30,6 +34,7 @@ function render(state) {
   translateBtn.disabled = state.status === "translating" || state.status === "discovering";
   cancelBtn.disabled = state.status !== "translating" && state.status !== "discovering";
   restoreBtn.disabled = !state.hasTranslations;
+  clearCacheBtn.disabled = state.canClearCache === false;
 }
 
 async function refresh() {
@@ -42,6 +47,7 @@ async function refresh() {
     translateBtn.disabled = true;
     cancelBtn.disabled = true;
     restoreBtn.disabled = true;
+    clearCacheBtn.disabled = true;
   }
 }
 
@@ -61,6 +67,11 @@ cancelBtn.addEventListener("click", async () => {
 statusBtn.addEventListener("click", async () => {
   await send("checkStatus");
   render(await send("getPopupState"));
+});
+
+clearCacheBtn.addEventListener("click", async () => {
+  statusEl.textContent = "Clearing cached translations...";
+  render(await send("clearCurrentPageCache"));
 });
 
 chrome.runtime.onMessage.addListener((message) => {

@@ -34,6 +34,45 @@ async function runBackgroundBatchCheck() {
   const startSessionMessages = [];
   const contextMenuItems = new Map();
   const localStorageData = {};
+  let nativePortMessageListener = null;
+  let nativePortDisconnectListener = null;
+
+  function nativeResponseFor(message) {
+    if (message.type === "getStatus") {
+      return {
+        requestID: message.requestID,
+        status: "ok",
+        payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText" }
+      };
+    }
+    if (message.type === "translateSegments") {
+      nativeTranslatePayloads.push(message.payload);
+      return {
+        requestID: message.requestID,
+        status: "ok",
+        payload: {
+          modelName: "stub-model",
+          translations: message.payload.segments.map((segment) => ({
+            segmentID: segment.segmentID,
+            translation: segment.textHash === repeatHash ? "重复标签" : "敏捷的棕色狐狸跳过懒狗。",
+            status: "translated"
+          }))
+        }
+      };
+    }
+    if (message.type === "cancelJob") {
+      return {
+        requestID: message.requestID,
+        status: "ok",
+        payload: { cancelled: true }
+      };
+    }
+    return {
+      requestID: message.requestID,
+      status: "error",
+      error: { message: `Unexpected native message type: ${message.type}` }
+    };
+  }
 
   const chrome = {
     runtime: {
@@ -52,6 +91,24 @@ async function runBackgroundBatchCheck() {
       sendMessage(message) {
         popupStates.push(message);
         return Promise.resolve();
+      },
+      connectNative() {
+        return {
+          postMessage(message) {
+            const response = nativeResponseFor(message);
+            setTimeout(() => nativePortMessageListener?.(response), 0);
+          },
+          onMessage: {
+            addListener(listener) {
+              nativePortMessageListener = listener;
+            }
+          },
+          onDisconnect: {
+            addListener(listener) {
+              nativePortDisconnectListener = listener;
+            }
+          }
+        };
       },
       sendNativeMessage(_hostName, message) {
         if (message.type === "getStatus") {
@@ -140,6 +197,9 @@ async function runBackgroundBatchCheck() {
           tabActivatedListener = listener;
         }
       },
+      get(tabID) {
+        return Promise.resolve({ id: tabID, url: "https://example.test/article" });
+      },
       sendMessage(_tabID, message) {
         if (message.type === "ping") {
           return Promise.resolve({ ok: true });
@@ -201,6 +261,7 @@ async function runBackgroundBatchCheck() {
   assert(tabActivatedListener, "tab activation listener was not registered");
   assert(contextMenuClickListener, "context menu click listener was not registered");
   assert(contextMenuShownListener, "context menu shown listener was not registered");
+  assert(nativePortDisconnectListener === null, "native port should not connect before a native request");
   assert(contextMenuItems.size === 1, `expected one top-level context menu item, got ${contextMenuItems.size}`);
   assert(contextMenuItems.has("llmtranslate-toggle-page"), "toggle context menu was not created");
   assert(contextMenuItems.get("llmtranslate-toggle-page").title === "翻译/原文", "toggle context menu should use the requested label");
@@ -231,6 +292,19 @@ async function runBackgroundBatchCheck() {
   await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not re-apply translations");
   assert(nativeTranslatePayloads.length === nativeCallsAfterFirstTranslate, "second translation should reuse persistent cache without native translateSegments");
+  const clearedState = await sendBackgroundMessage(backgroundListener, {
+    type: "clearCurrentPageCache",
+    tabID: 7,
+    tabURL: "https://example.test/article"
+  });
+  assert(clearedState.status === "idle", `expected idle state after clearing cache, got ${clearedState.status}`);
+  assert(clearedState.hasTranslations === false, "clear cache should clear translated state");
+  assert(clearedState.message.includes("Cleared 2 cached translations"), `unexpected clear cache message: ${clearedState.message}`);
+  assert(appliedTranslations.length === 0, "clear cache should restore page translations");
+  assert(Object.keys(localStorageData.webPageTranslationCacheV1 || {}).length === 0, "clear cache should remove current page storage entries");
+  await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
+  await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not translate after clearing cache");
+  assert(nativeTranslatePayloads.length === nativeCallsAfterFirstTranslate + 1, "translation after clearing cache should call native translateSegments again");
   tabUpdatedListener(7, { status: "loading" }, { id: 7 });
   const reloadedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(reloadedState.status === "idle", `expected idle state after reload, got ${reloadedState.status}`);

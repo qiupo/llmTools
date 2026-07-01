@@ -9,30 +9,38 @@ struct LLMTranslateNativeHost {
     }
 }
 
-final class NativeMessagingHost {
+final class NativeMessagingHost: @unchecked Sendable {
     private let input = FileHandle.standardInput
     private let output = FileHandle.standardOutput
-    private let decoder = JSONDecoder()
-    private let encoder = JSONEncoder()
+    private let outputLock = NSLock()
 
-    init() {
+    init() {}
+
+    private func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        encoder.dateEncodingStrategy = .iso8601
+        return decoder
     }
 
     func run() {
+        let group = DispatchGroup()
         while true {
             guard let messageData = readNativeMessage() else {
-                return
+                break
             }
-            let response = handle(messageData: messageData)
-            writeNativeMessage(response)
+            group.enter()
+            DispatchQueue.global(qos: .userInitiated).async { [self] in
+                let response = handle(messageData: messageData)
+                writeNativeMessage(response)
+                group.leave()
+            }
         }
+        group.wait()
     }
 
     private func handle(messageData: Data) -> Data {
         do {
-            let request = try decoder.decode(GenericNativeEnvelope.self, from: messageData)
+            let request = try makeDecoder().decode(GenericNativeEnvelope.self, from: messageData)
             switch request.type {
             case "hello", "getStatus":
                 return try statusResponse(for: request)
@@ -112,7 +120,7 @@ final class NativeMessagingHost {
 
     private func readBridgeState() -> LocalBridgeState? {
         guard let data = try? Data(contentsOf: AppPaths.webPageBridgeStateFileURL),
-              let state = try? decoder.decode(LocalBridgeState.self, from: data) else {
+              let state = try? makeDecoder().decode(LocalBridgeState.self, from: data) else {
             return nil
         }
         guard state.pid > 0, kill(state.pid, 0) == 0 else {
@@ -152,7 +160,7 @@ final class NativeMessagingHost {
             throw NativeHostHTTPError(code: .appNotRunning, message: "本地桥接没有响应。")
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = (try? decoder.decode(BridgeErrorEnvelope.self, from: data).error.message)
+            let message = (try? makeDecoder().decode(BridgeErrorEnvelope.self, from: data).error.message)
                 ?? HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
             throw NativeHostHTTPError(code: .translationFailed, message: message)
         }
@@ -234,6 +242,8 @@ final class NativeMessagingHost {
     private func writeNativeMessage(_ data: Data) {
         var length = UInt32(data.count).littleEndian
         let lengthData = Data(bytes: &length, count: 4)
+        outputLock.lock()
+        defer { outputLock.unlock() }
         output.write(lengthData)
         output.write(data)
     }

@@ -714,6 +714,102 @@ final class CommandFriendlyTextView: NSTextView {
     }
 }
 
+struct CommandFriendlyTextField: NSViewRepresentable {
+    @Binding var text: String
+    var placeholder: String
+    var isSecure: Bool = false
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let textField: NSTextField = isSecure ? CommandFriendlySecureTextField() : CommandFriendlyPlainTextField()
+        textField.delegate = context.coordinator
+        textField.stringValue = text
+        textField.placeholderString = placeholder
+        textField.isBordered = true
+        textField.isBezeled = true
+        textField.bezelStyle = .roundedBezel
+        textField.drawsBackground = true
+        textField.isEditable = true
+        textField.isSelectable = true
+        textField.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textField.lineBreakMode = .byTruncatingMiddle
+        return textField
+    }
+
+    func updateNSView(_ textField: NSTextField, context: Context) {
+        context.coordinator.text = $text
+        if textField.stringValue != text {
+            textField.stringValue = text
+        }
+        textField.placeholderString = placeholder
+        textField.isEnabled = context.environment.isEnabled
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var text: Binding<String>
+
+        init(text: Binding<String>) {
+            self.text = text
+        }
+
+        func controlTextDidChange(_ notification: Notification) {
+            guard let textField = notification.object as? NSTextField else {
+                return
+            }
+            text.wrappedValue = textField.stringValue
+        }
+    }
+}
+
+private final class CommandFriendlyPlainTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        performCommandShortcut(event) || super.performKeyEquivalent(with: event)
+    }
+}
+
+private final class CommandFriendlySecureTextField: NSSecureTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        performCommandShortcut(event) || super.performKeyEquivalent(with: event)
+    }
+}
+
+private extension NSTextField {
+    func performCommandShortcut(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
+              let characters = event.charactersIgnoringModifiers?.lowercased(),
+              let editor = currentEditor() else {
+            return false
+        }
+
+        switch characters {
+        case "a":
+            editor.selectAll(nil)
+            return true
+        case "c":
+            editor.copy(nil)
+            return true
+        case "v":
+            editor.paste(nil)
+            return true
+        case "x":
+            editor.cut(nil)
+            return true
+        case "z":
+            if event.modifierFlags.contains(.shift) {
+                undoManager?.redo()
+            } else {
+                undoManager?.undo()
+            }
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 struct FloatingWidgetView: View {
     @ObservedObject var appState: AppState
 
@@ -868,13 +964,20 @@ struct ModelPickerView: View {
                 Text(L10n.text("No model", language: language)).tag(UUID?.none)
             } else {
                 ForEach(appState.models) { model in
-                    Text("\(model.name) · \(model.format.rawValue.uppercased()) · \(model.sizeClass)")
+                    Text(modelPickerTitle(model))
                         .tag(Optional(model.id))
                 }
             }
         }
         .pickerStyle(.menu)
         .disabled(appState.models.isEmpty || appState.isRunning)
+    }
+
+    private func modelPickerTitle(_ model: ModelDescriptor) -> String {
+        if model.isRemoteProvider {
+            return "\(model.name) · \(model.providerDisplayName)"
+        }
+        return "\(model.name) · \(model.format.rawValue.uppercased()) · \(model.sizeClass)"
     }
 }
 
@@ -990,6 +1093,13 @@ struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var selectedTab: SettingsTab = .general
     @State private var showImporter = false
+    @State private var providerDraftID: ModelProviderID = .siliconFlow
+    @State private var providerDraftName = ""
+    @State private var providerDraftModelID = ""
+    @State private var providerDraftAPIKey = ""
+    @State private var providerDraftBaseURL = ModelProviderCatalog.preset(for: .siliconFlow)?.defaultBaseURL ?? ""
+    @State private var providerDraftContextLength = ModelProviderCatalog.preset(for: .siliconFlow)?.defaultContextLength ?? 32768
+    @State private var editingProviderModelID: UUID?
     @State private var chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutRecorderMessage: String?
@@ -1005,7 +1115,7 @@ struct SettingsView: View {
             contentArea
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 700, minHeight: 380)
+        .frame(minWidth: 600, maxWidth: 700, minHeight: 380)
         .background(Color(NSColor.windowBackgroundColor))
         .background {
             ShortcutCaptureBridge(
@@ -1030,6 +1140,7 @@ struct SettingsView: View {
         }
         .onAppear {
             chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+            initializeProviderDraftIfNeeded()
         }
         .onDisappear {
             shortcutCaptureTarget = nil
@@ -1229,6 +1340,9 @@ struct SettingsView: View {
             modelSettingsHeader
                 .frame(maxWidth: 650, alignment: .topLeading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
+            providerAddPanel
+                .frame(maxWidth: 650, alignment: .topLeading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
 
             Group {
                 if appState.models.isEmpty {
@@ -1252,10 +1366,122 @@ struct SettingsView: View {
             Button {
                 showImporter = true
             } label: {
-                Label(L10n.text("Add Model", language: language), systemImage: "plus")
+                Label(L10n.text("Add Local Model", language: language), systemImage: "externaldrive.badge.plus")
             }
             .controlSize(.small)
         }
+    }
+
+    private var providerAddPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Label(
+                    editingProviderModelID == nil
+                        ? L10n.text("Add Provider", language: language)
+                        : L10n.text("Save Provider", language: language),
+                    systemImage: editingProviderModelID == nil ? "cloud.badge.plus" : "square.and.pencil"
+                )
+                    .font(.subheadline.weight(.semibold))
+                Spacer(minLength: 8)
+                Text(selectedProviderPreset.note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                fieldStack(title: L10n.text("Provider", language: language), width: 170) {
+                    Picker("", selection: Binding(
+                        get: { providerDraftID },
+                        set: { newValue in
+                            providerDraftID = newValue
+                            applyProviderPreset(newValue)
+                        }
+                    )) {
+                        ForEach(ModelProviderCatalog.remotePresets) { preset in
+                            Text(preset.name).tag(preset.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+
+                fieldStack(title: L10n.text("Provider model", language: language), width: 190) {
+                    CommandFriendlyTextField(
+                        text: $providerDraftModelID,
+                        placeholder: providerModelPlaceholder
+                    )
+                }
+
+                fieldStack(title: L10n.text("Base URL", language: language), width: 250) {
+                    CommandFriendlyTextField(
+                        text: $providerDraftBaseURL,
+                        placeholder: "https://api.example.com/v1"
+                    )
+                }
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                fieldStack(title: L10n.text("Provider name", language: language), width: 170) {
+                    CommandFriendlyTextField(
+                        text: $providerDraftName,
+                        placeholder: L10n.text("Optional display name", language: language)
+                    )
+                }
+
+                fieldStack(title: L10n.text("API Key", language: language), width: 250) {
+                    CommandFriendlyTextField(
+                        text: $providerDraftAPIKey,
+                        placeholder: selectedProviderPreset.requiresAPIKey ? "sk-..." : "optional",
+                        isSecure: true
+                    )
+                }
+                .disabled(!selectedProviderPreset.requiresAPIKey)
+                .opacity(selectedProviderPreset.requiresAPIKey ? 1 : 0.55)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.text("Context", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Stepper(
+                        "\(providerDraftContextLength)",
+                        value: $providerDraftContextLength,
+                        in: 1024...1_000_000,
+                        step: 1024
+                    )
+                    .font(.caption.monospacedDigit())
+                    .frame(width: 118, alignment: .leading)
+                }
+
+                Spacer(minLength: 0)
+
+                HStack(spacing: 6) {
+                    iconToolButton(
+                        systemImage: editingProviderModelID == nil ? "plus" : "checkmark",
+                        help: editingProviderModelID == nil
+                            ? L10n.text("Add Provider", language: language)
+                            : L10n.text("Save Provider", language: language),
+                        isDisabled: addProviderDisabled,
+                        action: addProviderDraft
+                    )
+
+                    if editingProviderModelID != nil {
+                        iconToolButton(
+                            systemImage: "xmark",
+                            help: L10n.text("Cancel Edit", language: language),
+                            action: resetProviderDraft
+                        )
+                    }
+                }
+                .frame(height: 24, alignment: .center)
+                .padding(.top, 17)
+            }
+        }
+        .padding(12)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.72))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var modelList: some View {
@@ -1315,6 +1541,10 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    Text(chromeExtensionManualInstallText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 8) {
                         Button {
                             do {
@@ -1442,7 +1672,7 @@ struct SettingsView: View {
         )) {
             Text(L10n.text("No model", language: language)).tag(UUID?.none)
             ForEach(appState.models) { model in
-                Text(model.name).tag(Optional(model.id))
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
@@ -1460,7 +1690,7 @@ struct SettingsView: View {
         )) {
             Text(L10n.text("Use default model", language: language)).tag(UUID?.none)
             ForEach(appState.models.filter { $0.enabled }) { model in
-                Text(model.name).tag(Optional(model.id))
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
@@ -1557,7 +1787,7 @@ struct SettingsView: View {
             Button {
                 showImporter = true
             } label: {
-                Label(L10n.text("Add Model", language: language), systemImage: "plus")
+                Label(L10n.text("Add Local Model", language: language), systemImage: "externaldrive.badge.plus")
             }
             .controlSize(.small)
         }
@@ -1596,6 +1826,13 @@ struct SettingsView: View {
         return "\(version) (\(build))"
     }
 
+    private func defaultModelPickerTitle(_ model: ModelDescriptor) -> String {
+        if model.isRemoteProvider {
+            return "\(model.name) · \(model.providerDisplayName)"
+        }
+        return model.name
+    }
+
     private func settingsTabButton(_ tab: SettingsTab) -> some View {
         let isSelected = selectedTab == tab
         return Button {
@@ -1628,6 +1865,85 @@ struct SettingsView: View {
         .help(tab.title(language: language))
     }
 
+    private var selectedProviderPreset: ModelProviderPreset {
+        ModelProviderCatalog.preset(for: providerDraftID)
+            ?? ModelProviderCatalog.remotePresets.first
+            ?? ModelProviderPreset(id: .customOpenAICompatible, name: "Custom OpenAI-Compatible", apiStyle: .openAICompatible)
+    }
+
+    private var providerModelPlaceholder: String {
+        selectedProviderPreset.defaultModelID.isEmpty ? "model-id" : selectedProviderPreset.defaultModelID
+    }
+
+    private var addProviderDisabled: Bool {
+        providerDraftModelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || providerDraftBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || (selectedProviderPreset.requiresAPIKey && providerDraftAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    private func initializeProviderDraftIfNeeded() {
+        guard providerDraftBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        applyProviderPreset(providerDraftID)
+    }
+
+    private func applyProviderPreset(_ providerID: ModelProviderID) {
+        guard let preset = ModelProviderCatalog.preset(for: providerID) else {
+            return
+        }
+        providerDraftBaseURL = preset.defaultBaseURL
+        providerDraftModelID = preset.defaultModelID
+        providerDraftContextLength = preset.defaultContextLength
+        if !preset.requiresAPIKey {
+            providerDraftAPIKey = ""
+        }
+    }
+
+    private func addProviderDraft() {
+        if let editingProviderModelID {
+            appState.updateProviderModel(
+                id: editingProviderModelID,
+                providerID: providerDraftID,
+                name: providerDraftName,
+                modelID: providerDraftModelID,
+                apiKey: providerDraftAPIKey,
+                baseURL: providerDraftBaseURL,
+                contextLength: providerDraftContextLength
+            )
+        } else {
+            appState.addProviderModel(
+                providerID: providerDraftID,
+                name: providerDraftName,
+                modelID: providerDraftModelID,
+                apiKey: providerDraftAPIKey,
+                baseURL: providerDraftBaseURL,
+                contextLength: providerDraftContextLength
+            )
+        }
+        resetProviderDraft()
+    }
+
+    private func editProviderDraft(_ model: ModelDescriptor) {
+        guard let configuration = model.providerConfiguration, configuration.isRemote else {
+            return
+        }
+        editingProviderModelID = model.id
+        providerDraftID = configuration.providerID
+        providerDraftName = model.name
+        providerDraftModelID = configuration.modelID
+        providerDraftAPIKey = ""
+        providerDraftBaseURL = configuration.baseURL?.absoluteString ?? ""
+        providerDraftContextLength = model.contextLength
+    }
+
+    private func resetProviderDraft() {
+        editingProviderModelID = nil
+        providerDraftName = ""
+        providerDraftAPIKey = ""
+        applyProviderPreset(providerDraftID)
+    }
+
     private func settingsForm<Content: View>(
         maxWidth: CGFloat,
         @ViewBuilder content: () -> Content
@@ -1637,6 +1953,20 @@ struct SettingsView: View {
         }
         .frame(maxWidth: maxWidth, alignment: .topLeading)
         .frame(maxWidth: .infinity, alignment: .topLeading)
+    }
+
+    private func fieldStack<Content: View>(
+        title: String,
+        width: CGFloat,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            content()
+        }
+        .frame(width: width, alignment: .topLeading)
     }
 
     private func settingRow<Content: View>(
@@ -1787,6 +2117,26 @@ struct SettingsView: View {
             .help(text)
     }
 
+    private func iconToolButton(
+        systemImage: String,
+        help: String,
+        isDisabled: Bool = false,
+        role: ButtonRole? = nil,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(role: role) {
+            action()
+        } label: {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .disabled(isDisabled)
+        .help(help)
+    }
+
     private func modelCard(_ model: ModelDescriptor) -> some View {
         let isDefault = model.id == appState.preferences.defaultModelID
 
@@ -1808,7 +2158,10 @@ struct SettingsView: View {
                             .lineLimit(1)
                             .truncationMode(.tail)
                         Spacer(minLength: 8)
-                        formatBadge(model.format.rawValue.uppercased(), tint: modelTint(for: model.format))
+                        formatBadge(model.isRemoteProvider ? model.providerDisplayName : model.format.rawValue.uppercased(), tint: modelTint(for: model.format))
+                        if model.isRemoteProvider {
+                            formatBadge(model.format.rawValue.uppercased(), tint: .gray)
+                        }
                         if isDefault {
                             formatBadge(L10n.text("Default", language: language), tint: .green)
                         }
@@ -1825,7 +2178,11 @@ struct SettingsView: View {
 
             HStack(spacing: 6) {
                 metaChip("\(L10n.text("Role", language: language)): \(roleName(model.role))", systemImage: "person.badge.key")
-                metaChip("\(L10n.text("Size", language: language)): \(model.sizeClass)", systemImage: "externaldrive")
+                if model.isRemoteProvider {
+                    metaChip("\(L10n.text("Model", language: language)): \(model.apiModelID ?? model.sizeClass)", systemImage: "cube")
+                } else {
+                    metaChip("\(L10n.text("Size", language: language)): \(model.sizeClass)", systemImage: "externaldrive")
+                }
                 metaChip("\(L10n.text("Ctx", language: language)): \(model.contextLength)", systemImage: "text.alignleft")
                 Spacer(minLength: 8)
                 statusBadge(validationName(model.validationState), systemImage: validationIcon(model.validationState))
@@ -1838,8 +2195,28 @@ struct SettingsView: View {
                     .lineLimit(2)
             }
 
-            HStack(spacing: 8) {
+            HStack(alignment: .center, spacing: 6) {
                 Spacer()
+                if model.isRemoteProvider {
+                    iconToolButton(
+                        systemImage: "square.and.pencil",
+                        help: L10n.text("Edit", language: language),
+                        isDisabled: appState.providerTestModelID != nil
+                    ) {
+                        editProviderDraft(model)
+                    }
+
+                    iconToolButton(
+                        systemImage: appState.providerTestModelID == model.id ? "clock" : "network",
+                        help: appState.providerTestModelID == model.id
+                            ? L10n.text("Testing", language: language)
+                            : L10n.text("Test", language: language),
+                        isDisabled: appState.providerTestModelID != nil
+                    ) {
+                        appState.testProviderModel(id: model.id)
+                    }
+                }
+
                 if !isDefault {
                     Button {
                         appState.setDefaultModel(id: model.id)
@@ -1849,14 +2226,16 @@ struct SettingsView: View {
                     .buttonStyle(.borderless)
                 }
 
-                Button(role: .destructive) {
+                iconToolButton(
+                    systemImage: "trash",
+                    help: L10n.text("Remove", language: language),
+                    isDisabled: appState.providerTestModelID == model.id,
+                    role: .destructive
+                ) {
                     appState.removeModel(id: model.id)
-                } label: {
-                    Image(systemName: "trash")
                 }
-                .buttonStyle(.borderless)
-                .help(L10n.text("Remove", language: language))
             }
+            .frame(height: 24, alignment: .center)
         }
         .padding(13)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.8))
@@ -1902,6 +2281,10 @@ struct SettingsView: View {
             return "cpu"
         case .gguf:
             return "memorychip"
+        case .openAICompatible:
+            return "network"
+        case .anthropicMessages:
+            return "cloud"
         case .unknown:
             return "questionmark.square.dashed"
         }
@@ -1913,6 +2296,10 @@ struct SettingsView: View {
             return .pink
         case .gguf:
             return .blue
+        case .openAICompatible:
+            return .indigo
+        case .anthropicMessages:
+            return .orange
         case .unknown:
             return .gray
         }
@@ -1968,7 +2355,7 @@ struct SettingsView: View {
         case (.chinese, .notInstalled):
             return "未安装"
         case (.chinese, .extensionMissing):
-            return "待加载扩展"
+            return "需手动加载"
         case (.chinese, .extensionInstalledDisabled):
             return "扩展已关闭"
         case (.chinese, .permissionMissing):
@@ -1987,6 +2374,15 @@ struct SettingsView: View {
             return "失败"
         case (.english, _):
             return status.rawValue
+        }
+    }
+
+    private var chromeExtensionManualInstallText: String {
+        switch language {
+        case .chinese:
+            return "如果 Chrome 扩展页里没有 llmTranslate：打开 Chrome 扩展，开启“开发者模式”，点击“加载已解压的扩展程序”，选择下方扩展文件夹。"
+        case .english:
+            return "If llmTranslate is not listed in Chrome Extensions: open Chrome Extensions, enable Developer mode, choose Load unpacked, then select the extension folder below."
         }
     }
 
