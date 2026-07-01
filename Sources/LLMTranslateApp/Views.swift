@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import SwiftUI
 import UniformTypeIdentifiers
 import LLMTranslateCore
@@ -924,10 +925,74 @@ struct TaskOptionsView: View {
     }
 }
 
+private enum SettingsTab: CaseIterable, Identifiable {
+    case general
+    case shortcuts
+    case models
+    case webPage
+    case defaults
+    case about
+
+    var id: Self { self }
+
+    var systemImage: String {
+        switch self {
+        case .general:
+            return "gearshape"
+        case .shortcuts:
+            return "keyboard"
+        case .models:
+            return "cpu"
+        case .webPage:
+            return "safari"
+        case .defaults:
+            return "dial.low"
+        case .about:
+            return "info.circle"
+        }
+    }
+
+    func title(language: AppLanguage) -> String {
+        switch self {
+        case .general:
+            return L10n.text("General", language: language)
+        case .shortcuts:
+            return L10n.text("Shortcuts", language: language)
+        case .models:
+            return L10n.text("Models", language: language)
+        case .webPage:
+            return L10n.text("Web Page Translation", language: language)
+        case .defaults:
+            return L10n.text("Defaults", language: language)
+        case .about:
+            return L10n.text("About", language: language)
+        }
+    }
+
+    func tabTitle(language: AppLanguage) -> String {
+        switch self {
+        case .webPage:
+            return L10n.text("Webpage", language: language)
+        default:
+            return title(language: language)
+        }
+    }
+}
+
+private enum ShortcutCaptureTarget: Identifiable {
+    case quickAction
+    case quickActionWithoutSelection
+
+    var id: Self { self }
+}
+
 struct SettingsView: View {
     @ObservedObject var appState: AppState
+    @State private var selectedTab: SettingsTab = .general
     @State private var showImporter = false
     @State private var chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+    @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
+    @State private var shortcutRecorderMessage: String?
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -935,25 +1000,29 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
+            toolbar
             Divider()
-            HStack(alignment: .top, spacing: 16) {
-                VStack(spacing: 14) {
-                    preferencesSection
-                    webPageTranslationSection
-                    defaultsSection
-                }
-                .frame(width: 326, alignment: .top)
-                .frame(maxHeight: .infinity, alignment: .top)
-
-                modelSection
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-            }
-            .padding(16)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            contentArea
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 780, minHeight: 500)
+        .frame(minWidth: 700, minHeight: 380)
         .background(Color(NSColor.windowBackgroundColor))
+        .background {
+            ShortcutCaptureBridge(
+                target: $shortcutCaptureTarget,
+                onShortcut: { target, shortcut in
+                    applyShortcut(shortcut, for: target)
+                },
+                onInvalidShortcut: {
+                    shortcutRecorderMessage = L10n.text("Use Command, Option, or Control with a key", language: language)
+                },
+                onCancel: {
+                    shortcutCaptureTarget = nil
+                    shortcutRecorderMessage = nil
+                }
+            )
+            .frame(width: 0, height: 0)
+        }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.folder, .item], allowsMultipleSelection: false) { result in
             if case let .success(urls) = result, let url = urls.first {
                 appState.addModel(from: url)
@@ -962,74 +1031,108 @@ struct SettingsView: View {
         .onAppear {
             chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
         }
-    }
-
-    private var header: some View {
-        HStack(spacing: 12) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(L10n.text("Models & Settings", language: language))
-                    .font(.title3.bold())
-                Text(headerSubtitle)
-                    .font(.caption)
-                    .foregroundStyle(appState.validationError == nil ? Color.secondary : Color.red)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
-            Spacer()
-            statusBadge(appState.statusMessage, systemImage: "bolt.horizontal.circle")
-            Button {
-                showImporter = true
-            } label: {
-                Label(L10n.text("Add Model", language: language), systemImage: "plus")
-            }
-            .controlSize(.regular)
+        .onDisappear {
+            shortcutCaptureTarget = nil
+            shortcutRecorderMessage = nil
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 13)
     }
 
-    private var preferencesSection: some View {
-        settingsPanel(title: L10n.text("Preferences", language: language), systemImage: "slider.horizontal.3", fillsVertical: false) {
-            VStack(spacing: 8) {
-                toggleRow(
-                    title: L10n.text("Launch at login", language: language),
-                    systemImage: "power",
-                    isOn: Binding(
-                        get: { appState.preferences.launchAtLogin },
-                        set: { newValue in
-                            appState.setLaunchAtLogin(newValue)
-                        }
-                    ),
-                    trailing: AnyView(statusBadge(appState.launchAtLoginStatusText(), systemImage: launchStatusIcon))
-                )
+    private var toolbar: some View {
+        VStack(spacing: 5) {
+            Text(selectedTab.title(language: language))
+                .font(.headline)
+                .frame(maxWidth: .infinity)
 
-                Divider()
+            HStack(spacing: 4) {
+                ForEach(SettingsTab.allCases) { tab in
+                    settingsTabButton(tab)
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .padding(.top, 6)
+        .padding(.bottom, 6)
+        .padding(.horizontal, 18)
+    }
 
-                toggleRow(
-                    title: L10n.text("Widget visible on all Spaces", language: language),
-                    systemImage: "rectangle.on.rectangle",
-                    isOn: Binding(
-                        get: { appState.preferences.widgetVisibleOnAllSpaces },
-                        set: { newValue in
-                            appState.updatePreferences { $0.widgetVisibleOnAllSpaces = newValue }
-                        }
+    @ViewBuilder
+    private var contentArea: some View {
+        if selectedTab == .models {
+            modelSettingsPage
+                .padding(.horizontal, 18)
+                .padding(.top, 12)
+                .padding(.bottom, 16)
+        } else {
+            ScrollView {
+                selectedContent
+                    .padding(.horizontal, 18)
+                    .padding(.top, 12)
+                    .padding(.bottom, 16)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var selectedContent: some View {
+        switch selectedTab {
+        case .general:
+            generalSettingsPage
+        case .shortcuts:
+            shortcutSettingsPage
+        case .models:
+            modelSettingsPage
+        case .webPage:
+            webPageTranslationPage
+        case .defaults:
+            defaultsSettingsPage
+        case .about:
+            aboutSettingsPage
+        }
+    }
+
+    private var generalSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Launch", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Launch at login", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.launchAtLogin },
+                            set: { newValue in
+                                appState.setLaunchAtLogin(newValue)
+                            }
+                        ),
+                        trailing: AnyView(statusBadge(appState.launchAtLoginStatusText(), systemImage: launchStatusIcon))
                     )
-                )
+                }
+            }
 
-                toggleRow(
-                    title: L10n.text("Auto-collapse widget at screen edge", language: language),
-                    systemImage: "sidebar.trailing",
-                    isOn: Binding(
-                        get: { appState.preferences.autoCollapseWidget },
-                        set: { newValue in
-                            appState.updatePreferences { $0.autoCollapseWidget = newValue }
-                        }
+            settingRow(title: L10n.text("Interface", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Widget visible on all Spaces", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.widgetVisibleOnAllSpaces },
+                            set: { newValue in
+                                appState.updatePreferences { $0.widgetVisibleOnAllSpaces = newValue }
+                            }
+                        )
                     )
-                )
+                    checkboxLine(
+                        title: L10n.text("Auto-collapse widget at screen edge", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.autoCollapseWidget },
+                            set: { newValue in
+                                appState.updatePreferences { $0.autoCollapseWidget = newValue }
+                            }
+                        )
+                    )
+                }
+            }
 
-                toggleRow(
+            settingRow(title: L10n.text("Text", language: language)) {
+                checkboxLine(
                     title: L10n.text("Replace original text after processing", language: language),
-                    systemImage: "arrow.triangle.2.circlepath",
                     isOn: Binding(
                         get: { appState.preferences.replaceOriginalText },
                         set: { newValue in
@@ -1037,241 +1140,393 @@ struct SettingsView: View {
                         }
                     )
                 )
+            }
 
-                toggleRow(
-                    title: L10n.text("Show selection action panel", language: language),
-                    systemImage: "cursorarrow.click.2",
-                    isOn: Binding(
-                        get: { appState.preferences.selectionActionEnabled },
-                        set: { newValue in
-                            appState.updatePreferences { $0.selectionActionEnabled = newValue }
-                        }
-                    )
-                )
+            settingRow(title: L10n.text("Selection", language: language)) {
+                selectionActionControls
+            }
 
-                VStack(spacing: 7) {
-                    triggerToggleRow(
-                        title: L10n.text("Trigger after mouse drag selection", language: language),
-                        systemImage: "text.cursor",
-                        isOn: Binding(
-                            get: { appState.preferences.selectionActionTriggerMouseDrag },
-                            set: { newValue in
-                                appState.updatePreferences { $0.selectionActionTriggerMouseDrag = newValue }
-                            }
-                        )
-                    )
-
-                    triggerToggleRow(
-                        title: L10n.text("Trigger after double-click selection", language: language),
-                        systemImage: "cursorarrow.click.2",
-                        isOn: Binding(
-                            get: { appState.preferences.selectionActionTriggerDoubleClick },
-                            set: { newValue in
-                                appState.updatePreferences { $0.selectionActionTriggerDoubleClick = newValue }
-                            }
-                        )
-                    )
-
-                }
-                .disabled(!appState.preferences.selectionActionEnabled)
-                .opacity(appState.preferences.selectionActionEnabled ? 1 : 0.45)
+            settingRow(title: L10n.text("Language", language: language)) {
+                appLanguagePicker
             }
         }
     }
 
-    private var defaultsSection: some View {
-        settingsPanel(title: L10n.text("Defaults", language: language), systemImage: "dial.low", fillsVertical: true) {
-            VStack(spacing: 9) {
-                menuRow(title: L10n.text("App language", language: language), systemImage: "globe") {
-                    Picker("", selection: Binding(
-                        get: { appState.preferences.appLanguage },
-                        set: { newValue in
-                            appState.updatePreferences { $0.appLanguage = newValue }
-                        }
-                    )) {
-                        ForEach(AppLanguage.allCases) { appLanguage in
-                            Text(appLanguage.displayName).tag(appLanguage)
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 118)
-                }
-
-                menuRow(title: L10n.text("Default translation target", language: language), systemImage: "character.book.closed") {
-                    Picker("", selection: Binding(
-                        get: { appState.preferences.defaultTranslationTarget },
-                        set: { newValue in
-                            appState.updatePreferences { $0.defaultTranslationTarget = newValue }
-                        }
-                    )) {
-                        Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
-                        Text(L10n.targetLanguageName("Chinese", language: language)).tag("Chinese")
-                        Text(L10n.targetLanguageName("English", language: language)).tag("English")
-                        Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
-                        Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 118)
-                }
-
-                menuRow(title: L10n.text("Default polish style", language: language), systemImage: "wand.and.stars") {
-                    Picker("", selection: Binding(
-                        get: { appState.preferences.defaultPolishStyle },
-                        set: { newValue in
-                            appState.updatePreferences { $0.defaultPolishStyle = newValue }
-                        }
-                    )) {
-                        Text(L10n.polishStyleName("natural", language: language)).tag("natural")
-                        Text(L10n.polishStyleName("formal", language: language)).tag("formal")
-                        Text(L10n.polishStyleName("concise", language: language)).tag("concise")
-                        Text(L10n.polishStyleName("conversational", language: language)).tag("conversational")
-                        Text(L10n.polishStyleName("technical", language: language)).tag("technical")
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
-                    .frame(width: 118)
-                }
-
-                historyLimitRow
-            }
-        }
-    }
-
-    private var webPageTranslationSection: some View {
-        settingsPanel(title: L10n.text("Web Page Translation", language: language), systemImage: "safari", fillsVertical: false) {
-            VStack(alignment: .leading, spacing: 9) {
-                toggleRow(
-                    title: L10n.text("Enable webpage translation", language: language),
-                    systemImage: "globe.badge.chevron.backward",
-                    isOn: Binding(
-                        get: { appState.preferences.webPageTranslation.enabled },
-                        set: { newValue in
-                            appState.updatePreferences { $0.webPageTranslation.enabled = newValue }
-                        }
+    private var shortcutSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Global shortcuts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    shortcutRecorderLine(
+                        title: L10n.text("Open Quick Action", language: language),
+                        shortcut: appState.preferences.quickActionShortcut,
+                        target: .quickAction
                     )
-                )
-
-                Divider()
-
-                HStack(alignment: .top, spacing: 10) {
-                    settingIcon("globe")
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack(spacing: 8) {
-                            Text(chromeIntegrationState.name)
-                                .font(.subheadline.weight(.medium))
-                            statusBadge(browserStatusName(chromeIntegrationState.status), systemImage: browserStatusIcon(chromeIntegrationState.status))
-                        }
-                        if let message = chromeIntegrationState.lastErrorMessage {
-                            Text(message)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Text(BrowserIntegrationService.shared.extensionFolderPath())
-                            .font(.caption2.monospaced())
+                    shortcutRecorderLine(
+                        title: L10n.text("Open Quick Action without selected text", language: language),
+                        shortcut: appState.preferences.quickActionWithoutSelectionShortcut,
+                        target: .quickActionWithoutSelection
+                    )
+                    if let shortcutRecorderMessage {
+                        Text(shortcutRecorderMessage)
+                            .font(.caption)
                             .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                            .help(BrowserIntegrationService.shared.extensionFolderPath())
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Spacer(minLength: 8)
-                }
-
-                HStack(spacing: 8) {
-                    Button {
-                        do {
-                            chromeIntegrationState = try BrowserIntegrationService.shared.installOrRepairChromeDevelopmentHost()
-                            BrowserIntegrationService.shared.openChromeExtensionsPage()
-                            appState.statusMessage = L10n.text("Chrome bridge repaired", language: language)
-                        } catch {
-                            appState.validationError = error.localizedDescription
-                            chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
-                        }
-                    } label: {
-                        Label(L10n.text("Repair Chrome Bridge", language: language), systemImage: "wrench.and.screwdriver")
-                    }
-                    .controlSize(.small)
-
-                    Button {
-                        BrowserIntegrationService.shared.openChromeExtensionsPage()
-                    } label: {
-                        Label(L10n.text("Open Chrome Extensions", language: language), systemImage: "arrow.up.forward.app")
-                    }
-                    .controlSize(.small)
                 }
             }
         }
     }
 
-    private var modelSection: some View {
+    private var selectionActionControls: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            checkboxLine(
+                title: L10n.text("Show selection action panel", language: language),
+                isOn: Binding(
+                    get: { appState.preferences.selectionActionEnabled },
+                    set: { newValue in
+                        appState.updatePreferences { $0.selectionActionEnabled = newValue }
+                    }
+                )
+            )
+
+            VStack(alignment: .leading, spacing: 8) {
+                checkboxLine(
+                    title: L10n.text("Trigger after mouse drag selection", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.selectionActionTriggerMouseDrag },
+                        set: { newValue in
+                            appState.updatePreferences { $0.selectionActionTriggerMouseDrag = newValue }
+                        }
+                    )
+                )
+                checkboxLine(
+                    title: L10n.text("Trigger after double-click selection", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.selectionActionTriggerDoubleClick },
+                        set: { newValue in
+                            appState.updatePreferences { $0.selectionActionTriggerDoubleClick = newValue }
+                        }
+                    )
+                )
+                checkboxLine(
+                    title: L10n.text("Trigger after Command-A selection", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.selectionActionTriggerSelectAll },
+                        set: { newValue in
+                            appState.updatePreferences { $0.selectionActionTriggerSelectAll = newValue }
+                        }
+                    )
+                )
+            }
+            .padding(.leading, 18)
+            .disabled(!appState.preferences.selectionActionEnabled)
+            .opacity(appState.preferences.selectionActionEnabled ? 1 : 0.45)
+        }
+    }
+
+    private var modelSettingsPage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(L10n.text("Registered Models", language: language))
-                    .font(.headline)
-                Text(modelCountText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .background(.quaternary.opacity(0.65))
-                    .clipShape(Capsule())
-                Spacer()
-            }
+            modelSettingsHeader
+                .frame(maxWidth: 650, alignment: .topLeading)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
 
-            if appState.models.isEmpty {
-                emptyModelsView
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(appState.models) { model in
-                            modelCard(model)
-                        }
-                    }
-                    .padding(.trailing, 2)
+            Group {
+                if appState.models.isEmpty {
+                    emptyModelsView
+                        .frame(maxWidth: 650, alignment: .topLeading)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                } else {
+                    modelList
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .padding(14)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(NSColor.controlBackgroundColor).opacity(0.44))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var emptyModelsView: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "shippingbox")
-                .font(.system(size: 28, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(L10n.text("No models registered yet.", language: language))
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+    private var modelSettingsHeader: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text(L10n.text("Registered Models", language: language))
+                .font(.headline)
+            statusBadge(modelCountText, systemImage: "shippingbox")
+            Spacer()
             Button {
                 showImporter = true
             } label: {
                 Label(L10n.text("Add Model", language: language), systemImage: "plus")
             }
+            .controlSize(.small)
         }
-        .frame(maxWidth: .infinity, minHeight: 220)
-        .background(Color(NSColor.controlBackgroundColor).opacity(0.65))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private var historyLimitRow: some View {
+    private var modelList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                LazyVStack(spacing: 10) {
+                    ForEach(appState.models) { model in
+                        modelCard(model)
+                    }
+                }
+                .padding(.trailing, 4)
+                .padding(.bottom, 2)
+            }
+            .frame(maxWidth: 650, alignment: .topLeading)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var webPageTranslationPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Webpage", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Enable webpage translation", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.webPageTranslation.enabled },
+                            set: { newValue in
+                                appState.updatePreferences { $0.webPageTranslation.enabled = newValue }
+                            }
+                        )
+                    )
+
+                    HStack(spacing: 10) {
+                        Text(L10n.text("Pending translation style", language: language))
+                            .font(.subheadline)
+                        Spacer(minLength: 8)
+                        pendingIndicatorStylePicker
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("Translation model", language: language)) {
+                webPageTranslationModelPicker
+            }
+
+            settingRow(title: L10n.text("Browser", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Text(chromeIntegrationState.name)
+                            .font(.subheadline.weight(.medium))
+                        statusBadge(browserStatusName(chromeIntegrationState.status), systemImage: browserStatusIcon(chromeIntegrationState.status))
+                    }
+                    if let message = chromeIntegrationState.lastErrorMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 8) {
+                        Button {
+                            do {
+                                chromeIntegrationState = try BrowserIntegrationService.shared.installOrRepairChromeDevelopmentHost()
+                                BrowserIntegrationService.shared.openChromeExtensionsPage()
+                                appState.statusMessage = L10n.text("Chrome bridge repaired", language: language)
+                            } catch {
+                                appState.validationError = error.localizedDescription
+                                chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+                            }
+                        } label: {
+                            Label(L10n.text("Repair Chrome Bridge", language: language), systemImage: "wrench.and.screwdriver")
+                        }
+                        .controlSize(.small)
+
+                        Button {
+                            BrowserIntegrationService.shared.openChromeExtensionsPage()
+                        } label: {
+                            Label(L10n.text("Open Chrome Extensions", language: language), systemImage: "arrow.up.forward.app")
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("Extension folder", language: language)) {
+                pathText(BrowserIntegrationService.shared.extensionFolderPath())
+            }
+        }
+    }
+
+    private var defaultsSettingsPage: some View {
+        settingsForm(maxWidth: 540) {
+            settingRow(title: L10n.text("Default model", language: language)) {
+                defaultModelPicker
+            }
+
+            settingRow(title: L10n.text("Target", language: language)) {
+                translationTargetPicker
+            }
+
+            settingRow(title: L10n.text("Style", language: language)) {
+                polishStylePicker
+            }
+
+            settingRow(title: L10n.text("History", language: language)) {
+                historyLimitControl
+            }
+        }
+    }
+
+    private var aboutSettingsPage: some View {
+        settingsForm(maxWidth: 560) {
+            settingRow(title: L10n.text("Application", language: language)) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("llmTranslate")
+                        .font(.subheadline.weight(.medium))
+                    Text("\(L10n.text("Version", language: language)): \(appVersionText)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            settingRow(title: L10n.text("Status", language: language)) {
+                VStack(alignment: .leading, spacing: 7) {
+                    statusBadge(appState.statusMessage, systemImage: "bolt.horizontal.circle")
+                    if let error = appState.validationError {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("Data", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Button {
+                        openApplicationSupportFolder()
+                    } label: {
+                        Label(L10n.text("Open Data Folder", language: language), systemImage: "folder")
+                    }
+                    .controlSize(.small)
+                    pathText(AppPaths.applicationSupportDirectory.path)
+                }
+            }
+
+            settingRow(title: L10n.text("Quit", language: language)) {
+                Button {
+                    NSApp.terminate(nil)
+                } label: {
+                    Text(L10n.text("Quit llmTranslate", language: language))
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var appLanguagePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.appLanguage },
+            set: { newValue in
+                appState.updatePreferences { $0.appLanguage = newValue }
+            }
+        )) {
+            ForEach(AppLanguage.allCases) { appLanguage in
+                Text(appLanguage.displayName).tag(appLanguage)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 150)
+    }
+
+    private var defaultModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.defaultModelID },
+            set: { newValue in
+                if let newValue {
+                    appState.setDefaultModel(id: newValue)
+                } else {
+                    appState.updatePreferences { $0.defaultModelID = nil }
+                }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.models) { model in
+                Text(model.name).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 230)
+        .disabled(appState.models.isEmpty)
+    }
+
+    private var webPageTranslationModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.webPageTranslation.modelID },
+            set: { newValue in
+                appState.updatePreferences { $0.webPageTranslation.modelID = newValue }
+            }
+        )) {
+            Text(L10n.text("Use default model", language: language)).tag(UUID?.none)
+            ForEach(appState.models.filter { $0.enabled }) { model in
+                Text(model.name).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 230)
+        .disabled(appState.models.isEmpty)
+    }
+
+    private var translationTargetPicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultTranslationTarget },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultTranslationTarget = newValue }
+            }
+        )) {
+            Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
+            Text(L10n.targetLanguageName("Chinese", language: language)).tag("Chinese")
+            Text(L10n.targetLanguageName("English", language: language)).tag("English")
+            Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
+            Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 150)
+    }
+
+    private var polishStylePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultPolishStyle },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultPolishStyle = newValue }
+            }
+        )) {
+            Text(L10n.polishStyleName("natural", language: language)).tag("natural")
+            Text(L10n.polishStyleName("formal", language: language)).tag("formal")
+            Text(L10n.polishStyleName("concise", language: language)).tag("concise")
+            Text(L10n.polishStyleName("conversational", language: language)).tag("conversational")
+            Text(L10n.polishStyleName("technical", language: language)).tag("technical")
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 150)
+    }
+
+    private var pendingIndicatorStylePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.webPageTranslation.pendingIndicatorStyle },
+            set: { newValue in
+                appState.updatePreferences { $0.webPageTranslation.pendingIndicatorStyle = newValue }
+            }
+        )) {
+            ForEach(WebPagePendingIndicatorStyle.allCases) { style in
+                Text(L10n.pendingIndicatorStyleName(style, language: language)).tag(style)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: 210)
+    }
+
+    private var historyLimitControl: some View {
         HStack(spacing: 10) {
-            settingIcon("clock.arrow.circlepath")
-            Text(L10n.text("Recent history limit", language: language))
-                .font(.subheadline)
-                .lineLimit(1)
-            Spacer()
             Text("\(appState.preferences.recentHistoryLimit)")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 26)
+                .frame(width: 30)
                 .padding(.horizontal, 6)
                 .padding(.vertical, 4)
                 .background(.quaternary.opacity(0.65))
@@ -1291,11 +1546,25 @@ struct SettingsView: View {
         }
     }
 
-    private var headerSubtitle: String {
-        if let error = appState.validationError {
-            return error
+    private var emptyModelsView: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "shippingbox")
+                .font(.system(size: 28, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(L10n.text("No models registered yet.", language: language))
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Button {
+                showImporter = true
+            } label: {
+                Label(L10n.text("Add Model", language: language), systemImage: "plus")
+            }
+            .controlSize(.small)
         }
-        return "\(modelCountText) · \(appState.launchAtLoginStatusText())"
+        .frame(maxWidth: .infinity, minHeight: 220)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.65))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var modelCountText: String {
@@ -1320,81 +1589,202 @@ struct SettingsView: View {
         }
     }
 
-    private func settingsPanel<Content: View>(
-        title: String,
-        systemImage: String,
-        fillsVertical: Bool,
+    private var appVersionText: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let build = info?["CFBundleVersion"] as? String ?? "dev"
+        return "\(version) (\(build))"
+    }
+
+    private func settingsTabButton(_ tab: SettingsTab) -> some View {
+        let isSelected = selectedTab == tab
+        return Button {
+            selectedTab = tab
+            if tab == .webPage {
+                chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+            }
+        } label: {
+            VStack(spacing: 3) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
+                    Image(systemName: tab.systemImage)
+                        .font(.system(size: 22, weight: .medium))
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+                }
+                .frame(width: 54, height: 36)
+
+                Text(tab.tabTitle(language: language))
+                    .font(.caption2)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
+            }
+            .frame(width: 82, height: 56)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(tab.title(language: language))
+    }
+
+    private func settingsForm<Content: View>(
+        maxWidth: CGFloat,
         @ViewBuilder content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(title, systemImage: systemImage)
-                .font(.headline)
             content()
-            if fillsVertical {
-                Spacer(minLength: 0)
-            }
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, maxHeight: fillsVertical ? .infinity : nil, alignment: .topLeading)
-        .background(Color(NSColor.controlBackgroundColor).opacity(0.72))
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .frame(maxWidth: maxWidth, alignment: .topLeading)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
-    private func toggleRow(
+    private func settingRow<Content: View>(
         title: String,
-        systemImage: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("\(title):")
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .frame(width: 96, alignment: .trailing)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 6) {
+                content()
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func checkboxLine(
+        title: String,
         isOn: Binding<Bool>,
         trailing: AnyView? = nil
     ) -> some View {
-        HStack(spacing: 10) {
-            settingIcon(systemImage)
-            Text(title)
+        HStack(alignment: .center, spacing: 8) {
+            Toggle(title, isOn: isOn)
+                .toggleStyle(.checkbox)
                 .font(.subheadline)
-                .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 8)
             if let trailing {
                 trailing
             }
-            CompactSwitch(isOn: isOn)
+            Spacer(minLength: 0)
         }
     }
 
-    private func triggerToggleRow(
+    private func shortcutRecorderLine(
         title: String,
-        systemImage: String,
-        isOn: Binding<Bool>
+        shortcut: KeyboardShortcutPreference,
+        target: ShortcutCaptureTarget
     ) -> some View {
-        HStack(spacing: 8) {
-            Spacer()
-                .frame(width: 18)
-            settingIcon(systemImage)
-                .opacity(0.78)
-            Text(title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 8)
-            CompactSwitch(isOn: isOn)
-        }
-    }
+        let isRecording = shortcutCaptureTarget == target
 
-    private func menuRow<Control: View>(
-        title: String,
-        systemImage: String,
-        @ViewBuilder control: () -> Control
-    ) -> some View {
-        HStack(spacing: 10) {
-            settingIcon(systemImage)
+        return HStack(spacing: 12) {
             Text(title)
                 .font(.subheadline)
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
-            Spacer(minLength: 8)
-            control()
+            Spacer(minLength: 10)
+
+            Button {
+                shortcutCaptureTarget = target
+                shortcutRecorderMessage = nil
+            } label: {
+                HStack(spacing: 4) {
+                    if isRecording {
+                        Text(L10n.text("Press shortcut", language: language))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .frame(minWidth: 112, minHeight: 20)
+                            .padding(.horizontal, 5)
+                            .background(Color.accentColor.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 5))
+                    } else {
+                        shortcutKeyCaps(shortcut.displayKeys)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .help(L10n.text("Change shortcut", language: language))
+
+            Button {
+                resetShortcut(for: target)
+            } label: {
+                Image(systemName: "arrow.counterclockwise")
+                    .font(.system(size: 12, weight: .semibold))
+                    .frame(width: 22, height: 22)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .help(L10n.text("Reset shortcut", language: language))
         }
+    }
+
+    private func shortcutKeyCaps(_ keys: [String]) -> some View {
+        HStack(spacing: 4) {
+            ForEach(keys, id: \.self) { key in
+                Text(key)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .frame(minWidth: key == "Space" ? 48 : 22, minHeight: 20)
+                    .padding(.horizontal, 3)
+                    .background(.quaternary.opacity(0.72))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+            }
+        }
+    }
+
+    private func applyShortcut(_ shortcut: KeyboardShortcutPreference, for target: ShortcutCaptureTarget) {
+        guard !isShortcutAlreadyAssigned(shortcut, target: target) else {
+            shortcutRecorderMessage = L10n.text("Shortcut is already assigned", language: language)
+            NSSound.beep()
+            shortcutCaptureTarget = nil
+            return
+        }
+
+        appState.updatePreferences { preferences in
+            switch target {
+            case .quickAction:
+                preferences.quickActionShortcut = shortcut
+            case .quickActionWithoutSelection:
+                preferences.quickActionWithoutSelectionShortcut = shortcut
+            }
+        }
+        shortcutRecorderMessage = nil
+        shortcutCaptureTarget = nil
+    }
+
+    private func resetShortcut(for target: ShortcutCaptureTarget) {
+        applyShortcut(defaultShortcut(for: target), for: target)
+    }
+
+    private func isShortcutAlreadyAssigned(_ shortcut: KeyboardShortcutPreference, target: ShortcutCaptureTarget) -> Bool {
+        switch target {
+        case .quickAction:
+            return shortcut == appState.preferences.quickActionWithoutSelectionShortcut
+        case .quickActionWithoutSelection:
+            return shortcut == appState.preferences.quickActionShortcut
+        }
+    }
+
+    private func defaultShortcut(for target: ShortcutCaptureTarget) -> KeyboardShortcutPreference {
+        switch target {
+        case .quickAction:
+            return .optionSpace
+        case .quickActionWithoutSelection:
+            return .optionShiftSpace
+        }
+    }
+
+    private func pathText(_ text: String) -> some View {
+        Text(text)
+            .font(.caption2.monospaced())
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .truncationMode(.middle)
+            .help(text)
     }
 
     private func modelCard(_ model: ModelDescriptor) -> some View {
@@ -1472,13 +1862,6 @@ struct SettingsView: View {
         .background(Color(NSColor.controlBackgroundColor).opacity(0.8))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
         .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func settingIcon(_ systemImage: String) -> some View {
-        Image(systemName: systemImage)
-            .font(.system(size: 13, weight: .semibold))
-            .foregroundStyle(.secondary)
-            .frame(width: 20)
     }
 
     private func statusBadge(_ text: String, systemImage: String) -> some View {
@@ -1617,6 +2000,199 @@ struct SettingsView: View {
             return "xmark.octagon.fill"
         default:
             return "circle.dashed"
+        }
+    }
+
+    private func openApplicationSupportFolder() {
+        let url = AppPaths.applicationSupportDirectory
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+    }
+}
+
+private struct ShortcutCaptureBridge: NSViewRepresentable {
+    @Binding var target: ShortcutCaptureTarget?
+    var onShortcut: (ShortcutCaptureTarget, KeyboardShortcutPreference) -> Void
+    var onInvalidShortcut: () -> Void
+    var onCancel: () -> Void
+
+    func makeNSView(context: Context) -> ShortcutCaptureNSView {
+        ShortcutCaptureNSView()
+    }
+
+    func updateNSView(_ nsView: ShortcutCaptureNSView, context: Context) {
+        nsView.isCapturing = target != nil
+        nsView.onShortcut = { shortcut in
+            guard let target else {
+                return
+            }
+            onShortcut(target, shortcut)
+        }
+        nsView.onInvalidShortcut = onInvalidShortcut
+        nsView.onCancel = onCancel
+
+        if target != nil {
+            DispatchQueue.main.async {
+                nsView.window?.makeFirstResponder(nsView)
+            }
+        }
+    }
+}
+
+private final class ShortcutCaptureNSView: NSView {
+    var isCapturing = false
+    var onShortcut: ((KeyboardShortcutPreference) -> Void)?
+    var onInvalidShortcut: (() -> Void)?
+    var onCancel: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard isCapturing else {
+            super.keyDown(with: event)
+            return
+        }
+
+        if event.keyCode == UInt16(kVK_Escape) {
+            onCancel?()
+            return
+        }
+
+        guard let shortcut = KeyboardShortcutPreference(event: event) else {
+            NSSound.beep()
+            onInvalidShortcut?()
+            return
+        }
+
+        onShortcut?(shortcut)
+    }
+}
+
+private extension KeyboardShortcutPreference {
+    init?(event: NSEvent) {
+        let keyCode = UInt32(event.keyCode)
+        guard !Self.modifierKeyCodes.contains(keyCode) else {
+            return nil
+        }
+
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        var carbonModifiers: UInt32 = 0
+        if flags.contains(.command) {
+            carbonModifiers |= Self.commandModifier
+        }
+        if flags.contains(.shift) {
+            carbonModifiers |= Self.shiftModifier
+        }
+        if flags.contains(.option) {
+            carbonModifiers |= Self.optionModifier
+        }
+        if flags.contains(.control) {
+            carbonModifiers |= Self.controlModifier
+        }
+
+        let requiredModifiers = Self.commandModifier | Self.optionModifier | Self.controlModifier
+        guard carbonModifiers & requiredModifiers != 0 else {
+            return nil
+        }
+
+        self.init(keyCode: keyCode, modifiers: carbonModifiers)
+    }
+
+    var displayKeys: [String] {
+        var keys: [String] = []
+        if modifiers & Self.commandModifier != 0 {
+            keys.append("⌘")
+        }
+        if modifiers & Self.optionModifier != 0 {
+            keys.append("⌥")
+        }
+        if modifiers & Self.controlModifier != 0 {
+            keys.append("⌃")
+        }
+        if modifiers & Self.shiftModifier != 0 {
+            keys.append("⇧")
+        }
+        keys.append(Self.keyName(for: keyCode))
+        return keys
+    }
+
+    private static let modifierKeyCodes: Set<UInt32> = [
+        54, 55, 56, 57, 58, 59, 60, 61, 62, 63
+    ]
+
+    private static func keyName(for keyCode: UInt32) -> String {
+        switch keyCode {
+        case UInt32(kVK_ANSI_A): return "A"
+        case UInt32(kVK_ANSI_S): return "S"
+        case UInt32(kVK_ANSI_D): return "D"
+        case UInt32(kVK_ANSI_F): return "F"
+        case UInt32(kVK_ANSI_H): return "H"
+        case UInt32(kVK_ANSI_G): return "G"
+        case UInt32(kVK_ANSI_Z): return "Z"
+        case UInt32(kVK_ANSI_X): return "X"
+        case UInt32(kVK_ANSI_C): return "C"
+        case UInt32(kVK_ANSI_V): return "V"
+        case UInt32(kVK_ANSI_B): return "B"
+        case UInt32(kVK_ANSI_Q): return "Q"
+        case UInt32(kVK_ANSI_W): return "W"
+        case UInt32(kVK_ANSI_E): return "E"
+        case UInt32(kVK_ANSI_R): return "R"
+        case UInt32(kVK_ANSI_Y): return "Y"
+        case UInt32(kVK_ANSI_T): return "T"
+        case UInt32(kVK_ANSI_1): return "1"
+        case UInt32(kVK_ANSI_2): return "2"
+        case UInt32(kVK_ANSI_3): return "3"
+        case UInt32(kVK_ANSI_4): return "4"
+        case UInt32(kVK_ANSI_6): return "6"
+        case UInt32(kVK_ANSI_5): return "5"
+        case UInt32(kVK_ANSI_Equal): return "="
+        case UInt32(kVK_ANSI_9): return "9"
+        case UInt32(kVK_ANSI_7): return "7"
+        case UInt32(kVK_ANSI_Minus): return "-"
+        case UInt32(kVK_ANSI_8): return "8"
+        case UInt32(kVK_ANSI_0): return "0"
+        case UInt32(kVK_ANSI_RightBracket): return "]"
+        case UInt32(kVK_ANSI_O): return "O"
+        case UInt32(kVK_ANSI_U): return "U"
+        case UInt32(kVK_ANSI_LeftBracket): return "["
+        case UInt32(kVK_ANSI_I): return "I"
+        case UInt32(kVK_ANSI_P): return "P"
+        case UInt32(kVK_ANSI_L): return "L"
+        case UInt32(kVK_ANSI_J): return "J"
+        case UInt32(kVK_ANSI_Quote): return "'"
+        case UInt32(kVK_ANSI_K): return "K"
+        case UInt32(kVK_ANSI_Semicolon): return ";"
+        case UInt32(kVK_ANSI_Backslash): return "\\"
+        case UInt32(kVK_ANSI_Comma): return ","
+        case UInt32(kVK_ANSI_Slash): return "/"
+        case UInt32(kVK_ANSI_N): return "N"
+        case UInt32(kVK_ANSI_M): return "M"
+        case UInt32(kVK_ANSI_Period): return "."
+        case UInt32(kVK_ANSI_Grave): return "`"
+        case UInt32(kVK_Space): return "Space"
+        case UInt32(kVK_Return): return "Return"
+        case UInt32(kVK_Tab): return "Tab"
+        case UInt32(kVK_Delete): return "Delete"
+        case UInt32(kVK_ForwardDelete): return "Del"
+        case UInt32(kVK_LeftArrow): return "←"
+        case UInt32(kVK_RightArrow): return "→"
+        case UInt32(kVK_DownArrow): return "↓"
+        case UInt32(kVK_UpArrow): return "↑"
+        case UInt32(kVK_F1): return "F1"
+        case UInt32(kVK_F2): return "F2"
+        case UInt32(kVK_F3): return "F3"
+        case UInt32(kVK_F4): return "F4"
+        case UInt32(kVK_F5): return "F5"
+        case UInt32(kVK_F6): return "F6"
+        case UInt32(kVK_F7): return "F7"
+        case UInt32(kVK_F8): return "F8"
+        case UInt32(kVK_F9): return "F9"
+        case UInt32(kVK_F10): return "F10"
+        case UInt32(kVK_F11): return "F11"
+        case UInt32(kVK_F12): return "F12"
+        default: return "#\(keyCode)"
         }
     }
 }

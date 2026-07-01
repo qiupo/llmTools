@@ -2,13 +2,23 @@ const HOST_NAME = "com.llmtranslate.native_host";
 const VERSION = "0.1.0";
 const MAX_SEGMENTS_PER_BATCH = 20;
 const MAX_CHARS_PER_BATCH = 2000;
+const MAX_SEGMENTS_PER_JOB = 320;
+const MAX_QUEUE_BACKLOG = 80;
+const RESUME_QUEUE_BACKLOG = 36;
+const MAX_INLINE_PENDING_INDICATORS = 80;
+const MAX_ANIMATED_SEGMENTS = 48;
 const MENU_TOGGLE_ID = "llmtranslate-toggle-page";
 const TARGET_LANGUAGE = "zh-Hans";
 const TRANSLATION_CACHE_KEY = "webPageTranslationCacheV1";
 const TRANSLATION_CACHE_MAX_ENTRIES = 2000;
+const DEFAULT_PENDING_INDICATOR_STYLE = "loading";
+const NATIVE_REQUEST_TIMEOUT_MS = 130000;
 
 const tabStates = new Map();
 const tabJobs = new Map();
+const pendingNativeRequests = new Map();
+let pendingIndicatorStyle = DEFAULT_PENDING_INDICATOR_STYLE;
+let nativePort = null;
 
 setupContextMenus();
 
@@ -130,7 +140,10 @@ function getJob(tabID) {
       discovered: 0,
       done: 0,
       failed: 0,
-      modelName: ""
+      modelName: "",
+      storageCache: null,
+      pendingCacheEntries: [],
+      discoveryPaused: false
     });
   }
   return tabJobs.get(tabID);
@@ -139,6 +152,7 @@ function getJob(tabID) {
 async function checkStatus(tabID) {
   const response = await nativeRequest("getStatus", {});
   const modelName = response?.payload?.modelName || "";
+  pendingIndicatorStyle = normalizePendingIndicatorStyle(response?.payload?.pendingIndicatorStyle);
   const current = await getSyncedState(tabID).catch(() => getState(tabID));
   if (current.hasTranslations) {
     return stateFor(tabID, current.status || "translated", current.message || "Translated.", { modelName });
@@ -217,7 +231,10 @@ async function translatePage(tabID) {
     discovered: 0,
     done: 0,
     failed: 0,
-    modelName: status.modelName || ""
+    modelName: status.modelName || "",
+    storageCache: null,
+    pendingCacheEntries: [],
+    discoveryPaused: false
   };
   tabJobs.set(tabID, job);
 
@@ -232,11 +249,19 @@ async function translatePage(tabID) {
     pageStateInvalidated: false
   });
 
-  const discovered = await sendContent(tabID, { type: "startSession", pageSessionID: job.pageSessionID });
+  const discovered = await sendContent(tabID, {
+    type: "startSession",
+    pageSessionID: job.pageSessionID,
+    pendingIndicatorStyle,
+    segmentBudget: MAX_SEGMENTS_PER_JOB,
+    maxInlinePendingIndicators: MAX_INLINE_PENDING_INDICATORS,
+    maxAnimatedSegments: MAX_ANIMATED_SEGMENTS
+  });
   job.urlHash = await sha256(discovered?.url || "");
   job.title = discovered?.title || "";
   await hydrateJobCache(job, discovered?.segments || []);
   enqueueSegments(job, discovered?.segments || []);
+  await syncDiscoveryPressure(tabID, job);
   if (!job.queue.length) {
     return stateFor(tabID, "idle", "No visible English text found.", {
       total: 0,
@@ -263,6 +288,7 @@ async function enqueueDiscoveredSegments(tabID, message) {
   const segments = message?.segments || [];
   await hydrateJobCache(job, segments);
   enqueueSegments(job, segments);
+  await syncDiscoveryPressure(tabID, job);
   if (!job.running && job.queue.length) {
     drainQueue(tabID).catch((error) => {
       stateFor(tabID, "failed", error?.message || String(error));
@@ -273,6 +299,9 @@ async function enqueueDiscoveredSegments(tabID, message) {
 
 function enqueueSegments(job, segments) {
   for (const segment of segments) {
+    if (job.discovered >= MAX_SEGMENTS_PER_JOB) {
+      break;
+    }
     if (!segment?.segmentID || !segment?.textHash || job.queuedIDs.has(segment.segmentID)) {
       continue;
     }
@@ -285,6 +314,30 @@ function enqueueSegments(job, segments) {
       job.queue.push(segment);
     }
   }
+}
+
+async function syncDiscoveryPressure(tabID, job) {
+  if (!tabID || !job) {
+    return;
+  }
+  let shouldPause;
+  if (job.cancelled || job.discovered >= MAX_SEGMENTS_PER_JOB) {
+    shouldPause = true;
+  } else if (job.discoveryPaused) {
+    shouldPause = job.queue.length > RESUME_QUEUE_BACKLOG;
+  } else {
+    shouldPause = job.queue.length >= MAX_QUEUE_BACKLOG;
+  }
+  if (job.discoveryPaused === shouldPause) {
+    return;
+  }
+  job.discoveryPaused = shouldPause;
+  await sendContent(tabID, {
+    type: "setDiscoveryPaused",
+    paused: shouldPause,
+    reason: job.discovered >= MAX_SEGMENTS_PER_JOB ? "budget" : "backlog",
+    segmentBudget: MAX_SEGMENTS_PER_JOB
+  }).catch(() => {});
 }
 
 async function drainQueue(tabID) {
@@ -331,6 +384,7 @@ async function drainQueue(tabID) {
       if (cached.length) {
         await sendContent(tabID, { type: "applyTranslations", translations: cached });
         job.done += cached.length;
+        await syncDiscoveryPressure(tabID, job);
       }
 
       if (toTranslate.length) {
@@ -374,7 +428,7 @@ async function drainQueue(tabID) {
             cacheEntries.push(cacheEntryForSegment(job, source, translation.translation));
           }
         }
-        await saveTranslationCacheEntries(cacheEntries);
+        queueTranslationCacheEntries(job, cacheEntries);
         const duplicatedTranslations = [];
         for (const [textHash, duplicateSegments] of duplicateByHash.entries()) {
           const sourceTranslation = translationsByHash.get(textHash);
@@ -392,6 +446,7 @@ async function drainQueue(tabID) {
         await sendContent(tabID, { type: "applyTranslations", translations: translationsToApply });
         job.done += translationsToApply.filter((item) => item.status === "translated").length;
         job.failed += translationsToApply.filter((item) => item.status === "failed").length;
+        await syncDiscoveryPressure(tabID, job);
       }
 
       stateFor(tabID, "translating", `Translating ${job.done}/${job.discovered} segments...`, {
@@ -427,6 +482,7 @@ async function drainQueue(tabID) {
       });
     }
   } finally {
+    await flushTranslationCache(job).catch(() => {});
     job.running = false;
   }
 }
@@ -435,6 +491,7 @@ async function restorePage(tabID) {
   const job = tabJobs.get(tabID);
   if (job) {
     job.cancelled = true;
+    await flushTranslationCache(job).catch(() => {});
   }
   await sendContent(tabID, { type: "restore" }).catch(() => {});
   tabJobs.delete(tabID);
@@ -455,6 +512,7 @@ async function cancelTranslation(tabID) {
   if (job) {
     job.cancelled = true;
     job.queue = [];
+    await flushTranslationCache(job).catch(() => {});
     if (job.jobID) {
       await nativeRequest("cancelJob", { jobID: job.jobID }, { tabID, pageSessionID: job.pageSessionID }).catch(() => {});
     }
@@ -486,13 +544,20 @@ async function hydrateJobCache(job, segments) {
   if (!segments.length || !job.urlHash) {
     return;
   }
-  const cache = await loadTranslationCache();
+  const cache = await loadJobStorageCache(job);
   for (const segment of segments) {
     const entry = cache[translationCacheID(job, segment)];
     if (entry?.sourceText === segment.text && entry.translation) {
       setCachedTranslation(job, segment, entry.translation);
     }
   }
+}
+
+async function loadJobStorageCache(job) {
+  if (!job.storageCache) {
+    job.storageCache = await loadTranslationCache();
+  }
+  return job.storageCache;
 }
 
 function getCachedTranslation(job, segment) {
@@ -533,16 +598,30 @@ async function loadTranslationCache() {
   }
 }
 
-async function saveTranslationCacheEntries(entries) {
-  if (!entries.length || !chrome.storage?.local) {
+function queueTranslationCacheEntries(job, entries) {
+  if (!entries.length) {
     return;
   }
-  const cache = await loadTranslationCache();
   for (const entry of entries) {
+    if (job.storageCache) {
+      job.storageCache[entry.id] = entry;
+    }
+    job.pendingCacheEntries.push(entry);
+  }
+}
+
+async function flushTranslationCache(job) {
+  if (!job?.pendingCacheEntries?.length || !chrome.storage?.local) {
+    return;
+  }
+  const cache = job.storageCache || await loadTranslationCache();
+  for (const entry of job.pendingCacheEntries) {
     cache[entry.id] = entry;
   }
   pruneTranslationCache(cache);
   await chrome.storage.local.set({ [TRANSLATION_CACHE_KEY]: cache }).catch(() => {});
+  job.storageCache = cache;
+  job.pendingCacheEntries = [];
 }
 
 function pruneTranslationCache(cache) {
@@ -618,9 +697,10 @@ async function togglePageTranslation(tabID) {
 }
 
 async function nativeRequest(type, payload, context = {}) {
+  const requestID = crypto.randomUUID();
   const message = {
     protocolVersion: 1,
-    requestID: crypto.randomUUID(),
+    requestID,
     type,
     browserID: "chrome",
     extensionVersion: VERSION,
@@ -629,11 +709,71 @@ async function nativeRequest(type, payload, context = {}) {
     sentAt: new Date().toISOString(),
     payload
   };
-  const response = await chrome.runtime.sendNativeMessage(HOST_NAME, message);
+  const response = await postNativeMessage(message);
   if (!response || response.status === "error") {
     throw new Error(response?.error?.message || "Native host request failed.");
   }
   return response;
+}
+
+function postNativeMessage(message) {
+  return new Promise((resolve, reject) => {
+    let port;
+    try {
+      port = ensureNativePort();
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
+    const timeout = setTimeout(() => {
+      pendingNativeRequests.delete(message.requestID);
+      reject(new Error("Native host request timed out."));
+    }, NATIVE_REQUEST_TIMEOUT_MS);
+
+    pendingNativeRequests.set(message.requestID, { resolve, reject, timeout });
+    try {
+      port.postMessage(message);
+    } catch (error) {
+      clearTimeout(timeout);
+      pendingNativeRequests.delete(message.requestID);
+      reject(error);
+    }
+  });
+}
+
+function ensureNativePort() {
+  if (nativePort) {
+    return nativePort;
+  }
+  nativePort = chrome.runtime.connectNative(HOST_NAME);
+  nativePort.onMessage.addListener((response) => {
+    const requestID = response?.requestID;
+    const pending = requestID ? pendingNativeRequests.get(requestID) : null;
+    if (!pending) {
+      return;
+    }
+    clearTimeout(pending.timeout);
+    pendingNativeRequests.delete(requestID);
+    pending.resolve(response);
+  });
+  nativePort.onDisconnect.addListener(() => {
+    const message = chrome.runtime.lastError?.message || "Native host disconnected.";
+    nativePort = null;
+    for (const [requestID, pending] of pendingNativeRequests.entries()) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error(message));
+      pendingNativeRequests.delete(requestID);
+    }
+  });
+  return nativePort;
+}
+
+function normalizePendingIndicatorStyle(style) {
+  if (style === "flipText" || style === "none" || style === "loading") {
+    return style;
+  }
+  return DEFAULT_PENDING_INDICATOR_STYLE;
 }
 
 async function sha256(text) {

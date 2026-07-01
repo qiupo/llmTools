@@ -27,7 +27,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         hotKeyService.delegate = self
-        hotKeyService.registerDefaultHotKey()
         selectionActionService.delegate = self
         configureStatusItem()
         configureWindows()
@@ -37,6 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             localAppBridgeServer.start()
             applyWindowPreferences()
             applySelectionActionPreference()
+            applyHotKeyPreferences()
             refreshStatusMenuItem()
         }
     }
@@ -106,8 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             autoCollapseAtScreenEdge: appState.preferences.autoCollapseWidget
         )
         settingsWindowController = WindowController(
-            title: "模型",
-            frame: NSRect(x: 0, y: 0, width: 860, height: 600),
+            title: "设置",
+            frame: NSRect(x: 0, y: 0, width: 680, height: 420),
             contentView: AnyView(SettingsView(appState: appState))
         )
     }
@@ -322,6 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .sink { [weak self] preferences in
                 self?.applyWindowPreferences(preferences)
                 self?.applySelectionActionPreference(preferences)
+                self?.applyHotKeyPreferences(preferences)
                 self?.refreshStatusMenuItem()
             }
             .store(in: &cancellables)
@@ -393,6 +394,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
     }
 
+    private func applyHotKeyPreferences(_ preferences: AppPreferences? = nil) {
+        let preferences = preferences ?? appState.preferences
+        hotKeyService.registerHotKeys(
+            quickActionShortcut: preferences.quickActionShortcut,
+            quickActionWithoutSelectionShortcut: preferences.quickActionWithoutSelectionShortcut
+        )
+    }
+
     private func selectionActionTriggerSources(for preferences: AppPreferences) -> Set<SelectionActionTriggerSource> {
         var sources = Set<SelectionActionTriggerSource>()
         if preferences.selectionActionTriggerMouseDrag {
@@ -400,6 +409,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
         if preferences.selectionActionTriggerDoubleClick {
             sources.insert(.doubleClick)
+        }
+        if preferences.selectionActionTriggerSelectAll {
+            sources.insert(.selectAllShortcut)
         }
         return sources
     }

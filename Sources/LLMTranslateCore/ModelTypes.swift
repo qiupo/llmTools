@@ -79,6 +79,31 @@ public enum AppLanguage: String, Codable, Sendable, CaseIterable, Identifiable {
     }
 }
 
+public struct KeyboardShortcutPreference: Codable, Sendable, Hashable {
+    public var keyCode: UInt32
+    public var modifiers: UInt32
+
+    public init(keyCode: UInt32, modifiers: UInt32) {
+        self.keyCode = keyCode
+        self.modifiers = modifiers
+    }
+
+    public static let optionSpace = KeyboardShortcutPreference(
+        keyCode: 49,
+        modifiers: KeyboardShortcutPreference.optionModifier
+    )
+
+    public static let optionShiftSpace = KeyboardShortcutPreference(
+        keyCode: 49,
+        modifiers: KeyboardShortcutPreference.optionModifier | KeyboardShortcutPreference.shiftModifier
+    )
+
+    public static let commandModifier: UInt32 = 1 << 8
+    public static let shiftModifier: UInt32 = 1 << 9
+    public static let optionModifier: UInt32 = 1 << 11
+    public static let controlModifier: UInt32 = 1 << 12
+}
+
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
     public var autoCollapseWidget: Bool
@@ -94,6 +119,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultPolishStyle: String
     public var recentHistoryLimit: Int
     public var webPageTranslation: WebPageTranslationPreferences
+    public var quickActionShortcut: KeyboardShortcutPreference
+    public var quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
 
     public init(
         defaultModelID: UUID? = nil,
@@ -104,12 +131,14 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionEnabled: Bool = true,
         selectionActionTriggerMouseDrag: Bool = true,
         selectionActionTriggerDoubleClick: Bool = true,
-        selectionActionTriggerSelectAll: Bool = true,
+        selectionActionTriggerSelectAll: Bool = false,
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
         defaultPolishStyle: String = "natural",
         recentHistoryLimit: Int = 20,
-        webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences()
+        webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
+        quickActionShortcut: KeyboardShortcutPreference = .optionSpace,
+        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace
     ) {
         self.defaultModelID = defaultModelID
         self.autoCollapseWidget = autoCollapseWidget
@@ -125,6 +154,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.defaultPolishStyle = defaultPolishStyle
         self.recentHistoryLimit = recentHistoryLimit
         self.webPageTranslation = webPageTranslation
+        self.quickActionShortcut = quickActionShortcut
+        self.quickActionWithoutSelectionShortcut = quickActionWithoutSelectionShortcut
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -142,6 +173,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case defaultPolishStyle
         case recentHistoryLimit
         case webPageTranslation
+        case quickActionShortcut
+        case quickActionWithoutSelectionShortcut
     }
 
     public init(from decoder: Decoder) throws {
@@ -154,12 +187,14 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionEnabled = try container.decodeIfPresent(Bool.self, forKey: .selectionActionEnabled) ?? true
         selectionActionTriggerMouseDrag = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerMouseDrag) ?? true
         selectionActionTriggerDoubleClick = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerDoubleClick) ?? true
-        selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? true
+        selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? false
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
         recentHistoryLimit = try container.decodeIfPresent(Int.self, forKey: .recentHistoryLimit) ?? 20
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
+        quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
+        quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
     }
 }
 

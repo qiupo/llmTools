@@ -1,9 +1,19 @@
 import Foundation
 
+public enum WebPagePendingIndicatorStyle: String, Codable, Sendable, Hashable, CaseIterable, Identifiable {
+    case loading
+    case flipText
+    case none
+
+    public var id: String { rawValue }
+}
+
 public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public var enabled: Bool
     public var defaultTargetLanguage: String
+    public var modelID: UUID?
     public var translateVisibleOnly: Bool
+    public var pendingIndicatorStyle: WebPagePendingIndicatorStyle
     public var autoTranslateDomains: [String]
     public var disabledDomains: [String]
     public var persistWebHistory: Bool
@@ -13,7 +23,9 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public init(
         enabled: Bool = true,
         defaultTargetLanguage: String = "zh-Hans",
+        modelID: UUID? = nil,
         translateVisibleOnly: Bool = true,
+        pendingIndicatorStyle: WebPagePendingIndicatorStyle = .loading,
         autoTranslateDomains: [String] = [],
         disabledDomains: [String] = [],
         persistWebHistory: Bool = false,
@@ -22,12 +34,41 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     ) {
         self.enabled = enabled
         self.defaultTargetLanguage = defaultTargetLanguage
+        self.modelID = modelID
         self.translateVisibleOnly = translateVisibleOnly
+        self.pendingIndicatorStyle = pendingIndicatorStyle
         self.autoTranslateDomains = autoTranslateDomains
         self.disabledDomains = disabledDomains
         self.persistWebHistory = persistWebHistory
         self.maxSegmentsPerBatch = maxSegmentsPerBatch
         self.maxCharactersPerBatch = maxCharactersPerBatch
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case defaultTargetLanguage
+        case modelID
+        case translateVisibleOnly
+        case pendingIndicatorStyle
+        case autoTranslateDomains
+        case disabledDomains
+        case persistWebHistory
+        case maxSegmentsPerBatch
+        case maxCharactersPerBatch
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        defaultTargetLanguage = try container.decodeIfPresent(String.self, forKey: .defaultTargetLanguage) ?? "zh-Hans"
+        modelID = try container.decodeIfPresent(UUID.self, forKey: .modelID)
+        translateVisibleOnly = try container.decodeIfPresent(Bool.self, forKey: .translateVisibleOnly) ?? true
+        pendingIndicatorStyle = try container.decodeIfPresent(WebPagePendingIndicatorStyle.self, forKey: .pendingIndicatorStyle) ?? .loading
+        autoTranslateDomains = try container.decodeIfPresent([String].self, forKey: .autoTranslateDomains) ?? []
+        disabledDomains = try container.decodeIfPresent([String].self, forKey: .disabledDomains) ?? []
+        persistWebHistory = try container.decodeIfPresent(Bool.self, forKey: .persistWebHistory) ?? false
+        maxSegmentsPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxSegmentsPerBatch) ?? 20
+        maxCharactersPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxCharactersPerBatch) ?? 2_000
     }
 }
 
@@ -278,4 +319,3 @@ public struct NativeMessageEnvelope<Payload: Codable & Sendable>: Codable, Senda
 public struct EmptyPayload: Codable, Sendable, Hashable {
     public init() {}
 }
-

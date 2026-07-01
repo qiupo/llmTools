@@ -13,12 +13,19 @@
     processedNodes: new WeakSet(),
     pendingNodes: new Set(),
     cancelled: false,
+    discoveryPaused: false,
     overlay: null,
     overlayMinimized: false,
+    pendingIndicatorStyle: "loading",
+    segmentBudget: 320,
+    maxInlinePendingIndicators: 80,
+    maxAnimatedSegments: 48,
+    animatedSegmentIDs: new Set(),
     segmentSpinnerStyleInstalled: false,
     intersectionObserver: null,
     mutationObserver: null,
-    discoveryTimer: null
+    discoveryTimer: null,
+    staleIndicatorCleanupTimer: null
   };
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -33,7 +40,7 @@
       case "ping":
         return { ok: true };
       case "startSession":
-        return startSession(message.pageSessionID);
+        return startSession(message.pageSessionID, message.pendingIndicatorStyle, message);
       case "applyTranslations":
         applyTranslations(message.translations || []);
         return { ok: true, applied: state.translatedByID.size };
@@ -47,28 +54,40 @@
         return { ok: true };
       case "cancel":
         state.cancelled = true;
+        state.discoveryPaused = true;
         state.pendingNodes.clear();
         removeAllSegmentSpinners();
         updateOverlay("Cancelled");
+        return { ok: true };
+      case "setDiscoveryPaused":
+        setDiscoveryPaused(Boolean(message.paused), message.reason, message.segmentBudget);
         return { ok: true };
       default:
         return { ok: true };
     }
   }
 
-  function startSession(pageSessionID) {
+  function startSession(pageSessionID, pendingIndicatorStyle, options = {}) {
     state.pageSessionID = pageSessionID || crypto.randomUUID();
+    state.pendingIndicatorStyle = normalizePendingIndicatorStyle(pendingIndicatorStyle);
+    state.segmentBudget = Math.max(Number(options.segmentBudget) || 320, 1);
+    state.maxInlinePendingIndicators = Math.max(Number(options.maxInlinePendingIndicators) || 80, 0);
+    state.maxAnimatedSegments = Math.max(Number(options.maxAnimatedSegments) || 48, 0);
     state.cancelled = false;
+    state.discoveryPaused = false;
     state.overlayMinimized = false;
     state.processedNodes = new WeakSet();
     state.pendingNodes.clear();
     state.nodeByID.clear();
     state.originalByID.clear();
     state.translatedByID.clear();
+    state.animatedSegmentIDs.clear();
+    clearTimeout(state.staleIndicatorCleanupTimer);
+    state.staleIndicatorCleanupTimer = null;
     removeAllSegmentSpinners();
     showOverlay("Discovering text...");
     installObservers();
-    const segments = discoverSegments();
+    const segments = discoverSegments(document.body, state.segmentBudget);
     updateOverlay(`Found ${segments.length} segments`);
     return {
       ok: true,
@@ -90,11 +109,16 @@
     };
   }
 
-  function discoverSegments(root = document.body) {
-    if (!root || state.cancelled) {
+  function remainingSegmentBudget() {
+    return Math.max(state.segmentBudget - state.originalByID.size, 0);
+  }
+
+  function discoverSegments(root = document.body, limit = 200) {
+    if (!root || state.cancelled || state.discoveryPaused || remainingSegmentBudget() <= 0) {
       return [];
     }
     const segments = [];
+    const maxSegments = Math.min(Math.max(limit, 0), 200, remainingSegmentBudget());
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (!candidateNode(node)) return NodeFilter.FILTER_REJECT;
@@ -102,9 +126,14 @@
       }
     });
 
+    const nodes = [];
     let node;
-    while ((node = walker.nextNode()) && segments.length < 200) {
-      const segment = registerNode(node);
+    while ((node = walker.nextNode()) && nodes.length < maxSegments) {
+      nodes.push(node);
+    }
+
+    for (const textNode of nodes) {
+      const segment = registerNode(textNode);
       if (segment) {
         segments.push(segment);
       }
@@ -113,16 +142,20 @@
   }
 
   function registerNode(node) {
+    if (remainingSegmentBudget() <= 0) {
+      return null;
+    }
     const text = normalizeText(node.nodeValue || "");
     const textHash = stableHash(text);
     if (state.processedNodes.has(node)) {
       return null;
     }
     const segmentID = crypto.randomUUID();
-    state.nodeByID.set(segmentID, node);
-    state.originalByID.set(segmentID, node.nodeValue);
+    const original = node.nodeValue;
+    const indicator = showSegmentSpinner(segmentID, node);
+    state.nodeByID.set(segmentID, indicator || node);
+    state.originalByID.set(segmentID, original);
     state.processedNodes.add(node);
-    showSegmentSpinner(segmentID, node);
     return {
       segmentID,
       text,
@@ -164,9 +197,14 @@
         removeSegmentSpinner(item.segmentID);
         continue;
       }
-      node.nodeValue = preserveWhitespace(original, item.translation);
-      state.translatedByID.set(item.segmentID, item.translation);
-      removeSegmentSpinner(item.segmentID);
+      if (shouldAnimateTranslation(item.segmentID)) {
+        state.animatedSegmentIDs.add(item.segmentID);
+        applyFlipTextTranslation(item.segmentID, node, original, item.translation);
+      } else {
+        node.nodeValue = preserveWhitespace(original, item.translation);
+        state.translatedByID.set(item.segmentID, item.translation);
+        removeSegmentSpinner(item.segmentID);
+      }
     }
     updateOverlay(`Applied ${state.translatedByID.size} translations`, {
       canRestore: state.translatedByID.size > 0
@@ -179,12 +217,17 @@
     for (const [segmentID, original] of state.originalByID.entries()) {
       const node = state.nodeByID.get(segmentID);
       if (node && node.isConnected && state.translatedByID.has(segmentID)) {
-        node.nodeValue = original;
+        if (node.nodeType === Node.TEXT_NODE) {
+          node.nodeValue = original;
+        } else if (node.nodeType === Node.ELEMENT_NODE) {
+          node.replaceWith(document.createTextNode(original));
+        }
       }
     }
     state.nodeByID.clear();
     state.originalByID.clear();
     state.translatedByID.clear();
+    state.animatedSegmentIDs.clear();
     removeAllSegmentSpinners();
     state.processedNodes = new WeakSet();
     state.pendingNodes.clear();
@@ -229,6 +272,26 @@
     observeElement(document.body);
   }
 
+  function setDiscoveryPaused(paused, reason, segmentBudget) {
+    state.discoveryPaused = paused;
+    if (Number(segmentBudget) > 0) {
+      state.segmentBudget = Number(segmentBudget);
+    }
+    if (paused) {
+      state.pendingNodes.clear();
+      clearTimeout(state.discoveryTimer);
+      state.discoveryTimer = null;
+      updateOverlay(reason === "budget" ? `Queued ${state.originalByID.size} segments` : "Translation queue is full", {
+        canCancel: true,
+        canRestore: state.translatedByID.size > 0
+      });
+      return;
+    }
+    if (!state.cancelled && state.pageSessionID && remainingSegmentBudget() > 0) {
+      queueDiscovery(document.body);
+    }
+  }
+
   function observeElement(root) {
     if (!state.intersectionObserver || !root || root.nodeType !== Node.ELEMENT_NODE) {
       return;
@@ -245,7 +308,7 @@
   }
 
   function queueDiscovery(root) {
-    if (!state.pageSessionID || state.cancelled || !root) {
+    if (!state.pageSessionID || state.cancelled || state.discoveryPaused || !root || remainingSegmentBudget() <= 0) {
       return;
     }
     state.pendingNodes.add(root);
@@ -254,7 +317,7 @@
   }
 
   function flushPendingDiscovery() {
-    if (!state.pageSessionID || state.cancelled) {
+    if (!state.pageSessionID || state.cancelled || state.discoveryPaused || remainingSegmentBudget() <= 0) {
       return;
     }
     const pending = Array.from(state.pendingNodes);
@@ -266,9 +329,9 @@
         const segment = candidateNode(root) ? registerNode(root) : null;
         if (segment) segments.push(segment);
       } else if (root.nodeType === Node.ELEMENT_NODE) {
-        segments.push(...discoverSegments(root));
+        segments.push(...discoverSegments(root, remainingSegmentBudget()));
       }
-      if (segments.length >= 200) break;
+      if (segments.length >= 200 || remainingSegmentBudget() <= 0) break;
     }
     if (segments.length) {
       updateOverlay(`Queued ${segments.length} new segments`, {
@@ -296,6 +359,8 @@
     }
     clearTimeout(state.discoveryTimer);
     state.discoveryTimer = null;
+    clearTimeout(state.staleIndicatorCleanupTimer);
+    state.staleIndicatorCleanupTimer = null;
   }
 
   function shouldSkipElement(element) {
@@ -303,6 +368,7 @@
     for (let current = element; current && current !== document.body; current = current.parentElement) {
       if (skipped.has(current.tagName)) return true;
       if (current.dataset?.llmTranslateSpinner === "true") return true;
+      if (current.dataset?.llmTranslateIndicator === "true") return true;
       if (current.isContentEditable) return true;
       if (current.getAttribute("aria-hidden") === "true") return true;
     }
@@ -344,18 +410,52 @@
 
   function showSegmentSpinner(segmentID, node) {
     if (!segmentID || !node?.parentNode || state.spinnerByID.has(segmentID)) {
-      return;
+      return null;
+    }
+    const indicatorStyle = effectivePendingIndicatorStyle();
+    if (indicatorStyle === "none") {
+      return null;
+    }
+    if (indicatorStyle === "flipText") {
+      installSegmentSpinnerStyle();
+      const indicator = createFlipTextIndicator(node.nodeValue || "", "", "pending");
+      node.parentNode.insertBefore(indicator, node);
+      node.remove();
+      state.spinnerByID.set(segmentID, indicator);
+      state.animatedSegmentIDs.add(segmentID);
+      return indicator;
     }
     installSegmentSpinnerStyle();
     const spinner = document.createElement("span");
     spinner.className = "llmtranslate-segment-spinner";
     spinner.dataset.llmTranslateSpinner = "true";
+    spinner.dataset.llmTranslateIndicator = "true";
+    spinner.dataset.llmTranslateIndicatorKind = "loading";
+    spinner.dataset.llmTranslateCreatedAt = String(Date.now());
     spinner.setAttribute("aria-label", "Translating");
     spinner.setAttribute("aria-live", "polite");
     spinner.setAttribute("contenteditable", "false");
     spinner.style.cssText = segmentSpinnerStyle();
     node.parentNode.insertBefore(spinner, node.nextSibling);
     state.spinnerByID.set(segmentID, spinner);
+    return null;
+  }
+
+  function effectivePendingIndicatorStyle() {
+    if (state.originalByID.size >= state.maxInlinePendingIndicators) {
+      return "none";
+    }
+    return state.pendingIndicatorStyle;
+  }
+
+  function shouldAnimateTranslation(segmentID) {
+    if (state.pendingIndicatorStyle !== "flipText") {
+      return false;
+    }
+    if (state.animatedSegmentIDs.has(segmentID)) {
+      return true;
+    }
+    return state.animatedSegmentIDs.size < state.maxAnimatedSegments;
   }
 
   function removeSegmentSpinner(segmentID) {
@@ -364,16 +464,47 @@
     }
     const spinner = state.spinnerByID.get(segmentID);
     if (spinner) {
-      spinner.remove();
+      const replacement = removeSegmentIndicatorElement(spinner);
+      if (replacement) {
+        state.nodeByID.set(segmentID, replacement);
+      }
       state.spinnerByID.delete(segmentID);
     }
   }
 
   function removeAllSegmentSpinners() {
-    for (const spinner of state.spinnerByID.values()) {
-      spinner.remove();
+    for (const [segmentID, spinner] of state.spinnerByID.entries()) {
+      const replacement = removeSegmentIndicatorElement(spinner);
+      if (replacement) {
+        state.nodeByID.set(segmentID, replacement);
+      }
     }
     state.spinnerByID.clear();
+  }
+
+  function scheduleStaleIndicatorCleanup() {
+    const createdBefore = Date.now();
+    clearTimeout(state.staleIndicatorCleanupTimer);
+    state.staleIndicatorCleanupTimer = setTimeout(() => {
+      cleanupStaleSegmentIndicators(createdBefore);
+    }, 2600);
+  }
+
+  function cleanupStaleSegmentIndicators(createdBefore) {
+    if (!state.pageSessionID || state.cancelled || !state.spinnerByID.size) {
+      return;
+    }
+    for (const [segmentID, indicator] of Array.from(state.spinnerByID.entries())) {
+      const createdAt = Number(indicator?.dataset?.llmTranslateCreatedAt || 0);
+      if (!indicator?.isConnected || createdAt > createdBefore) {
+        continue;
+      }
+      const replacement = removeSegmentIndicatorElement(indicator);
+      if (replacement) {
+        state.nodeByID.set(segmentID, replacement);
+      }
+      state.spinnerByID.delete(segmentID);
+    }
   }
 
   function installSegmentSpinnerStyle() {
@@ -386,9 +517,227 @@
       @keyframes llmtranslate-segment-spin {
         to { transform: rotate(360deg); }
       }
+      .llmtranslate-segment-flip {
+        display: inline;
+        perspective: 700px;
+        transform-style: preserve-3d;
+        pointer-events: none;
+        user-select: none;
+      }
+      .llmtranslate-segment-flip-tile {
+        display: inline-grid;
+        grid-template-areas: "llmtranslate-flip-stack";
+        transform-origin: 50% 55%;
+        transform-style: preserve-3d;
+        vertical-align: baseline;
+        will-change: transform;
+      }
+      .llmtranslate-segment-flip-face {
+        display: inline-block;
+        grid-area: llmtranslate-flip-stack;
+        white-space: pre-wrap;
+      }
+      .llmtranslate-segment-flip-pending .llmtranslate-segment-flip-tile {
+        animation: llmtranslate-segment-sway 1.35s ease-in-out infinite;
+        animation-delay: var(--llmtranslate-delay, 0ms);
+      }
+      .llmtranslate-segment-flip-pending .llmtranslate-segment-flip-back {
+        display: none;
+      }
+      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-tile {
+        animation: llmtranslate-segment-complete-flip .78s cubic-bezier(.22,.9,.18,1) forwards;
+        animation-delay: var(--llmtranslate-delay, 0ms);
+      }
+      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-front {
+        animation: llmtranslate-segment-front-out .78s linear forwards;
+        animation-delay: var(--llmtranslate-delay, 0ms);
+      }
+      .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-back {
+        color: #2563eb;
+        opacity: 0;
+        animation: llmtranslate-segment-back-in .78s linear forwards;
+        animation-delay: var(--llmtranslate-delay, 0ms);
+      }
+      @keyframes llmtranslate-segment-sway {
+        0%, 100% { transform: rotateX(0deg); }
+        24% { transform: rotateX(-18deg); }
+        54% { transform: rotateX(16deg); }
+        76% { transform: rotateX(-6deg); }
+      }
+      @keyframes llmtranslate-segment-complete-flip {
+        0% { transform: rotateX(0deg); }
+        48% { transform: rotateX(172deg); }
+        52% { transform: rotateX(188deg); }
+        100% { transform: rotateX(360deg); }
+      }
+      @keyframes llmtranslate-segment-front-out {
+        0%, 48% { opacity: 1; }
+        49%, 100% { opacity: 0; }
+      }
+      @keyframes llmtranslate-segment-back-in {
+        0%, 48% { opacity: 0; color: #2563eb; }
+        49%, 100% { opacity: 1; color: inherit; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .llmtranslate-segment-flip-tile,
+        .llmtranslate-segment-flip-face {
+          animation: none !important;
+          transform: none !important;
+        }
+        .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-front {
+          display: none;
+        }
+        .llmtranslate-segment-flip-complete .llmtranslate-segment-flip-back {
+          opacity: 1;
+          color: inherit;
+        }
+      }
     `;
     document.documentElement.appendChild(style);
     state.segmentSpinnerStyleInstalled = true;
+  }
+
+  function applyFlipTextTranslation(segmentID, node, original, translation) {
+    const finalText = preserveWhitespace(original, translation);
+    if (!node?.parentNode && !node?.isConnected) {
+      return;
+    }
+    installSegmentSpinnerStyle();
+    const wrapper = node.nodeType === Node.ELEMENT_NODE && node.dataset?.llmTranslateIndicatorKind === "flipText"
+      ? node
+      : createFlipTextIndicator(original, "", "pending");
+    wrapper.dataset.llmTranslateFinalText = finalText;
+    wrapper.setAttribute("aria-label", finalText);
+    wrapper.setAttribute("aria-live", "polite");
+    wrapper.setAttribute("contenteditable", "false");
+    const blockCount = renderFlipTextBlocks(wrapper, original, finalText, "complete");
+
+    if (wrapper !== node) {
+      node.parentNode.insertBefore(wrapper, node);
+      node.remove();
+    }
+    state.nodeByID.set(segmentID, wrapper);
+    state.translatedByID.set(segmentID, translation);
+    state.spinnerByID.set(segmentID, wrapper);
+
+    setTimeout(() => {
+      if (state.spinnerByID.get(segmentID) !== wrapper || !wrapper.isConnected) {
+        return;
+      }
+      const textNode = document.createTextNode(finalText);
+      state.processedNodes.add(textNode);
+      wrapper.replaceWith(textNode);
+      state.nodeByID.set(segmentID, textNode);
+      state.spinnerByID.delete(segmentID);
+    }, flipSettleDelay(blockCount));
+  }
+
+  function createFlipTextIndicator(originalText, finalText, phase) {
+    const wrapper = document.createElement("span");
+    wrapper.className = "llmtranslate-segment-flip";
+    wrapper.dataset.llmTranslateIndicator = "true";
+    wrapper.dataset.llmTranslateIndicatorKind = "flipText";
+    wrapper.dataset.llmTranslateOriginalText = originalText;
+    wrapper.dataset.llmTranslateFinalText = finalText;
+    wrapper.dataset.llmTranslateCreatedAt = String(Date.now());
+    wrapper.setAttribute("aria-live", "polite");
+    wrapper.setAttribute("contenteditable", "false");
+    renderFlipTextBlocks(wrapper, originalText, finalText, phase);
+    return wrapper;
+  }
+
+  function renderFlipTextBlocks(wrapper, originalText, finalText, phase) {
+    const originalChunks = splitFlipTextChunks(originalText);
+    const finalChunks = phase === "complete" ? splitFlipTextChunks(finalText) : [];
+    const blockCount = phase === "complete"
+      ? Math.max(originalChunks.length, finalChunks.length, 1)
+      : Math.max(originalChunks.length, 1);
+    wrapper.classList.toggle("llmtranslate-segment-flip-pending", phase === "pending");
+    wrapper.classList.toggle("llmtranslate-segment-flip-complete", phase === "complete");
+    wrapper.replaceChildren();
+    for (let index = 0; index < blockCount; index += 1) {
+      const tile = document.createElement("span");
+      tile.className = "llmtranslate-segment-flip-tile";
+      tile.style.setProperty("--llmtranslate-delay", `${flipBlockDelay(index, phase)}ms`);
+
+      const front = document.createElement("span");
+      front.className = "llmtranslate-segment-flip-face llmtranslate-segment-flip-front";
+      front.textContent = originalChunks[index] || "";
+      tile.appendChild(front);
+
+      const back = document.createElement("span");
+      back.className = "llmtranslate-segment-flip-face llmtranslate-segment-flip-back";
+      back.textContent = finalChunks[index] || "";
+      tile.appendChild(back);
+
+      wrapper.appendChild(tile);
+    }
+    return blockCount;
+  }
+
+  function splitFlipTextChunks(text) {
+    const source = String(text || "");
+    if (!source) {
+      return [""];
+    }
+    const chunkSize = source.length > 160 ? 8 : source.length > 80 ? 6 : 4;
+    const chunks = [];
+    let chunk = "";
+    for (const char of Array.from(source)) {
+      if (/\s/.test(char)) {
+        if (chunk) {
+          chunk += char;
+          chunks.push(chunk);
+          chunk = "";
+        } else if (chunks.length) {
+          chunks[chunks.length - 1] += char;
+        } else {
+          chunks.push(char);
+        }
+        continue;
+      }
+      chunk += char;
+      if (Array.from(chunk).length >= chunkSize) {
+        chunks.push(chunk);
+        chunk = "";
+      }
+    }
+    if (chunk) {
+      chunks.push(chunk);
+    }
+    return chunks.length ? chunks : [""];
+  }
+
+  function flipBlockDelay(index, phase) {
+    const step = phase === "complete" ? 42 : 58;
+    const maxDelay = phase === "complete" ? 900 : 1100;
+    return Math.min(index * step, maxDelay);
+  }
+
+  function flipSettleDelay(blockCount) {
+    const lastDelay = flipBlockDelay(Math.max(blockCount - 1, 0), "complete");
+    return lastDelay + 880;
+  }
+
+  function removeSegmentIndicatorElement(element) {
+    if (!element?.isConnected) {
+      return null;
+    }
+    if (element.dataset?.llmTranslateIndicatorKind === "flipText") {
+      const textNode = document.createTextNode(element.dataset.llmTranslateFinalText || element.textContent || "");
+      state.processedNodes.add(textNode);
+      element.replaceWith(textNode);
+      return textNode;
+    }
+    element.remove();
+    return null;
+  }
+
+  function normalizePendingIndicatorStyle(style) {
+    if (style === "loading" || style === "flipText" || style === "none") {
+      return style;
+    }
+    return "loading";
   }
 
   function segmentSpinnerStyle() {
@@ -439,11 +788,18 @@
     }
     const active = translationState.status === "discovering" || translationState.status === "translating";
     const complete = translationState.status === "translated" || translationState.status === "partiallyTranslated";
+    const failed = translationState.status === "failed";
     const total = translationState.total || 0;
     const done = translationState.done || 0;
-    const failed = translationState.failed || 0;
-    const progress = total > 0 ? `${done}/${total}${failed ? `, ${failed} failed` : ""}` : "";
+    const failedCount = translationState.failed || 0;
+    const progress = total > 0 ? `${done}/${total}${failedCount ? `, ${failedCount} failed` : ""}` : "";
     const message = translationState.message || progress || translationState.status;
+    if (active) {
+      clearTimeout(state.staleIndicatorCleanupTimer);
+      state.staleIndicatorCleanupTimer = null;
+    } else if (complete || failed) {
+      scheduleStaleIndicatorCleanup();
+    }
     updateOverlay(message, {
       progress,
       canCancel: active,
@@ -549,14 +905,27 @@
   }
 
   function safeRuntimeSendMessage(message) {
+    let handled = false;
+    const handleFailure = (error) => {
+      if (handled) {
+        return;
+      }
+      handled = true;
+      handleRuntimeSendFailure(error);
+    };
     try {
-      const result = chrome.runtime.sendMessage(message);
-      if (result?.catch) {
-        result.catch(handleRuntimeSendFailure);
+      const result = chrome.runtime.sendMessage(message, () => {
+        const error = chrome.runtime.lastError;
+        if (error) {
+          handleFailure(error);
+        }
+      });
+      if (typeof result?.catch === "function") {
+        result.catch(handleFailure);
       }
       return result;
     } catch (error) {
-      handleRuntimeSendFailure(error);
+      handleFailure(error);
       return null;
     }
   }

@@ -38,9 +38,11 @@ final class AppState: ObservableObject {
     func bootstrap() async {
         await engine.bootstrap()
         let snapshot = await engine.registry()
+        var preferences = snapshot.preferences
+        clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
         self.models = snapshot.models
-        self.preferences = snapshot.preferences
-        self.selectedModelID = snapshot.preferences.defaultModelID ?? snapshot.models.first?.id
+        self.preferences = preferences
+        self.selectedModelID = preferences.defaultModelID ?? snapshot.models.first?.id
         self.history = await engine.recentHistory()
         self.statusMessage = snapshot.models.isEmpty
             ? t("No model configured")
@@ -69,12 +71,14 @@ final class AppState: ObservableObject {
     func reloadSnapshot() async {
         let snapshot = await engine.registry()
         let currentModelID = selectedModelID
+        var preferences = snapshot.preferences
+        clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
         models = snapshot.models
-        preferences = snapshot.preferences
+        self.preferences = preferences
         if let currentModelID, snapshot.models.contains(where: { $0.id == currentModelID }) {
             selectedModelID = currentModelID
         } else {
-            selectedModelID = snapshot.preferences.defaultModelID ?? snapshot.models.first?.id
+            selectedModelID = preferences.defaultModelID ?? snapshot.models.first?.id
         }
         history = await engine.recentHistory()
     }
@@ -386,6 +390,18 @@ final class AppState: ObservableObject {
         L10n.text(key, language: preferences.appLanguage)
     }
 
+    private func clearMissingWebPageModelPreference(
+        _ preferences: inout AppPreferences,
+        models: [ModelDescriptor]
+    ) {
+        guard let modelID = preferences.webPageTranslation.modelID else {
+            return
+        }
+        if !models.contains(where: { $0.id == modelID && $0.enabled }) {
+            preferences.webPageTranslation.modelID = nil
+        }
+    }
+
     private var selectedModelContextLength: Int? {
         if let selectedModelID,
            let model = models.first(where: { $0.id == selectedModelID && $0.enabled }) {
@@ -427,6 +443,23 @@ final class AppState: ObservableObject {
         let resolvedName = models.first(where: { $0.id == selectedModelID })?.name
             ?? models.first?.name
             ?? t("No model configured")
+        return Self.condensedModelName(resolvedName, limit: limit)
+    }
+
+    var webPageTranslationModelID: UUID? {
+        if let modelID = preferences.webPageTranslation.modelID,
+           models.contains(where: { $0.id == modelID && $0.enabled }) {
+            return modelID
+        }
+        return selectedModelID
+            ?? preferences.defaultModelID
+            ?? models.first(where: { $0.enabled })?.id
+    }
+
+    func webPageTranslationModelDisplayName(limit: Int = 18) -> String {
+        let resolvedName = webPageTranslationModelID.flatMap { modelID in
+            models.first(where: { $0.id == modelID })?.name
+        } ?? t("No model configured")
         return Self.condensedModelName(resolvedName, limit: limit)
     }
 

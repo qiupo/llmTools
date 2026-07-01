@@ -71,6 +71,9 @@ public actor TaskEngine {
         if snapshot.preferences.defaultModelID == id {
             snapshot.preferences.defaultModelID = snapshot.models.first?.id
         }
+        if snapshot.preferences.webPageTranslation.modelID == id {
+            snapshot.preferences.webPageTranslation.modelID = nil
+        }
         try await registryStore.save(snapshot)
     }
 
@@ -120,94 +123,72 @@ public actor TaskEngine {
     ) async throws -> WebPageTranslateSegmentsResult {
         try validateWebPagePayload(payload)
         let model = try resolveModel(for: modelID)
-        let request = TaskRequest(
-            task: .webPageTranslate,
-            inputText: try PromptTemplates.webPageBatchPrompt(
-                segments: payload.segments,
-                targetLanguage: payload.targetLanguage,
-                isRetry: false
-            ),
-            sourceLanguage: payload.sourceLanguage,
-            targetLanguage: payload.targetLanguage
+        let persistHistory = snapshot.preferences.webPageTranslation.persistWebHistory
+        var translationsByID: [String: WebPageSegmentTranslation] = [:]
+        var latestModelName = model.name
+
+        let batchResult = try await runWebPageBatch(
+            segments: payload.segments,
+            payload: payload,
+            model: model,
+            isRetry: false,
+            persistHistory: persistHistory
         )
-        try validateInputSize(request, for: model)
-        let batchResult = try await run(
-            request: request,
-            modelID: model.id,
-            persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
+        latestModelName = batchResult.modelName
+        mergeSuccessfulTranslations(
+            batchResult.translations,
+            into: &translationsByID
         )
-        if let translations = parseWebPageTranslations(from: batchResult.text, segments: payload.segments) {
+        if hasTranslations(for: payload.segments, in: translationsByID) {
             return webPageResult(
                 jobID: payload.jobID,
-                modelName: batchResult.modelName,
+                modelName: latestModelName,
                 segments: payload.segments,
-                translations: translations
+                translations: orderedTranslations(for: payload.segments, from: translationsByID)
             )
         }
 
-        let retryRequest = TaskRequest(
-            task: .webPageTranslate,
-            inputText: try PromptTemplates.webPageBatchPrompt(
-                segments: payload.segments,
-                targetLanguage: payload.targetLanguage,
-                isRetry: true
-            ),
-            sourceLanguage: payload.sourceLanguage,
-            targetLanguage: payload.targetLanguage
+        let retrySegments = missingSegments(from: payload.segments, translationsByID: translationsByID)
+        let retryResult = try await runWebPageBatch(
+            segments: retrySegments,
+            payload: payload,
+            model: model,
+            isRetry: true,
+            persistHistory: persistHistory
         )
-        let retryResult = try await run(
-            request: retryRequest,
-            modelID: model.id,
-            persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
+        latestModelName = retryResult.modelName
+        mergeSuccessfulTranslations(
+            retryResult.translations,
+            into: &translationsByID
         )
-        if let translations = parseWebPageTranslations(from: retryResult.text, segments: payload.segments) {
+        if hasTranslations(for: payload.segments, in: translationsByID) {
             return webPageResult(
                 jobID: payload.jobID,
-                modelName: retryResult.modelName,
+                modelName: latestModelName,
                 segments: payload.segments,
-                translations: translations
+                translations: orderedTranslations(for: payload.segments, from: translationsByID)
             )
         }
 
-        var fallbackTranslations: [WebPageSegmentTranslation] = []
-        var fallbackModelName = retryResult.modelName
-        for segment in payload.segments {
-            try Task.checkCancellation()
-            do {
-                let result = try await run(
-                    request: TaskRequest(
-                        task: .translate,
-                        inputText: segment.text,
-                        targetLanguage: payload.targetLanguage
-                    ),
-                    modelID: model.id,
-                    persistHistory: snapshot.preferences.webPageTranslation.persistWebHistory
-                )
-                fallbackModelName = result.modelName
-                fallbackTranslations.append(
-                    WebPageSegmentTranslation(
-                        segmentID: segment.segmentID,
-                        translation: result.text,
-                        status: .translated
-                    )
-                )
-            } catch {
-                fallbackTranslations.append(
-                    WebPageSegmentTranslation(
-                        segmentID: segment.segmentID,
-                        translation: "",
-                        status: .failed,
-                        errorMessage: error.localizedDescription
-                    )
-                )
-            }
-        }
+        let fallbackSegments = missingSegments(from: payload.segments, translationsByID: translationsByID)
+        let fallbackResult = try await translateWebPageSegmentsBySplitting(
+            fallbackSegments,
+            payload: payload,
+            model: model,
+            persistHistory: persistHistory,
+            depth: 0
+        )
+        latestModelName = fallbackResult.modelName ?? latestModelName
+        mergeSuccessfulTranslations(
+            fallbackResult.translations,
+            into: &translationsByID
+        )
 
         return webPageResult(
             jobID: payload.jobID,
-            modelName: fallbackModelName,
+            modelName: latestModelName,
             segments: payload.segments,
-            translations: fallbackTranslations
+            translations: orderedTranslations(for: payload.segments, from: translationsByID)
         )
     }
 
@@ -278,19 +259,182 @@ public actor TaskEngine {
         }
     }
 
+    private func runWebPageBatch(
+        segments: [WebPageTranslationSegment],
+        payload: WebPageTranslateSegmentsPayload,
+        model: ModelDescriptor,
+        isRetry: Bool,
+        persistHistory: Bool
+    ) async throws -> WebPageBatchRunResult {
+        guard !segments.isEmpty else {
+            return WebPageBatchRunResult(modelName: model.name, translations: [])
+        }
+        let request = TaskRequest(
+            task: .webPageTranslate,
+            inputText: try PromptTemplates.webPageBatchPrompt(
+                segments: segments,
+                targetLanguage: payload.targetLanguage,
+                isRetry: isRetry
+            ),
+            sourceLanguage: payload.sourceLanguage,
+            targetLanguage: payload.targetLanguage
+        )
+        try validateInputSize(request, for: model)
+        let result = try await run(
+            request: request,
+            modelID: model.id,
+            persistHistory: persistHistory
+        )
+        return WebPageBatchRunResult(
+            modelName: result.modelName,
+            translations: parseWebPageTranslations(from: result.text, segments: segments)
+        )
+    }
+
+    private func translateWebPageSegmentsBySplitting(
+        _ segments: [WebPageTranslationSegment],
+        payload: WebPageTranslateSegmentsPayload,
+        model: ModelDescriptor,
+        persistHistory: Bool,
+        depth: Int
+    ) async throws -> WebPageFallbackResult {
+        guard !segments.isEmpty else {
+            return WebPageFallbackResult(modelName: nil, translations: [])
+        }
+        try Task.checkCancellation()
+
+        if segments.count == 1 {
+            let segment = segments[0]
+            do {
+                let result = try await run(
+                    request: TaskRequest(
+                        task: .translate,
+                        inputText: segment.text,
+                        targetLanguage: payload.targetLanguage
+                    ),
+                    modelID: model.id,
+                    persistHistory: persistHistory
+                )
+                return WebPageFallbackResult(
+                    modelName: result.modelName,
+                    translations: [
+                        WebPageSegmentTranslation(
+                            segmentID: segment.segmentID,
+                            translation: result.text,
+                            status: .translated
+                        )
+                    ]
+                )
+            } catch {
+                return WebPageFallbackResult(
+                    modelName: nil,
+                    translations: [
+                        WebPageSegmentTranslation(
+                            segmentID: segment.segmentID,
+                            translation: "",
+                            status: .failed,
+                            errorMessage: error.localizedDescription
+                        )
+                    ]
+                )
+            }
+        }
+
+        do {
+            let batchResult = try await runWebPageBatch(
+                segments: segments,
+                payload: payload,
+                model: model,
+                isRetry: true,
+                persistHistory: persistHistory
+            )
+            var translationsByID: [String: WebPageSegmentTranslation] = [:]
+            mergeSuccessfulTranslations(batchResult.translations, into: &translationsByID)
+            if hasTranslations(for: segments, in: translationsByID) {
+                return WebPageFallbackResult(
+                    modelName: batchResult.modelName,
+                    translations: orderedTranslations(for: segments, from: translationsByID)
+                )
+            }
+
+            let missing = missingSegments(from: segments, translationsByID: translationsByID)
+            let splitResult = try await splitWebPageSegments(
+                missing,
+                payload: payload,
+                model: model,
+                persistHistory: persistHistory,
+                depth: depth
+            )
+            mergeSuccessfulTranslations(splitResult.translations, into: &translationsByID)
+            return WebPageFallbackResult(
+                modelName: splitResult.modelName ?? batchResult.modelName,
+                translations: orderedTranslations(for: segments, from: translationsByID)
+            )
+        } catch {
+            return try await splitWebPageSegments(
+                segments,
+                payload: payload,
+                model: model,
+                persistHistory: persistHistory,
+                depth: depth
+            )
+        }
+    }
+
+    private func splitWebPageSegments(
+        _ segments: [WebPageTranslationSegment],
+        payload: WebPageTranslateSegmentsPayload,
+        model: ModelDescriptor,
+        persistHistory: Bool,
+        depth: Int
+    ) async throws -> WebPageFallbackResult {
+        guard segments.count > 1 else {
+            return try await translateWebPageSegmentsBySplitting(
+                segments,
+                payload: payload,
+                model: model,
+                persistHistory: persistHistory,
+                depth: depth + 1
+            )
+        }
+        let midpoint = max(1, segments.count / 2)
+        let left = try await translateWebPageSegmentsBySplitting(
+            Array(segments[..<midpoint]),
+            payload: payload,
+            model: model,
+            persistHistory: persistHistory,
+            depth: depth + 1
+        )
+        let right = try await translateWebPageSegmentsBySplitting(
+            Array(segments[midpoint...]),
+            payload: payload,
+            model: model,
+            persistHistory: persistHistory,
+            depth: depth + 1
+        )
+        return WebPageFallbackResult(
+            modelName: right.modelName ?? left.modelName,
+            translations: left.translations + right.translations
+        )
+    }
+
     private func parseWebPageTranslations(
         from output: String,
         segments: [WebPageTranslationSegment]
-    ) -> [WebPageSegmentTranslation]? {
+    ) -> [WebPageSegmentTranslation] {
         let jsonText = extractJSONArray(from: output)
         guard let data = jsonText.data(using: .utf8),
               let decoded = try? JSONDecoder().decode([WebPageTranslationJSONItem].self, from: data) else {
-            return nil
+            return []
         }
 
         let expectedIDs = Set(segments.map(\.segmentID))
-        let mapped = decoded.compactMap { item -> WebPageSegmentTranslation? in
+        var seenIDs = Set<String>()
+        return decoded.compactMap { item -> WebPageSegmentTranslation? in
             guard expectedIDs.contains(item.id) else {
+                return nil
+            }
+            guard seenIDs.insert(item.id).inserted else {
                 return nil
             }
             let translation = item.translation.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -308,11 +452,43 @@ public actor TaskEngine {
                 status: .translated
             )
         }
+    }
 
-        guard mapped.count == segments.count else {
-            return nil
+    private func mergeSuccessfulTranslations(
+        _ translations: [WebPageSegmentTranslation],
+        into translationsByID: inout [String: WebPageSegmentTranslation]
+    ) {
+        for translation in translations where translation.status == .translated && !translation.translation.isEmpty {
+            translationsByID[translation.segmentID] = translation
         }
-        return mapped
+    }
+
+    private func hasTranslations(
+        for segments: [WebPageTranslationSegment],
+        in translationsByID: [String: WebPageSegmentTranslation]
+    ) -> Bool {
+        segments.allSatisfy { translationsByID[$0.segmentID] != nil }
+    }
+
+    private func missingSegments(
+        from segments: [WebPageTranslationSegment],
+        translationsByID: [String: WebPageSegmentTranslation]
+    ) -> [WebPageTranslationSegment] {
+        segments.filter { translationsByID[$0.segmentID] == nil }
+    }
+
+    private func orderedTranslations(
+        for segments: [WebPageTranslationSegment],
+        from translationsByID: [String: WebPageSegmentTranslation]
+    ) -> [WebPageSegmentTranslation] {
+        segments.map { segment in
+            translationsByID[segment.segmentID] ?? WebPageSegmentTranslation(
+                segmentID: segment.segmentID,
+                translation: "",
+                status: .failed,
+                errorMessage: "Translation failed"
+            )
+        }
     }
 
     private func extractJSONArray(from output: String) -> String {
@@ -406,6 +582,16 @@ public actor TaskEngine {
             return url.lastPathComponent
         }
         return url.deletingPathExtension().lastPathComponent
+    }
+
+    private struct WebPageBatchRunResult {
+        var modelName: String
+        var translations: [WebPageSegmentTranslation]
+    }
+
+    private struct WebPageFallbackResult {
+        var modelName: String?
+        var translations: [WebPageSegmentTranslation]
     }
 
     private struct WebPageTranslationJSONItem: Decodable {

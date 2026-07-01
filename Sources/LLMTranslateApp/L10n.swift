@@ -46,11 +46,53 @@ enum L10n {
         }
     }
 
+    static func pendingIndicatorStyleName(_ style: WebPagePendingIndicatorStyle, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            switch style {
+            case .loading: return "Loading"
+            case .flipText: return "Flip text"
+            case .none: return "None"
+            }
+        case .chinese:
+            switch style {
+            case .loading: return "Loading"
+            case .flipText: return "翻牌"
+            case .none: return "无样式"
+            }
+        }
+    }
+
     private static let chinese: [String: String] = [
         "Quick Action": "快捷操作",
         "Selection Actions": "选择操作",
         "Choose an action": "选择操作",
         "Widget": "组件",
+        "General": "通用",
+        "Shortcuts": "快捷键",
+        "About": "关于",
+        "Launch": "启动",
+        "Interface": "界面",
+        "Text": "文本",
+        "Language": "语言",
+        "Selection": "划词",
+        "Global shortcuts": "全局快捷键",
+        "Open Quick Action without selected text": "打开快捷操作（不读取选中文本）",
+        "Press shortcut": "按下快捷键",
+        "Change shortcut": "修改快捷键",
+        "Reset shortcut": "恢复默认快捷键",
+        "Shortcut is already assigned": "快捷键已被占用",
+        "Use Command, Option, or Control with a key": "请使用 Command、Option 或 Control 加一个按键",
+        "Webpage": "网页",
+        "Browser": "浏览器",
+        "Extension folder": "扩展文件夹",
+        "Default model": "默认模型",
+        "History": "历史",
+        "Application": "应用",
+        "Version": "版本",
+        "Data": "数据",
+        "Open Data Folder": "打开数据文件夹",
+        "Quit llmTranslate": "退出 llmTranslate",
         "Models": "模型",
         "Models & Settings": "模型与设置",
         "Settings": "设置",
@@ -58,6 +100,9 @@ enum L10n {
         "Defaults": "默认值",
         "Web Page Translation": "网页翻译",
         "Enable webpage translation": "启用网页翻译",
+        "Translation model": "翻译模型",
+        "Use default model": "跟随默认模型",
+        "Pending translation style": "待翻译样式",
         "Repair Chrome Bridge": "修复 Chrome 桥接",
         "Open Chrome Extensions": "打开 Chrome 扩展",
         "Chrome bridge repaired": "Chrome 桥接已修复",

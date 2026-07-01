@@ -141,8 +141,9 @@ final class LocalAppBridgeServer {
                         appName: "llmTranslate",
                         protocolVersion: 1,
                         bridgeReady: true,
-                        modelName: appState.selectedModelDisplayName(limit: 48),
-                        webPageTranslationEnabled: appState.preferences.webPageTranslation.enabled
+                        modelName: appState.webPageTranslationModelDisplayName(limit: 48),
+                        webPageTranslationEnabled: appState.preferences.webPageTranslation.enabled,
+                        pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue
                     )
                 )
             case ("POST", "/translateSegments"):
@@ -150,7 +151,7 @@ final class LocalAppBridgeServer {
                 let task = Task {
                     try await appState.engine.translateWebPageSegments(
                         payload: payload,
-                        modelID: appState.selectedModelID
+                        modelID: appState.webPageTranslationModelID
                     )
                 }
                 activeJobs[payload.jobID] = task
@@ -283,6 +284,7 @@ private struct BridgeStatusPayload: Codable {
     var bridgeReady: Bool
     var modelName: String
     var webPageTranslationEnabled: Bool
+    var pendingIndicatorStyle: String
 }
 
 private struct CancelJobPayload: Codable {

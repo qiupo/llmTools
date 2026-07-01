@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import LLMTranslateCore
 
 @MainActor
 protocol HotKeyServiceDelegate: AnyObject {
@@ -26,7 +27,12 @@ final class HotKeyService {
         }
     }
 
-    func registerDefaultHotKey() {
+    func registerHotKeys(
+        quickActionShortcut: KeyboardShortcutPreference,
+        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
+    ) {
+        unregister()
+
         let eventSpec = EventTypeSpec(
             eventClass: OSType(kEventClassKeyboard),
             eventKind: UInt32(kEventHotKeyPressed)
@@ -65,8 +71,16 @@ final class HotKeyService {
             &eventHandler
         )
 
-        registerHotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey), id: 1)
-        registerHotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey | shiftKey), id: 2)
+        registerHotKey(
+            keyCode: quickActionShortcut.keyCode,
+            modifiers: quickActionShortcut.modifiers,
+            id: 1
+        )
+        registerHotKey(
+            keyCode: quickActionWithoutSelectionShortcut.keyCode,
+            modifiers: quickActionWithoutSelectionShortcut.modifiers,
+            id: 2
+        )
     }
 
     private func registerHotKey(keyCode: UInt32, modifiers: UInt32, id: UInt32) {

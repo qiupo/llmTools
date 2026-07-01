@@ -127,10 +127,21 @@ struct LLMTranslateChecks {
         try require(preferences.selectionActionTriggerSelectAll, "Expected Command-A selection trigger to default on.")
         try require(preferences.webPageTranslation.enabled, "Expected webpage translation to default on.")
         try require(preferences.webPageTranslation.defaultTargetLanguage == "zh-Hans", "Expected webpage translation target to default to Simplified Chinese.")
+        try require(preferences.webPageTranslation.pendingIndicatorStyle == .loading, "Expected webpage pending indicator to default to loading.")
         try require(!preferences.webPageTranslation.persistWebHistory, "Expected webpage translation history to default off.")
+        try require(preferences.quickActionShortcut == .optionSpace, "Expected quick action shortcut to default to Option-Space.")
+        try require(preferences.quickActionWithoutSelectionShortcut == .optionShiftSpace, "Expected no-selection quick action shortcut to default to Option-Shift-Space.")
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
+
+        let webPagePreferences = try JSONDecoder().decode(WebPageTranslationPreferences.self, from: Data("""
+        {
+          "enabled": true,
+          "defaultTargetLanguage": "zh-Hans"
+        }
+        """.utf8))
+        try require(webPagePreferences.pendingIndicatorStyle == .loading, "Expected older webpage preferences to default pending indicator to loading.")
     }
 
     private static func checkWebPageTranslationBatchSkipsHistoryByDefault() async throws {

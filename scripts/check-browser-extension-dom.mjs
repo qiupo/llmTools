@@ -31,6 +31,7 @@ async function runBackgroundBatchCheck() {
   const nativeTranslatePayloads = [];
   const appliedTranslations = [];
   const popupStates = [];
+  const startSessionMessages = [];
   const contextMenuItems = new Map();
   const localStorageData = {};
 
@@ -54,7 +55,7 @@ async function runBackgroundBatchCheck() {
       },
       sendNativeMessage(_hostName, message) {
         if (message.type === "getStatus") {
-          return Promise.resolve({ status: "ok", payload: { modelName: "stub-model" } });
+          return Promise.resolve({ status: "ok", payload: { modelName: "stub-model", pendingIndicatorStyle: "flipText" } });
         }
         if (message.type === "translateSegments") {
           nativeTranslatePayloads.push(message.payload);
@@ -144,6 +145,7 @@ async function runBackgroundBatchCheck() {
           return Promise.resolve({ ok: true });
         }
         if (message.type === "startSession") {
+          startSessionMessages.push(message);
           return Promise.resolve({
             ok: true,
             url: "https://example.test/article",
@@ -213,6 +215,7 @@ async function runBackgroundBatchCheck() {
   assert(nativeTranslatePayloads[0].segments.some((segment) => segment.segmentID === "s1"), "expected first repeated segment to be translated");
   assert(!nativeTranslatePayloads[0].segments.some((segment) => segment.segmentID === "s2"), "expected duplicate repeated segment to reuse the first translation");
   assert(appliedTranslations.some((item) => item.segmentID === "s2" && item.translation === "重复标签"), "expected duplicate node to receive reused translation");
+  assert(startSessionMessages[0]?.pendingIndicatorStyle === "flipText", "expected background to pass configured pending indicator style to content script");
   assert(finalState.status === "translated", `expected translated state, got ${finalState.status}`);
   assert(finalState.done === 3 && finalState.total === 3, `expected 3/3 final progress, got ${finalState.done}/${finalState.total}`);
   assert(popupStates.some((message) => message.state?.modelName === "stub-model"), "expected model name to be published to popup state");
@@ -387,6 +390,135 @@ async function runContentScriptDomCheck() {
     assert(restoredState.inputValue === "Do not translate input values", "restore should leave input value unchanged");
     assert(restoredState.spinnerCount === 0, "restore should remove pending segment spinners");
 
+    await evaluate(client, "window.__llmTranslateMessages = []");
+    const flipStartResult = await sendContentMessage(client, {
+      type: "startSession",
+      pageSessionID: "flip-style-check",
+      pendingIndicatorStyle: "flipText"
+    });
+    const flipInitialState = await evaluate(client, `
+      (() => ({
+        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        pendingCount: document.querySelectorAll(".llmtranslate-segment-flip-pending").length,
+        completeCount: document.querySelectorAll(".llmtranslate-segment-flip-complete").length,
+        tileCount: document.querySelectorAll(".llmtranslate-segment-flip-tile").length
+      }))()
+    `);
+    assert(flipInitialState.spinnerCount === 0, "flip text style should not show segment spinners while pending");
+    assert(flipInitialState.flipCount === flipStartResult.segments.length, `expected one pending flip wrapper per segment, got ${flipInitialState.flipCount}/${flipStartResult.segments.length}`);
+    assert(flipInitialState.pendingCount === flipStartResult.segments.length, "flip text style should start in pending swing state");
+    assert(flipInitialState.completeCount === 0, "flip text style should not start in complete state");
+    assert(flipInitialState.tileCount > flipInitialState.flipCount, "flip text style should split text into left-to-right blocks");
+    await sendContentMessage(client, {
+      type: "applyTranslations",
+      translations: flipStartResult.segments.map((segment, index) => ({
+        segmentID: segment.segmentID,
+        status: "translated",
+        translation: `README.md yesterday ${index + 1}`
+      }))
+    });
+    const flipAnimatingState = await evaluate(client, `
+      (() => ({
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        pendingCount: document.querySelectorAll(".llmtranslate-segment-flip-pending").length,
+        completeCount: document.querySelectorAll(".llmtranslate-segment-flip-complete").length,
+        tileCount: document.querySelectorAll(".llmtranslate-segment-flip-tile").length,
+        flipTexts: Array.from(document.querySelectorAll(".llmtranslate-segment-flip")).map((node) => node.textContent || ""),
+        flipFinalTexts: Array.from(document.querySelectorAll(".llmtranslate-segment-flip")).map((node) => node.dataset.llmTranslateFinalText || ""),
+        styleCount: document.querySelectorAll("style[data-llm-translate-spinner-style='true']").length
+      }))()
+    `);
+    assert(flipAnimatingState.flipCount === flipStartResult.segments.length, `expected all flip text indicators while animating, got ${flipAnimatingState.flipCount}`);
+    assert(flipAnimatingState.pendingCount === 0, "translated flip indicators should leave pending swing state");
+    assert(flipAnimatingState.completeCount === flipStartResult.segments.length, "translated flip indicators should enter complete flip state");
+    assert(flipAnimatingState.tileCount > flipAnimatingState.flipCount, "complete flip state should keep left-to-right block tiles");
+    assert(flipAnimatingState.flipFinalTexts.some((text) => text.includes("README.md yesterday")), "flip text indicator should retain the translated text");
+    assert(flipAnimatingState.styleCount === 1, "flip text style should reuse the shared indicator style tag");
+    await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 1900))");
+    const flipSettledState = await evaluate(client, `
+      (() => ({
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        pageText: document.documentElement.textContent
+      }))()
+    `);
+    assert(flipSettledState.flipCount === 0, "flip text indicator should settle back to a plain text node");
+    assert(flipSettledState.pageText.includes("README.md yesterday 1"), "settled flip text translation should remain visible");
+    await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 700))");
+    const postFlipMessages = await evaluate(client, "window.__llmTranslateMessages");
+    assert(
+      !postFlipMessages.some((message) => message.type === "segmentsDiscovered" && message.segments?.some((segment) => segment.text.includes("README.md yesterday"))),
+      "settled flip text that still contains English should not be rediscovered as new segments"
+    );
+    await sendContentMessage(client, { type: "restore" });
+
+    await evaluate(client, "window.__llmTranslateMessages = []");
+    await sendContentMessage(client, {
+      type: "startSession",
+      pageSessionID: "flip-stale-cleanup-check",
+      pendingIndicatorStyle: "flipText"
+    });
+    const stalePendingBefore = await evaluate(client, "document.querySelectorAll('.llmtranslate-segment-flip-pending').length");
+    assert(stalePendingBefore > 0, "stale cleanup check should start with pending flip indicators");
+    await sendContentMessage(client, {
+      type: "translationState",
+      state: {
+        status: "translated",
+        message: "Translated 0/0 segments.",
+        done: 0,
+        total: 0,
+        failed: 0,
+        hasTranslations: false
+      }
+    });
+    await evaluate(client, "new Promise((resolve) => setTimeout(resolve, 3300))");
+    const stalePendingAfter = await evaluate(client, `
+      (() => ({
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        messages: window.__llmTranslateMessages
+      }))()
+    `);
+    assert(stalePendingAfter.flipCount === 0, "terminal translation state should clear stale pending flip indicators");
+    assert(
+      !stalePendingAfter.messages.some((message) => message.type === "segmentsDiscovered"),
+      "stale pending cleanup should not rediscover restored original text"
+    );
+    await sendContentMessage(client, { type: "restore" });
+
+    const noneStartResult = await sendContentMessage(client, {
+      type: "startSession",
+      pageSessionID: "none-style-check",
+      pendingIndicatorStyle: "none"
+    });
+    const noneInitialState = await evaluate(client, `
+      (() => ({
+        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length
+      }))()
+    `);
+    assert(noneStartResult.segments.length > 0, "none style session should still discover segments");
+    assert(noneInitialState.spinnerCount === 0, "none style should not show segment spinners");
+    assert(noneInitialState.flipCount === 0, "none style should not show flip indicators");
+    await sendContentMessage(client, {
+      type: "applyTranslations",
+      translations: noneStartResult.segments.slice(0, 1).map((segment) => ({
+        segmentID: segment.segmentID,
+        status: "translated",
+        translation: "无样式译文"
+      }))
+    });
+    const noneTranslatedState = await evaluate(client, `
+      (() => ({
+        spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+        flipCount: document.querySelectorAll(".llmtranslate-segment-flip").length,
+        pageText: document.documentElement.textContent
+      }))()
+    `);
+    assert(noneTranslatedState.spinnerCount === 0, "none style should not leave segment spinners after translation");
+    assert(noneTranslatedState.flipCount === 0, "none style should not create flip indicators after translation");
+    assert(noneTranslatedState.pageText.includes("无样式译文"), "none style should still apply translations");
+    await sendContentMessage(client, { type: "restore" });
+
     await sendContentMessage(client, { type: "startSession", pageSessionID: "invalidated-context-check" });
     await sendContentMessage(client, {
       type: "translationState",
@@ -433,6 +565,42 @@ async function runContentScriptDomCheck() {
     assert(invalidatedResult.threw === false, `invalidated runtime send should not throw: ${invalidatedResult.message || ""}`);
     assert(invalidatedResult.after.spinnerCount === 0, "invalidated runtime send should clear pending spinners");
     assert(invalidatedResult.after.overlayPresent === false, "invalidated runtime send should hide overlay");
+
+    await sendContentMessage(client, { type: "startSession", pageSessionID: "invalidated-context-reject-check" });
+    const rejectedResult = await evaluate(client, `
+      (async () => {
+        window.__llmTranslateSendMessageMode = "reject";
+        window.chrome.runtime.sendMessage = (_message) => {
+          return Promise.reject(new Error("Extension context invalidated."));
+        };
+        const before = {
+          spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+          overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
+        };
+        try {
+          const p = document.createElement("p");
+          p.dataset.invalidatedPromiseReject = "true";
+          p.textContent = "Rejected runtime context should not throw here.";
+          document.querySelector("main").appendChild(p);
+          await new Promise((resolve) => setTimeout(resolve, 700));
+        } catch (error) {
+          return { threw: true, message: error.message, before };
+        }
+        return {
+          threw: false,
+          before,
+          after: {
+            spinnerCount: document.querySelectorAll(".llmtranslate-segment-spinner").length,
+            overlayPresent: Boolean(document.querySelector("html > div[style*='z-index: 2147483647']"))
+          }
+        };
+      })()
+    `);
+    assert(rejectedResult.before.spinnerCount > 0, "rejected promise check should start with pending spinners");
+    assert(rejectedResult.before.overlayPresent === true, "rejected promise check should start with overlay");
+    assert(rejectedResult.threw === false, `invalidated promise rejection should not throw: ${rejectedResult.message || ""}`);
+    assert(rejectedResult.after.spinnerCount === 0, "invalidated promise rejection should clear pending spinners");
+    assert(rejectedResult.after.overlayPresent === false, "invalidated promise rejection should hide overlay");
   } catch (error) {
     error.message = `${error.message}\nChrome stderr:\n${stderr.slice(-4_000)}`;
     throw error;
