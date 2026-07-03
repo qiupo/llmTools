@@ -1,12 +1,19 @@
-# Phase 1 Spec
+# Phase 1 Spec - Completed
 
-Last updated: 2026-06-26
+Last updated: 2026-07-03
+
+Status: completed and accepted as the Phase 1 baseline.
+
+This document now serves two purposes:
+
+- record the Phase 1 product contract that was implemented
+- define the regression surface that later phases must not break
 
 ## 1. Objective
 
-Phase 1 delivers the first usable native macOS version of llmTools.
+Phase 1 delivered the first usable native macOS version of llmTools.
 
-The app should let a user:
+The app lets a user:
 
 - register existing local Qwen models
 - select or paste text
@@ -14,7 +21,7 @@ The app should let a user:
 - copy the result
 - use a small floating desktop widget
 
-The most important Phase 1 loop is:
+The most important Phase 1 loop remains:
 
 1. select text in any macOS app
 2. press a global shortcut
@@ -23,6 +30,8 @@ The most important Phase 1 loop is:
 5. copy the generated result
 
 ## 2. Phase 1 Scope
+
+Phase 1 scope is closed. New work should not be added here unless it is a regression fix or documentation correction.
 
 ### In Scope
 
@@ -529,7 +538,7 @@ Examples:
 
 ## 19. Acceptance Criteria
 
-Phase 1 is complete when:
+Phase 1 is complete and accepted because the product surface covers:
 
 - The app launches as a native macOS menu-bar utility.
 - The user can register multiple local model paths.
@@ -549,7 +558,37 @@ Phase 1 is complete when:
 - The app can be packaged and launched as a local `.app` for real macOS permission and window-behavior testing.
 - Failures produce visible, understandable messages.
 
-## 20. Implementation Milestones
+## 20. Completion Record
+
+Accepted date: 2026-07-03.
+
+Completed capability groups:
+
+- Native macOS menu-bar app lifecycle.
+- Global shortcut and quick action flow for selected or pasted text.
+- Manual input fallback when selected-text capture is unavailable.
+- Model registry with local GGUF and MLX model support.
+- Shared task engine for translation, polishing, summarization, explanation, and TODO extraction.
+- Real local runner support for GGUF and MLX model formats.
+- Copyable results and recent history capped by local preferences.
+- Floating widget MVP with drag/dock/collapse behavior.
+- Local app packaging through `./scripts/package-app.sh`.
+- Packaged app output at `dist/llmTools.app`.
+
+Regression baseline:
+
+- `swift build` should compile.
+- `swift run LLMToolsChecks` should pass.
+- Real-model smoke checks should continue to work for representative GGUF and MLX paths when models are present.
+- The packaged app should launch from `dist/llmTools.app`.
+- Settings, model registration, quick action, selected-text fallback, floating widget, and history clearing should remain usable after Phase 2 changes.
+
+Maintenance boundary:
+
+- Bugs found in Phase 1 flows should be fixed against this document.
+- New product scope should be tracked in Phase 2 or later documents instead of reopening Phase 1.
+
+## 21. Completed Implementation Milestones
 
 ### Milestone 1: Native Shell
 
@@ -604,7 +643,7 @@ Phase 1 is complete when:
 - local `.app` packaging check
 - recent history clear action
 
-## 21. Confirmed Phase 1 Decisions
+## 22. Confirmed Phase 1 Decisions
 
 The following product decisions are confirmed:
 

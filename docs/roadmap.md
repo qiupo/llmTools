@@ -1,6 +1,6 @@
 # llmTools Roadmap
 
-Last updated: 2026-06-30
+Last updated: 2026-07-03
 
 ## Product Direction
 
@@ -12,11 +12,19 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 - local model reuse through user-selected model files or model folders
 - task-first interaction, with model selection hidden behind sensible defaults
 
-The app should default to local processing. Cloud APIs are not part of the initial product scope.
+The app should default to local processing. Remote provider entries can exist in the shared model registry, but browser page translation must remain local/private by default unless the user explicitly chooses a remote provider.
+
+## Current Status
+
+- Phase 1 native MVP is complete as of 2026-07-03.
+- Phase 1 should now be treated as the stable baseline for regression checks: selected-text processing, quick action, model registry, GGUF/MLX runners, task templates, floating widget, local packaging, and recent history.
+- Phase 2 is the active next product phase.
+- Phase 2.0 Chrome webpage translation baseline is complete: current-page translation, native bridge, real model translation, restore, cancel, dynamic scroll translation, cache, context-menu toggle, popup, overlay, Settings entry, and packaged-app workflow.
+- Remaining Phase 2 work should focus on product expansion that was deferred in the original plan: site/domain rules, production distribution, additional browsers, advanced reading modes, complex-page support, and release-grade QA/privacy controls.
 
 ## Confirmed Decisions
 
-- Phase 1 native MVP is complete.
+- Phase 1 native MVP is complete and frozen as the baseline for future regression checks.
 - Platform: native macOS app using SwiftUI/AppKit.
 - Minimum platform target: macOS 14 or newer, with development and verification on the current newer macOS environment.
 - Model source: users can reuse already downloaded local models by selecting model files or model folders.
@@ -34,6 +42,10 @@ The app should default to local processing. Cloud APIs are not part of the initi
 - Web-page translation should reuse the local translation engine through a local bridge. Page text must not be sent to cloud services by default.
 - Web-page translation default: translate visible English page text into Chinese while preserving page structure and allowing the user to restore the original text.
 - Browser extension installation cannot be silent on normal consumer browsers. The app should provide a guided installer in Settings that opens the correct browser or extension settings page, installs local bridge assets, and verifies the extension after the user confirms browser permissions.
+- Phase 2.0 starts with Google Chrome on macOS.
+- Phase 2.0 uses a Chrome extension, native messaging host, and a local `127.0.0.1` app bridge protected by an app-generated token.
+- Development Chrome extension ID: `jednddlgkkohaebgoejcidfppddjegij`.
+- Phase 2.0 Chrome baseline is complete. Later Phase 2 work should not relitigate the Chrome MVP architecture unless a regression or browser policy change requires it.
 
 ## Phase 1: Native MVP - Completed
 
@@ -63,6 +75,12 @@ Primary acceptance:
 - A user can paste text into the floating widget and process it.
 - A user can clear recent results with one action.
 
+Completion record:
+
+- Accepted as complete on 2026-07-03.
+- Future work in this area should be treated as maintenance, polish, or regression repair unless a new phase explicitly changes scope.
+- Phase 1 verification should continue to use the packaged app path `dist/llmTools.app`, not only `swift build`.
+
 See `docs/phase-1-spec.md` for the detailed spec.
 
 ## Phase 2: Web Page Translation
@@ -71,41 +89,53 @@ Goal: provide the existing local translation capability to webpages, so a user c
 
 Detailed PRD: `docs/phase-2-web-page-translation-prd.md`.
 
-Core capabilities:
+Completed Phase 2.0 baseline:
 
-- browser extension MVP connected to the native app
+- Chrome MV3 extension in `browser-extension/chromium`.
+- Native messaging executable target `LLMToolsNativeHost`.
+- Local bridge server in the native app, with bridge state at `~/Library/Application Support/llmTools/web-page-bridge.json`.
+- Settings UI section `网页翻译` with Chrome bridge repair and extension-folder guidance.
+- Webpage-specific translation request/response types and `TaskEngine.translateWebPageSegments`.
+- DOM text discovery, English-dominant filtering, skip rules, overlay, restore, cancel, dynamic discovery, context-menu toggle, and translation cache logic in the extension.
+- Packaged-app workflow for the Chrome development extension.
+- Focused checks through `swift run LLMToolsChecks` and `node scripts/check-browser-extension-dom.mjs`.
+
+Completed Phase 2.0 capabilities:
+
+- Chrome browser extension connected to the native app
 - Settings-page browser integration panel
-- guided extension installer for supported browsers
-- local bridge between the extension and llmTools
-- one-click "translate this page" action for the current tab
+- Chrome development bridge repair flow
+- native messaging host and local app bridge
+- one-click current-tab translation
 - visible-text extraction from the page DOM
 - English-to-Chinese translation in place
-- original-text restore action
-- per-page and per-domain enable/disable controls
-- progress, cancellation, and error display for large pages
+- original-text restore
+- cancellation
+- progress and error display
 - batching, rate limiting, and incremental translation
-- lightweight translation cache for repeated text segments
+- persistent local translation cache for repeated text segments
 - dynamic-page handling for text that appears after scroll or navigation
-- local-only privacy boundary by default
+- context-menu toggle
+- local-only bridge boundary
 
-Implementation direction:
+Remaining implementation direction:
 
-- Start with a browser extension because webpage DOM replacement needs browser-side code.
-- If no browser priority is specified, build the first MVP for the user's primary Chromium-based browser, then add Safari Web Extension support after the bridge and DOM translation behavior are stable.
+- Preserve the Chrome 2.0 architecture as the baseline.
+- Add site/domain rules and optional auto-translation before adding broad browser or content-type scope.
+- Add production Chrome distribution if the user wants non-development installation.
+- Add Edge before Safari or Firefox unless user priority changes.
+- Add bilingual/original reading mode after site rules are stable.
+- Add complex-page and embedded-content support incrementally, with graceful unsupported states.
 - Do not design for silent extension installation. Chrome, Safari, Firefox, and similar browsers require user confirmation, store distribution, enabling, or browser-controlled permission prompts outside the app's direct control.
-- The Settings installer should be a one-click guided flow: detect installed supported browsers, show extension status, open the correct install or enable page, install or repair native messaging bridge assets, pair the extension with the app, run a test ping, and then offer "Translate current page" when ready.
-- The extension owns browser permissions, page text discovery, DOM replacement, restore behavior, and page-level controls.
-- The native macOS app owns model selection, prompt templates, runner lifecycle, task execution, logging, and local privacy controls.
-- Connect the extension to the app through a local-only bridge, such as a loopback HTTP/WebSocket service or native messaging host.
-- Protect the local bridge with an app-generated token or pairing flow so random webpages cannot call the local model endpoint.
-- Add a `webPageTranslate` task path in the app layer instead of treating webpage translation as generic pasted text.
-- Translate text nodes in batches, preserve links and layout, and avoid rewriting HTML structure unless required.
-- Keep page translation cancellable. Closing the tab, navigating away, or pressing cancel should stop queued work.
+- Keep the extension responsible for browser permissions, page text discovery, DOM replacement, restore behavior, site rules, and page-level controls.
+- Keep the native macOS app responsible for model selection, prompt templates, runner lifecycle, task execution, logging, diagnostics, and local privacy controls.
 
-Settings installer behavior:
+Remaining Settings behavior:
 
 - Show browser rows for installed supported browsers, with statuses such as "not installed", "installed but disabled", "needs permission", "bridge missing", "paired", and "ready".
-- For Chromium-based browsers, prefer a published extension flow for normal use. The app may open the extension's store listing or managed install instructions, but the user must confirm installation and permissions in the browser.
+- Show development/production extension channel, extension ID, version, native host path, manifest path, and last successful ping.
+- Show domain rules and cache controls.
+- For Chromium-based browsers, prefer a published extension flow for normal use once production distribution is selected. The app may open the extension's store listing or managed install instructions, but the user must confirm installation and permissions in the browser.
 - For Safari, package the Safari Web Extension with a containing app target when that becomes the chosen distribution path. The Settings button may open Safari's extension preferences, but the user must enable the extension in Safari.
 - For Firefox, support a signed add-on flow and native messaging manifest installation. The user must install or approve the add-on through Firefox's controlled flow.
 - Provide a local development mode only for developer builds, such as opening `chrome://extensions` with load-unpacked instructions or Safari unsigned-extension instructions. Do not treat development install flows as the normal user path.
@@ -120,22 +150,31 @@ DOM translation rules:
 - Store enough original text in the page session to restore the page without a reload.
 - Avoid permanent storage of full page content unless the user explicitly enables history for webpage translation.
 
-Suggested scope:
+Remaining suggested scope:
 
-- Start with manual current-tab translation.
-- Start with English-to-Chinese only.
-- Start with ordinary article, documentation, blog, and product pages.
-- Translate the initially visible page first, then translate additional visible content as the user scrolls.
-- Defer full-page pretranslation, bilingual side-by-side view, image/OCR translation, PDF-in-browser translation, form-writing assistance, and complex web-app mutation handling until the MVP is stable.
+- Add site rules and auto-translate first.
+- Add production Chrome distribution second.
+- Add Edge third.
+- Add bilingual/original reading mode after domain behavior is stable.
+- Add full-page pretranslation, browser PDF viewer translation, image/OCR translation, form-writing assistance, and complex web-app mutation handling only after the normal DOM path remains stable.
 
-Primary acceptance:
+Remaining primary acceptance:
 
-- A user can open an English article or documentation page, trigger llmTools, and see the English text replaced by readable Chinese in the page.
-- The page remains usable: links still work, layout does not collapse, and buttons/forms are not corrupted.
-- The user can restore the original English text without reloading the page.
-- The user can cancel a long translation and see a clear partial/failed state.
-- Page text stays local by default, and the app shows which local model handled the webpage translation.
-- Repeated text on the same page is not translated redundantly.
+- A user can set per-site rules and auto-translate trusted domains.
+- A user can use a production-like Chrome install path or see a clear development-only decision.
+- A user can translate pages in Edge with the same privacy boundary as Chrome.
+- A user can switch between replacement, bilingual, and original modes without reloading.
+- Complex pages fail gracefully when they cannot be safely translated.
+- Webpage cache/history behavior is visible, clearable, and documented.
+
+Remaining Phase 2 requirement groups:
+
+1. Site rules and auto-translation: per-site enable/disable, ask-every-time, optional auto-translate for trusted domains, domain cache controls, and clear UI state in popup/overlay/Settings.
+2. Production Chrome distribution: production extension ID, Chrome Web Store listed/unlisted decision, production install/repair flow, version reporting, upgrade/repair diagnostics, and release notes.
+3. Additional browsers: Edge first, then Brave/Arc if needed, then Safari Web Extension once Chromium behavior is stable, with Firefox deferred unless it becomes a priority.
+4. Advanced reading modes: optional full-page pretranslation, bilingual/original comparison mode, retranslate current page with a different model, and page-level translation quality controls.
+5. Complex content support: SPA route changes, virtualized lists, accessible iframes, table-heavy pages, browser PDF viewer translation, and image/canvas/OCR text only after the normal DOM path remains stable.
+6. Release-grade QA and privacy: browser E2E coverage, permission/privacy checks, cache/history policy documentation, and regression checks for Phase 1 native flows.
 
 ## Phase 3: Floating File Drop Workflow
 

@@ -674,7 +674,8 @@ final class CommandFriendlyTextView: NSTextView {
     override func keyDown(with event: NSEvent) {
         if let onSubmit,
            event.keyCode == 36 || event.keyCode == 76,
-           !event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift) {
+           !event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift),
+           !hasMarkedText() {
             onSubmit()
             return
         }
@@ -1103,6 +1104,8 @@ struct SettingsView: View {
     @State private var chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutRecorderMessage: String?
+    @State private var showSelectionLimitAppImporter = false
+    @State private var selectionLimitDraftLineCount = 2
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -1136,6 +1139,11 @@ struct SettingsView: View {
         .fileImporter(isPresented: $showImporter, allowedContentTypes: [.folder, .item], allowsMultipleSelection: false) { result in
             if case let .success(urls) = result, let url = urls.first {
                 appState.addModel(from: url)
+            }
+        }
+        .fileImporter(isPresented: $showSelectionLimitAppImporter, allowedContentTypes: [.applicationBundle, .application, .item], allowsMultipleSelection: false) { result in
+            if case let .success(urls) = result, let url = urls.first {
+                addSelectionLineLimitRule(from: url)
             }
         }
         .onAppear {
@@ -1328,10 +1336,79 @@ struct SettingsView: View {
                         }
                     )
                 )
+                selectionLineLimitRulesControl
             }
             .padding(.leading, 18)
             .disabled(!appState.preferences.selectionActionEnabled)
             .opacity(appState.preferences.selectionActionEnabled ? 1 : 0.45)
+        }
+    }
+
+    private var selectionLineLimitRulesControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(L10n.text("Special app line limits", language: language))
+                .font(.subheadline)
+            ForEach(appState.preferences.selectionLineLimitRules) { rule in
+                HStack(spacing: 8) {
+                    Text(rule.bundleIdentifier)
+                        .font(.caption.monospaced())
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(width: 210, alignment: .leading)
+                    selectionLineCountStepper(
+                        value: rule.maximumLineCount,
+                        setValue: { newValue in
+                            updateSelectionLineLimitRule(id: rule.id) { $0.maximumLineCount = newValue }
+                        }
+                    )
+                    iconToolButton(
+                        systemImage: "trash",
+                        help: L10n.text("Remove", language: language),
+                        role: .destructive
+                    ) {
+                        removeSelectionLineLimitRule(id: rule.id)
+                    }
+                }
+            }
+
+            HStack(spacing: 8) {
+                selectionLineCountStepper(
+                    value: selectionLimitDraftLineCount,
+                    setValue: { selectionLimitDraftLineCount = $0 }
+                )
+                Button {
+                    showSelectionLimitAppImporter = true
+                } label: {
+                    Label(L10n.text("Choose App", language: language), systemImage: "app.badge")
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private func selectionLineCountStepper(value: Int, setValue: @escaping (Int) -> Void) -> some View {
+        HStack(spacing: 6) {
+            Text("\(value)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 22)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 3)
+                .background(.quaternary.opacity(0.65))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            Text(L10n.text("lines", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Stepper(
+                "",
+                value: Binding(
+                    get: { value },
+                    set: { setValue($0) }
+                ),
+                in: 1...10,
+                step: 1
+            )
+            .labelsHidden()
         }
     }
 
@@ -1651,7 +1728,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 150)
+        .frame(width: 150, alignment: .leading)
     }
 
     private var defaultModelPicker: some View {
@@ -1690,7 +1767,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 230)
+        .frame(width: 230, alignment: .leading)
         .disabled(appState.models.isEmpty)
     }
 
@@ -1709,7 +1786,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 150)
+        .frame(width: 150, alignment: .leading)
     }
 
     private var polishStylePicker: some View {
@@ -1727,7 +1804,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 150)
+        .frame(width: 150, alignment: .leading)
     }
 
     private var pendingIndicatorStylePicker: some View {
@@ -2083,6 +2160,53 @@ struct SettingsView: View {
 
     private func resetShortcut(for target: ShortcutCaptureTarget) {
         applyShortcut(defaultShortcut(for: target), for: target)
+    }
+
+    private func addSelectionLineLimitRule(from url: URL) {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+        guard let bundle = Bundle(url: url),
+              let bundleIdentifier = bundle.bundleIdentifier,
+              !bundleIdentifier.isEmpty else {
+            return
+        }
+        let maximumLineCount = min(max(selectionLimitDraftLineCount, 1), 10)
+        appState.updatePreferences { preferences in
+            if let index = preferences.selectionLineLimitRules.firstIndex(where: { $0.bundleIdentifier == bundleIdentifier }) {
+                preferences.selectionLineLimitRules[index].maximumLineCount = maximumLineCount
+            } else {
+                preferences.selectionLineLimitRules.append(
+                    SelectionLineLimitRule(
+                        bundleIdentifier: bundleIdentifier,
+                        maximumLineCount: maximumLineCount
+                    )
+                )
+            }
+        }
+        selectionLimitDraftLineCount = 2
+    }
+
+    private func updateSelectionLineLimitRule(id: UUID, update: @escaping (inout SelectionLineLimitRule) -> Void) {
+        appState.updatePreferences { preferences in
+            guard let index = preferences.selectionLineLimitRules.firstIndex(where: { $0.id == id }) else {
+                return
+            }
+            update(&preferences.selectionLineLimitRules[index])
+            preferences.selectionLineLimitRules[index].maximumLineCount = min(
+                max(preferences.selectionLineLimitRules[index].maximumLineCount, 1),
+                10
+            )
+        }
+    }
+
+    private func removeSelectionLineLimitRule(id: UUID) {
+        appState.updatePreferences { preferences in
+            preferences.selectionLineLimitRules.removeAll { $0.id == id }
+        }
     }
 
     private func isShortcutAlreadyAssigned(_ shortcut: KeyboardShortcutPreference, target: ShortcutCaptureTarget) -> Bool {

@@ -5,7 +5,8 @@ protocol SelectionActionServiceDelegate: AnyObject {
     func selectionActionService(
         _ service: SelectionActionService,
         didTriggerSelectionAt screenPoint: NSPoint,
-        source: SelectionActionTriggerSource
+        source: SelectionActionTriggerSource,
+        gesture: SelectionActionGesture?
     )
 }
 
@@ -13,6 +14,28 @@ enum SelectionActionTriggerSource {
     case mouseDrag
     case doubleClick
     case selectAllShortcut
+}
+
+struct SelectionActionGesture {
+    let startPoint: NSPoint
+    let endPoint: NSPoint
+    let bounds: NSRect
+
+    var width: CGFloat {
+        bounds.width
+    }
+
+    var height: CGFloat {
+        bounds.height
+    }
+
+    var horizontalDistance: CGFloat {
+        abs(endPoint.x - startPoint.x)
+    }
+
+    var verticalDistance: CGFloat {
+        abs(endPoint.y - startPoint.y)
+    }
 }
 
 @MainActor
@@ -24,6 +47,7 @@ final class SelectionActionService {
     private var monitors: [Any] = []
     private var pendingTriggerTask: Task<Void, Never>?
     private var dragStartPoint: NSPoint?
+    private var dragBounds: NSRect?
     private var hasDragged = false
     private var mouseDownClickCount = 0
     private var lastTriggerDate = Date.distantPast
@@ -86,6 +110,7 @@ final class SelectionActionService {
 
     private func resetGestureState() {
         dragStartPoint = nil
+        dragBounds = nil
         hasDragged = false
         mouseDownClickCount = 0
     }
@@ -109,6 +134,7 @@ final class SelectionActionService {
         }
 
         dragStartPoint = screenPoint
+        dragBounds = NSRect(origin: screenPoint, size: .zero)
         hasDragged = false
         mouseDownClickCount = event.clickCount
     }
@@ -122,6 +148,7 @@ final class SelectionActionService {
         if distance >= minimumDragDistance {
             hasDragged = true
         }
+        dragBounds = (dragBounds ?? NSRect(origin: dragStartPoint, size: .zero)).union(NSRect(origin: screenPoint, size: .zero))
     }
 
     private func handleKeyDown(_ event: NSEvent, at screenPoint: NSPoint) {
@@ -171,12 +198,26 @@ final class SelectionActionService {
         }
 
         let source: SelectionActionTriggerSource?
+        let gesture: SelectionActionGesture?
         if event.clickCount >= 2 || mouseDownClickCount >= 2 {
             source = .doubleClick
+            gesture = nil
         } else if hasDragged {
             source = .mouseDrag
+            if let dragStartPoint {
+                let bounds = (dragBounds ?? NSRect(origin: dragStartPoint, size: .zero))
+                    .union(NSRect(origin: screenPoint, size: .zero))
+                gesture = SelectionActionGesture(
+                    startPoint: dragStartPoint,
+                    endPoint: screenPoint,
+                    bounds: bounds
+                )
+            } else {
+                gesture = nil
+            }
         } else {
             source = nil
+            gesture = nil
         }
 
         guard let source,
@@ -184,10 +225,14 @@ final class SelectionActionService {
             return
         }
 
-        scheduleTrigger(source: source, at: screenPoint)
+        scheduleTrigger(source: source, at: screenPoint, gesture: gesture)
     }
 
-    private func scheduleTrigger(source: SelectionActionTriggerSource, at screenPoint: NSPoint) {
+    private func scheduleTrigger(
+        source: SelectionActionTriggerSource,
+        at screenPoint: NSPoint,
+        gesture: SelectionActionGesture? = nil
+    ) {
         let now = Date()
         guard now.timeIntervalSince(lastTriggerDate) >= minimumTriggerInterval else {
             return
@@ -203,7 +248,7 @@ final class SelectionActionService {
             guard !Task.isCancelled, isEnabled else {
                 return
             }
-            delegate?.selectionActionService(self, didTriggerSelectionAt: screenPoint, source: source)
+            delegate?.selectionActionService(self, didTriggerSelectionAt: screenPoint, source: source, gesture: gesture)
             pendingTriggerTask = nil
         }
     }

@@ -128,6 +128,22 @@ public struct KeyboardShortcutPreference: Codable, Sendable, Hashable {
     public static let controlModifier: UInt32 = 1 << 12
 }
 
+public struct SelectionLineLimitRule: Codable, Identifiable, Sendable, Hashable {
+    public var id: UUID
+    public var bundleIdentifier: String
+    public var maximumLineCount: Int
+
+    public init(
+        id: UUID = UUID(),
+        bundleIdentifier: String,
+        maximumLineCount: Int
+    ) {
+        self.id = id
+        self.bundleIdentifier = bundleIdentifier
+        self.maximumLineCount = maximumLineCount
+    }
+}
+
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
     public var autoCollapseWidget: Bool
@@ -138,6 +154,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var selectionActionTriggerMouseDrag: Bool
     public var selectionActionTriggerDoubleClick: Bool
     public var selectionActionTriggerSelectAll: Bool
+    public var selectionLineLimitRules: [SelectionLineLimitRule]
     public var appLanguage: AppLanguage
     public var defaultTranslationTarget: String
     public var defaultPolishStyle: String
@@ -156,6 +173,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionTriggerMouseDrag: Bool = true,
         selectionActionTriggerDoubleClick: Bool = true,
         selectionActionTriggerSelectAll: Bool = false,
+        selectionLineLimitRules: [SelectionLineLimitRule] = [
+            SelectionLineLimitRule(bundleIdentifier: "com.tencent.xinWeChat", maximumLineCount: 2)
+        ],
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
         defaultPolishStyle: String = "natural",
@@ -173,6 +193,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.selectionActionTriggerMouseDrag = selectionActionTriggerMouseDrag
         self.selectionActionTriggerDoubleClick = selectionActionTriggerDoubleClick
         self.selectionActionTriggerSelectAll = selectionActionTriggerSelectAll
+        self.selectionLineLimitRules = selectionLineLimitRules
         self.appLanguage = appLanguage
         self.defaultTranslationTarget = defaultTranslationTarget
         self.defaultPolishStyle = defaultPolishStyle
@@ -192,6 +213,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case selectionActionTriggerMouseDrag
         case selectionActionTriggerDoubleClick
         case selectionActionTriggerSelectAll
+        case selectionLineLimitRules
+        case wechatSelectionMaximumLineCount
         case appLanguage
         case defaultTranslationTarget
         case defaultPolishStyle
@@ -212,6 +235,20 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         selectionActionTriggerMouseDrag = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerMouseDrag) ?? true
         selectionActionTriggerDoubleClick = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerDoubleClick) ?? true
         selectionActionTriggerSelectAll = try container.decodeIfPresent(Bool.self, forKey: .selectionActionTriggerSelectAll) ?? false
+        if let rules = try container.decodeIfPresent([SelectionLineLimitRule].self, forKey: .selectionLineLimitRules) {
+            selectionLineLimitRules = rules
+        } else if let wechatSelectionMaximumLineCount = try container.decodeIfPresent(Int.self, forKey: .wechatSelectionMaximumLineCount) {
+            selectionLineLimitRules = [
+                SelectionLineLimitRule(
+                    bundleIdentifier: "com.tencent.xinWeChat",
+                    maximumLineCount: wechatSelectionMaximumLineCount
+                )
+            ]
+        } else {
+            selectionLineLimitRules = [
+                SelectionLineLimitRule(bundleIdentifier: "com.tencent.xinWeChat", maximumLineCount: 2)
+            ]
+        }
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
@@ -219,6 +256,27 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
         quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
         quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(defaultModelID, forKey: .defaultModelID)
+        try container.encode(autoCollapseWidget, forKey: .autoCollapseWidget)
+        try container.encode(widgetVisibleOnAllSpaces, forKey: .widgetVisibleOnAllSpaces)
+        try container.encode(launchAtLogin, forKey: .launchAtLogin)
+        try container.encode(replaceOriginalText, forKey: .replaceOriginalText)
+        try container.encode(selectionActionEnabled, forKey: .selectionActionEnabled)
+        try container.encode(selectionActionTriggerMouseDrag, forKey: .selectionActionTriggerMouseDrag)
+        try container.encode(selectionActionTriggerDoubleClick, forKey: .selectionActionTriggerDoubleClick)
+        try container.encode(selectionActionTriggerSelectAll, forKey: .selectionActionTriggerSelectAll)
+        try container.encode(selectionLineLimitRules, forKey: .selectionLineLimitRules)
+        try container.encode(appLanguage, forKey: .appLanguage)
+        try container.encode(defaultTranslationTarget, forKey: .defaultTranslationTarget)
+        try container.encode(defaultPolishStyle, forKey: .defaultPolishStyle)
+        try container.encode(recentHistoryLimit, forKey: .recentHistoryLimit)
+        try container.encode(webPageTranslation, forKey: .webPageTranslation)
+        try container.encode(quickActionShortcut, forKey: .quickActionShortcut)
+        try container.encode(quickActionWithoutSelectionShortcut, forKey: .quickActionWithoutSelectionShortcut)
     }
 }
 

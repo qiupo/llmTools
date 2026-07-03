@@ -1,6 +1,8 @@
 # Phase 2 PRD: Web Page Translation
 
-Last updated: 2026-06-30
+Last updated: 2026-07-03
+
+Status: active Phase 2 product and engineering plan. Phase 2.0 Chrome current-page translation is complete; this document now tracks the remaining Phase 2 expansion requirements.
 
 ## 1. Objective
 
@@ -9,6 +11,39 @@ Phase 2 adds browser web-page translation to llmTools.
 The user should be able to open an English webpage, trigger llmTools from the browser, and see the visible English text translated into Simplified Chinese directly inside the page. The page must remain usable, translation must be reversible, and page text must stay local by default.
 
 This phase is not a separate chat product and not a cloud translation feature. It extends the existing local-model translation engine to browser pages.
+
+## 1.1 Completed Phase 2.0 Baseline
+
+Phase 2.0 established the Chrome current-page translation baseline:
+
+- Chrome MV3 extension in `browser-extension/chromium`.
+- Development extension ID: `jednddlgkkohaebgoejcidfppddjegij`.
+- `LLMToolsNativeHost` Swift executable target for Chrome native messaging.
+- `LocalAppBridgeServer` in the macOS app, bound to `127.0.0.1` and protected by an app-generated bearer token.
+- Bridge state file at `~/Library/Application Support/llmTools/web-page-bridge.json`.
+- `BrowserIntegrationService` for Chrome detection, native host manifest writing, extension folder discovery, and `chrome://extensions` launch.
+- Settings section `网页翻译`, including Chrome bridge repair and manual unpacked-extension guidance.
+- Shared webpage translation models in `WebPageTranslationTypes`.
+- App-side webpage batch translation through `TaskEngine.translateWebPageSegments`.
+- Browser popup controls for translate, restore, cancel, test, and cache clear.
+- Content script support for visible text discovery, English-dominant filtering, skip rules, in-page overlay, pending indicators, restore, cancellation, mutation/scroll discovery, and dynamic segment enqueueing.
+- Extension background support for batching, duplicate segment reuse, native messaging, context-menu toggle, translation state, and a `chrome.storage.local` translation cache.
+- Focused checks through `swift run LLMToolsChecks` and `node scripts/check-browser-extension-dom.mjs`.
+
+Do not treat these as remaining Phase 2 requirements unless a regression is found. They are the baseline that later Phase 2 work must preserve.
+
+## 1.2 Remaining Phase 2 Scope
+
+The remaining Phase 2 work should be organized into these requirement groups:
+
+1. Site rules and automatic translation controls.
+2. Production Chrome distribution and repair UX.
+3. Additional browser support.
+4. Advanced reading and translation modes.
+5. Complex webpage and embedded-content support.
+6. Release-grade QA, observability, and privacy controls.
+
+The remaining work should not reopen the Phase 2.0 Chrome bridge architecture. Extend it unless a browser policy or security finding requires a change.
 
 ## 2. Product Principles
 
@@ -74,42 +109,38 @@ These constraints are product requirements, not implementation preferences.
 
 ### 6.1 Product
 
-- Settings panel for browser integration.
-- Guided Chrome extension installer/repair flow.
-- Extension status detection and connection verification.
-- One-click current-page translation from the browser extension.
-- In-place English-to-Simplified-Chinese translation.
-- Restore original page text.
-- Cancel running translation.
-- Visible-first translation and incremental scroll translation.
-- Local translation cache for repeated text segments.
-- Clear user-facing errors.
-- Basic per-domain preference: enabled/disabled and ask-every-time.
-- Local-only default privacy behavior.
+- Site/domain rules: always translate, never translate, ask every time, and clear site-specific state.
+- Optional auto-translate on trusted domains, off by default.
+- Production Chrome extension distribution and update path.
+- Multi-browser support after Chrome, starting with Edge.
+- Advanced reading modes, including bilingual/original comparison and full-page pretranslation after the current visible-first path remains stable.
+- Complex-page handling for SPAs, virtualized lists, accessible frames, and table-heavy pages.
+- Browser PDF viewer and image/OCR translation as later Phase 2.x extensions, not part of the already completed 2.0 baseline.
+- Release-grade privacy, cache, diagnostics, and browser E2E coverage.
 
 ### 6.2 Native App
 
-- Browser integration state in preferences/registry.
-- Native messaging host installer for Chrome MVP.
-- Native messaging helper executable.
-- Local app bridge from native helper to the running llmTools app.
-- New webpage translation task path.
-- Translation batching and cancellation support.
-- Redacted diagnostics for setup and translation failures.
+- Store and expose site/domain translation preferences.
+- Show production/development extension channel, extension version, browser version, last ping, and repair diagnostics.
+- Support additional browser native messaging manifest paths.
+- Provide explicit cache/history controls for webpage translation.
+- Keep webpage diagnostics redacted by default.
+- Preserve Phase 1 native workflows while webpage features expand.
 
 ### 6.3 Browser Extension
 
-- Manifest V3 Chrome extension.
-- Background service worker.
-- Popup UI with translate, cancel, restore, and status.
-- Content script for DOM discovery, text-node mapping, replacement, mutation/scroll observation, and restore.
-- Native messaging client.
-- Session cache and per-page translation state.
+- Domain toggle and per-site status in popup and context menu.
+- Optional auto-translate permission request for domains the user enables.
+- Bilingual/original comparison UI without corrupting page layout.
+- Retranslate current page with a different model or quality mode.
+- Production extension identity, versioning, and upgrade compatibility.
+- Additional Chromium browser manifests and build/distribution variants.
+- More robust SPA route, iframe, virtualized list, and PDF viewer handling.
 
 ## 7. Out of Scope
 
 - Cloud translation APIs.
-- OCR for images, videos, canvas, screenshots, or scanned PDFs.
+- Automatic cloud fallback.
 - Translating browser internal pages such as `chrome://`, extension store pages, or browser settings pages.
 - Translating user-entered form text.
 - Rewriting page HTML structure.
@@ -119,97 +150,100 @@ These constraints are product requirements, not implementation preferences.
 - Enterprise managed extension deployment.
 - Mobile browser support.
 - Cross-device sync.
-- Full bilingual side-by-side mode.
-- PDF viewer translation inside the browser.
 - Multi-tab bulk translation.
 
 ## 8. Success Metrics
 
-Phase 2 is successful when:
+Remaining Phase 2 work is successful when:
 
-- Chrome extension can be installed or repaired through the Settings guided flow.
-- Extension can verify native-app connectivity from the browser.
-- English article/documentation pages translate visible content into readable Chinese in place.
-- Restore returns translated text nodes to their original English text without reload.
-- Cancel stops queued work within 1 second and prevents additional DOM replacement after cancellation.
-- Links, buttons, tables, and ordinary navigation remain usable after translation.
-- Page content is not written to persistent history unless explicitly enabled.
-- Repeated text segments on the same page are not sent to the model repeatedly.
+- Users can set per-site behavior: ask, always translate, never translate, clear cached translations, and disable auto-translate quickly.
+- Chrome has a production-like install/update path with a stable production extension ID or an explicitly documented decision to stay development-only.
+- Edge can use the same webpage translation feature with the same local app bridge behavior.
+- Settings can show clear status across supported browsers and repair the correct native messaging manifest for each one.
+- Users can choose a readable bilingual/original comparison mode without breaking links, tables, forms, or page layout.
+- Complex pages such as SPAs, table-heavy pages, documentation pages, and virtualized feeds have defined supported behavior and graceful fallback.
+- Webpage cache/history behavior is explicit, user-controlled, and covered by privacy checks.
+- Automated browser tests cover the supported browser/page matrix, not only the local static DOM harness.
 
 ## 9. User Stories
 
-### 9.1 Browser Setup
+### 9.1 Site Translation Rules
 
-As a user, I can open llmTools Settings and see which supported browsers are installed and whether webpage translation is ready for each browser.
-
-Acceptance:
-
-- Chrome row appears when `/Applications/Google Chrome.app` exists.
-- Row status is one of: `notInstalled`, `extensionMissing`, `extensionInstalledDisabled`, `permissionMissing`, `nativeHostMissing`, `appNotRunning`, `pairingRequired`, `ready`, `failed`.
-- A primary action changes with status: `Install`, `Enable`, `Repair`, `Pair`, `Test`, or `Open Browser`.
-- Failure text says exactly which action is needed next.
-
-### 9.2 Guided Extension Installation
-
-As a user, I can click one button in Settings to install or repair browser translation for Chrome.
+As a user, I can decide how llmTools behaves on the current website.
 
 Acceptance:
 
-- The app installs or repairs the native messaging host manifest.
-- The app opens the Chrome Web Store listing when a production extension ID is configured.
-- In development builds, the app opens `chrome://extensions` and shows load-unpacked instructions.
-- The user still confirms extension installation/enablement in Chrome.
-- After confirmation, the app runs a ping from extension to native app and updates status to `ready`.
+- Popup shows the current domain and rule: `ask`, `alwaysTranslate`, or `neverTranslate`.
+- The user can enable auto-translate for the current domain only after a clear browser permission prompt when extra host permission is required.
+- `neverTranslate` prevents automatic translation and hides auto-translate prompts for the domain.
+- Domain rules are visible and editable in Settings.
+- Clearing a domain rule does not delete unrelated model or app settings.
 
-### 9.3 Translate Current Page
+### 9.2 Production Chrome Distribution
 
-As a user, I can click the browser extension action and translate the current English page into Chinese.
-
-Acceptance:
-
-- Popup shows `Translate Page` when page is translatable and bridge is ready.
-- Content script extracts visible English-dominant text nodes.
-- Extension sends batches to llmTools through native messaging.
-- Translated text replaces original text nodes in the page.
-- Popup and in-page overlay show progress.
-- Links and page controls remain clickable.
-
-### 9.4 Restore Original
-
-As a user, I can restore the original English page text.
+As a user, I can install or update the Chrome extension through a production-like path instead of relying only on load-unpacked development mode.
 
 Acceptance:
 
-- `Restore Original` appears after at least one successful replacement.
-- Restore uses in-memory original text mapping and does not require a page reload.
-- Restore removes llmTools markers and stops incremental translation.
+- A production extension ID is defined, or the product explicitly documents that Phase 2 remains development-only.
+- If a Chrome Web Store path is chosen, Settings opens the correct listing and writes a manifest with the production extension ID.
+- Development and production extension IDs cannot be mixed silently.
+- Settings shows extension version, native host path, manifest path, and last successful connection time.
+- Repair tells the user exactly whether the failure is extension missing, wrong extension ID, native host missing, app not running, or permission missing.
 
-### 9.5 Cancel
+### 9.3 Additional Browser Support
 
-As a user, I can cancel a long page translation.
-
-Acceptance:
-
-- Cancel is available while discovery, batching, translation, or DOM application is active.
-- Extension sends cancellation to native app and clears queued batches.
-- Already replaced nodes remain translated unless user presses restore.
-- No new nodes are replaced after cancellation has been acknowledged.
-
-### 9.6 Dynamic Scroll
-
-As a user, when I scroll down a long page after translating, newly visible English paragraphs are translated automatically for the same page session.
+As a user, I can use webpage translation from another supported browser after Chrome.
 
 Acceptance:
 
-- Newly visible nodes are enqueued with debounce.
-- Previously translated or skipped nodes are not reprocessed.
-- Translation pauses when tab is hidden and resumes when visible.
+- Edge is the first additional browser target.
+- Settings detects Edge and writes/repairs the correct Edge native messaging manifest path.
+- The Edge extension build uses the correct extension ID and allowed origin.
+- Chrome and Edge can be installed side by side without overwriting each other's manifest or status.
+- Browser rows share one visual pattern but show browser-specific repair actions and paths.
+
+### 9.4 Bilingual Reading Mode
+
+As a user, I can compare the original English text with the Chinese translation when direct replacement is not enough.
+
+Acceptance:
+
+- The user can switch between `replace`, `bilingual`, and `original` for the current page session.
+- Bilingual mode does not use `innerHTML` injection for source page content.
+- Links, buttons, form controls, code blocks, and tables remain usable.
+- Restore returns the page to the original state without leaving duplicate bilingual artifacts.
+- The mode choice is per-page by default, with optional per-domain default later.
+
+### 9.5 Complex Page Support
+
+As a user, I can translate common modern web pages without the page becoming unstable.
+
+Acceptance:
+
+- SPA route changes reset or resume translation without mixing old and new page sessions.
+- Virtualized lists and constantly changing nodes are skipped or handled without repeated retranslation loops.
+- Table-heavy pages preserve row/column structure.
+- Accessible iframes are translated only when the extension has permission and can safely inject a content script.
+- Unsupported frames, PDF viewers, closed shadow DOM, canvas, and image text show a graceful unsupported/partial state.
+
+### 9.6 Cache, History, And Privacy Controls
+
+As a user, I can understand and control what webpage translation data is stored locally.
+
+Acceptance:
+
+- Settings explains whether page translations are session-only or persisted in local extension storage.
+- The user can clear current-page cache, current-domain cache, and all webpage translation cache.
+- Cache entries are capped and pruned.
+- Recent history remains off for webpage translation unless the user explicitly enables it.
+- Logs and diagnostics use hashes/counts/error codes by default, not raw page text.
 
 ## 10. UX Requirements
 
 ### 10.1 Native Settings Panel
 
-Add a Settings section named `网页翻译`.
+Extend the existing Settings section named `网页翻译`.
 
 The section should contain:
 
@@ -218,17 +252,24 @@ The section should contain:
 - One primary button per browser.
 - `全部检测` action.
 - `修复本地桥接` action when host manifest is missing or invalid.
-- Privacy note: page text is processed locally and not stored by default.
+- Production/development channel indicator.
+- Extension version and last successful ping time.
+- Domain rules table.
+- Cache controls: clear current domain, clear all webpage cache, and reset domain rules.
+- Privacy note that matches the chosen cache/history policy.
 - Advanced disclosure for development mode install steps.
-- Last successful ping time and extension version.
 
 Browser row fields:
 
 - Browser name.
 - Browser path.
+- Distribution channel.
+- Extension ID.
+- Extension version.
 - Extension status.
 - Native host status.
 - Pairing status.
+- Last successful ping time.
 - Last error.
 - Primary action.
 
@@ -240,6 +281,15 @@ Primary actions:
 - `配对`: start pairing challenge.
 - `测试连接`: ping extension/native app.
 - `打开当前浏览器`: launch browser.
+
+Domain rule fields:
+
+- Domain.
+- Rule: `ask`, `alwaysTranslate`, `neverTranslate`.
+- Auto-translate permission state.
+- Cached entry count.
+- Last translated time.
+- Actions: edit, clear cache, reset rule.
 
 ### 10.2 Browser Extension Popup
 
@@ -258,7 +308,10 @@ Popup controls:
 - `取消`
 - `恢复原文`
 - `重新翻译`
+- Mode selector: `替换`, `双语`, `原文`.
 - Domain toggle: `此网站自动翻译` off by default.
+- Domain rule selector: `每次询问`, `总是翻译`, `永不翻译`.
+- `清除此页缓存`
 - Link/button to open llmTools Settings.
 
 ### 10.3 In-Page Overlay
@@ -327,20 +380,22 @@ flowchart LR
 
 ### 11.4 IPC Decision
 
-Preferred MVP path:
+Chosen MVP path:
 
 1. Browser extension talks to `LLMToolsNativeHost` through native messaging.
-2. `LLMToolsNativeHost` talks to the running app through a local-only app bridge.
-3. The app bridge can be implemented as loopback HTTP on `127.0.0.1` with a random port and bearer token, or as Unix domain socket if implementation cost is acceptable.
+2. `LLMToolsNativeHost` talks to the running app through a local-only loopback HTTP bridge.
+3. The app bridge binds to `127.0.0.1`, uses a random port, and requires a bearer token written by the running app to the user-private bridge state file.
 
-Phase 2.0 recommendation:
+Current implementation:
 
-- Use native messaging from extension to helper.
-- Use loopback HTTP from helper to app for faster Swift implementation.
+- Native messaging from extension to helper is implemented by `Sources/LLMToolsNativeHost/main.swift`.
+- Loopback HTTP from helper to app is implemented by `Sources/LLMToolsApp/LocalAppBridgeServer.swift`.
+- Bridge state is written to `~/Library/Application Support/llmTools/web-page-bridge.json`.
+- The helper reads the bridge state, checks the app PID, and forwards `getStatus`, `translateSegments`, and `cancelJob`.
+- The app bridge exposes `GET /status`, `POST /translateSegments`, and `POST /cancelJob`.
 - Do not expose the loopback token to the extension or page.
 - Bind only to `127.0.0.1`.
-- Require a bearer token generated by the app and stored in a user-private file readable by the helper.
-- Reject all direct browser/page requests to the app bridge unless they include the token.
+- Reject all bridge requests unless they include the bearer token.
 
 Rationale:
 
@@ -924,6 +979,21 @@ Rules:
 - Do not persist page text to disk.
 - Clear cache on restore, tab close, extension reload, or user clear.
 
+Current implementation note:
+
+- The extension also has a `chrome.storage.local` cache keyed by target language, URL hash, and text hash.
+- Cached entries include source text, translated text, target language, URL hash, text hash, model name, and update time.
+- The popup includes a current-page cache clear action.
+- Remaining Phase 2 work should formalize this as a product feature by exposing the policy in Settings/README, adding domain/all-cache clearing, enforcing caps, and testing that cached content remains local.
+
+Persistent cache product requirements:
+
+- Keep storage local to the extension.
+- Cap entries and prune deterministically.
+- Add a visible clear-cache action.
+- Document that page source snippets and translations can be retained locally.
+- Add automated checks that no cache data is sent remotely.
+
 ### 19.2 App Cache
 
 MVP:
@@ -992,99 +1062,149 @@ Expected behavior:
 - Show partial success when some segments fail.
 - Restore should remain available after partial success.
 
-## 23. Implementation Plan
+## 23. Remaining Implementation Plan
 
-### Milestone 0: PRD And Skeleton
+### Phase 2.0: Chrome Current-Page Translation - Done
 
-- Add PRD.
-- Add `browser-extension/chromium` folder.
-- Add `LLMToolsNativeHost` executable target.
-- Add shared protocol models.
-- Add browser integration status enums.
+The Chrome baseline is complete and is now the compatibility contract for later Phase 2 work:
 
-Exit criteria:
+- Development Chrome extension.
+- Native messaging host.
+- Local app bridge.
+- Current-page translation.
+- Restore original.
+- Cancel translation.
+- Dynamic scroll translation.
+- Repeated-text cache.
+- Context-menu toggle.
+- Popup and in-page overlay.
+- Settings entry and bridge repair flow.
+- Packaged-app workflow.
 
-- Project builds with empty/native-host skeleton.
-- Extension folder has a valid MVP manifest.
+### Phase 2.1: Site Rules And Auto-Translate
 
-### Milestone 1: Native Messaging Ping
+Goal: make webpage translation behave predictably per website instead of being only a manual per-page action.
 
-- Implement native messaging host stdio protocol.
-- Install Chrome native host manifest from Settings.
-- Extension sends `hello`.
-- App/host returns app version, protocol version, and model status.
+Requirements:
 
-Exit criteria:
-
-- Settings can show Chrome `ready` after ping.
-- Failure modes show actionable messages.
-
-### Milestone 2: DOM Discovery And Restore
-
-- Implement content script injection.
-- Implement visible text discovery.
-- Implement English-dominant filter.
-- Implement node mapping and original text storage.
-- Implement dummy replacement with test translation.
-- Implement restore.
+- Add domain rule states: `ask`, `alwaysTranslate`, `neverTranslate`.
+- Show current domain and rule in the popup.
+- Add a domain rule table in Settings.
+- Support optional auto-translate for a domain after explicit user opt-in.
+- Request optional host permissions only when needed for auto-translate.
+- Allow clearing current-page, current-domain, and all webpage translation cache.
+- Keep `neverTranslate` stronger than auto-translate and context-menu actions.
+- Make route changes and newly opened pages respect the domain rule.
 
 Exit criteria:
 
-- Local static test page can replace visible English text with marker text.
-- Restore returns original content.
-- Links/forms/code blocks remain untouched.
+- User can set `alwaysTranslate` on a documentation site and future pages on that domain translate automatically.
+- User can set `neverTranslate` on a site and no automatic translation runs there.
+- User can clear a domain's cached translations and rule independently.
+- No global all-sites auto-translation is enabled by default.
 
-### Milestone 3: Real Translation Batch
+### Phase 2.2: Production Chrome Distribution
 
-- Connect extension batches to native host and app bridge.
-- Add webpage translation service.
-- Reuse model runner.
-- Add JSON batch prompt and fallback.
-- Apply real Chinese translations.
+Goal: move Chrome support from development-only loading toward a reproducible production-like install/update path.
 
-Exit criteria:
+Requirements:
 
-- Real English article page translates to Chinese with local model.
-- Extension shows model name and progress.
-
-### Milestone 4: Cancellation, Cache, And Dynamic Pages
-
-- Add page session jobs.
-- Add cancellation propagation.
-- Add session cache.
-- Add IntersectionObserver and MutationObserver.
-- Add hidden-tab pause.
+- Decide production distribution: Chrome Web Store listed, Chrome Web Store unlisted, or development-only for now.
+- If production distribution is chosen, define the production extension ID and keep it separate from `jednddlgkkohaebgoejcidfppddjegij`.
+- Generate or maintain manifests for both development and production extension IDs.
+- Settings should show extension channel, extension ID, version, native host path, manifest path, and last ping.
+- Repair should detect stale/wrong manifest, wrong extension ID, missing host executable, and app-not-running states.
+- README should document production and development install flows separately.
 
 Exit criteria:
 
-- Cancel stops queued work.
-- Scrolling translates new visible content.
-- Repeated text is not sent twice.
+- The app can repair the native messaging manifest for the selected Chrome extension channel.
+- The user can tell whether the loaded extension is development or production.
+- Extension updates do not silently break allowed origins.
 
-### Milestone 5: Settings Installer And Repair UX
+### Phase 2.3: Additional Browser Support
 
-- Add full browser integration panel.
-- Add install/repair/test actions.
-- Add dev install mode.
-- Add pairing reset.
-- Add clear cache/pairing actions.
+Goal: reuse the proven Chrome architecture in other desktop browsers without weakening the permission model.
+
+Priority:
+
+1. Microsoft Edge.
+2. Brave or Arc if the user explicitly prioritizes them.
+3. Safari Web Extension after Chromium behavior is stable.
+4. Firefox only if it becomes a clear priority.
+
+Requirements:
+
+- Add browser config objects for each supported browser: bundle id, app paths, native messaging manifest path, extension ID, install URL, settings URL.
+- Add Settings rows for installed supported browsers.
+- Add manifest repair for Edge first.
+- Keep browser-specific manifests independent.
+- Ensure one browser's repair action never overwrites another browser's manifest.
+- For Safari, plan the containing-app and Safari extension enablement flow separately.
 
 Exit criteria:
 
-- Fresh machine flow can be completed from Settings with clear manual browser confirmation steps.
-- Broken native host manifest can be repaired.
+- Edge can translate pages through llmTools with the same local privacy boundary as Chrome.
+- Chrome and Edge can coexist with correct manifests and status.
+- Unsupported browsers show clear manual or unsupported state.
 
-### Milestone 6: Hardening And QA
+### Phase 2.4: Advanced Reading Modes
 
-- Add unit tests.
-- Add Playwright E2E pages.
-- Add privacy/log redaction checks.
-- Add package script integration.
-- Verify packaged `.app` and browser extension together.
+Goal: give the user more control over how translations appear on the page.
+
+Requirements:
+
+- Add page mode selector: `replace`, `bilingual`, `original`.
+- Bilingual mode should preserve layout and avoid unsafe HTML injection.
+- Add `retranslate` with the selected webpage translation model or quality mode.
+- Add page-level translation quality controls such as simpler wording, more literal translation, or technical translation after the core mode switch is stable.
+- Preserve restore behavior across mode changes.
 
 Exit criteria:
 
-- Definition of Done is satisfied.
+- User can switch between Chinese-only replacement, bilingual view, and original text without reloading.
+- Bilingual mode does not break links, forms, tables, or code blocks.
+- Retranslation replaces prior llmTools translations without duplicating artifacts.
+
+### Phase 2.5: Complex Pages And Embedded Content
+
+Goal: expand from normal articles/docs pages to harder but common web content.
+
+Requirements:
+
+- Handle SPA route changes cleanly.
+- Avoid infinite translation loops on virtualized lists and constantly mutating DOM.
+- Improve table-heavy page behavior.
+- Translate accessible same-origin iframes when content script injection is allowed.
+- Detect and explain unsupported frames, closed shadow DOM, canvas/image text, browser PDF viewers, and pages that block injection.
+- Add browser PDF viewer translation only after ordinary DOM and iframe handling remain stable.
+- Add image/canvas/OCR translation only after PDF/browser embedding is stable.
+
+Exit criteria:
+
+- SPA route changes do not mix old and new translations.
+- Virtualized feeds do not repeatedly retranslate the same content.
+- Table layout remains usable after translation.
+- Unsupported embedded content produces a clear partial state instead of silent failure.
+
+### Phase 2.6: Release-Grade QA, Privacy, And Diagnostics
+
+Goal: make the expanded Phase 2 surface maintainable.
+
+Requirements:
+
+- Add browser E2E fixtures for article, docs/code, product page, table-heavy page, SPA route, virtualized list, form/editor page, iframe page, and unsupported PDF/canvas page.
+- Add diagnostics that expose counts, timings, browser, extension version, model, and error codes without raw page text by default.
+- Document webpage cache and history policy in README and Settings.
+- Keep Phase 1 regression checks in the acceptance path.
+- Keep `swift run LLMToolsChecks` and `node scripts/check-browser-extension-dom.mjs` passing.
+- Package `dist/llmTools.app` for release-grade checks when browser integration changes.
+
+Exit criteria:
+
+- New browser/page support has automated coverage.
+- Privacy behavior is explicit and testable.
+- Debug output is useful without leaking raw page content.
 
 ## 24. Test Plan
 
@@ -1099,6 +1219,10 @@ Native:
 - protocol request/response decoding
 - error mapping
 - webpage prompt fallback behavior
+- domain rule persistence and precedence
+- multi-browser manifest path generation
+- production/development extension ID selection
+- cache/history preference migration
 
 Extension:
 
@@ -1109,6 +1233,10 @@ Extension:
 - cache key normalization
 - restore behavior for detached/changed nodes
 - protocol envelope validation
+- domain rule matching
+- auto-translate permission gating
+- mode switching between replace, bilingual, and original
+- cache clear by page/domain/all
 
 ### 24.2 Integration Tests
 
@@ -1118,10 +1246,13 @@ Extension:
 - App bridge returns `model_not_configured` when no model exists.
 - Translation batch returns expected schema.
 - Cancel request cancels queued batches.
+- Domain rules are shared correctly between Settings and extension behavior.
+- Chrome and Edge manifests can coexist.
+- Production and development Chrome extension IDs do not overwrite each other.
 
 ### 24.3 Browser E2E Tests
 
-Use Playwright with a dev-loaded Chromium extension.
+Use Playwright or an equivalent browser automation path where possible. Keep the existing DOM harness for fast extension logic checks.
 
 Test pages:
 
@@ -1134,6 +1265,9 @@ Test pages:
 - dynamic page appending content after scroll
 - form page with inputs/contenteditable
 - page with iframes
+- SPA route-change page
+- virtualized list page
+- unsupported PDF/canvas fixture
 
 Assertions:
 
@@ -1145,6 +1279,10 @@ Assertions:
 - cancel prevents further replacements
 - no console errors from extension
 - no remote network requests containing page text
+- domain rules drive auto/manual behavior correctly
+- bilingual mode can switch back to original without duplicates
+- cache clearing removes the intended scope only
+- Chrome and Edge behavior match where both are supported
 
 ### 24.4 Manual Acceptance Tests
 
@@ -1155,6 +1293,10 @@ Run against:
 - GitHub README page with code blocks.
 - Product marketing page.
 - Long news article.
+- A multi-page documentation site with per-domain auto-translate enabled.
+- A SPA documentation/product site.
+- A table-heavy dashboard or docs page.
+- Edge after browser support is added.
 
 Manual checks:
 
@@ -1164,35 +1306,43 @@ Manual checks:
 - Restore correctness.
 - Extension/app status clarity.
 - App restart and browser restart recovery.
+- Domain rule clarity.
+- Production/development extension channel clarity.
+- Cache/history privacy controls.
 
 ## 25. Definition Of Done
 
-Phase 2.0 is done when:
+Remaining Phase 2 is done when:
 
-- Chrome extension MVP is installable in development mode and has a defined production install path.
-- Settings can install/repair native messaging assets and verify extension connectivity.
-- Current-tab English-to-Chinese page translation works through the local app and local model.
-- Visible-first translation, restore, cancel, dynamic-scroll translation, and session cache work.
-- Browser and native app errors are actionable.
-- No page text is persisted by default.
-- Logs are redacted.
-- Automated tests cover DOM skip rules, protocol, native host manifest generation, and core E2E flows.
-- Packaged app verification uses `./scripts/package-app.sh`, launches `dist/llmTools.app`, and verifies the running app path before final acceptance.
+- Phase 2.1 site rules and auto-translate are implemented with explicit user opt-in.
+- Phase 2.2 has either a production Chrome distribution path or a documented decision to remain development-only.
+- Phase 2.3 supports Edge or records a product decision to defer additional browsers.
+- Phase 2.4 provides a stable bilingual/original comparison mode.
+- Phase 2.5 defines and implements the supported behavior for complex pages, with graceful unsupported states.
+- Phase 2.6 test/privacy/diagnostic requirements are satisfied.
+- Page text is not persisted beyond the accepted local cache/history policy.
+- Cache/history behavior is visible, clearable, and documented.
+- Logs and diagnostics are redacted by default.
+- Automated tests cover domain rules, cache scope, browser manifests, mode switching, DOM skip rules, protocol, and supported browser E2E flows.
+- Packaged app verification uses `./scripts/package-app.sh`, launches `dist/llmTools.app`, and verifies the running app path before final acceptance of browser-integration changes.
 
 ## 26. Open Decisions
 
-Resolve before implementation starts:
+Resolve while executing the remaining Phase 2 requirement groups:
 
-- Production extension distribution path: Chrome Web Store listed/unlisted, or development-only until later?
-- Exact Chrome extension ID for production and development.
-- App bridge IPC: loopback HTTP MVP or Unix domain socket MVP?
+- Cache policy: keep the current `chrome.storage.local` persistent extension cache as a formal product feature, or restrict persistence to domain/page metadata only?
+- Production extension distribution path: Chrome Web Store listed, Chrome Web Store unlisted, or development-only until later?
+- Exact Chrome production extension ID. Development ID is currently `jednddlgkkohaebgoejcidfppddjegij`.
 - Whether app sandboxing or App Store distribution is planned soon. This affects native host manifest installation.
-- First additional browser after Chrome: Edge, Safari, Brave, Arc, or Firefox?
+- First additional browser is recommended to be Edge, but user priority can override this.
+- Whether browser PDF viewer translation belongs in Phase 2.5 or should move to a later document/PDF phase.
+- Whether image/canvas/OCR translation belongs in Phase 2.5 or should remain out of scope until a dedicated OCR phase.
 
 Recommended defaults:
 
-- Chrome Web Store unlisted extension for production-like testing.
-- Native messaging helper plus loopback HTTP bridge for MVP.
+- Treat persistent extension cache as accepted only if Settings and README clearly expose and clear it.
+- Chrome Web Store unlisted extension for production-like testing once the user wants non-development installation.
+- Native messaging helper plus loopback HTTP bridge is the current MVP implementation.
 - Edge as second Chromium browser.
 - Safari after Chrome/Edge behavior is stable.
 

@@ -221,6 +221,9 @@ struct LLMToolsChecks {
         try require(preferences.selectionActionTriggerMouseDrag, "Expected mouse-drag selection trigger to default on.")
         try require(preferences.selectionActionTriggerDoubleClick, "Expected double-click selection trigger to default on.")
         try require(!preferences.selectionActionTriggerSelectAll, "Expected Command-A selection trigger to default off.")
+        try require(preferences.selectionLineLimitRules.count == 1, "Expected one default selection line-limit rule.")
+        try require(preferences.selectionLineLimitRules.first?.bundleIdentifier == "com.tencent.xinWeChat", "Expected WeChat line-limit rule by default.")
+        try require(preferences.selectionLineLimitRules.first?.maximumLineCount == 2, "Expected WeChat selection line limit to default to 2.")
         try require(preferences.webPageTranslation.enabled, "Expected webpage translation to default on.")
         try require(preferences.webPageTranslation.defaultTargetLanguage == "zh-Hans", "Expected webpage translation target to default to Simplified Chinese.")
         try require(preferences.webPageTranslation.modelID == nil, "Expected webpage translation model to follow the default model.")
@@ -232,6 +235,16 @@ struct LLMToolsChecks {
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
+
+        let legacySelectionLimitJSON = """
+        {
+          "wechatSelectionMaximumLineCount": 3
+        }
+        """
+        let migratedPreferences = try JSONDecoder().decode(AppPreferences.self, from: Data(legacySelectionLimitJSON.utf8))
+        try require(migratedPreferences.selectionLineLimitRules.count == 1, "Expected legacy WeChat line limit to migrate to one rule.")
+        try require(migratedPreferences.selectionLineLimitRules.first?.bundleIdentifier == "com.tencent.xinWeChat", "Expected migrated rule to target WeChat.")
+        try require(migratedPreferences.selectionLineLimitRules.first?.maximumLineCount == 3, "Expected migrated WeChat line limit to preserve value.")
 
         let webPagePreferences = try JSONDecoder().decode(WebPageTranslationPreferences.self, from: Data("""
         {

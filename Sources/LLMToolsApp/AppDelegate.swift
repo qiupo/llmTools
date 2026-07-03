@@ -25,6 +25,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var selectionActionShownAt = Date.distantPast
     private var isSelectionActionEnabled = false
     private var isSelectionActionVisible = false
+    private let selectionGestureLineHeight: CGFloat = 28
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         hotKeyService.delegate = self
@@ -87,14 +88,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             frame: NSRect(x: 0, y: 0, width: 500, height: 400),
             contentView: AnyView(QuickActionView(appState: appState) { [weak self] in
                 self?.quickActionWindowController?.close()
-            })
+            }),
+            windowLevel: .floating
         )
+        if let quickActionWindow = quickActionWindowController?.window as? FloatingWindow {
+            quickActionWindow.onEscape = { [weak self] in
+                self?.quickActionWindowController?.close()
+            }
+            quickActionWindow.onCommandNumber = { [weak self] shortcutIndex in
+                self?.selectQuickActionTask(shortcutIndex: shortcutIndex)
+            }
+        }
         selectionActionWindowController = WindowController(
             title: "选择操作",
             frame: NSRect(origin: .zero, size: selectionActionCompactSize),
             contentView: AnyView(SelectionActionView(appState: appState) { [weak self] task in
                 self?.performSelectionAction(task)
             }),
+            windowLevel: .floating,
             windowKind: .nonActivatingPanel
         )
         selectionActionWindowController?.window?.isOpaque = false
@@ -104,6 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             title: "悬浮组件",
             frame: NSRect(x: 0, y: 0, width: 360, height: 520),
             contentView: AnyView(FloatingWidgetView(appState: appState)),
+            windowLevel: .floating,
             autoCollapseAtScreenEdge: appState.preferences.autoCollapseWidget
         )
         settingsWindowController = WindowController(
@@ -157,7 +169,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     func selectionActionService(
         _ service: SelectionActionService,
         didTriggerSelectionAt screenPoint: NSPoint,
-        source: SelectionActionTriggerSource
+        source: SelectionActionTriggerSource,
+        gesture: SelectionActionGesture?
     ) {
         guard isSelectionActionEnabled else {
             return
@@ -167,12 +180,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             guard let self else {
                 return
             }
-            await self.handleSelectionActionTrigger(at: screenPoint, source: source)
+            await self.handleSelectionActionTrigger(at: screenPoint, source: source, gesture: gesture)
         }
     }
 
-    private func handleSelectionActionTrigger(at screenPoint: NSPoint, source: SelectionActionTriggerSource) async {
+    private func handleSelectionActionTrigger(
+        at screenPoint: NSPoint,
+        source: SelectionActionTriggerSource,
+        gesture: SelectionActionGesture?
+    ) async {
         guard isSelectionActionEnabled else {
+            return
+        }
+        guard shouldHandleSelectionActionTrigger(source: source, gesture: gesture) else {
             return
         }
 
@@ -209,11 +229,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             guard isSelectionActionEnabled else {
                 return nil
             }
-            if let selectedText = await SelectedTextService.captureSelectedText() {
+            if let selectedText = await SelectedTextService.captureSelectedText(
+                near: screenPoint,
+                preserveNonTextClipboardPayloads: true
+            ) {
                 return selectedText
             }
         }
         return nil
+    }
+
+    private func shouldHandleSelectionActionTrigger(source: SelectionActionTriggerSource, gesture: SelectionActionGesture?) -> Bool {
+        guard source == .mouseDrag,
+              let bundleIdentifier = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+              let lineLimitRule = appState.preferences.selectionLineLimitRules.first(where: { $0.bundleIdentifier == bundleIdentifier }),
+              let gesture else {
+            return true
+        }
+
+        let maximumLines = max(1, lineLimitRule.maximumLineCount)
+        let maximumHeight = CGFloat(maximumLines) * selectionGestureLineHeight
+        if gesture.height > maximumHeight {
+            return false
+        }
+        return true
     }
 
     private func populateSelectedTextIfAvailable() {
@@ -484,6 +523,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    private func selectQuickActionTask(shortcutIndex: Int) {
+        guard !appState.isRunning else {
+            return
+        }
+        let tasks = TaskKind.interactiveCases
+        guard tasks.indices.contains(shortcutIndex) else {
+            return
+        }
+        appState.selectedTask = tasks[shortcutIndex]
+        quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
+    }
+
     private var selectionActionShouldShowInlineResult: Bool {
         appState.inputOrigin == .selection && appState.selectionInlineResultVisible
     }
@@ -623,6 +674,7 @@ final class WindowController: NSWindowController {
         title: String,
         frame: NSRect,
         contentView: AnyView,
+        windowLevel: NSWindow.Level = .normal,
         autoCollapseAtScreenEdge: Bool = false,
         windowKind: WindowKind = .regular
     ) {
@@ -655,7 +707,7 @@ final class WindowController: NSWindowController {
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .managed]
         window.isMovableByWindowBackground = true
-        window.level = .floating
+        window.level = windowLevel
         super.init(window: window)
     }
 
@@ -683,9 +735,31 @@ final class SelectionActionWindow: NSPanel {
 
 class FloatingWindow: NSWindow {
     var autoCollapseAtScreenEdge = false
+    var onEscape: (() -> Void)?
+    var onCommandNumber: ((Int) -> Void)?
     private var expandedWidth: CGFloat = 360
     private let collapsedWidth: CGFloat = 42
     private let edgeTolerance: CGFloat = 24
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if event.keyCode == 53, modifiers.isEmpty, let onEscape {
+                onEscape()
+                return
+            }
+            if modifiers == .command,
+               let characters = event.charactersIgnoringModifiers,
+               let shortcutNumber = Int(characters),
+               (1...9).contains(shortcutNumber),
+               let onCommandNumber {
+                onCommandNumber(shortcutNumber - 1)
+                return
+            }
+        }
+
+        super.sendEvent(event)
+    }
 
     override func setFrameOrigin(_ point: NSPoint) {
         super.setFrameOrigin(point)
