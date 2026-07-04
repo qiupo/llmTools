@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-04
 
-Status: active Phase 2 product and engineering plan, now in closure/acceptance planning. Phase 2.0 Chrome current-page translation, Phase 2.1 site rules, Phase 2.2 development-only Chrome distribution decision, Phase 2.4 current-page controls, Phase 2.5 complex-page baseline, and Phase 2.6 privacy/fixture baseline are implemented. Phase 2.3 Edge support is implemented at the app/config/manifest/test-runner level and still needs real Edge loading/native-messaging/translation acceptance when Edge is available. Chrome Web Store distribution, Safari/Firefox support, browser PDF translation, and image/OCR translation are deferred to later product decisions.
+Status: active Phase 2 product and engineering plan, now in closure/acceptance planning. Phase 2.0 Chrome current-page translation, Phase 2.1 site rules, Phase 2.2 development-only Chrome distribution decision, Phase 2.4 current-page controls, Phase 2.5 complex-page baseline, and Phase 2.6 privacy/fixture baseline are implemented. Phase 2.3 Edge support is implemented at the app/config/manifest/test-runner level and still needs real Edge loading/native-messaging/translation acceptance when Edge is available. Chrome Web Store distribution, Safari/Firefox support, browser PDF translation, and browser image/canvas OCR translation are deferred to later browser product decisions. Native image OCR is planned in Phase 3.
 
 ## 1. Objective
 
@@ -47,7 +47,7 @@ That list is no longer the active backlog. The current Phase 2 requirement state
 
 - Closed for Phase 2: site/domain rules, auto-translate permission gating, page/site/all cache controls, development-only Chrome distribution decision, stable native-manifest diagnostics, reading modes, visible/full-page discovery controls, translation quality modes, pending translation style controls in the extension popup, current-page retranslate, per-domain reading/quality defaults, SPA route reset, virtualized rows, same-origin iframes, open shadow roots, table-heavy pages, unsupported embedded-content detection, redacted diagnostics, cache/history policy, and Phase 1 regression coverage.
 - Still in Phase 2 closure: real Microsoft Edge acceptance, packaged-app Chrome/Edge release smoke, restart recovery smoke, and defect fixing found by those acceptance runs.
-- Deferred to later release tracks: Chrome Web Store listed/unlisted production distribution and production extension ID, Brave/Arc/Safari/Firefox expansion, actual browser PDF viewer translation, image/canvas/OCR translation, form-writing assistance, multi-tab bulk translation, cross-device sync, and enterprise managed deployment.
+- Deferred to later release tracks: Chrome Web Store listed/unlisted production distribution and production extension ID, Brave/Arc/Safari/Firefox expansion, actual browser PDF viewer translation, browser image/canvas OCR translation, form-writing assistance, multi-tab bulk translation, cross-device sync, and enterprise managed deployment. Native image OCR is handled by the Phase 3 native-task plan.
 
 The remaining work should not reopen the Phase 2.0 Chrome bridge architecture. Extend it only if a browser policy, security finding, or acceptance bug requires a change.
 
@@ -141,7 +141,7 @@ These constraints are product requirements, not implementation preferences.
 - Production Chrome extension distribution and update path only after a later release/distribution decision.
 - Advanced reading and translation modes, including bilingual/original comparison, visible-first/full-page discovery scope, and natural/literal/technical quality modes.
 - Complex-page handling for SPAs, virtualized lists, accessible frames, and table-heavy pages.
-- Browser PDF viewer and image/OCR translation are deferred from Phase 2 closure unless a separate product decision reopens them.
+- Browser PDF viewer translation and browser image/canvas OCR are deferred from Phase 2 closure unless a separate product decision reopens them. Native image OCR belongs to Phase 3.
 - Release-grade privacy, cache, diagnostics, and browser E2E coverage.
 
 ### 6.2 Native App
@@ -1129,7 +1129,7 @@ Deferred from Phase 2 closure unless explicitly reprioritized:
 - Brave, Arc, Safari, and Firefox support.
 - Actual closed Shadow DOM translation.
 - Browser PDF viewer translation.
-- Image/canvas/OCR translation.
+- Browser image/canvas OCR translation; native image OCR belongs to Phase 3.
 - Form-writing assistance or user-input rewriting.
 - Multi-tab bulk translation, cross-device sync, and enterprise managed extension deployment.
 
@@ -1319,7 +1319,7 @@ Requirements:
 - Translate accessible same-origin iframes when content script injection is allowed.
 - Detect and explain unsupported frames, closed shadow DOM, canvas/image text, browser PDF viewers, and pages that block injection.
 - Add browser PDF viewer translation only after ordinary DOM and iframe handling remain stable.
-- Add image/canvas/OCR translation only after PDF/browser embedding is stable.
+- Add browser image/canvas OCR translation only after native OCR and normal browser DOM translation are stable.
 
 Current implementation:
 
@@ -1343,7 +1343,7 @@ Current implementation:
 Remaining:
 
 - Broader closed Shadow DOM heuristics can be expanded later; actual closed Shadow DOM translation remains unsupported because browser APIs do not expose those internals.
-- Actual browser PDF viewer translation and image/canvas/OCR translation once the normal DOM and unsupported-state paths remain stable.
+- Actual browser PDF viewer translation and browser image/canvas OCR translation once the normal DOM and unsupported-state paths remain stable.
 
 Exit criteria:
 
@@ -1546,7 +1546,7 @@ Resolved for Phase 2:
 - Persistent extension cache is accepted as a Phase 2 local feature because README and Settings expose the policy and the popup can clear page/site/all webpage cache.
 - Chrome distribution remains development-only for Phase 2. Development ID is `jednddlgkkohaebgoejcidfppddjegij`.
 - Edge is the first additional browser target. The app/config/manifest/test-runner work is implemented; real Edge acceptance remains the closure item.
-- Browser PDF viewer translation and image/canvas/OCR translation are deferred out of Phase 2 closure.
+- Browser PDF viewer translation and browser image/canvas OCR translation are deferred out of Phase 2 closure. Native image OCR is planned in Phase 3.
 
 Later release decisions:
 
@@ -1555,7 +1555,7 @@ Later release decisions:
 - Whether app sandboxing or App Store distribution is planned soon. This affects native host manifest installation.
 - Whether Brave, Arc, Safari, or Firefox should be prioritized after Edge.
 - Whether browser PDF translation belongs in a document/PDF phase.
-- Whether image/canvas/OCR translation belongs in a dedicated OCR phase.
+- Native image OCR belongs in Phase 3. Browser image/canvas OCR remains a later browser feature.
 
 Recommended defaults:
 

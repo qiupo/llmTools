@@ -8,6 +8,7 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 
 - selected-text translation, polishing, summarization, explanation, and TODO extraction
 - direct web-page translation, where English text in a page can be translated into Chinese in place
+- native image OCR using explicitly configured vision-capable models
 - a floating desktop widget that accepts pasted text and dragged files
 - local model reuse through user-selected model files or model folders
 - task-first interaction, with model selection hidden behind sensible defaults
@@ -26,7 +27,8 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 2.4 current-page controls are implemented for replacement/bilingual/original reading modes, visible-first/full-page discovery scope, natural/literal/technical quality modes, pending translation style selection in the extension popup, current-page retranslate, and per-domain reading/quality defaults.
 - Phase 2.5 complex-page baseline is implemented for SPA route reset, stale page-session rejection, virtualized rows, same-origin iframes, open shadow roots, high-frequency mutations, table-heavy pages, protected/page-PDF unsupported states, and partial-support reporting for unsupported embedded content.
 - Phase 2.6 privacy, diagnostics, and release-QA baseline is implemented: redacted webpage diagnostics, explicit cache/history policy, default-off webpage Recent History, fixture matrix coverage, least-privilege manifest checks, browser runtime/console checks, and Phase 1 regression checks.
-- Remaining Phase 2 work is now limited to closure tasks: real Edge acceptance, packaged-app browser smoke on real sites, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, image/OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
+- Remaining Phase 2 work is now limited to closure tasks: real Edge acceptance, packaged-app browser smoke on real sites, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, browser image/canvas OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
+- Phase 3 is the next product phase. It should close the remaining translation acceptance work, improve the existing polish/summarize/explain/TODO workflows, add explicit model capability metadata, and provide native image OCR through local Apple Vision, a user-selected vision-capable model, or a hybrid of both.
 
 ## Confirmed Decisions
 
@@ -52,6 +54,10 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 2.0 uses a Chrome extension, native messaging host, and a local `127.0.0.1` app bridge protected by an app-generated token.
 - Development Chrome extension ID: `jednddlgkkohaebgoejcidfppddjegij`.
 - Phase 2.0 Chrome baseline is complete. Later Phase 2 work should not relitigate the Chrome MVP architecture unless a regression or browser policy change requires it.
+- Phase 3 OCR starts in the native app, not inside browser page translation. Browser image/canvas OCR remains a later browser feature after native OCR and normal DOM translation are stable.
+- Local Apple Vision OCR is allowed in Phase 3 as a deterministic macOS OCR service. It is separate from local multimodal LLM support.
+- OCR models must be chosen from models marked as vision-capable. When provider APIs cannot prove vision support, the app should expose confidence and allow a clear manual override instead of silently assuming support.
+- Local text-only GGUF and MLX models should remain unavailable for OCR until a real multimodal local runner exists.
 
 ## Phase 1: Native MVP - Completed
 
@@ -244,7 +250,7 @@ Deferred out of the current Phase 2 closure:
 - Chrome Web Store listed/unlisted production distribution and a production extension ID.
 - Brave, Arc, Safari, and Firefox support.
 - Actual browser PDF viewer translation.
-- Image/canvas/OCR translation.
+- Browser image/canvas OCR translation; native image OCR belongs to Phase 3.
 - Form-writing assistance or user-input rewriting.
 - Multi-tab bulk translation and cross-device sync.
 - Enterprise managed extension deployment.
@@ -258,9 +264,49 @@ Phase 2 completion checklist:
 5. Phase 1 selected-text, quick action, model registry, floating widget, recent history, and packaging regressions remain green.
 6. All intentionally unsupported content shows graceful unsupported or partial-support states.
 
-## Phase 3: Floating File Drop Workflow
+## Phase 3: Native Task Polish And Vision OCR
 
-Goal: make the floating widget a natural file-processing entry point.
+Goal: turn the current task-first macOS assistant into a reliable everyday tool by closing translation acceptance, improving the existing text workflows, and adding native OCR paths for images through local Apple Vision, explicitly configured vision-capable models, and hybrid cleanup/structure workflows.
+
+Detailed PRD: `docs/phase-3-native-task-and-ocr-prd.md`.
+
+Core capabilities:
+
+- Phase 2 translation closure and acceptance bug fixing
+- selected-text and quick-action translation quality hardening
+- task-specific improvements for polishing, summarization, explanation, and TODO extraction
+- clearer run/cancel/retry/error states across all native text tasks
+- model capability metadata for text-only and vision-capable models
+- capability detection through provider metadata where available, provider/model heuristics where necessary, and user-visible manual override when automatic detection is uncertain
+- local Apple Vision OCR for private, fast image text extraction
+- OCR engine modes for local-only, vision-model, and hybrid extraction
+- OCR model preference that only accepts vision-capable models
+- native image OCR from image files, clipboard images, and screenshots
+- OCR output modes for plain text, key-value/table preservation, and optional translate-after-OCR
+- privacy controls that make remote OCR opt-in and avoid storing raw images by default
+- focused regression coverage for existing Phase 1 and Phase 2 behavior
+
+Suggested scope:
+
+- Finish Phase 2 acceptance before broadening browser translation.
+- Improve existing text tasks before adding new document-assistant surfaces.
+- Start OCR in the native app with PNG, JPEG, WebP where decodable, and clipboard/screenshot input.
+- Use Apple Vision as the local OCR baseline, and provider-backed vision models for hard images, structure cleanup, and model-assisted extraction because the current local GGUF/MLX runners are text-only.
+- Keep browser image/canvas OCR, PDF translation, and document indexing out of this phase unless explicitly reprioritized.
+
+Primary acceptance:
+
+- A user can complete Phase 2 browser-translation closure without regressing Phase 1 native tasks.
+- A user can run translate, polish, summarize, explain, and extract TODOs with task-specific output that is copyable, retryable, and predictable.
+- Settings clearly shows which models are text-only, vision-capable, unknown, or manually overridden.
+- A non-vision model cannot be selected as the OCR model.
+- A user can run local-only OCR without a remote model, or choose a vision-capable model for model/hybrid OCR.
+- A user can drop or paste an image and get extracted text with preserved line/table structure where possible.
+- OCR failures explain whether the blocker is missing vision support, provider configuration, input format, network/API failure, or no readable text.
+
+## Phase 4: File Drop And Document Intake
+
+Goal: make the floating widget a natural file-processing entry point after native text tasks and OCR are stable.
 
 Core capabilities:
 
@@ -268,6 +314,7 @@ Core capabilities:
 - drag-to-process interaction
 - screen-edge docking and auto-collapse
 - TXT and Markdown file ingestion
+- image file OCR handoff to the Phase 3 OCR engine
 - PDF ingestion after text extraction is stable
 - automatic task suggestion based on file content
 - file summary
@@ -278,17 +325,17 @@ Core capabilities:
 
 Suggested scope:
 
-- Start with TXT/Markdown because they are predictable and allow the model pipeline to be hardened first.
+- Start with TXT/Markdown and images because text extraction and OCR paths are explicit.
 - Add PDF only after text chunking, page extraction, and progress reporting are reliable.
 - Treat DOCX as a later extension unless it becomes an explicit priority.
 
 Primary acceptance:
 
-- A user can drag a supported file onto the floating widget and receive a structured result.
+- A user can drag a supported text or image file onto the floating widget and receive a structured result.
 - The widget remains unobtrusive when docked to the side of the screen.
 - Large-file failures produce understandable messages instead of silent hangs.
 
-## Phase 4: Local Document Assistant
+## Phase 5: Local Document Assistant
 
 Goal: move from single-shot processing to reusable local document understanding.
 
@@ -315,7 +362,7 @@ Primary acceptance:
 - A user can summarize a set of files without manually opening each file.
 - The app clearly separates raw files, extracted text, generated summaries, and vector/index data.
 
-## Phase 5: Model Routing and Automation
+## Phase 6: Model Routing and Automation
 
 Goal: make multiple small models cooperate behind simple task workflows.
 

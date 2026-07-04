@@ -139,7 +139,8 @@ Current scope:
 
 - Implemented: Chrome page translation, site rules, cache controls, reading modes, quality modes, retranslate, privacy diagnostics, and Phase 1 regression checks.
 - Implemented for Edge: Settings detection, native manifest repair, `edge://extensions` launch, and reusable browser fixture runner.
-- Deferred: Chrome Web Store distribution, production extension ID, Safari/Firefox support, browser PDF viewer translation, OCR/image/canvas translation, form-writing assistance, and multi-tab bulk translation.
+- Deferred from browser translation: Chrome Web Store distribution, production extension ID, Safari/Firefox support, browser PDF viewer translation, browser image/canvas OCR translation, form-writing assistance, and multi-tab bulk translation.
+- Planned next phase: native text-task polish plus image OCR through local Apple Vision, an explicitly configured vision-capable model, or a hybrid of both.
 
 Chrome cannot be silently installed, enabled, or confirmed by the app. Final extension loading and permission prompts stay under browser control.
 
@@ -232,6 +233,7 @@ Resources/              app icon assets
 - [Roadmap](docs/roadmap.md)
 - [Phase 1 spec](docs/phase-1-spec.md)
 - [Phase 2 webpage translation PRD](docs/phase-2-web-page-translation-prd.md)
+- [Phase 3 native task and OCR PRD](docs/phase-3-native-task-and-ocr-prd.md)
 
 ## Contributing
 
