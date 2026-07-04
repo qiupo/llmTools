@@ -16,9 +16,13 @@ APP_ICON_NAME="AppIcon"
 DEFAULT_OMLX_METALLIB="/Applications/oMLX.app/Contents/Python/framework-mlx-framework/lib/python3.11/site-packages/mlx/lib/mlx.metallib"
 
 cd "$ROOT_DIR"
-swift build -c "$CONFIGURATION"
+swift_build_args=(-c "$CONFIGURATION")
+if [ -n "${SWIFT_BUILD_JOBS:-}" ]; then
+    swift_build_args+=(--jobs "$SWIFT_BUILD_JOBS")
+fi
+swift build "${swift_build_args[@]}"
 
-BIN_DIR="$(swift build -c "$CONFIGURATION" --show-bin-path)"
+BIN_DIR="$(swift build "${swift_build_args[@]}" --show-bin-path)"
 EXECUTABLE_PATH="$BIN_DIR/llmTools"
 NATIVE_HOST_PATH="$BIN_DIR/LLMToolsNativeHost"
 

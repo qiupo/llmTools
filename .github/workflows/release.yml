@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 90
     env:
       RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.event.inputs.version }}
+      SWIFT_BUILD_JOBS: "2"
 
     steps:
       - name: Checkout
@@ -83,9 +84,9 @@ jobs:
           python3 --version
           python3.12 --version || true
 
-      - name: Run Swift checks
+      - name: Build Swift checks
         shell: bash
-        run: swift run LLMToolsChecks
+        run: swift build --product LLMToolsChecks --jobs "$SWIFT_BUILD_JOBS"
 
       - name: Check browser extension scripts
         shell: bash

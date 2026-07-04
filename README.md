@@ -202,10 +202,10 @@ The workflow:
 
 1. Runs on `macos-15` arm64 GitHub-hosted runners.
 2. Checks the Swift and Node toolchains.
-3. Runs `swift run LLMToolsChecks`.
+3. Builds `LLMToolsChecks` as a Swift compile gate.
 4. Runs syntax checks for the browser extension scripts.
 5. Installs the Python MLX package to locate `mlx.metallib` for the release bundle.
-6. Packages `dist/llmTools.app` through `scripts/package-app.sh`.
+6. Packages `dist/llmTools.app` through `scripts/package-app.sh` with limited SwiftPM parallelism on CI.
 7. Verifies the app bundle signature.
 8. Creates release zip files and sha256 checksums.
 9. Publishes the assets to the matching GitHub Release.
