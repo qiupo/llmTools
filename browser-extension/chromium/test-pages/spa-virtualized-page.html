@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTools SPA Virtualized Fixture</title>
+  <style>
+    body {
+      max-width: 760px;
+      margin: 40px auto;
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .feed {
+      display: grid;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .virtual-window {
+      display: grid;
+      gap: 8px;
+      margin-top: 18px;
+      padding-top: 12px;
+      border-top: 1px solid #d7dce2;
+    }
+    .row {
+      padding: 10px;
+      border: 1px solid #cfd6dd;
+      border-radius: 6px;
+      background: #ffffff;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>SPA virtualized route</h1>
+    <p>SPA route content should be translated before navigation.</p>
+    <section class="feed" aria-label="Virtualized feed">
+      <p class="row" data-virtualized-row>Virtualized row one should be translated.</p>
+      <p class="row" data-pooled-row>Virtualized pool row one should be translated.</p>
+      <p class="row" data-high-frequency>High frequency update 0 should flush before updates stop.</p>
+      <div class="virtual-window" data-virtual-window aria-label="Long virtualized feed window"></div>
+    </section>
+  </main>
+  <script>
+    const virtualWindowSize = 20;
+    const virtualWindow = document.querySelector("[data-virtual-window]");
+    const virtualRows = Array.from({ length: virtualWindowSize }, (_, index) => {
+      const row = document.createElement("p");
+      row.className = "row";
+      row.dataset.virtualWindowRow = String(index);
+      virtualWindow.appendChild(row);
+      return row;
+    });
+
+    const virtualFeedText = (itemIndex) => (
+      `Virtualized feed item ${itemIndex} should be translated after scroll window reuse.`
+    );
+
+    window.renderVirtualizedWindow = (startIndex) => {
+      const start = Number(startIndex) || 1;
+      return virtualRows.map((row, rowIndex) => {
+        const itemIndex = start + rowIndex;
+        const text = virtualFeedText(itemIndex);
+        row.dataset.virtualItem = String(itemIndex);
+        if (rowIndex % 2 === 0 && row.firstChild) {
+          row.firstChild.nodeValue = text;
+        } else {
+          row.textContent = text;
+        }
+        return text;
+      });
+    };
+
+    window.renderVirtualizedWindow(1);
+
+    window.reuseDetachedVirtualizedRow = (nextText) => {
+      const feed = document.querySelector(".feed");
+      const row = document.querySelector("[data-pooled-row]");
+      row.remove();
+      row.firstChild.nodeValue = nextText;
+      feed.insertBefore(row, virtualWindow);
+      return row.textContent;
+    };
+  </script>
+</body>
+</html>

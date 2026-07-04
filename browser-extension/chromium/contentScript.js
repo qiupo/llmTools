@@ -5,6 +5,39 @@
   window.__llmToolsContentLoaded = true;
 
   const DEFAULT_APP_LANGUAGE = "zh-Hans";
+  const READING_MODE_REPLACE = "replace";
+  const READING_MODE_BILINGUAL = "bilingual";
+  const READING_MODE_ORIGINAL = "original";
+  const DISCOVERY_SCOPE_VISIBLE = "visible";
+  const DISCOVERY_SCOPE_PAGE = "page";
+  const VISIBLE_DISCOVERY_LIMIT = 200;
+  const PAGE_DISCOVERY_LIMIT = 1000;
+  const DISCOVERY_DEBOUNCE_MS = 250;
+  const DISCOVERY_MAX_WAIT_MS = 1000;
+  const CLOSED_SHADOW_SEMANTIC_ROLES = new Set([
+    "button",
+    "checkbox",
+    "combobox",
+    "dialog",
+    "grid",
+    "link",
+    "listbox",
+    "menu",
+    "menuitem",
+    "option",
+    "radio",
+    "region",
+    "searchbox",
+    "slider",
+    "switch",
+    "tab",
+    "tabpanel",
+    "textbox",
+    "toolbar",
+    "tooltip",
+    "tree",
+    "treeitem"
+  ]);
   const CONTENT_TEXT = {
     "zh-Hans": {
       cancelled: "已取消",
@@ -41,19 +74,28 @@
     originalByID: new Map(),
     translatedByID: new Map(),
     spinnerByID: new Map(),
-    processedNodes: new WeakSet(),
+    processedNodeHashes: new WeakMap(),
+    segmentIDByNode: new WeakMap(),
     pendingNodes: new Set(),
+    unsupportedEmbeddedContent: emptyUnsupportedEmbeddedContent(),
     cancelled: false,
     discoveryPaused: false,
     overlay: null,
     overlayMinimized: false,
     pendingIndicatorStyle: "loading",
+    readingMode: READING_MODE_REPLACE,
+    discoveryScope: DISCOVERY_SCOPE_VISIBLE,
     animatedSegmentIDs: new Set(),
-    segmentSpinnerStyleInstalled: false,
+    segmentStyleDocuments: new WeakSet(),
+    observedMutationRoots: new WeakSet(),
     intersectionObserver: null,
     mutationObserver: null,
     discoveryTimer: null,
-    staleIndicatorCleanupTimer: null
+    discoveryFirstQueuedAt: null,
+    staleIndicatorCleanupTimer: null,
+    overlayNoticeHideTimer: null,
+    lastURL: location.href,
+    routeChangeTimer: null
   };
 
   function normalizeAppLanguage(language) {
@@ -63,6 +105,21 @@
   function setAppLanguage(language) {
     state.appLanguage = normalizeAppLanguage(language);
     return state.appLanguage;
+  }
+
+  function normalizeReadingMode(mode) {
+    if (mode === READING_MODE_BILINGUAL || mode === READING_MODE_ORIGINAL) {
+      return mode;
+    }
+    return READING_MODE_REPLACE;
+  }
+
+  function normalizeDiscoveryScope(scope) {
+    return scope === DISCOVERY_SCOPE_PAGE ? DISCOVERY_SCOPE_PAGE : DISCOVERY_SCOPE_VISIBLE;
+  }
+
+  function discoveryLimitForScope(scope) {
+    return normalizeDiscoveryScope(scope) === DISCOVERY_SCOPE_PAGE ? PAGE_DISCOVERY_LIMIT : VISIBLE_DISCOVERY_LIMIT;
   }
 
   function t(key, values = {}, language = state.appLanguage) {
@@ -79,6 +136,8 @@
     return true;
   });
 
+  installRouteChangeWatcher();
+
   async function handleMessage(message) {
     switch (message?.type) {
       case "ping":
@@ -86,9 +145,25 @@
       case "startSession":
         return startSession(message.pageSessionID, message.pendingIndicatorStyle, message);
       case "applyTranslations":
+        if (state.cancelled) {
+          return { ok: true, applied: state.translatedByID.size, cancelled: true };
+        }
+        if (message.pageSessionID && message.pageSessionID !== state.pageSessionID) {
+          return { ok: false, applied: state.translatedByID.size, reason: "stale_page_session" };
+        }
         applyTranslations(message.translations || []);
         return { ok: true, applied: state.translatedByID.size };
+      case "setReadingMode":
+        setReadingMode(message.mode);
+        return getPageTranslationState();
       case "translationState":
+        if (message.state?.pageSessionID && message.state.pageSessionID !== state.pageSessionID) {
+          return {
+            ok: false,
+            reason: "stale_page_session",
+            pageSessionID: state.pageSessionID
+          };
+        }
         setAppLanguage(message.state?.appLanguage);
         updateOverlayFromState(message.state || {});
         return { ok: true };
@@ -116,31 +191,44 @@
     state.pageSessionID = pageSessionID || crypto.randomUUID();
     setAppLanguage(options.appLanguage);
     state.pendingIndicatorStyle = normalizePendingIndicatorStyle(pendingIndicatorStyle);
+    state.readingMode = normalizeReadingMode(options.readingMode);
+    state.discoveryScope = normalizeDiscoveryScope(options.discoveryScope);
     state.cancelled = false;
     state.discoveryPaused = false;
     state.overlayMinimized = false;
-    state.processedNodes = new WeakSet();
+    state.processedNodeHashes = new WeakMap();
+    state.segmentIDByNode = new WeakMap();
     state.pendingNodes.clear();
+    state.discoveryFirstQueuedAt = null;
+    state.unsupportedEmbeddedContent = emptyUnsupportedEmbeddedContent();
     state.nodeByID.clear();
     state.originalByID.clear();
     state.translatedByID.clear();
+    state.observedMutationRoots = new WeakSet();
     state.animatedSegmentIDs.clear();
     clearTimeout(state.staleIndicatorCleanupTimer);
     state.staleIndicatorCleanupTimer = null;
+    clearOverlayNoticeHideTimer();
     removeAllSegmentSpinners();
     showOverlay(t("discoveringText"));
     installObservers();
-    const segments = discoverSegments(document.body);
+    const segments = discoverSegments(document.body, discoveryLimitForScope(state.discoveryScope), {
+      discoveryScope: state.discoveryScope
+    });
+    state.unsupportedEmbeddedContent = detectUnsupportedEmbeddedContent(document.body);
     updateOverlay(t("foundSegments", { count: segments.length }));
     return {
       ok: true,
       url: location.href,
       title: document.title,
-      segments
+      pageSessionID: state.pageSessionID,
+      segments,
+      unsupportedEmbeddedContent: state.unsupportedEmbeddedContent
     };
   }
 
   function getPageTranslationState() {
+    state.unsupportedEmbeddedContent = detectUnsupportedEmbeddedContent(document.body);
     return {
       ok: true,
       url: location.href,
@@ -148,51 +236,259 @@
       pageSessionID: state.pageSessionID,
       trackedCount: state.originalByID.size,
       translatedCount: state.translatedByID.size,
-      hasTranslations: state.translatedByID.size > 0
+      hasTranslations: state.translatedByID.size > 0,
+      readingMode: state.readingMode,
+      cancelled: state.cancelled,
+      overlayMessage: state.overlay?.message || "",
+      unsupportedEmbeddedContent: state.unsupportedEmbeddedContent
     };
   }
 
-  function discoverSegments(root = document.body, limit = 200) {
+  function discoverSegments(root = document.body, limit = discoveryLimitForScope(state.discoveryScope), options = {}) {
     if (!root || state.cancelled || state.discoveryPaused) {
       return [];
     }
     const segments = [];
+    const discoveryScope = normalizeDiscoveryScope(options.discoveryScope || state.discoveryScope);
     const requestedLimit = Number.isFinite(Number(limit)) ? Math.max(Number(limit), 0) : Number.POSITIVE_INFINITY;
-    const maxSegments = Math.min(requestedLimit, 200);
-    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-      acceptNode(node) {
-        if (!candidateNode(node)) return NodeFilter.FILTER_REJECT;
-        return NodeFilter.FILTER_ACCEPT;
+    const maxSegments = Math.min(requestedLimit, discoveryLimitForScope(discoveryScope));
+    for (const segmentRoot of segmentRootsFor(root)) {
+      if (segments.length >= maxSegments) {
+        break;
       }
-    });
+      const doc = segmentRoot.ownerDocument || document;
+      const walker = doc.createTreeWalker(segmentRoot, NodeFilter.SHOW_TEXT, {
+        acceptNode(node) {
+          if (!candidateNode(node, { discoveryScope })) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        }
+      });
 
-    const nodes = [];
-    let node;
-    while ((node = walker.nextNode()) && nodes.length < maxSegments) {
-      nodes.push(node);
-    }
+      const nodes = [];
+      let node;
+      while ((node = walker.nextNode()) && nodes.length + segments.length < maxSegments) {
+        nodes.push(node);
+      }
 
-    for (const textNode of nodes) {
-      const segment = registerNode(textNode);
-      if (segment) {
-        segments.push(segment);
+      for (const textNode of nodes) {
+        const segment = registerNode(textNode);
+        if (segment) {
+          segments.push(segment);
+        }
       }
     }
     return segments;
   }
 
+  function segmentRootsFor(root) {
+    if (!root) {
+      return [];
+    }
+    if (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE) {
+      return [root].filter(Boolean);
+    }
+    const roots = [root];
+    if (root.nodeType === Node.ELEMENT_NODE && root.tagName === "IFRAME") {
+      const body = sameOriginFrameBody(root);
+      return body ? [body] : [];
+    }
+    const frames = root.querySelectorAll?.("iframe") || [];
+    for (const frame of frames) {
+      const body = sameOriginFrameBody(frame);
+      if (body) {
+        roots.push(body);
+      }
+    }
+    roots.push(...openShadowRootsFor(root));
+    return roots;
+  }
+
+  function openShadowRootsFor(root) {
+    const roots = [];
+    const seen = new WeakSet();
+    const visitHost = (host) => {
+      const shadowRoot = host?.shadowRoot;
+      if (!shadowRoot || seen.has(shadowRoot)) {
+        return;
+      }
+      seen.add(shadowRoot);
+      roots.push(shadowRoot);
+      for (const nestedHost of shadowRoot.querySelectorAll?.("*") || []) {
+        visitHost(nestedHost);
+      }
+    };
+    if (root.nodeType === Node.ELEMENT_NODE) {
+      visitHost(root);
+    }
+    for (const host of root.querySelectorAll?.("*") || []) {
+      visitHost(host);
+    }
+    return roots;
+  }
+
+  function emptyUnsupportedEmbeddedContent() {
+    return {
+      frames: 0,
+      shadowRoots: 0,
+      canvas: 0,
+      images: 0,
+      pdf: 0,
+      total: 0
+    };
+  }
+
+  function detectUnsupportedEmbeddedContent(root = document.body) {
+    const summary = emptyUnsupportedEmbeddedContent();
+    if (!root || root.nodeType !== Node.ELEMENT_NODE) {
+      return summary;
+    }
+    const embedded = [];
+    const closedShadowHosts = [];
+    for (const searchRoot of [root, ...openShadowRootsFor(root)]) {
+      if (isEmbeddedCandidate(searchRoot)) {
+        embedded.push(searchRoot);
+      }
+      embedded.push(...(searchRoot.querySelectorAll?.("iframe, frame, canvas, img, embed, object") || []));
+      if (isPotentialClosedShadowHost(searchRoot)) {
+        closedShadowHosts.push(searchRoot);
+      }
+      closedShadowHosts.push(...Array.from(searchRoot.querySelectorAll?.("*") || []).filter(isPotentialClosedShadowHost));
+    }
+    for (const element of embedded) {
+      if (!shouldReportUnsupportedEmbeddedElement(element)) {
+        continue;
+      }
+      switch (element.tagName) {
+      case "IFRAME":
+      case "FRAME":
+        if (!sameOriginFrameBody(element)) {
+          summary.frames += 1;
+        }
+        break;
+      case "CANVAS":
+        summary.canvas += 1;
+        break;
+      case "IMG":
+        if (hasPotentialImageText(element)) {
+          summary.images += 1;
+        }
+        break;
+      case "EMBED":
+      case "OBJECT":
+        if (isPdfEmbed(element)) {
+          summary.pdf += 1;
+        }
+        break;
+      default:
+        break;
+      }
+    }
+    summary.shadowRoots = closedShadowHosts.length;
+    summary.total = summary.frames + summary.shadowRoots + summary.canvas + summary.images + summary.pdf;
+    return summary;
+  }
+
+  function isEmbeddedCandidate(element) {
+    return ["IFRAME", "FRAME", "CANVAS", "IMG", "EMBED", "OBJECT"].includes(element?.tagName || "");
+  }
+
+  function shouldReportUnsupportedEmbeddedElement(element) {
+    if (!element || element.dataset?.llmToolsIndicator === "true") {
+      return false;
+    }
+    if (element.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    if (!isVisible(element)) {
+      return false;
+    }
+    return state.discoveryScope === DISCOVERY_SCOPE_PAGE || nearViewport(element);
+  }
+
+  function isPotentialClosedShadowHost(element) {
+    if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+      return false;
+    }
+    const tagName = String(element.localName || element.tagName || "").toLowerCase();
+    if (!tagName.includes("-") || element.shadowRoot) {
+      return false;
+    }
+    if (shouldSkipElement(element) || !shouldReportUnsupportedEmbeddedElement(element)) {
+      return false;
+    }
+    const lightDomText = normalizeText(element.textContent || "");
+    if (isEnglishDominant(lightDomText)) {
+      return false;
+    }
+    const label = closedShadowAccessibleText(element);
+    if (isEnglishDominant(label)) {
+      return true;
+    }
+    return hasClosedShadowComponentSignal(element, lightDomText);
+  }
+
+  function closedShadowAccessibleText(element) {
+    return [
+      element.getAttribute("aria-label") || "",
+      element.getAttribute("aria-description") || "",
+      element.getAttribute("title") || "",
+      textForIDReferences(element, "aria-labelledby"),
+      textForIDReferences(element, "aria-describedby")
+    ].join(" ");
+  }
+
+  function textForIDReferences(element, attributeName) {
+    const ownerDocument = element.ownerDocument || document;
+    const ids = String(element.getAttribute(attributeName) || "").split(/\s+/).filter(Boolean);
+    return ids.map((id) => ownerDocument.getElementById(id)?.textContent || "").join(" ");
+  }
+
+  function hasClosedShadowComponentSignal(element, lightDomText) {
+    if (lightDomText) {
+      return false;
+    }
+    const role = String(element.getAttribute("role") || "").toLowerCase();
+    if (CLOSED_SHADOW_SEMANTIC_ROLES.has(role)) {
+      return true;
+    }
+    if (element.hasAttribute("part") || element.hasAttribute("exportparts")) {
+      return true;
+    }
+    if (element.tabIndex >= 0 && element.getAttribute("aria-disabled") !== "true" && !element.hasAttribute("disabled")) {
+      return true;
+    }
+    return false;
+  }
+
+  function hasPotentialImageText(image) {
+    const label = [
+      image.getAttribute("alt") || "",
+      image.getAttribute("title") || "",
+      image.getAttribute("aria-label") || ""
+    ].join(" ");
+    return isEnglishDominant(label);
+  }
+
+  function isPdfEmbed(element) {
+    const type = String(element.getAttribute("type") || "").toLowerCase();
+    const data = String(element.getAttribute("data") || "").toLowerCase();
+    const src = String(element.getAttribute("src") || "").toLowerCase();
+    return type.includes("pdf") || data.includes(".pdf") || src.includes(".pdf");
+  }
+
   function registerNode(node) {
     const text = normalizeText(node.nodeValue || "");
     const textHash = stableHash(text);
-    if (state.processedNodes.has(node)) {
+    if (state.processedNodeHashes.get(node) === textHash) {
       return null;
     }
+    forgetSegmentForNode(node);
     const segmentID = crypto.randomUUID();
     const original = node.nodeValue;
     const indicator = showSegmentSpinner(segmentID, node);
-    state.nodeByID.set(segmentID, indicator || node);
+    setSegmentNode(segmentID, indicator || node, indicator ? indicator.textContent : original);
     state.originalByID.set(segmentID, original);
-    state.processedNodes.add(node);
+    markProcessedNode(node, text);
     return {
       segmentID,
       text,
@@ -203,17 +499,57 @@
     };
   }
 
-  function candidateNode(node) {
+  function setSegmentNode(segmentID, node, text = "") {
+    if (!segmentID || !node) {
+      return;
+    }
+    state.nodeByID.set(segmentID, node);
+    state.segmentIDByNode.set(node, segmentID);
+    markProcessedNode(node, text || node.nodeValue || node.textContent || "");
+  }
+
+  function markProcessedNode(node, text = "") {
+    if (!node) {
+      return;
+    }
+    const normalized = normalizeText(text || "");
+    if (!normalized) {
+      return;
+    }
+    state.processedNodeHashes.set(node, stableHash(normalized));
+  }
+
+  function forgetSegmentForNode(node) {
+    const segmentID = state.segmentIDByNode.get(node);
+    if (!segmentID) {
+      return;
+    }
+    const mappedNode = state.nodeByID.get(segmentID);
+    if (mappedNode) {
+      state.segmentIDByNode.delete(mappedNode);
+    }
+    state.segmentIDByNode.delete(node);
+    removeSegmentSpinner(segmentID);
+    state.nodeByID.delete(segmentID);
+    state.originalByID.delete(segmentID);
+    state.translatedByID.delete(segmentID);
+    state.animatedSegmentIDs.delete(segmentID);
+  }
+
+  function candidateNode(node, options = {}) {
     if (!node.nodeValue || !normalizeText(node.nodeValue)) return false;
     const element = node.parentElement;
     if (!element || shouldSkipElement(element) || !isVisible(element)) return false;
     const text = normalizeText(node.nodeValue);
     if (!isEnglishDominant(text)) return false;
-    if (!nearViewport(element)) return false;
+    if (normalizeDiscoveryScope(options.discoveryScope || state.discoveryScope) === DISCOVERY_SCOPE_VISIBLE && !nearViewport(element)) return false;
     return true;
   }
 
   function applyTranslations(translations) {
+    if (state.cancelled) {
+      return;
+    }
     for (const item of translations) {
       if (state.cancelled) break;
       if (!item || item.status !== "translated" || !item.translation) {
@@ -234,18 +570,120 @@
         removeSegmentSpinner(item.segmentID);
         continue;
       }
-      if (shouldAnimateTranslation(item.segmentID)) {
-        state.animatedSegmentIDs.add(item.segmentID);
-        applyFlipTextTranslation(item.segmentID, node, original, item.translation);
-      } else {
-        node.nodeValue = preserveWhitespace(original, item.translation);
-        state.translatedByID.set(item.segmentID, item.translation);
-        removeSegmentSpinner(item.segmentID);
-      }
+      state.translatedByID.set(item.segmentID, item.translation);
+      renderSegmentTranslation(item.segmentID, { animate: shouldAnimateTranslation(item.segmentID) });
     }
     updateOverlay(t("appliedTranslations", { count: state.translatedByID.size }), {
       canRestore: state.translatedByID.size > 0
     });
+  }
+
+  function setReadingMode(mode) {
+    const nextMode = normalizeReadingMode(mode);
+    state.readingMode = nextMode;
+    for (const segmentID of state.translatedByID.keys()) {
+      renderSegmentTranslation(segmentID, { animate: false });
+    }
+    return nextMode;
+  }
+
+  function renderSegmentTranslation(segmentID, options = {}) {
+    const original = state.originalByID.get(segmentID);
+    const translation = state.translatedByID.get(segmentID);
+    if (!original || !translation) {
+      removeSegmentSpinner(segmentID);
+      return;
+    }
+    let node = state.nodeByID.get(segmentID);
+    if (!node || !node.isConnected) {
+      removeSegmentSpinner(segmentID);
+      node = state.nodeByID.get(segmentID);
+      if (!node || !node.isConnected) {
+        return;
+      }
+    }
+    if (state.readingMode !== READING_MODE_REPLACE || !options.animate) {
+      removeSegmentSpinner(segmentID);
+      node = state.nodeByID.get(segmentID);
+      if (!node || !node.isConnected) {
+        return;
+      }
+    }
+    switch (state.readingMode) {
+    case READING_MODE_ORIGINAL:
+      replaceSegmentNodeWithText(segmentID, original);
+      break;
+    case READING_MODE_BILINGUAL:
+      replaceSegmentNodeWithElement(segmentID, createBilingualNode(original, translation, {
+        ownerDocument: node.ownerDocument || document,
+        styleRoot: styleRootForNode(node),
+        tableCell: Boolean(closestTableCell(node.parentElement))
+      }));
+      break;
+    case READING_MODE_REPLACE:
+    default:
+      if (options.animate) {
+        state.animatedSegmentIDs.add(segmentID);
+        applyFlipTextTranslation(segmentID, node, original, translation);
+      } else {
+        replaceSegmentNodeWithText(segmentID, preserveWhitespace(original, translation));
+      }
+      break;
+    }
+  }
+
+  function replaceSegmentNodeWithText(segmentID, text) {
+    const node = state.nodeByID.get(segmentID);
+    if (!node || !node.isConnected) {
+      return;
+    }
+    if (node.nodeType === Node.TEXT_NODE) {
+      node.nodeValue = text;
+      setSegmentNode(segmentID, node, text);
+      return;
+    }
+    const textNode = (node.ownerDocument || document).createTextNode(text);
+    node.replaceWith(textNode);
+    setSegmentNode(segmentID, textNode, text);
+  }
+
+  function replaceSegmentNodeWithElement(segmentID, element) {
+    const node = state.nodeByID.get(segmentID);
+    if (!node || !node.isConnected) {
+      return;
+    }
+    state.segmentIDByNode.delete(node);
+    setSegmentNode(segmentID, element, element.textContent || "");
+    if (node.nodeType === Node.TEXT_NODE) {
+      node.parentNode.insertBefore(element, node);
+      node.remove();
+    } else {
+      node.replaceWith(element);
+    }
+  }
+
+  function createBilingualNode(original, translation, options = {}) {
+    const ownerDocument = options.ownerDocument || document;
+    installSegmentSpinnerStyle(options.styleRoot || ownerDocument);
+    const wrapper = ownerDocument.createElement("span");
+    wrapper.className = "llmtools-bilingual";
+    wrapper.dataset.llmToolsBilingual = "true";
+    wrapper.dataset.llmToolsIndicator = "true";
+    if (options.tableCell) {
+      wrapper.dataset.llmToolsTableCell = "true";
+    }
+    wrapper.setAttribute("contenteditable", "false");
+
+    const translated = ownerDocument.createElement("span");
+    translated.className = "llmtools-bilingual-translation";
+    translated.textContent = preserveWhitespace(original, translation);
+
+    const source = ownerDocument.createElement("span");
+    source.className = "llmtools-bilingual-source";
+    source.textContent = normalizeText(original);
+
+    wrapper.append(translated, source);
+    return wrapper;
   }
 
   function restoreOriginal() {
@@ -257,7 +695,7 @@
         if (node.nodeType === Node.TEXT_NODE) {
           node.nodeValue = original;
         } else if (node.nodeType === Node.ELEMENT_NODE) {
-          node.replaceWith(document.createTextNode(original));
+          node.replaceWith((node.ownerDocument || document).createTextNode(original));
         }
       }
     }
@@ -266,8 +704,11 @@
     state.translatedByID.clear();
     state.animatedSegmentIDs.clear();
     removeAllSegmentSpinners();
-    state.processedNodes = new WeakSet();
+    state.processedNodeHashes = new WeakMap();
+    state.segmentIDByNode = new WeakMap();
+    state.observedMutationRoots = new WeakSet();
     state.pendingNodes.clear();
+    state.discoveryFirstQueuedAt = null;
     state.pageSessionID = null;
     state.overlayMinimized = false;
     hideOverlay();
@@ -295,24 +736,27 @@
             queueDiscovery(node.parentElement);
           }
         }
+        if (mutation.type === "childList" && mutation.target?.nodeType === Node.ELEMENT_NODE) {
+          observeElement(mutation.target);
+          queueDiscovery(mutation.target);
+        }
         if (mutation.type === "characterData" && mutation.target?.parentElement) {
           queueDiscovery(mutation.target.parentElement);
         }
       }
     });
 
-    state.mutationObserver.observe(document.body, {
-      childList: true,
-      subtree: true,
-      characterData: true
-    });
+    observeMutationRoot(document.body);
     observeElement(document.body);
+    observeSameOriginFrames(document.body);
+    observeOpenShadowRoots(document.body);
   }
 
   function setDiscoveryPaused(paused) {
     state.discoveryPaused = paused;
     if (paused) {
       state.pendingNodes.clear();
+      state.discoveryFirstQueuedAt = null;
       clearTimeout(state.discoveryTimer);
       state.discoveryTimer = null;
       updateOverlay(t("discoveryPaused"), {
@@ -330,8 +774,27 @@
     if (!state.intersectionObserver || !root || root.nodeType !== Node.ELEMENT_NODE) {
       return;
     }
-    if (root !== document.body && !shouldSkipElement(root)) {
+    if (root !== document.body && root.ownerDocument === document && !shouldSkipElement(root)) {
       state.intersectionObserver.observe(root);
+    }
+    if (root.tagName === "IFRAME") {
+      observeFrameElement(root, { queue: true });
+    }
+    const candidates = root.querySelectorAll?.("p, li, td, th, h1, h2, h3, h4, h5, h6, article, section, main, button, a, span, div") || [];
+    if (root.ownerDocument === document) {
+      for (const element of candidates) {
+        if (!shouldSkipElement(element)) {
+          state.intersectionObserver.observe(element);
+        }
+      }
+    }
+    observeSameOriginFrames(root);
+    observeOpenShadowRoots(root, { queue: true });
+  }
+
+  function observeVisibleCandidates(root) {
+    if (!state.intersectionObserver || !root || root.ownerDocument !== document) {
+      return;
     }
     const candidates = root.querySelectorAll?.("p, li, td, th, h1, h2, h3, h4, h5, h6, article, section, main, button, a, span, div") || [];
     for (const element of candidates) {
@@ -341,13 +804,88 @@
     }
   }
 
+  function observeMutationRoot(root) {
+    if (!state.mutationObserver || !root || state.observedMutationRoots.has(root)) {
+      return;
+    }
+    state.mutationObserver.observe(root, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+    state.observedMutationRoots.add(root);
+  }
+
+  function observeOpenShadowRoots(root, options = {}) {
+    for (const shadowRoot of openShadowRootsFor(root)) {
+      observeMutationRoot(shadowRoot);
+      observeVisibleCandidates(shadowRoot);
+      observeSameOriginFrames(shadowRoot);
+      if (options.queue) {
+        queueDiscovery(shadowRoot);
+      }
+    }
+  }
+
+  function observeSameOriginFrames(root) {
+    if (!root || (root.nodeType !== Node.ELEMENT_NODE && root.nodeType !== Node.DOCUMENT_FRAGMENT_NODE)) {
+      return;
+    }
+    if (root.nodeType === Node.ELEMENT_NODE && root.tagName === "IFRAME") {
+      observeFrameElement(root, { queue: true });
+      return;
+    }
+    const frames = root.querySelectorAll?.("iframe") || [];
+    for (const frame of frames) {
+      observeFrameElement(frame, { queue: false });
+    }
+  }
+
+  function observeFrameElement(frame, options = {}) {
+    const body = sameOriginFrameBody(frame);
+    if (body) {
+      observeMutationRoot(body);
+      observeVisibleCandidates(frame);
+      if (options.queue) {
+        queueDiscovery(body);
+      }
+      return;
+    }
+    if (!frame.dataset.llmToolsFrameLoadWatch) {
+      frame.dataset.llmToolsFrameLoadWatch = "true";
+      frame.addEventListener("load", () => {
+        const loadedBody = sameOriginFrameBody(frame);
+        if (!loadedBody) {
+          return;
+        }
+        observeMutationRoot(loadedBody);
+        observeVisibleCandidates(frame);
+        queueDiscovery(loadedBody);
+      }, { once: false });
+    }
+  }
+
+  function sameOriginFrameBody(frame) {
+    try {
+      const doc = frame?.contentDocument;
+      return doc?.body || null;
+    } catch {
+      return null;
+    }
+  }
+
   function queueDiscovery(root) {
     if (!state.pageSessionID || state.cancelled || state.discoveryPaused || !root) {
       return;
     }
     state.pendingNodes.add(root);
+    if (!state.discoveryFirstQueuedAt) {
+      state.discoveryFirstQueuedAt = Date.now();
+    }
+    const elapsed = Date.now() - state.discoveryFirstQueuedAt;
+    const delay = Math.max(0, Math.min(DISCOVERY_DEBOUNCE_MS, DISCOVERY_MAX_WAIT_MS - elapsed));
     clearTimeout(state.discoveryTimer);
-    state.discoveryTimer = setTimeout(flushPendingDiscovery, 250);
+    state.discoveryTimer = setTimeout(flushPendingDiscovery, delay);
   }
 
   function flushPendingDiscovery() {
@@ -356,14 +894,18 @@
     }
     const pending = Array.from(state.pendingNodes);
     state.pendingNodes.clear();
+    state.discoveryFirstQueuedAt = null;
     const segments = [];
     for (const root of pending) {
       if (!root.isConnected) continue;
       if (root.nodeType === Node.TEXT_NODE && root.parentElement) {
-        const segment = candidateNode(root) ? registerNode(root) : null;
+        const segment = candidateNode(root, { discoveryScope: state.discoveryScope }) ? registerNode(root) : null;
         if (segment) segments.push(segment);
       } else if (root.nodeType === Node.ELEMENT_NODE) {
-        segments.push(...discoverSegments(root));
+        observeSameOriginFrames(root);
+        segments.push(...discoverSegments(root, discoveryLimitForScope(state.discoveryScope), {
+          discoveryScope: state.discoveryScope
+        }));
       }
     }
     if (segments.length) {
@@ -392,8 +934,59 @@
     }
     clearTimeout(state.discoveryTimer);
     state.discoveryTimer = null;
+    state.discoveryFirstQueuedAt = null;
     clearTimeout(state.staleIndicatorCleanupTimer);
     state.staleIndicatorCleanupTimer = null;
+    clearOverlayNoticeHideTimer();
+  }
+
+  function installRouteChangeWatcher() {
+    if (window.__llmToolsRouteWatcherInstalled) {
+      return;
+    }
+    window.__llmToolsRouteWatcherInstalled = true;
+    const notifyRouteMaybeChanged = () => {
+      clearTimeout(state.routeChangeTimer);
+      state.routeChangeTimer = setTimeout(handleRouteMaybeChanged, 80);
+    };
+    for (const methodName of ["pushState", "replaceState"]) {
+      const original = history[methodName];
+      if (typeof original !== "function") {
+        continue;
+      }
+      history[methodName] = function llmToolsHistoryWrapper(...args) {
+        const result = original.apply(this, args);
+        notifyRouteMaybeChanged();
+        return result;
+      };
+    }
+    window.addEventListener("popstate", notifyRouteMaybeChanged);
+    window.addEventListener("hashchange", notifyRouteMaybeChanged);
+  }
+
+  function handleRouteMaybeChanged() {
+    if (location.href === state.lastURL) {
+      return;
+    }
+    const previousURL = state.lastURL;
+    const pageSessionID = state.pageSessionID;
+    state.lastURL = location.href;
+    if (state.originalByID.size || state.translatedByID.size || state.spinnerByID.size || state.overlay) {
+      restoreOriginal();
+    } else {
+      state.cancelled = true;
+      disconnectObservers();
+      state.pendingNodes.clear();
+      state.discoveryFirstQueuedAt = null;
+      state.pageSessionID = null;
+    }
+    safeRuntimeSendMessage({
+      type: "llmToolsRouteChanged",
+      previousURL,
+      url: location.href,
+      title: document.title,
+      pageSessionID
+    });
   }
 
   function shouldSkipElement(element) {
@@ -409,15 +1002,17 @@
   }
 
   function isVisible(element) {
-    const style = getComputedStyle(element);
+    const view = element.ownerDocument?.defaultView || window;
+    const style = view.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) return false;
     return element.getClientRects().length > 0;
   }
 
   function nearViewport(element) {
-    const margin = Math.max(window.innerHeight, 800);
+    const view = element.ownerDocument?.defaultView || window;
+    const margin = Math.max(view.innerHeight, 800);
     const rect = element.getBoundingClientRect();
-    return rect.bottom >= -margin && rect.top <= window.innerHeight + margin;
+    return rect.bottom >= -margin && rect.top <= view.innerHeight + margin;
   }
 
   function isEnglishDominant(text) {
@@ -450,16 +1045,18 @@
       return null;
     }
     if (indicatorStyle === "flipText") {
-      installSegmentSpinnerStyle();
-      const indicator = createFlipTextIndicator(node.nodeValue || "", "", "pending");
+      const ownerDocument = node.ownerDocument || document;
+      installSegmentSpinnerStyle(styleRootForNode(node));
+      const indicator = createFlipTextIndicator(node.nodeValue || "", "", "pending", ownerDocument);
       node.parentNode.insertBefore(indicator, node);
       node.remove();
       state.spinnerByID.set(segmentID, indicator);
       state.animatedSegmentIDs.add(segmentID);
       return indicator;
     }
-    installSegmentSpinnerStyle();
-    const spinner = document.createElement("span");
+    const ownerDocument = node.ownerDocument || document;
+    installSegmentSpinnerStyle(styleRootForNode(node));
+    const spinner = ownerDocument.createElement("span");
     spinner.className = "llmtools-segment-spinner";
     spinner.dataset.llmToolsSpinner = "true";
     spinner.dataset.llmToolsIndicator = "true";
@@ -479,7 +1076,7 @@
   }
 
   function shouldAnimateTranslation(segmentID) {
-    return state.pendingIndicatorStyle === "flipText";
+    return state.pendingIndicatorStyle === "flipText" && state.readingMode === READING_MODE_REPLACE;
   }
 
   function removeSegmentSpinner(segmentID) {
@@ -490,7 +1087,7 @@
     if (spinner) {
       const replacement = removeSegmentIndicatorElement(spinner);
       if (replacement) {
-        state.nodeByID.set(segmentID, replacement);
+        setSegmentNode(segmentID, replacement, replacement.nodeValue || replacement.textContent || "");
       }
       state.spinnerByID.delete(segmentID);
     }
@@ -500,7 +1097,7 @@
     for (const [segmentID, spinner] of state.spinnerByID.entries()) {
       const replacement = removeSegmentIndicatorElement(spinner);
       if (replacement) {
-        state.nodeByID.set(segmentID, replacement);
+        setSegmentNode(segmentID, replacement, replacement.nodeValue || replacement.textContent || "");
       }
     }
     state.spinnerByID.clear();
@@ -525,17 +1122,26 @@
       }
       const replacement = removeSegmentIndicatorElement(indicator);
       if (replacement) {
-        state.nodeByID.set(segmentID, replacement);
+        setSegmentNode(segmentID, replacement, replacement.nodeValue || replacement.textContent || "");
       }
       state.spinnerByID.delete(segmentID);
     }
   }
 
-  function installSegmentSpinnerStyle() {
-    if (state.segmentSpinnerStyleInstalled) {
+  function styleRootForNode(node) {
+    const root = node?.getRootNode?.();
+    if (root?.nodeType === Node.DOCUMENT_FRAGMENT_NODE && root.host) {
+      return root;
+    }
+    return node?.ownerDocument || document;
+  }
+
+  function installSegmentSpinnerStyle(styleRoot = document) {
+    if (state.segmentStyleDocuments.has(styleRoot)) {
       return;
     }
-    const style = document.createElement("style");
+    const ownerDocument = styleRoot.nodeType === Node.DOCUMENT_NODE ? styleRoot : (styleRoot.ownerDocument || document);
+    const style = ownerDocument.createElement("style");
     style.dataset.llmToolsSpinnerStyle = "true";
     style.textContent = `
       @keyframes llmtools-segment-spin {
@@ -547,6 +1153,32 @@
         transform-style: preserve-3d;
         pointer-events: none;
         user-select: none;
+      }
+      .llmtools-bilingual {
+        display: inline;
+      }
+      .llmtools-bilingual[data-llm-tools-table-cell="true"] {
+        display: block;
+        line-height: 1.25;
+      }
+      .llmtools-bilingual-source {
+        margin-left: .35em;
+        color: #6b7280;
+        font-size: .92em;
+        text-decoration: none;
+      }
+      .llmtools-bilingual[data-llm-tools-table-cell="true"] .llmtools-bilingual-source {
+        display: block;
+        margin-left: 0;
+        margin-top: .12em;
+        font-size: .86em;
+        line-height: 1.2;
+      }
+      .llmtools-bilingual-source::before {
+        content: "(";
+      }
+      .llmtools-bilingual-source::after {
+        content: ")";
       }
       .llmtools-segment-flip-tile {
         display: inline-grid;
@@ -617,8 +1249,9 @@
         }
       }
     `;
-    document.documentElement.appendChild(style);
-    state.segmentSpinnerStyleInstalled = true;
+    const target = styleRoot.nodeType === Node.DOCUMENT_FRAGMENT_NODE ? styleRoot : ownerDocument.documentElement;
+    target.appendChild(style);
+    state.segmentStyleDocuments.add(styleRoot);
   }
 
   function applyFlipTextTranslation(segmentID, node, original, translation) {
@@ -626,10 +1259,11 @@
     if (!node?.parentNode && !node?.isConnected) {
       return;
     }
-    installSegmentSpinnerStyle();
+    const ownerDocument = node.ownerDocument || document;
+    installSegmentSpinnerStyle(styleRootForNode(node));
     const wrapper = node.nodeType === Node.ELEMENT_NODE && node.dataset?.llmToolsIndicatorKind === "flipText"
       ? node
-      : createFlipTextIndicator(original, "", "pending");
+      : createFlipTextIndicator(original, "", "pending", ownerDocument);
     wrapper.dataset.llmToolsFinalText = finalText;
     wrapper.setAttribute("aria-label", finalText);
     wrapper.setAttribute("aria-live", "polite");
@@ -637,10 +1271,11 @@
     const blockCount = renderFlipTextBlocks(wrapper, original, finalText, "complete");
 
     if (wrapper !== node) {
+      state.segmentIDByNode.delete(node);
       node.parentNode.insertBefore(wrapper, node);
       node.remove();
     }
-    state.nodeByID.set(segmentID, wrapper);
+    setSegmentNode(segmentID, wrapper, wrapper.textContent || original);
     state.translatedByID.set(segmentID, translation);
     state.spinnerByID.set(segmentID, wrapper);
 
@@ -648,16 +1283,16 @@
       if (state.spinnerByID.get(segmentID) !== wrapper || !wrapper.isConnected) {
         return;
       }
-      const textNode = document.createTextNode(finalText);
-      state.processedNodes.add(textNode);
+      const textNode = (wrapper.ownerDocument || document).createTextNode(finalText);
       wrapper.replaceWith(textNode);
-      state.nodeByID.set(segmentID, textNode);
+      state.segmentIDByNode.delete(wrapper);
+      setSegmentNode(segmentID, textNode, finalText);
       state.spinnerByID.delete(segmentID);
     }, flipSettleDelay(blockCount));
   }
 
-  function createFlipTextIndicator(originalText, finalText, phase) {
-    const wrapper = document.createElement("span");
+  function createFlipTextIndicator(originalText, finalText, phase, ownerDocument = document) {
+    const wrapper = ownerDocument.createElement("span");
     wrapper.className = "llmtools-segment-flip";
     wrapper.dataset.llmToolsIndicator = "true";
     wrapper.dataset.llmToolsIndicatorKind = "flipText";
@@ -680,16 +1315,17 @@
     wrapper.classList.toggle("llmtools-segment-flip-complete", phase === "complete");
     wrapper.replaceChildren();
     for (let index = 0; index < blockCount; index += 1) {
-      const tile = document.createElement("span");
+      const ownerDocument = wrapper.ownerDocument || document;
+      const tile = ownerDocument.createElement("span");
       tile.className = "llmtools-segment-flip-tile";
       tile.style.setProperty("--llmtools-delay", `${flipBlockDelay(index, phase)}ms`);
 
-      const front = document.createElement("span");
+      const front = ownerDocument.createElement("span");
       front.className = "llmtools-segment-flip-face llmtools-segment-flip-front";
       front.textContent = originalChunks[index] || "";
       tile.appendChild(front);
 
-      const back = document.createElement("span");
+      const back = ownerDocument.createElement("span");
       back.className = "llmtools-segment-flip-face llmtools-segment-flip-back";
       back.textContent = finalChunks[index] || "";
       tile.appendChild(back);
@@ -748,8 +1384,7 @@
       return null;
     }
     if (element.dataset?.llmToolsIndicatorKind === "flipText") {
-      const textNode = document.createTextNode(element.dataset.llmToolsFinalText || element.textContent || "");
-      state.processedNodes.add(textNode);
+      const textNode = (element.ownerDocument || document).createTextNode(element.dataset.llmToolsFinalText || element.textContent || "");
       element.replaceWith(textNode);
       return textNode;
     }
@@ -788,9 +1423,22 @@
     return "";
   }
 
+  function closestTableCell(element) {
+    for (let current = element; current && current.nodeType === Node.ELEMENT_NODE; current = current.parentElement) {
+      if (current.tagName === "TD" || current.tagName === "TH") {
+        return current;
+      }
+      if (current.tagName === "TABLE" || current === current.ownerDocument?.body) {
+        return null;
+      }
+    }
+    return null;
+  }
+
   function priorityFor(element) {
     const tag = element?.tagName || "";
     if (/^H[1-3]$/.test(tag)) return 20;
+    if (tag === "TH" || tag === "TD") return 12;
     if (tag === "P" || tag === "LI") return 10;
     return 5;
   }
@@ -806,7 +1454,11 @@
 
   function updateOverlayFromState(translationState) {
     if (!translationState.status) return;
-    if (!translationState.hasTranslations && state.translatedByID.size === 0 && (translationState.status === "idle" || translationState.status === "restored")) {
+    if (translationState.readingMode) {
+      setReadingMode(translationState.readingMode);
+    }
+    const notice = Boolean(translationState.notice);
+    if (!notice && !translationState.hasTranslations && state.translatedByID.size === 0 && (translationState.status === "idle" || translationState.status === "restored")) {
       hideOverlay();
       return;
     }
@@ -821,6 +1473,7 @@
     if (active) {
       clearTimeout(state.staleIndicatorCleanupTimer);
       state.staleIndicatorCleanupTimer = null;
+      clearOverlayNoticeHideTimer();
     } else if (complete || failed) {
       scheduleStaleIndicatorCleanup();
     }
@@ -829,6 +1482,9 @@
       canCancel: active,
       canRestore: Boolean(translationState.hasTranslations) || complete || state.translatedByID.size > 0
     });
+    if (notice && !active && !complete) {
+      scheduleOverlayNoticeHide();
+    }
   }
 
   function showOverlay(message) {
@@ -921,10 +1577,25 @@
   }
 
   function hideOverlay() {
+    clearOverlayNoticeHideTimer();
     if (state.overlay) {
       state.overlay.host.remove();
       state.overlay = null;
     }
+  }
+
+  function scheduleOverlayNoticeHide() {
+    clearOverlayNoticeHideTimer();
+    state.overlayNoticeHideTimer = setTimeout(() => {
+      if (state.translatedByID.size === 0) {
+        hideOverlay();
+      }
+    }, 4000);
+  }
+
+  function clearOverlayNoticeHideTimer() {
+    clearTimeout(state.overlayNoticeHideTimer);
+    state.overlayNoticeHideTimer = null;
   }
 
   function overlayButtonStyle() {

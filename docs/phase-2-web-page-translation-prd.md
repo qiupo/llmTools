@@ -1,8 +1,8 @@
 # Phase 2 PRD: Web Page Translation
 
-Last updated: 2026-07-03
+Last updated: 2026-07-04
 
-Status: active Phase 2 product and engineering plan. Phase 2.0 Chrome current-page translation is complete; this document now tracks the remaining Phase 2 expansion requirements.
+Status: active Phase 2 product and engineering plan, now in closure/acceptance planning. Phase 2.0 Chrome current-page translation, Phase 2.1 site rules, Phase 2.2 development-only Chrome distribution decision, Phase 2.4 current-page controls, Phase 2.5 complex-page baseline, and Phase 2.6 privacy/fixture baseline are implemented. Phase 2.3 Edge support is implemented at the app/config/manifest/test-runner level and still needs real Edge loading/native-messaging/translation acceptance when Edge is available. Chrome Web Store distribution, Safari/Firefox support, browser PDF translation, and image/OCR translation are deferred to later product decisions.
 
 ## 1. Objective
 
@@ -32,9 +32,9 @@ Phase 2.0 established the Chrome current-page translation baseline:
 
 Do not treat these as remaining Phase 2 requirements unless a regression is found. They are the baseline that later Phase 2 work must preserve.
 
-## 1.2 Remaining Phase 2 Scope
+## 1.2 Phase 2 Scope Reset
 
-The remaining Phase 2 work should be organized into these requirement groups:
+The original remaining Phase 2 work was organized into these requirement groups:
 
 1. Site rules and automatic translation controls.
 2. Production Chrome distribution and repair UX.
@@ -43,7 +43,32 @@ The remaining Phase 2 work should be organized into these requirement groups:
 5. Complex webpage and embedded-content support.
 6. Release-grade QA, observability, and privacy controls.
 
-The remaining work should not reopen the Phase 2.0 Chrome bridge architecture. Extend it unless a browser policy or security finding requires a change.
+That list is no longer the active backlog. The current Phase 2 requirement state is:
+
+- Closed for Phase 2: site/domain rules, auto-translate permission gating, page/site/all cache controls, development-only Chrome distribution decision, stable native-manifest diagnostics, reading modes, visible/full-page discovery controls, translation quality modes, pending translation style controls in the extension popup, current-page retranslate, per-domain reading/quality defaults, SPA route reset, virtualized rows, same-origin iframes, open shadow roots, table-heavy pages, unsupported embedded-content detection, redacted diagnostics, cache/history policy, and Phase 1 regression coverage.
+- Still in Phase 2 closure: real Microsoft Edge acceptance, packaged-app Chrome/Edge release smoke, restart recovery smoke, and defect fixing found by those acceptance runs.
+- Deferred to later release tracks: Chrome Web Store listed/unlisted production distribution and production extension ID, Brave/Arc/Safari/Firefox expansion, actual browser PDF viewer translation, image/canvas/OCR translation, form-writing assistance, multi-tab bulk translation, cross-device sync, and enterprise managed deployment.
+
+The remaining work should not reopen the Phase 2.0 Chrome bridge architecture. Extend it only if a browser policy, security finding, or acceptance bug requires a change.
+
+Current completed Phase 2 implementation:
+
+- Implemented in Chrome development extension and macOS Settings: per-domain `ask`, `alwaysTranslate`, and `neverTranslate` state.
+- Popup now shows the normalized current domain and lets the user change its rule.
+- Domain rules persist in native llmTools preferences and are exposed through native messaging status; extension local storage remains a fallback when native is unavailable.
+- `alwaysTranslate` runs translation automatically when a matching HTTP/HTTPS tab finishes loading.
+- `neverTranslate` blocks automatic translation and context-menu translation for that domain.
+- Popup-triggered translation remains an explicit manual override.
+- Translation cache entries record the normalized domain, and popup cache controls can clear the current page, current site, or all webpage translation cache.
+- The in-page overlay shows short-lived notices for site-rule saves, never-translate blocking, and cache clearing while keeping overlay text out of the page DOM.
+- The Chrome manifest uses optional HTTP/HTTPS host permissions. Popup auto-translate enablement requests the current site's permission first, and background auto-translate is gated on that permission.
+- Settings shows Chrome diagnostics for extension ID, extension version, Native Host path, native manifest path, and last local check. Native manifest validation detects stale host paths and wrong extension IDs.
+- `node scripts/check-browser-extension-dom.mjs` covers domain rules, optional permission request/denial, auto-translate permission gating, cache scope, overlay notice behavior, the existing extension translation/cache/restore path, and a real-browser multi-page navigation smoke for article/docs fixtures.
+- Phase 2.2 is explicitly development-only: Settings shows channel/version/manifest diagnostics, opens `chrome://extensions`, reveals the unpacked extension folder, repairs the development native messaging manifest only, and browser regression derives the development extension ID from `manifest.key` to prevent silent ID drift.
+- Phase 2.3 has Microsoft Edge listed in Settings, independent Edge detection, independent Edge native messaging manifest repair, `edge://extensions` launch, and a reusable Edge-capable browser fixture runner.
+- Phase 2.4 has popup-driven current-page reading modes, discovery scope, quality controls, and pending translation style controls: replacement, bilingual, original, visible-first/full-page discovery, natural, literal, technical terminology, Loading, flip-text, no pending style, current-page retranslate without page reload, and per-domain reading/quality defaults.
+- Phase 2.5 has complex-page support for SPA route reset, stale page-session rejection, virtualized rows, same-origin iframes, open shadow roots, high-frequency mutations, table-heavy pages, protected/page-PDF unsupported states, and unsupported embedded-content partial reporting.
+- Phase 2.6 has redacted popup diagnostics for webpage translation, explicit cache/history policy in Settings, default-off webpage Recent History, expanded browser E2E fixtures, least-privilege permission checks, non-translation native-message privacy assertions, content-script JS network privacy assertions, and Phase 1 native workflow regression checks.
 
 ## 2. Product Principles
 
@@ -111,11 +136,12 @@ These constraints are product requirements, not implementation preferences.
 
 - Site/domain rules: always translate, never translate, ask every time, and clear site-specific state.
 - Optional auto-translate on trusted domains, off by default.
-- Production Chrome extension distribution and update path.
-- Multi-browser support after Chrome, starting with Edge.
-- Advanced reading modes, including bilingual/original comparison and full-page pretranslation after the current visible-first path remains stable.
+- Development-only Chrome distribution decision, diagnostics, and repair UX for this phase.
+- Microsoft Edge support after Chrome, with real Edge acceptance as the remaining Phase 2 browser task.
+- Production Chrome extension distribution and update path only after a later release/distribution decision.
+- Advanced reading and translation modes, including bilingual/original comparison, visible-first/full-page discovery scope, and natural/literal/technical quality modes.
 - Complex-page handling for SPAs, virtualized lists, accessible frames, and table-heavy pages.
-- Browser PDF viewer and image/OCR translation as later Phase 2.x extensions, not part of the already completed 2.0 baseline.
+- Browser PDF viewer and image/OCR translation are deferred from Phase 2 closure unless a separate product decision reopens them.
 - Release-grade privacy, cache, diagnostics, and browser E2E coverage.
 
 ### 6.2 Native App
@@ -133,9 +159,9 @@ These constraints are product requirements, not implementation preferences.
 - Optional auto-translate permission request for domains the user enables.
 - Bilingual/original comparison UI without corrupting page layout.
 - Retranslate current page with a different model or quality mode.
-- Production extension identity, versioning, and upgrade compatibility.
+- Development extension identity, versioning, and production upgrade compatibility notes.
 - Additional Chromium browser manifests and build/distribution variants.
-- More robust SPA route, iframe, virtualized list, and PDF viewer handling.
+- More robust SPA route, iframe, open shadow root, virtualized list, and PDF viewer handling.
 
 ## 7. Out of Scope
 
@@ -154,16 +180,16 @@ These constraints are product requirements, not implementation preferences.
 
 ## 8. Success Metrics
 
-Remaining Phase 2 work is successful when:
+Phase 2 closure is successful when:
 
 - Users can set per-site behavior: ask, always translate, never translate, clear cached translations, and disable auto-translate quickly.
-- Chrome has a production-like install/update path with a stable production extension ID or an explicitly documented decision to stay development-only.
-- Edge can use the same webpage translation feature with the same local app bridge behavior.
+- Chrome has an explicitly documented development-only distribution decision for this phase, with stable diagnostics and repair UX.
+- Edge can use the same webpage translation feature with the same local app bridge behavior, or Edge is explicitly deferred because the release environment cannot run Edge acceptance.
 - Settings can show clear status across supported browsers and repair the correct native messaging manifest for each one.
 - Users can choose a readable bilingual/original comparison mode without breaking links, tables, forms, or page layout.
 - Complex pages such as SPAs, table-heavy pages, documentation pages, and virtualized feeds have defined supported behavior and graceful fallback.
 - Webpage cache/history behavior is explicit, user-controlled, and covered by privacy checks.
-- Automated browser tests cover the supported browser/page matrix, not only the local static DOM harness.
+- Automated browser tests cover the supported browser/page matrix, and manual packaged-app smoke covers representative real pages before Phase 2 closes.
 
 ## 9. User Stories
 
@@ -179,14 +205,14 @@ Acceptance:
 - Domain rules are visible and editable in Settings.
 - Clearing a domain rule does not delete unrelated model or app settings.
 
-### 9.2 Production Chrome Distribution
+### 9.2 Chrome Distribution Decision And Diagnostics
 
-As a user, I can install or update the Chrome extension through a production-like path instead of relying only on load-unpacked development mode.
+As a user, I can tell whether Chrome support is development-only or production, and I can repair the development bridge without mixing extension IDs.
 
 Acceptance:
 
-- A production extension ID is defined, or the product explicitly documents that Phase 2 remains development-only.
-- If a Chrome Web Store path is chosen, Settings opens the correct listing and writes a manifest with the production extension ID.
+- Phase 2 explicitly documents that Chrome distribution remains development-only.
+- If a Chrome Web Store path is chosen in a later release track, Settings opens the correct listing and writes a manifest with the production extension ID.
 - Development and production extension IDs cannot be mixed silently.
 - Settings shows extension version, native host path, manifest path, and last successful connection time.
 - Repair tells the user exactly whether the failure is extension missing, wrong extension ID, native host missing, app not running, or permission missing.
@@ -210,10 +236,12 @@ As a user, I can compare the original English text with the Chinese translation 
 Acceptance:
 
 - The user can switch between `replace`, `bilingual`, and `original` for the current page session.
+- The user can choose `natural`, `literal`, or `technical` translation quality for the current page.
+- Retranslate uses the selected quality mode and does not reuse cached translations from a different quality mode.
 - Bilingual mode does not use `innerHTML` injection for source page content.
 - Links, buttons, form controls, code blocks, and tables remain usable.
 - Restore returns the page to the original state without leaving duplicate bilingual artifacts.
-- The mode choice is per-page by default, with optional per-domain default later.
+- The mode choice starts as a current-page override, and the user can save reading mode or quality as a per-domain default from the popup.
 
 ### 9.5 Complex Page Support
 
@@ -224,7 +252,7 @@ Acceptance:
 - SPA route changes reset or resume translation without mixing old and new page sessions.
 - Virtualized lists and constantly changing nodes are skipped or handled without repeated retranslation loops.
 - Table-heavy pages preserve row/column structure.
-- Accessible iframes are translated only when the extension has permission and can safely inject a content script.
+- Accessible iframes and open shadow roots are translated only when the extension has permission and can safely inspect their DOM.
 - Unsupported frames, PDF viewers, closed shadow DOM, canvas, and image text show a graceful unsupported/partial state.
 
 ### 9.6 Cache, History, And Privacy Controls
@@ -309,6 +337,7 @@ Popup controls:
 - `恢复原文`
 - `重新翻译`
 - Mode selector: `替换`, `双语`, `原文`.
+- Pending translation style selector: `Loading`, `翻牌`, `无样式`.
 - Domain toggle: `此网站自动翻译` off by default.
 - Domain rule selector: `每次询问`, `总是翻译`, `永不翻译`.
 - `清除此页缓存`
@@ -468,7 +497,7 @@ Rules:
 
 ### 12.3 Install Flow
 
-Production Chrome flow:
+Future production Chrome flow, not part of Phase 2 closure:
 
 1. User clicks `安装扩展` in llmTools Settings.
 2. App writes/repairs native host manifest.
@@ -516,11 +545,15 @@ Chrome MVP manifest permissions:
   "name": "llmTools",
   "permissions": [
     "activeTab",
+    "contextMenus",
     "scripting",
     "storage",
     "nativeMessaging"
   ],
-  "host_permissions": [],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
@@ -534,8 +567,11 @@ Rules:
 
 - Use `activeTab` for manual current-tab translation.
 - Use `chrome.scripting.executeScript` to inject content script after user action.
-- Do not request `<all_urls>` in the MVP.
-- Request optional per-domain host permissions only when adding auto-translate for a domain.
+- Phase 2.0 manual current-tab translation should not request `<all_urls>`.
+- Phase 2.1 auto-translate uses optional HTTP/HTTPS host permissions.
+- Selecting `alwaysTranslate` in the popup must request the current site's host permission before the rule is saved.
+- Background auto-translate must verify the host permission before injecting the content script after page load.
+- Regression checks must reject normal host permissions, `<all_urls>`, or globally declared content scripts.
 - Do not use remote code.
 - Keep extension storage minimal and avoid storing page text persistently.
 
@@ -743,7 +779,7 @@ Every request:
   "requestID": "uuid",
   "type": "translateSegments",
   "browserID": "chrome",
-  "extensionVersion": "0.1.0",
+  "extensionVersion": "0.2.0",
   "tabID": 123,
   "pageSessionID": "uuid",
   "sentAt": "2026-06-30T12:00:00Z",
@@ -983,8 +1019,12 @@ Current implementation note:
 
 - The extension also has a `chrome.storage.local` cache keyed by target language, URL hash, and text hash.
 - Cached entries include source text, translated text, target language, URL hash, text hash, model name, and update time.
-- The popup includes a current-page cache clear action.
-- Remaining Phase 2 work should formalize this as a product feature by exposing the policy in Settings/README, adding domain/all-cache clearing, enforcing caps, and testing that cached content remains local.
+- The popup includes current-page, current-site, and all-webpage cache clear actions.
+- Persistent cache entries are capped and pruned deterministically.
+- README and Settings document that the extension cache is local, capped, and clearable.
+- Settings keeps webpage translation out of Recent History by default and exposes an explicit opt-in for saving webpage translation batches to Recent History.
+- `swift run LLMToolsChecks` covers default-off webpage history and explicit opt-in history persistence.
+- `scripts/check-browser-extension-dom.mjs` verifies that diagnostics do not expose raw page text or translated text, non-translation native messages do not carry page text, and the content script does not send page text through page-side fetch/XHR/beacon requests.
 
 Persistent cache product requirements:
 
@@ -1062,7 +1102,36 @@ Expected behavior:
 - Show partial success when some segments fail.
 - Restore should remain available after partial success.
 
-## 23. Remaining Implementation Plan
+## 23. Phase 2 Implementation Status And Closure Plan
+
+The original Phase 2 implementation plan has been executed far enough that the remaining work should be treated as closure and acceptance, not a broad feature backlog.
+
+Consolidated remaining Phase 2 requirements:
+
+1. Run real Microsoft Edge acceptance when Edge is available: load the Chromium extension, repair the Edge native messaging manifest, run the Edge browser fixture suite, and manually translate representative pages through `dist/llmTools.app`.
+2. Run packaged-app release smoke against Chrome development extension and representative real pages: article/docs/product/long/table/SPA/iframe-style pages, plus app restart and browser restart recovery.
+3. Fix defects found during Edge acceptance, release smoke, privacy checks, or Phase 1 regression checks.
+4. Keep README, roadmap, and this PRD aligned around the development-only Chrome decision, Edge acceptance status, cache/history policy, and intentionally unsupported embedded content.
+
+Phase 2 closure requirement matrix:
+
+| Requirement | Current status | Proof or gate |
+| --- | --- | --- |
+| Chrome packaged-app smoke | Implementation is complete; real Chrome manual acceptance still must be recorded after the unpacked extension is loaded from this repo. | `./scripts/check-phase2-closure.sh`, `node scripts/check-browser-extension-install.mjs --browser chrome --require-ready`, then manual keys `reload-extension`, `settings-status`, `translate-article`, `restore-article`, `cancel-late`, `reading-modes`, `quality-retranslate`, `cache-clear`, `auto-permission`, `never-translate`, and `restart-reconnect`. |
+| Edge acceptance | App/config/manifest/test-runner support is implemented. Real Edge extension loading, native messaging, and page translation acceptance remain conditional on Edge being installed in the release environment. | `LLMTOOLS_E2E_BROWSER=edge ./scripts/check-phase2-closure.sh` when Edge is available, or the closure report's explicit `edge-acceptance` skip when Edge is unavailable. |
+| Regression, diagnostics, and privacy gates | Automated checks are part of the closure script. | Passing Swift checks, browser fixture checks, manifest/readiness snapshots, packaged-app launch verification, and redacted diagnostics/privacy assertions in the latest closure report. |
+| Acceptance bug fixing | Only defects discovered by the gates above should reopen Phase 2 implementation work. | A failing closure command, a failed browser readiness check, a failed manual acceptance item, or a documented privacy/diagnostics regression. |
+| Documentation handoff | README, roadmap, and this PRD must all describe the same completed scope, remaining closure scope, and deferred scope. | This section plus the README Phase 2 status and roadmap Phase 2 remaining-scope sections stay aligned. |
+
+Deferred from Phase 2 closure unless explicitly reprioritized:
+
+- Chrome Web Store listed/unlisted production distribution and production extension ID.
+- Brave, Arc, Safari, and Firefox support.
+- Actual closed Shadow DOM translation.
+- Browser PDF viewer translation.
+- Image/canvas/OCR translation.
+- Form-writing assistance or user-input rewriting.
+- Multi-tab bulk translation, cross-device sync, and enterprise managed extension deployment.
 
 ### Phase 2.0: Chrome Current-Page Translation - Done
 
@@ -1081,7 +1150,7 @@ The Chrome baseline is complete and is now the compatibility contract for later 
 - Settings entry and bridge repair flow.
 - Packaged-app workflow.
 
-### Phase 2.1: Site Rules And Auto-Translate
+### Phase 2.1: Site Rules And Auto-Translate - Done
 
 Goal: make webpage translation behave predictably per website instead of being only a manual per-page action.
 
@@ -1091,10 +1160,32 @@ Requirements:
 - Show current domain and rule in the popup.
 - Add a domain rule table in Settings.
 - Support optional auto-translate for a domain after explicit user opt-in.
-- Request optional host permissions only when needed for auto-translate.
+- Use optional per-site Chrome host permissions for auto-translate.
 - Allow clearing current-page, current-domain, and all webpage translation cache.
 - Keep `neverTranslate` stronger than auto-translate and context-menu actions.
 - Make route changes and newly opened pages respect the domain rule.
+
+Implemented in the Chrome development extension:
+
+- Domain rule storage and normalization.
+- Popup current-domain display and rule selector.
+- Popup rule changes are saved back to native llmTools preferences through native messaging.
+- `alwaysTranslate` for future pages on the same domain.
+- `neverTranslate` blocking for auto-translation and context-menu translation.
+- Manual popup translation override.
+- Settings-side auto-translate and never-translate domain lists.
+- Optional host permission request before saving popup `alwaysTranslate`.
+- Background permission gating before automatic content-script injection.
+- Current-page, current-domain, and all-page cache clearing in the Chrome popup.
+- Short-lived page overlay notices for site-rule and cache states.
+- Settings-side Chrome diagnostics for extension ID/version, Native Host path, manifest path, and last local check.
+- Focused test coverage in `node scripts/check-browser-extension-dom.mjs`.
+
+Remaining:
+
+- None for Phase 2 feature implementation.
+- Broader browser coverage is handled by the Phase 2 closure work, especially real Edge acceptance.
+- Production Chrome distribution is deferred to a later release/distribution track.
 
 Exit criteria:
 
@@ -1103,24 +1194,33 @@ Exit criteria:
 - User can clear a domain's cached translations and rule independently.
 - No global all-sites auto-translation is enabled by default.
 
-### Phase 2.2: Production Chrome Distribution
+### Phase 2.2: Chrome Development Distribution Decision - Done
 
-Goal: move Chrome support from development-only loading toward a reproducible production-like install/update path.
+Goal for this phase: make the Chrome distribution decision explicit and make development diagnostics reliable.
 
-Requirements:
+Current implementation:
 
-- Decide production distribution: Chrome Web Store listed, Chrome Web Store unlisted, or development-only for now.
-- If production distribution is chosen, define the production extension ID and keep it separate from `jednddlgkkohaebgoejcidfppddjegij`.
-- Generate or maintain manifests for both development and production extension IDs.
-- Settings should show extension channel, extension ID, version, native host path, manifest path, and last ping.
-- Repair should detect stale/wrong manifest, wrong extension ID, missing host executable, and app-not-running states.
-- README should document production and development install flows separately.
+- Chrome is explicitly marked as `development` in the browser integration state.
+- Settings shows the extension channel, development extension ID, extension version, Native Host path, manifest path, last error code, and last local check.
+- Settings provides development-only install copy, a repair action for the development native messaging manifest, an open-browser-extensions action, and a `Reveal Extension Folder` action.
+- README documents the development setup and states that Phase 2 Chrome distribution is intentionally development-only. Production setup is deferred to a later release/distribution decision.
+- Browser state decoding remains backward-compatible when older JSON lacks `extensionChannel`.
+- Browser regression derives the development extension ID from `manifest.key` and fails if it no longer matches `jednddlgkkohaebgoejcidfppddjegij`.
+- Native messaging manifest diagnostics now use stable codes for stale host paths, wrong extension IDs, wrong manifest type, unreadable JSON, missing manifests, missing browsers, and missing or non-executable Native Host binaries.
+
+Phase 2 requirements:
+
+- Keep Phase 2 development-only for Chrome distribution.
+- Settings shows extension channel, extension ID, version, native host path, manifest path, last error code, and last local check.
+- Repair detects stale/wrong manifest, wrong extension ID, wrong manifest type, missing host executable, unreadable manifest JSON, missing browser, and app-not-running states.
+- README documents that Chrome is development-only for Phase 2 and that production distribution is a later release decision.
+- If production distribution is chosen later, define the production extension ID and keep it separate from `jednddlgkkohaebgoejcidfppddjegij`.
 
 Exit criteria:
 
-- The app can repair the native messaging manifest for the selected Chrome extension channel.
-- The user can tell whether the loaded extension is development or production.
-- Extension updates do not silently break allowed origins.
+- The app can repair the native messaging manifest for the Phase 2 Chrome development channel.
+- The user can tell that the loaded extension is development-only.
+- Manifest-key and allowed-origin regressions cannot silently break the development extension ID.
 
 ### Phase 2.3: Additional Browser Support
 
@@ -1142,31 +1242,72 @@ Requirements:
 - Ensure one browser's repair action never overwrites another browser's manifest.
 - For Safari, plan the containing-app and Safari extension enablement flow separately.
 
+Current implementation:
+
+- `BrowserIntegrationService` has browser config objects for Google Chrome and Microsoft Edge.
+- Settings renders Chrome and Edge as browser rows from the same state list.
+- Edge detection checks `/Applications/Microsoft Edge.app`.
+- Edge repair writes `~/Library/Application Support/Microsoft Edge/NativeMessagingHosts/com.llmtools.native_host.json`.
+- Edge uses the shared Chromium development extension folder and expected development extension ID from the manifest key.
+- Edge setup opens `edge://extensions`; the user still confirms loading/enabling the unpacked extension and site permissions in Edge.
+- `scripts/check-browser-extension-dom.mjs` can run the same real-browser content-script fixture suite against Edge by setting `LLMTOOLS_E2E_BROWSER=edge`; use `LLMTOOLS_E2E_BROWSER=all` to run installed browser targets and `EDGE_PATH` for non-standard executable locations.
+
+Remaining:
+
+- Real Edge extension loading, native messaging, and page translation acceptance on a machine where Microsoft Edge is installed.
+- After Edge acceptance, Brave/Arc/Safari/Firefox stay out of scope unless user priority changes.
+
 Exit criteria:
 
 - Edge can translate pages through llmTools with the same local privacy boundary as Chrome.
 - Chrome and Edge can coexist with correct manifests and status.
 - Unsupported browsers show clear manual or unsupported state.
 
-### Phase 2.4: Advanced Reading Modes
+### Phase 2.4: Advanced Reading Modes - Done
 
 Goal: give the user more control over how translations appear on the page.
 
-Requirements:
+Current implementation:
+
+- The popup has a page-level reading mode selector for `replace`, `bilingual`, and `original`.
+- The popup has a page-level discovery scope selector for `visible` and `page`; visible-first remains the default, and full-page pretranslation discovers offscreen page text up to a bounded per-session cap.
+- The popup has a page-level translation quality selector for `natural`, `literal`, and `technical`.
+- The popup owns the pending translation style selector for `loading`, `flipText`, and `none`; changes persist back to native llmTools webpage preferences through native messaging.
+- Background tab state stores `readingMode`, includes a localized label, forwards mode changes to the content script, and passes the mode into new page sessions.
+- Background tab state stores `discoveryScope`, includes a localized label, resets it to visible-first on navigation, and passes it into new page sessions.
+- Background tab state stores `translationQuality`, includes a localized label, sends it to native webpage translation requests, and includes it in the extension translation cache key.
+- Content script keeps original and translated segment text in memory and can re-render translated segments as replacement, bilingual, or original text without a page reload or another model request.
+- Bilingual mode builds DOM nodes with `textContent`; it does not inject source page content through `innerHTML`.
+- Restore removes bilingual artifacts and returns the page to the original text.
+- Current-page retranslate clears the current page translation cache, restores the DOM, and translates again with the current webpage translation model and selected quality mode.
+- Native prompt generation receives the selected quality mode and adds natural, literal, or technical terminology instructions to the webpage batch prompt.
+- Popup `站点默认` actions save the selected reading mode or translation quality as a per-domain default. Defaults persist in native llmTools preferences, sync through native bridge status, apply after page navigation/route reset unless the current page has a manual override, and are visible/removable in Settings.
+- `scripts/check-browser-extension-dom.mjs` covers popup mode saving, popup discovery-scope saving, popup quality saving, popup retranslate, per-domain reading/quality defaults, background mode/scope state and forwarding, retranslate cache bypass with quality mode, real-browser DOM switching between replacement/bilingual/original, and long-page full-page pretranslation.
+
+Implemented requirements:
 
 - Add page mode selector: `replace`, `bilingual`, `original`.
 - Bilingual mode should preserve layout and avoid unsafe HTML injection.
 - Add `retranslate` with the selected webpage translation model or quality mode.
-- Add page-level translation quality controls such as simpler wording, more literal translation, or technical translation after the core mode switch is stable.
+- Add page-level translation quality controls: natural, more literal translation, and technical terminology preservation.
+- Move pending translation style control from macOS Settings into the extension popup while keeping native preferences as the persistence source.
+- Add per-domain reading mode and translation quality defaults.
+- Add bounded full-page pretranslation as an explicit current-page discovery scope.
 - Preserve restore behavior across mode changes.
+
+Remaining:
+
+- Extend the same restore/cache safety rules to any future page-level modes.
 
 Exit criteria:
 
 - User can switch between Chinese-only replacement, bilingual view, and original text without reloading.
+- User can switch between natural, literal, and technical quality and retranslate the current page with that quality.
+- User can save reading mode and translation quality as site defaults and see those defaults applied to later sessions on that domain.
 - Bilingual mode does not break links, forms, tables, or code blocks.
 - Retranslation replaces prior llmTools translations without duplicating artifacts.
 
-### Phase 2.5: Complex Pages And Embedded Content
+### Phase 2.5: Complex Pages And Embedded Content - Baseline Done
 
 Goal: expand from normal articles/docs pages to harder but common web content.
 
@@ -1180,6 +1321,30 @@ Requirements:
 - Add browser PDF viewer translation only after ordinary DOM and iframe handling remain stable.
 - Add image/canvas/OCR translation only after PDF/browser embedding is stable.
 
+Current implementation:
+
+- Same-document SPA route changes are detected in the content script through `history.pushState`, `history.replaceState`, `popstate`, and `hashchange`.
+- Route changes restore current llmTools translations before clearing the page session, pending discovery, and old observers.
+- The content script sends `llmToolsRouteChanged` to the background page with previous URL, current URL, title, and page session id.
+- The background page resets translated state and cancels the tab job when it receives the route-change notification; opted-in auto-translate domains can then start a fresh session for the new route.
+- The background page rejects `segmentsDiscovered` messages whose `pageSessionID` does not match the current tab job, and content scripts reject `applyTranslations` messages for the wrong `pageSessionID`, so delayed dynamic discovery or translation results from an old route/session cannot leak into a new translation job.
+- Reused text nodes in virtualized rows are tracked by current text hash instead of node identity alone, so changed English text can be discovered once without re-queuing unchanged translated text; detached/reattached row pools and larger reusable scroll-window feed updates are covered by the same regression fixture.
+- Accessible same-origin iframe bodies are included in initial text discovery, mutation observation, translation application, and restore.
+- Open shadow roots are included in initial text discovery, mutation observation, translation application, and restore for supported web components.
+- Dynamic text discovery uses a 250 ms debounce plus a 1000 ms max wait, so high-frequency DOM mutations still flush periodically instead of postponing discovery forever.
+- Table cells are discovered and translated, and bilingual mode uses a table-cell-specific block layout so translation/original comparison does not replace the table structure.
+- Large dashboard table fixtures verify bounded full-page discovery across hundreds of sticky-header rows, table-cell bilingual layout, and restore.
+- Protected browser pages and content-script injection failures return an `unsupportedPage` state with actionable popup copy and stable diagnostics error codes instead of raw browser errors.
+- Top-level PDF/browser PDF viewer URLs return an `unsupportedPage` state with a `browser_pdf_page` diagnostics code; actual PDF translation remains out of scope for the normal DOM path.
+- Unsupported embedded content detection reports cross-origin or restricted frames, closed Shadow DOM/component content, semantic/interactive closed-component candidates, canvas text candidates, image-text candidates, and PDF/embed counts in page state.
+- The popup/background state appends a short partial-support notice when a translated page also contains unsupported embedded content.
+- `scripts/check-browser-extension-dom.mjs` covers background route reset, stale page-session dynamic discovery, translation application, and state update rejection, a real-browser `history.pushState` route-change smoke, reused virtualized text-node discovery, detached/reattached row pools, reusable virtual scroll-window pressure, same-origin iframe translation/restore, open shadow root translation/restore, cancel/late-translation guarding, closed Shadow DOM/component heuristics, high-frequency mutation flushing, table-cell bilingual layout/restore, large dashboard table full-page discovery/restore, protected/injection-blocked page reporting, top-level PDF unsupported reporting, unsupported embedded-content detection, and the background popup notice.
+
+Remaining:
+
+- Broader closed Shadow DOM heuristics can be expanded later; actual closed Shadow DOM translation remains unsupported because browser APIs do not expose those internals.
+- Actual browser PDF viewer translation and image/canvas/OCR translation once the normal DOM and unsupported-state paths remain stable.
+
 Exit criteria:
 
 - SPA route changes do not mix old and new translations.
@@ -1187,7 +1352,7 @@ Exit criteria:
 - Table layout remains usable after translation.
 - Unsupported embedded content produces a clear partial state instead of silent failure.
 
-### Phase 2.6: Release-Grade QA, Privacy, And Diagnostics
+### Phase 2.6: Release-Grade QA, Privacy, And Diagnostics - Baseline Done
 
 Goal: make the expanded Phase 2 surface maintainable.
 
@@ -1200,11 +1365,48 @@ Requirements:
 - Keep `swift run LLMToolsChecks` and `node scripts/check-browser-extension-dom.mjs` passing.
 - Package `dist/llmTools.app` for release-grade checks when browser integration changes.
 
+Current implementation:
+
+- The extension background state generates redacted diagnostics for each tab: browser ID, extension version, status, segment counts, elapsed time, model name, page URL hash, domain hash, reading mode, discovery scope, quality mode, unsupported embedded-content counts, and error code.
+- The popup renders the diagnostics summary without raw page URL, raw domain, source text, translated text, or DOM content.
+- Settings documents the webpage cache/history policy and exposes the explicit Recent History opt-in for webpage translation batches.
+- Static browser E2E fixtures now cover article, docs/code, product page, shadow components page, form/editor page, long page, table-heavy page, dashboard table stress page, iframe page, unsupported embedded-content page, and SPA/virtualized page routes.
+- `scripts/check-browser-extension-dom.mjs` now includes a manifest permission regression check that enforces MV3, `activeTab` manual access, optional HTTP/HTTPS host permissions for auto-translate, no normal `host_permissions`, no `<all_urls>`, and no globally declared content scripts.
+- `scripts/check-browser-extension-dom.mjs` covers diagnostics generation, redaction, unsupported embedded-content counts inside diagnostics, non-translation native-message privacy, content-script JS network privacy, real-browser runtime/console-error absence, popup rendering, product button/link preservation, cancel/late-translation guarding, stale page-session dynamic discovery, translation application, and state update rejection, open shadow root translation/restore, closed Shadow DOM/component heuristics, form/editor skip behavior, long-page visible-first discovery, full-page pretranslation, scroll discovery for distant long-page content, table-cell bilingual layout, large dashboard table full-page discovery/restore, protected/injection-blocked page reporting, top-level PDF unsupported reporting, same-origin iframe translation/restore, unsupported embedded-content reporting, SPA route reset, virtualized text-node reuse, detached/reattached virtualized row pools, and high-frequency mutation flushing.
+- `swift run LLMToolsChecks` covers native messaging manifest diagnostic codes, browser integration state compatibility, the webpage history default-off policy, explicit opt-in behavior, and Phase 1 interactive native task regression across translate, polish, summarize, explain, extract-TODOs, recent-history ordering, and history clearing.
+
 Exit criteria:
 
 - New browser/page support has automated coverage.
 - Privacy behavior is explicit and testable.
 - Debug output is useful without leaking raw page content.
+
+### Phase 2.7: Closure And Acceptance
+
+Goal: prove the implemented Phase 2 surface is ready to hand off as a coherent release baseline.
+
+Requirements:
+
+- Run `./scripts/check-phase2-closure.sh` for browser-integration changes.
+- The closure script must run `swift run LLMToolsChecks`, `swift build --product llmTools`, Node syntax checks, `git diff --check`, `node scripts/check-browser-extension-dom.mjs`, `LLMTOOLS_E2E_BROWSER=all node scripts/check-browser-extension-dom.mjs`, package with `./scripts/package-app.sh`, record `node scripts/check-browser-extension-install.mjs --browser all`, launch `dist/llmTools.app`, verify the running app path, write a timestamped report under `dist/phase2-closure-reports/`, and refresh `dist/phase2-closure-report.md` as the latest report. Reports must include Git, toolchain, browser-path, worktree, command-output evidence, extension install readiness evidence, and the remaining manual acceptance checklist.
+- Manual checklist results can be recorded with `node scripts/record-phase2-manual-check.mjs --pass <key> <note>` or `--skip <key> <note>`; the recorder requires a note with acceptance evidence or skip reason, and updates both `dist/phase2-closure-report.md` and the timestamped archive referenced inside that report.
+- Manual acceptance completion must be checked with `node scripts/record-phase2-manual-check.mjs --assert-complete`; it is read-only and exits non-zero while any manual item is unchecked.
+- Phase 2 acceptance status can be summarized with `node scripts/check-phase2-acceptance-status.mjs`; `--assert-complete` must combine latest report checklist state with current Chrome extension readiness and exit non-zero while any blocker remains. The status output must include actionable `nextSteps` for the current blockers. Closure reports must include a maintained Phase 2 acceptance status snapshot, and the manual recorder must refresh that snapshot after checklist updates.
+- Chrome unpacked extension readiness can be checked with `node scripts/check-browser-extension-install.mjs --browser chrome --require-ready`; it is read-only, emits `ready`, stable `issueCodes`, and issue details in text/JSON output, and fails until the extension is loaded from the repo and the Chrome native messaging manifest points at the packaged app host.
+- `node scripts/record-phase2-manual-check.mjs --pass reload-extension ...` must run that Chrome readiness check first, refuse to mark the item complete while the extension is not actually loaded, and print the unpacked extension folder plus verification command.
+- If Edge is not installed, the closure script output should record the Chrome pass and automatically record the Edge skip explicitly with the checked Edge executable path and Edge readiness issue codes. Run `LLMTOOLS_E2E_BROWSER=edge ./scripts/check-phase2-closure.sh` once Edge is available.
+- Manually verify Chrome development extension load-unpacked flow, page translation, restore, cancel, retranslate, reading mode switching, cache clearing, domain rules, and app/browser restart recovery on representative real pages.
+- Run the same manual acceptance in Edge once Edge is available.
+
+Exit criteria:
+
+- Chrome development extension plus packaged app passes automated and manual smoke.
+- `node scripts/check-browser-extension-install.mjs --browser chrome --require-ready` passes after loading or reloading the unpacked extension.
+- `node scripts/check-phase2-acceptance-status.mjs --assert-complete` passes against the latest closure report and current browser readiness state.
+- `node scripts/record-phase2-manual-check.mjs --assert-complete` passes against the latest closure report.
+- Edge either passes real acceptance or is explicitly deferred because Edge is unavailable in the release environment.
+- No privacy, diagnostics, Phase 1 regression, or browser runtime/console-error blocker remains open.
+- Any remaining unsupported content is documented as unsupported or partial-support instead of being presented as a silent failure.
 
 ## 24. Test Plan
 
@@ -1254,12 +1456,20 @@ Extension:
 
 Use Playwright or an equivalent browser automation path where possible. Keep the existing DOM harness for fast extension logic checks.
 
+Current coverage:
+
+- `scripts/check-browser-extension-dom.mjs` launches real browsers through CDP for content-script checks. It runs Google Chrome by default and supports Microsoft Edge through `LLMTOOLS_E2E_BROWSER=edge` or `LLMTOOLS_E2E_BROWSER=all`.
+- The real-browser smoke covers the article fixture plus navigation to documentation, product, shadow components, form/editor, long-page, table-heavy, dashboard table stress, iframe, unsupported embedded-content, and SPA/virtualized fixtures; it verifies fresh segment discovery after navigation, skips code/pre and hidden aside content, preserves product buttons/links, skips input/textarea/contenteditable user content, applies translations, restores original page text, verifies cancel ignores late translations and keeps the cancelled overlay state, verifies a new session after cancel resumes dynamic discovery, verifies open shadow root translation/restore, verifies long-page visible-first discovery, bounded full-page pretranslation, and scroll discovery, verifies table-cell bilingual layout/restore, verifies large dashboard table full-page discovery/restore with sticky headers, verifies same-origin iframe translation/restore, verifies unsupported embedded-content reporting, verifies same-document SPA route reset after `history.pushState`, verifies stale page-session dynamic discoveries are rejected by the background page, verifies stale page-session translation application and state updates are rejected by the content script, verifies a reused virtualized text node is rediscovered once after its text changes, verifies detached/reattached virtualized row pools, verifies high-frequency mutations flush before updates stop, intercepts fetch/XHR/beacon to assert the content script does not send page text through page-side JS network calls, and fails if the browser reports uncaught runtime exceptions or console errors.
+- The DOM/background harness also verifies unsupported embedded-content detection for restricted frames, semantic/interactive closed Shadow DOM component candidates, canvas, image text candidates, and PDF embeds, plus the popup/background partial-support notice and non-translation native-message privacy.
+
 Test pages:
 
 - article page with headings, paragraphs, links
 - documentation page with code/pre blocks
 - product page with buttons and cards
+- shadow components page
 - table-heavy page
+- dashboard table stress page
 - long page with 500+ segments
 - SPA page with route change
 - dynamic page appending content after scroll
@@ -1278,7 +1488,8 @@ Assertions:
 - restore returns original text
 - cancel prevents further replacements
 - no console errors from extension
-- no remote network requests containing page text
+- no page-side JS network requests containing page text
+- no non-translation native message contains raw page text or translated text
 - domain rules drive auto/manual behavior correctly
 - bilingual mode can switch back to original without duplicates
 - cache clearing removes the intended scope only
@@ -1305,6 +1516,7 @@ Manual checks:
 - Link/button usability.
 - Restore correctness.
 - Extension/app status clarity.
+- Pending translation style selector in the extension popup works for Loading, flip-text, and no-style modes.
 - App restart and browser restart recovery.
 - Domain rule clarity.
 - Production/development extension channel clarity.
@@ -1312,14 +1524,15 @@ Manual checks:
 
 ## 25. Definition Of Done
 
-Remaining Phase 2 is done when:
+Phase 2 is done when:
 
 - Phase 2.1 site rules and auto-translate are implemented with explicit user opt-in.
-- Phase 2.2 has either a production Chrome distribution path or a documented decision to remain development-only.
-- Phase 2.3 supports Edge or records a product decision to defer additional browsers.
-- Phase 2.4 provides a stable bilingual/original comparison mode.
+- Phase 2.2 has a documented decision to remain development-only.
+- Phase 2.3 either passes real Edge acceptance or records that Edge acceptance is deferred because Edge is unavailable in the release environment.
+- Phase 2.4 provides stable bilingual/original comparison, quality-mode selection, popup-owned pending translation style selection, and current-page retranslate.
 - Phase 2.5 defines and implements the supported behavior for complex pages, with graceful unsupported states.
 - Phase 2.6 test/privacy/diagnostic requirements are satisfied.
+- Phase 2.7 closure checks pass for Chrome development extension and packaged `dist/llmTools.app`.
 - Page text is not persisted beyond the accepted local cache/history policy.
 - Cache/history behavior is visible, clearable, and documented.
 - Logs and diagnostics are redacted by default.
@@ -1328,19 +1541,24 @@ Remaining Phase 2 is done when:
 
 ## 26. Open Decisions
 
-Resolve while executing the remaining Phase 2 requirement groups:
+Resolved for Phase 2:
 
-- Cache policy: keep the current `chrome.storage.local` persistent extension cache as a formal product feature, or restrict persistence to domain/page metadata only?
-- Production extension distribution path: Chrome Web Store listed, Chrome Web Store unlisted, or development-only until later?
-- Exact Chrome production extension ID. Development ID is currently `jednddlgkkohaebgoejcidfppddjegij`.
+- Persistent extension cache is accepted as a Phase 2 local feature because README and Settings expose the policy and the popup can clear page/site/all webpage cache.
+- Chrome distribution remains development-only for Phase 2. Development ID is `jednddlgkkohaebgoejcidfppddjegij`.
+- Edge is the first additional browser target. The app/config/manifest/test-runner work is implemented; real Edge acceptance remains the closure item.
+- Browser PDF viewer translation and image/canvas/OCR translation are deferred out of Phase 2 closure.
+
+Later release decisions:
+
+- Chrome Web Store listed or unlisted production distribution.
+- Exact Chrome production extension ID.
 - Whether app sandboxing or App Store distribution is planned soon. This affects native host manifest installation.
-- First additional browser is recommended to be Edge, but user priority can override this.
-- Whether browser PDF viewer translation belongs in Phase 2.5 or should move to a later document/PDF phase.
-- Whether image/canvas/OCR translation belongs in Phase 2.5 or should remain out of scope until a dedicated OCR phase.
+- Whether Brave, Arc, Safari, or Firefox should be prioritized after Edge.
+- Whether browser PDF translation belongs in a document/PDF phase.
+- Whether image/canvas/OCR translation belongs in a dedicated OCR phase.
 
 Recommended defaults:
 
-- Treat persistent extension cache as accepted only if Settings and README clearly expose and clear it.
 - Chrome Web Store unlisted extension for production-like testing once the user wants non-development installation.
 - Native messaging helper plus loopback HTTP bridge is the current MVP implementation.
 - Edge as second Chromium browser.

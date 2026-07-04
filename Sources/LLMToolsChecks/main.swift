@@ -11,11 +11,16 @@ struct LLMToolsChecks {
         try await checkProviderModelRegistration()
         try await checkProviderModelUpdate()
         try await checkHistoryLimit()
+        try await checkPhase1InteractiveNativeTasks()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
+        try checkBrowserIntegrationStateDecodesWithoutExtensionChannel()
+        try checkBrowserNativeMessagingManifestDiagnostics()
         try await checkTaskEngineReturnsRawModelOutput()
         try await checkOpenAICompatibleRunnerUsesChatCompletions()
         try await checkProviderConnectivityTest()
         try await checkWebPageTranslationBatchSkipsHistoryByDefault()
+        try await checkWebPageTranslationBatchPersistsHistoryWhenEnabled()
+        try await checkWebPageTranslationQualityModePrompt()
         try await checkWebPageTranslationBatchFallback()
         try await checkWebPageTranslationBatchRetriesOnlyMissingSegments()
         try checkVisibleOutputHidesThinkBlock()
@@ -207,6 +212,80 @@ struct LLMToolsChecks {
         try require(history.first?.inputPreview == "item 2", "Expected latest history entry first.")
     }
 
+    private static func checkPhase1InteractiveNativeTasks() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubRunner(outputs: [
+            "translated native output",
+            "polished native output",
+            "summarized native output",
+            "explained native output",
+            "- extracted native todo"
+        ])
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        let descriptor = try await engine.addModel(from: modelDirectory)
+        try await engine.updatePreferences { preferences in
+            preferences.recentHistoryLimit = 10
+            preferences.defaultTranslationTarget = "Japanese"
+            preferences.defaultPolishStyle = "formal"
+        }
+
+        let requests = [
+            TaskRequest(task: .translate, inputText: "Phase one translate input", targetLanguage: "Japanese"),
+            TaskRequest(task: .polish, inputText: "Phase one polish input", polishStyle: "formal"),
+            TaskRequest(task: .summarize, inputText: "Phase one summarize input"),
+            TaskRequest(task: .explain, inputText: "Phase one explain input"),
+            TaskRequest(task: .extractTodos, inputText: "Alice must send the report by Friday.")
+        ]
+        try require(requests.map(\.task) == TaskKind.interactiveCases, "Expected Phase 1 regression to cover every interactive task.")
+
+        var outputs: [String] = []
+        for request in requests {
+            let result = try await engine.run(request: request)
+            try require(result.task == request.task, "Expected result task to match \(request.task.rawValue).")
+            try require(result.modelName == "Stub", "Expected Phase 1 task to run through the stub model.")
+            outputs.append(result.text)
+        }
+        try require(outputs == [
+            "translated native output",
+            "polished native output",
+            "summarized native output",
+            "explained native output",
+            "- extracted native todo"
+        ], "Expected each Phase 1 native task to return its corresponding runner output.")
+        let loadedModelID = await runner.loadedModelID()
+        let generatedRequestCount = await runner.generatedRequestCount()
+        let recordedRequests = await runner.recordedRequests()
+        try require(loadedModelID == descriptor.id, "Expected Phase 1 native tasks to load the default model.")
+        try require(generatedRequestCount == requests.count, "Expected one generation per Phase 1 native task.")
+        try require(recordedRequests.map(\.task) == requests.map(\.task), "Expected runner to receive Phase 1 native tasks in order.")
+
+        let history = await engine.recentHistory()
+        try require(history.count == requests.count, "Expected Phase 1 native tasks to persist to recent history.")
+        try require(history.map(\.task) == requests.map(\.task).reversed(), "Expected recent history to store newest Phase 1 task first.")
+        try require(history.first?.task == .extractTodos, "Expected latest Phase 1 history item to be the TODO extraction task.")
+        try require(history.first?.inputPreview == "Alice must send the report by Friday.", "Expected latest Phase 1 history input preview to match the TODO source.")
+        try require(history.first?.outputPreview == "- extracted native todo", "Expected latest Phase 1 history output preview to match the TODO output.")
+
+        try await engine.clearHistory()
+        let clearedHistory = await engine.recentHistory()
+        try require(clearedHistory.isEmpty, "Expected Phase 1 clear-history flow to empty recent history.")
+    }
+
     private static func checkPreferenceDefaultsDecodeFromOlderRegistry() throws {
         let json = """
         {
@@ -228,6 +307,10 @@ struct LLMToolsChecks {
         try require(preferences.webPageTranslation.defaultTargetLanguage == "zh-Hans", "Expected webpage translation target to default to Simplified Chinese.")
         try require(preferences.webPageTranslation.modelID == nil, "Expected webpage translation model to follow the default model.")
         try require(preferences.webPageTranslation.pendingIndicatorStyle == .loading, "Expected webpage pending indicator to default to loading.")
+        try require(preferences.webPageTranslation.autoTranslateDomains.isEmpty, "Expected webpage auto-translate domains to default empty.")
+        try require(preferences.webPageTranslation.disabledDomains.isEmpty, "Expected webpage disabled domains to default empty.")
+        try require(preferences.webPageTranslation.domainReadingModes.isEmpty, "Expected webpage domain reading defaults to default empty.")
+        try require(preferences.webPageTranslation.domainTranslationQualities.isEmpty, "Expected webpage domain quality defaults to default empty.")
         try require(!preferences.webPageTranslation.persistWebHistory, "Expected webpage translation history to default off.")
         try require(preferences.webPageTranslation.localConcurrentTranslationRequests == 1, "Expected local webpage concurrency to default to 1.")
         try require(preferences.quickActionShortcut == .optionSpace, "Expected quick action shortcut to default to Option-Space.")
@@ -254,7 +337,24 @@ struct LLMToolsChecks {
         """.utf8))
         try require(webPagePreferences.pendingIndicatorStyle == .loading, "Expected older webpage preferences to default pending indicator to loading.")
         try require(webPagePreferences.modelID == nil, "Expected older webpage preferences to default modelID to nil.")
+        try require(webPagePreferences.autoTranslateDomains.isEmpty, "Expected older webpage preferences to default auto-translate domains to empty.")
+        try require(webPagePreferences.disabledDomains.isEmpty, "Expected older webpage preferences to default disabled domains to empty.")
+        try require(webPagePreferences.domainReadingModes.isEmpty, "Expected older webpage preferences to default domain reading modes to empty.")
+        try require(webPagePreferences.domainTranslationQualities.isEmpty, "Expected older webpage preferences to default domain translation qualities to empty.")
         try require(webPagePreferences.localConcurrentTranslationRequests == 1, "Expected older webpage preferences to default local concurrency to 1.")
+
+        let webPagePreferencesWithDomainDefaults = try JSONDecoder().decode(WebPageTranslationPreferences.self, from: Data("""
+        {
+          "domainReadingModes": {
+            "docs.example.com": "bilingual"
+          },
+          "domainTranslationQualities": {
+            "docs.example.com": "technical"
+          }
+        }
+        """.utf8))
+        try require(webPagePreferencesWithDomainDefaults.domainReadingModes["docs.example.com"] == .bilingual, "Expected domain reading mode defaults to decode.")
+        try require(webPagePreferencesWithDomainDefaults.domainTranslationQualities["docs.example.com"] == .technical, "Expected domain quality defaults to decode.")
 
         let clampedWebPagePreferences = try JSONDecoder().decode(WebPageTranslationPreferences.self, from: Data("""
         {
@@ -262,6 +362,130 @@ struct LLMToolsChecks {
         }
         """.utf8))
         try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
+    }
+
+    private static func checkBrowserIntegrationStateDecodesWithoutExtensionChannel() throws {
+        let json = """
+        {
+          "id": "chrome",
+          "name": "Google Chrome",
+          "bundleID": "com.google.Chrome",
+          "extensionID": "jednddlgkkohaebgoejcidfppddjegij",
+          "status": "ready"
+        }
+        """
+        let state = try JSONDecoder().decode(BrowserIntegrationState.self, from: Data(json.utf8))
+        try require(state.extensionChannel == nil, "Expected older browser state JSON to decode without extensionChannel.")
+
+        let encoded = try JSONEncoder().encode(BrowserIntegrationState(
+            id: "chrome",
+            name: "Google Chrome",
+            bundleID: "com.google.Chrome",
+            extensionChannel: "development",
+            extensionID: "jednddlgkkohaebgoejcidfppddjegij",
+            status: .ready
+        ))
+        let roundTripped = try JSONDecoder().decode(BrowserIntegrationState.self, from: encoded)
+        try require(roundTripped.extensionChannel == "development", "Expected browser extension channel to round-trip.")
+        try require(roundTripped.lastErrorCode == nil, "Expected ready browser state to round-trip without an error code.")
+    }
+
+    private static func checkBrowserNativeMessagingManifestDiagnostics() throws {
+        let expectedName = "com.llmtools.native_host"
+        let expectedPath = "/Applications/llmTools.app/Contents/MacOS/LLMToolsNativeHost"
+        let expectedExtensionID = "jednddlgkkohaebgoejcidfppddjegij"
+        let manifest = BrowserNativeMessagingManifest(
+            name: expectedName,
+            description: "llmTools native messaging host",
+            path: expectedPath,
+            allowedOrigins: ["chrome-extension://\(expectedExtensionID)/"]
+        )
+        let encoder = JSONEncoder()
+        let validData = try encoder.encode(manifest)
+        try require(
+            BrowserNativeMessagingManifestValidator.diagnosticCode(
+                data: validData,
+                expectedName: expectedName,
+                expectedPath: expectedPath,
+                expectedExtensionID: expectedExtensionID
+            ) == nil,
+            "Expected valid browser native messaging manifest to pass diagnostics."
+        )
+
+        let stalePathData = try encoder.encode(BrowserNativeMessagingManifest(
+            name: expectedName,
+            description: "llmTools native messaging host",
+            path: "/tmp/old/LLMToolsNativeHost",
+            allowedOrigins: ["chrome-extension://\(expectedExtensionID)/"]
+        ))
+        try require(
+            BrowserNativeMessagingManifestValidator.diagnosticCode(
+                data: stalePathData,
+                expectedName: expectedName,
+                expectedPath: expectedPath,
+                expectedExtensionID: expectedExtensionID
+            ) == .nativeHostManifestPathMismatch,
+            "Expected stale native host path to produce a stable diagnostic code."
+        )
+
+        let wrongExtensionData = try encoder.encode(BrowserNativeMessagingManifest(
+            name: expectedName,
+            description: "llmTools native messaging host",
+            path: expectedPath,
+            allowedOrigins: ["chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/"]
+        ))
+        try require(
+            BrowserNativeMessagingManifestValidator.diagnosticCode(
+                data: wrongExtensionData,
+                expectedName: expectedName,
+                expectedPath: expectedPath,
+                expectedExtensionID: expectedExtensionID
+            ) == .nativeHostManifestExtensionIDMismatch,
+            "Expected wrong extension ID to produce a stable diagnostic code."
+        )
+
+        let wrongTypeData = try encoder.encode(BrowserNativeMessagingManifest(
+            name: expectedName,
+            description: "llmTools native messaging host",
+            path: expectedPath,
+            type: "socket",
+            allowedOrigins: ["chrome-extension://\(expectedExtensionID)/"]
+        ))
+        try require(
+            BrowserNativeMessagingManifestValidator.diagnosticCode(
+                data: wrongTypeData,
+                expectedName: expectedName,
+                expectedPath: expectedPath,
+                expectedExtensionID: expectedExtensionID
+            ) == .nativeHostManifestTypeMismatch,
+            "Expected wrong native messaging manifest type to produce a stable diagnostic code."
+        )
+
+        try require(
+            BrowserNativeMessagingManifestValidator.diagnosticCode(
+                data: Data("{".utf8),
+                expectedName: expectedName,
+                expectedPath: expectedPath,
+                expectedExtensionID: expectedExtensionID
+            ) == .nativeHostManifestUnreadable,
+            "Expected unreadable native messaging manifest to produce a stable diagnostic code."
+        )
+
+        let encodedState = try JSONEncoder().encode(BrowserIntegrationState(
+            id: "chrome",
+            name: "Google Chrome",
+            bundleID: "com.google.Chrome",
+            extensionChannel: "development",
+            extensionID: expectedExtensionID,
+            status: .nativeHostInvalid,
+            lastErrorCode: BrowserIntegrationDiagnosticCode.nativeHostManifestPathMismatch.rawValue,
+            lastErrorMessage: "stale native host path"
+        ))
+        let decodedState = try JSONDecoder().decode(BrowserIntegrationState.self, from: encodedState)
+        try require(
+            decodedState.lastErrorCode == BrowserIntegrationDiagnosticCode.nativeHostManifestPathMismatch.rawValue,
+            "Expected browser integration diagnostic code to round-trip in state JSON."
+        )
     }
 
     private static func checkWebPageTranslationBatchSkipsHistoryByDefault() async throws {
@@ -302,6 +526,95 @@ struct LLMToolsChecks {
         try require(result.translations.first?.translation == "你好。", "Expected parsed JSON translation.")
         let history = await engine.recentHistory()
         try require(history.isEmpty, "Expected webpage translation to skip recent history by default.")
+    }
+
+    private static func checkWebPageTranslationBatchPersistsHistoryWhenEnabled() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubRunner(output: """
+        [
+          {"id":"s1","translation":"你好。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        _ = try await engine.addModel(from: modelDirectory)
+        try await engine.updatePreferences { preferences in
+            preferences.webPageTranslation.persistWebHistory = true
+        }
+        _ = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "history-job",
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "Hello.")
+                ]
+            )
+        )
+        let history = await engine.recentHistory()
+        try require(history.count == 1, "Expected opted-in webpage translation to persist one history entry.")
+        try require(history.first?.task == .webPageTranslate, "Expected opted-in history entry to be marked as webpage translation.")
+        try require(history.first?.outputPreview.contains("你好") == true, "Expected opted-in history entry to include the translation preview.")
+    }
+
+    private static func checkWebPageTranslationQualityModePrompt() async throws {
+        let legacyPayload = try JSONDecoder().decode(WebPageTranslateSegmentsPayload.self, from: Data("""
+        {
+          "jobID": "legacy-job",
+          "segments": [
+            { "segmentID": "s1", "text": "Open the API reference." }
+          ]
+        }
+        """.utf8))
+        try require(legacyPayload.translationQuality == .natural, "Expected missing translationQuality to default to natural.")
+
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubRunner(output: """
+        [
+          {"id":"s1","translation":"打开 API 参考。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        _ = try await engine.addModel(from: modelDirectory)
+        _ = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "quality-job",
+                translationQuality: .technical,
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "Open the API reference.")
+                ]
+            )
+        )
+        let prompt = await runner.lastInputText()
+        try require(prompt.contains("Preserve technical terminology"), "Expected technical quality mode to be included in webpage prompt.")
+        try require(prompt.contains("API names"), "Expected technical prompt to preserve API names.")
     }
 
     private static func checkWebPageTranslationBatchFallback() async throws {
@@ -566,6 +879,8 @@ private actor StubRunner: ModelRunner {
     private var loadedID: UUID?
     private var outputs: [String]
     private var requestCount = 0
+    private var lastInput = ""
+    private var requests: [TaskRequest] = []
 
     init(output: String? = nil, format: ModelFormat = .mlx) {
         self.format = format
@@ -603,6 +918,8 @@ private actor StubRunner: ModelRunner {
 
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
         requestCount += 1
+        lastInput = request.inputText
+        requests.append(request)
         let output = outputs.isEmpty ? "result \(request.inputText)" : outputs.removeFirst()
         return TaskResult(text: output, modelName: "Stub", task: request.task)
     }
@@ -613,6 +930,14 @@ private actor StubRunner: ModelRunner {
 
     func generatedRequestCount() -> Int {
         requestCount
+    }
+
+    func lastInputText() -> String {
+        lastInput
+    }
+
+    func recordedRequests() -> [TaskRequest] {
+        requests
     }
 }
 

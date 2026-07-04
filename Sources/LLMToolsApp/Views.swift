@@ -1090,6 +1090,11 @@ private enum ShortcutCaptureTarget: Identifiable {
     var id: Self { self }
 }
 
+private enum WebPageDomainRuleKind {
+    case alwaysTranslate
+    case neverTranslate
+}
+
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var selectedTab: SettingsTab = .general
@@ -1101,11 +1106,12 @@ struct SettingsView: View {
     @State private var providerDraftBaseURL = ModelProviderCatalog.preset(for: .siliconFlow)?.defaultBaseURL ?? ""
     @State private var providerDraftContextLength = ModelProviderCatalog.preset(for: .siliconFlow)?.defaultContextLength ?? 32768
     @State private var editingProviderModelID: UUID?
-    @State private var chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+    @State private var browserIntegrationStates = BrowserIntegrationService.shared.browserStates()
     @State private var shortcutCaptureTarget: ShortcutCaptureTarget?
     @State private var shortcutRecorderMessage: String?
     @State private var showSelectionLimitAppImporter = false
     @State private var selectionLimitDraftLineCount = 2
+    @State private var webPageDomainDraft = ""
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -1147,7 +1153,7 @@ struct SettingsView: View {
             }
         }
         .onAppear {
-            chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+            refreshBrowserIntegrationStates()
             initializeProviderDraftIfNeeded()
         }
         .onDisappear {
@@ -1592,60 +1598,255 @@ struct SettingsView: View {
                 )
             }
 
-            settingRow(title: L10n.text("Pending translation style", language: language)) {
-                pendingIndicatorStylePicker
-            }
-
             settingRow(title: L10n.text("Translation model", language: language)) {
                 webPageTranslationModelPicker
             }
 
-            settingRow(title: L10n.text("Browser", language: language)) {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        Text(chromeIntegrationState.name)
-                            .font(.subheadline.weight(.medium))
-                        statusBadge(browserStatusName(chromeIntegrationState.status), systemImage: browserStatusIcon(chromeIntegrationState.status))
-                    }
-                    if let message = chromeIntegrationState.lastErrorMessage {
-                        Text(message)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Text(chromeExtensionManualInstallText)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 8) {
-                        Button {
-                            do {
-                                chromeIntegrationState = try BrowserIntegrationService.shared.installOrRepairChromeDevelopmentHost()
-                                BrowserIntegrationService.shared.openChromeExtensionsPage()
-                                appState.statusMessage = L10n.text("Chrome bridge repaired", language: language)
-                            } catch {
-                                appState.validationError = error.localizedDescription
-                                chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
-                            }
-                        } label: {
-                            Label(L10n.text("Repair Chrome Bridge", language: language), systemImage: "wrench.and.screwdriver")
-                        }
-                        .controlSize(.small)
+            settingRow(title: L10n.text("Site rules", language: language)) {
+                webPageDomainRulesControl
+            }
 
-                        Button {
-                            BrowserIntegrationService.shared.openChromeExtensionsPage()
-                        } label: {
-                            Label(L10n.text("Open Chrome Extensions", language: language), systemImage: "arrow.up.forward.app")
-                        }
-                        .controlSize(.small)
-                    }
-                }
+            settingRow(title: L10n.text("Site defaults", language: language)) {
+                webPageSiteDefaultsControl
+            }
+
+            settingRow(title: L10n.text("Cache & Privacy", language: language)) {
+                webPagePrivacyControl
+            }
+
+            settingRow(title: L10n.text("Browser", language: language)) {
+                browserIntegrationList
             }
 
             settingRow(title: L10n.text("Extension folder", language: language)) {
                 pathText(BrowserIntegrationService.shared.extensionFolderPath())
             }
         }
+    }
+
+    private var browserIntegrationList: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(browserIntegrationStates) { state in
+                browserIntegrationCard(state)
+            }
+        }
+    }
+
+    private func browserIntegrationCard(_ state: BrowserIntegrationState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text(state.name)
+                    .font(.subheadline.weight(.medium))
+                statusBadge(browserStatusName(state.status), systemImage: browserStatusIcon(state.status))
+            }
+            if let message = state.lastErrorMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            browserDiagnostics(state)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(browserExtensionInstallModeText(for: state))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(browserExtensionManualInstallText(for: state))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(browserExtensionPermissionText(for: state))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 8) {
+                Button {
+                    repairBrowserBridge(state)
+                } label: {
+                    Label(browserRepairButtonTitle(for: state), systemImage: "wrench.and.screwdriver")
+                }
+                .controlSize(.small)
+
+                Button {
+                    BrowserIntegrationService.shared.revealExtensionFolder()
+                } label: {
+                    Label(L10n.text("Reveal Extension Folder", language: language), systemImage: "folder")
+                }
+                .controlSize(.small)
+
+                Button {
+                    BrowserIntegrationService.shared.openExtensionsPage(browserID: state.id)
+                } label: {
+                    Label(browserOpenExtensionsButtonTitle(for: state), systemImage: "arrow.up.forward.app")
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private func browserDiagnostics(_ state: BrowserIntegrationState) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            diagnosticLine(
+                L10n.text("Extension channel", language: language),
+                browserExtensionChannelName(state.extensionChannel)
+            )
+            diagnosticLine(
+                L10n.text("Extension ID", language: language),
+                state.extensionID ?? "-"
+            )
+            diagnosticLine(
+                L10n.text("Extension version", language: language),
+                state.extensionVersion ?? "-"
+            )
+            diagnosticLine(
+                L10n.text("Native Host", language: language),
+                BrowserIntegrationService.shared.nativeHostExecutableDisplayPath()
+            )
+            diagnosticLine(
+                L10n.text("Manifest", language: language),
+                state.nativeHostManifestPath ?? "-"
+            )
+            diagnosticLine(
+                L10n.text("Last error code", language: language),
+                state.lastErrorCode ?? "-"
+            )
+            diagnosticLine(
+                L10n.text("Last check", language: language),
+                state.lastPingAt.map(browserDiagnosticDateFormatter.string(from:)) ?? "-"
+            )
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var webPageDomainRulesControl: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                CommandFriendlyTextField(
+                    text: $webPageDomainDraft,
+                    placeholder: L10n.text("example.com", language: language)
+                )
+                .frame(width: 220)
+
+                Button {
+                    addWebPageDomainRule(rule: .alwaysTranslate)
+                } label: {
+                    Label(L10n.text("Auto translate", language: language), systemImage: "bolt.badge.checkmark")
+                }
+                .controlSize(.small)
+                .disabled(normalizedWebPageDomain(webPageDomainDraft).isEmpty)
+
+                Button {
+                    addWebPageDomainRule(rule: .neverTranslate)
+                } label: {
+                    Label(L10n.text("Never translate", language: language), systemImage: "nosign")
+                }
+                .controlSize(.small)
+                .disabled(normalizedWebPageDomain(webPageDomainDraft).isEmpty)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                webPageDomainList(
+                    title: L10n.text("Auto-translate domains", language: language),
+                    domains: appState.preferences.webPageTranslation.autoTranslateDomains,
+                    emptyText: L10n.text("No auto-translate domains.", language: language),
+                    rule: .alwaysTranslate
+                )
+                webPageDomainList(
+                    title: L10n.text("Never-translate domains", language: language),
+                    domains: appState.preferences.webPageTranslation.disabledDomains,
+                    emptyText: L10n.text("No never-translate domains.", language: language),
+                    rule: .neverTranslate
+                )
+            }
+
+            Button(role: .destructive) {
+                resetWebPageDomainRules()
+            } label: {
+                Label(L10n.text("Reset site rules", language: language), systemImage: "trash")
+            }
+            .controlSize(.small)
+            .disabled(appState.preferences.webPageTranslation.autoTranslateDomains.isEmpty && appState.preferences.webPageTranslation.disabledDomains.isEmpty)
+        }
+    }
+
+    private var webPagePrivacyControl: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            checkboxLine(
+                title: L10n.text("Save webpage translations to recent history", language: language),
+                isOn: Binding(
+                    get: { appState.preferences.webPageTranslation.persistWebHistory },
+                    set: { newValue in
+                        appState.updatePreferences { $0.webPageTranslation.persistWebHistory = newValue }
+                    }
+                )
+            )
+
+            Text(webPageHistoryPolicyText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+                .frame(maxWidth: 420)
+
+            webPagePrivacyLine(
+                systemImage: "externaldrive",
+                title: L10n.text("Extension cache", language: language),
+                body: L10n.text("Stored locally in browser extension storage, capped at 2,000 entries, and clearable from the popup by page, site, or all webpage cache.", language: language)
+            )
+
+            webPagePrivacyLine(
+                systemImage: "number.square",
+                title: L10n.text("Popup diagnostics", language: language),
+                body: L10n.text("Uses hashes, counts, timings, model name, and error codes by default; it does not show raw page URL, domain, source text, translated text, or DOM content.", language: language)
+            )
+        }
+    }
+
+    private var webPageSiteDefaultsControl: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            webPageReadingDefaultsList
+            webPageQualityDefaultsList
+
+            Button(role: .destructive) {
+                resetWebPageSiteDefaults()
+            } label: {
+                Label(L10n.text("Reset site defaults", language: language), systemImage: "trash")
+            }
+            .controlSize(.small)
+            .disabled(
+                appState.preferences.webPageTranslation.domainReadingModes.isEmpty
+                    && appState.preferences.webPageTranslation.domainTranslationQualities.isEmpty
+            )
+        }
+    }
+
+    private var webPageReadingDefaultsList: some View {
+        webPageModeDefaultsList(
+            title: L10n.text("Reading defaults", language: language),
+            emptyText: L10n.text("No reading defaults.", language: language),
+            rows: appState.preferences.webPageTranslation.domainReadingModes
+                .map { (domain: $0.key, value: L10n.webPageReadingModeName($0.value, language: language)) }
+                .sorted { $0.domain < $1.domain },
+            remove: { domain in
+                removeWebPageReadingDefault(domain: domain)
+            }
+        )
+    }
+
+    private var webPageQualityDefaultsList: some View {
+        webPageModeDefaultsList(
+            title: L10n.text("Quality defaults", language: language),
+            emptyText: L10n.text("No quality defaults.", language: language),
+            rows: appState.preferences.webPageTranslation.domainTranslationQualities
+                .map { (domain: $0.key, value: L10n.webPageTranslationQualityName($0.value, language: language)) }
+                .sorted { $0.domain < $1.domain },
+            remove: { domain in
+                removeWebPageQualityDefault(domain: domain)
+            }
+        )
     }
 
     private var defaultsSettingsPage: some View {
@@ -1807,22 +2008,6 @@ struct SettingsView: View {
         .frame(width: 150, alignment: .leading)
     }
 
-    private var pendingIndicatorStylePicker: some View {
-        Picker("", selection: Binding(
-            get: { appState.preferences.webPageTranslation.pendingIndicatorStyle },
-            set: { newValue in
-                appState.updatePreferences { $0.webPageTranslation.pendingIndicatorStyle = newValue }
-            }
-        )) {
-            ForEach(WebPagePendingIndicatorStyle.allCases) { style in
-                Text(L10n.pendingIndicatorStyleName(style, language: language)).tag(style)
-            }
-        }
-        .labelsHidden()
-        .pickerStyle(.segmented)
-        .frame(width: 210, alignment: .leading)
-    }
-
     private var historyLimitControl: some View {
         HStack(spacing: 10) {
             Text("\(appState.preferences.recentHistoryLimit)")
@@ -1845,6 +2030,31 @@ struct SettingsView: View {
                 step: 1
             )
             .labelsHidden()
+        }
+    }
+
+    private var webPageHistoryPolicyText: String {
+        if appState.preferences.webPageTranslation.persistWebHistory {
+            return L10n.text("Webpage translation batches will be saved to Recent History and can include page text snippets.", language: language)
+        }
+        return L10n.text("Default: webpage source text and translated text are not saved to the app recent history.", language: language)
+    }
+
+    private func webPagePrivacyLine(systemImage: String, title: String, body: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 16, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.primary)
+                Text(body)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -1893,9 +2103,16 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.1.0"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.2.0"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
+    }
+
+    private var browserDiagnosticDateFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .medium
+        return formatter
     }
 
     private func defaultModelPickerTitle(_ model: ModelDescriptor) -> String {
@@ -1910,7 +2127,7 @@ struct SettingsView: View {
         return Button {
             selectedTab = tab
             if tab == .webPage {
-                chromeIntegrationState = BrowserIntegrationService.shared.chromeState()
+                refreshBrowserIntegrationStates()
             }
         } label: {
             VStack(spacing: 3) {
@@ -2039,6 +2256,80 @@ struct SettingsView: View {
             content()
         }
         .frame(width: width, alignment: .topLeading)
+    }
+
+    private func webPageDomainList(
+        title: String,
+        domains: [String],
+        emptyText: String,
+        rule: WebPageDomainRuleKind
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if domains.isEmpty {
+                Text(emptyText)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(domains, id: \.self) { domain in
+                    HStack(spacing: 8) {
+                        Text(domain)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(width: 250, alignment: .leading)
+                        iconToolButton(
+                            systemImage: "trash",
+                            help: L10n.text("Remove", language: language),
+                            role: .destructive
+                        ) {
+                            removeWebPageDomainRule(domain: domain, rule: rule)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func webPageModeDefaultsList(
+        title: String,
+        emptyText: String,
+        rows: [(domain: String, value: String)],
+        remove: @escaping (String) -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if rows.isEmpty {
+                Text(emptyText)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(rows, id: \.domain) { row in
+                    HStack(spacing: 8) {
+                        Text(row.domain)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(width: 210, alignment: .leading)
+                        Text(row.value)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 80, alignment: .leading)
+                        iconToolButton(
+                            systemImage: "trash",
+                            help: L10n.text("Remove", language: language),
+                            role: .destructive
+                        ) {
+                            remove(row.domain)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private func settingRow<Content: View>(
@@ -2209,6 +2500,102 @@ struct SettingsView: View {
         }
     }
 
+    private func addWebPageDomainRule(rule: WebPageDomainRuleKind) {
+        let domain = normalizedWebPageDomain(webPageDomainDraft)
+        guard !domain.isEmpty else {
+            return
+        }
+        appState.updatePreferences { preferences in
+            applyWebPageDomainRule(domain: domain, rule: rule, preferences: &preferences)
+        }
+        webPageDomainDraft = ""
+    }
+
+    private func removeWebPageDomainRule(domain: String, rule: WebPageDomainRuleKind) {
+        let normalizedDomain = normalizedWebPageDomain(domain)
+        appState.updatePreferences { preferences in
+            switch rule {
+            case .alwaysTranslate:
+                preferences.webPageTranslation.autoTranslateDomains.removeAll { normalizedWebPageDomain($0) == normalizedDomain }
+            case .neverTranslate:
+                preferences.webPageTranslation.disabledDomains.removeAll { normalizedWebPageDomain($0) == normalizedDomain }
+            }
+        }
+    }
+
+    private func resetWebPageDomainRules() {
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.autoTranslateDomains = []
+            preferences.webPageTranslation.disabledDomains = []
+        }
+    }
+
+    private func removeWebPageReadingDefault(domain: String) {
+        let normalizedDomain = normalizedWebPageDomain(domain)
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.domainReadingModes.removeValue(forKey: normalizedDomain)
+        }
+    }
+
+    private func removeWebPageQualityDefault(domain: String) {
+        let normalizedDomain = normalizedWebPageDomain(domain)
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.domainTranslationQualities.removeValue(forKey: normalizedDomain)
+        }
+    }
+
+    private func resetWebPageSiteDefaults() {
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.domainReadingModes = [:]
+            preferences.webPageTranslation.domainTranslationQualities = [:]
+        }
+    }
+
+    private func applyWebPageDomainRule(
+        domain: String,
+        rule: WebPageDomainRuleKind,
+        preferences: inout AppPreferences
+    ) {
+        preferences.webPageTranslation.autoTranslateDomains = normalizedUniqueDomains(
+            preferences.webPageTranslation.autoTranslateDomains.filter { normalizedWebPageDomain($0) != domain }
+        )
+        preferences.webPageTranslation.disabledDomains = normalizedUniqueDomains(
+            preferences.webPageTranslation.disabledDomains.filter { normalizedWebPageDomain($0) != domain }
+        )
+        switch rule {
+        case .alwaysTranslate:
+            preferences.webPageTranslation.autoTranslateDomains = normalizedUniqueDomains(
+                preferences.webPageTranslation.autoTranslateDomains + [domain]
+            )
+        case .neverTranslate:
+            preferences.webPageTranslation.disabledDomains = normalizedUniqueDomains(
+                preferences.webPageTranslation.disabledDomains + [domain]
+            )
+        }
+    }
+
+    private func normalizedUniqueDomains(_ domains: [String]) -> [String] {
+        Array(Set(domains.map(normalizedWebPageDomain).filter { !$0.isEmpty })).sorted()
+    }
+
+    private func normalizedWebPageDomain(_ value: String) -> String {
+        let trimmed = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let withoutScheme = trimmed
+            .replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression)
+        let host = withoutScheme
+            .split(separator: "/", maxSplits: 1)
+            .first?
+            .split(separator: ":", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        if host.hasPrefix("www.") {
+            return String(host.dropFirst(4))
+        }
+        return host
+    }
+
     private func isShortcutAlreadyAssigned(_ shortcut: KeyboardShortcutPreference, target: ShortcutCaptureTarget) -> Bool {
         switch target {
         case .quickAction:
@@ -2234,6 +2621,21 @@ struct SettingsView: View {
             .lineLimit(2)
             .truncationMode(.middle)
             .help(text)
+    }
+
+    private func diagnosticLine(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 92, alignment: .leading)
+            Text(value)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(value)
+        }
     }
 
     private func iconToolButton(
@@ -2504,12 +2906,94 @@ struct SettingsView: View {
         }
     }
 
-    private var chromeExtensionManualInstallText: String {
+    private func refreshBrowserIntegrationStates() {
+        browserIntegrationStates = BrowserIntegrationService.shared.browserStates()
+    }
+
+    private func updateBrowserIntegrationState(_ updatedState: BrowserIntegrationState) {
+        if let index = browserIntegrationStates.firstIndex(where: { $0.id == updatedState.id }) {
+            browserIntegrationStates[index] = updatedState
+        } else {
+            browserIntegrationStates.append(updatedState)
+        }
+    }
+
+    private func repairBrowserBridge(_ state: BrowserIntegrationState) {
+        do {
+            let updatedState = try BrowserIntegrationService.shared.installOrRepairDevelopmentHost(browserID: state.id)
+            updateBrowserIntegrationState(updatedState)
+            BrowserIntegrationService.shared.openExtensionsPage(browserID: state.id)
+            appState.statusMessage = browserBridgeRepairedMessage(for: state)
+        } catch {
+            appState.validationError = error.localizedDescription
+            updateBrowserIntegrationState(BrowserIntegrationService.shared.browserState(id: state.id))
+        }
+    }
+
+    private func browserBridgeRepairedMessage(for state: BrowserIntegrationState) -> String {
         switch language {
         case .chinese:
-            return "如果 Chrome 扩展页里没有 llmTools：打开 Chrome 扩展，开启“开发者模式”，点击“加载已解压的扩展程序”，选择下方扩展文件夹。"
+            return "\(state.name) 桥接已修复"
         case .english:
-            return "If llmTools is not listed in Chrome Extensions: open Chrome Extensions, enable Developer mode, choose Load unpacked, then select the extension folder below."
+            return "\(state.name) bridge repaired"
+        }
+    }
+
+    private func browserRepairButtonTitle(for state: BrowserIntegrationState) -> String {
+        switch language {
+        case .chinese:
+            return "修复 \(state.name) 桥接"
+        case .english:
+            return "Repair \(state.name) Bridge"
+        }
+    }
+
+    private func browserOpenExtensionsButtonTitle(for state: BrowserIntegrationState) -> String {
+        switch language {
+        case .chinese:
+            return "打开 \(state.name) 扩展"
+        case .english:
+            return "Open \(state.name) Extensions"
+        }
+    }
+
+    private func browserExtensionManualInstallText(for state: BrowserIntegrationState) -> String {
+        switch language {
+        case .chinese:
+            return "开发版安装：打开 \(state.name) 扩展，开启“开发者模式”，点击“加载已解压的扩展程序”，选择下方扩展文件夹。"
+        case .english:
+            return "Development install: open \(state.name) Extensions, enable Developer mode, choose Load unpacked, then select the extension folder below."
+        }
+    }
+
+    private func browserExtensionInstallModeText(for state: BrowserIntegrationState) -> String {
+        switch language {
+        case .chinese:
+            return "Phase 2 中 \(state.name) 明确保持 development-only；生产扩展 ID 和商店安装链接留到后续发布决策。"
+        case .english:
+            return "For Phase 2, \(state.name) explicitly remains development-only; production extension ID and store install links are deferred to a later release decision."
+        }
+    }
+
+    private func browserExtensionPermissionText(for state: BrowserIntegrationState) -> String {
+        switch language {
+        case .chinese:
+            return "llmTools 只能写入 \(state.name) 本地桥接清单并打开扩展页；加载扩展、启用扩展和站点权限仍需在浏览器中确认。"
+        case .english:
+            return "llmTools can write the \(state.name) native bridge manifest and open its extensions page; loading, enabling, and site permissions still require browser confirmation."
+        }
+    }
+
+    private func browserExtensionChannelName(_ channel: String?) -> String {
+        switch (language, channel) {
+        case (.chinese, "development"):
+            return "开发版"
+        case (.chinese, "production"):
+            return "生产版"
+        case (.english, .some(let channel)):
+            return channel
+        default:
+            return "-"
         }
     }
 

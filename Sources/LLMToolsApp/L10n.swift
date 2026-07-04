@@ -63,6 +63,40 @@ enum L10n {
         }
     }
 
+    static func webPageReadingModeName(_ mode: WebPageReadingMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            switch mode {
+            case .replace: return "Replace"
+            case .bilingual: return "Bilingual"
+            case .original: return "Original"
+            }
+        case .chinese:
+            switch mode {
+            case .replace: return "替换译文"
+            case .bilingual: return "双语对照"
+            case .original: return "原文"
+            }
+        }
+    }
+
+    static func webPageTranslationQualityName(_ mode: WebPageTranslationQualityMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            switch mode {
+            case .natural: return "Natural"
+            case .literal: return "Literal"
+            case .technical: return "Technical"
+            }
+        case .chinese:
+            switch mode {
+            case .natural: return "自然"
+            case .literal: return "直译"
+            case .technical: return "技术术语"
+            }
+        }
+    }
+
     private static let chinese: [String: String] = [
         "Quick Action": "快捷操作",
         "Selection Actions": "选择操作",
@@ -103,9 +137,39 @@ enum L10n {
         "Translation model": "翻译模型",
         "Use default model": "跟随默认模型",
         "Pending translation style": "待翻译样式",
-        "Repair Chrome Bridge": "修复 Chrome 桥接",
-        "Open Chrome Extensions": "打开 Chrome 扩展",
-        "Chrome bridge repaired": "Chrome 桥接已修复",
+        "Site rules": "站点规则",
+        "Cache & Privacy": "缓存与隐私",
+        "Save webpage translations to recent history": "网页翻译写入最近历史",
+        "Webpage translation batches will be saved to Recent History and can include page text snippets.": "网页翻译批次会写入最近历史，可能包含页面文本片段。",
+        "Default: webpage source text and translated text are not saved to the app recent history.": "默认：网页原文和译文不会保存到应用最近历史。",
+        "Extension cache": "扩展缓存",
+        "Stored locally in browser extension storage, capped at 2,000 entries, and clearable from the popup by page, site, or all webpage cache.": "保存在浏览器扩展本地存储中，上限 2,000 条，可在扩展弹窗按页面、站点或全部网页缓存清除。",
+        "Popup diagnostics": "弹窗诊断",
+        "Uses hashes, counts, timings, model name, and error codes by default; it does not show raw page URL, domain, source text, translated text, or DOM content.": "默认只使用哈希、计数、耗时、模型名和错误码；不显示原始页面 URL、域名、原文、译文或 DOM 内容。",
+        "example.com": "example.com",
+        "Auto translate": "自动",
+        "Never translate": "不翻译",
+        "Auto-translate domains": "自动翻译域名",
+        "Never-translate domains": "不翻译域名",
+        "No auto-translate domains.": "暂无自动翻译域名。",
+        "No never-translate domains.": "暂无不翻译域名。",
+        "Reset site rules": "重置站点规则",
+        "Site defaults": "站点默认值",
+        "Reading defaults": "阅读模式默认值",
+        "Quality defaults": "翻译质量默认值",
+        "No reading defaults.": "暂无阅读模式默认值。",
+        "No quality defaults.": "暂无翻译质量默认值。",
+        "Reading": "阅读",
+        "Quality": "质量",
+        "Reset site defaults": "重置站点默认值",
+        "Reveal Extension Folder": "显示扩展文件夹",
+        "Extension channel": "扩展通道",
+        "Extension ID": "扩展 ID",
+        "Extension version": "扩展版本",
+        "Native Host": "Native Host",
+        "Manifest": "清单",
+        "Last error code": "最近错误码",
+        "Last check": "最近检查",
         "Input": "输入",
         "Result": "结果",
         "Recent History": "最近历史",

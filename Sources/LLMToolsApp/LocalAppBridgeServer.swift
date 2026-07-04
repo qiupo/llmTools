@@ -146,7 +146,11 @@ final class LocalAppBridgeServer {
                         maxConcurrentTranslationRequests: appState.webPageTranslationConcurrencyLimit,
                         appLanguage: appState.preferences.appLanguage.rawValue,
                         webPageTranslationEnabled: appState.preferences.webPageTranslation.enabled,
-                        pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue
+                        pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue,
+                        autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
+                        disabledDomains: appState.preferences.webPageTranslation.disabledDomains,
+                        domainReadingModes: domainReadingModePayload,
+                        domainTranslationQualities: domainTranslationQualityPayload
                     )
                 )
             case ("POST", "/translateSegments"):
@@ -179,6 +183,22 @@ final class LocalAppBridgeServer {
                 activeJobs[payload.jobID]?.values.forEach { $0.cancel() }
                 activeJobs[payload.jobID] = nil
                 sendResponse(connection: connection, statusCode: 200, payload: ["cancelled": true])
+            case ("POST", "/setDomainRule"):
+                let payload = try decoder.decode(SetDomainRulePayload.self, from: request.body)
+                let response = setDomainRule(domain: payload.domain, rule: payload.rule)
+                sendResponse(connection: connection, statusCode: 200, payload: response)
+            case ("POST", "/setDomainPageDefaults"):
+                let payload = try decoder.decode(SetDomainPageDefaultsPayload.self, from: request.body)
+                let response = setDomainPageDefaults(
+                    domain: payload.domain,
+                    readingMode: payload.readingMode,
+                    translationQuality: payload.translationQuality
+                )
+                sendResponse(connection: connection, statusCode: 200, payload: response)
+            case ("POST", "/setPendingIndicatorStyle"):
+                let payload = try decoder.decode(SetPendingIndicatorStylePayload.self, from: request.body)
+                let response = setPendingIndicatorStyle(payload.pendingIndicatorStyle)
+                sendResponse(connection: connection, statusCode: 200, payload: response)
             default:
                 sendResponse(connection: connection, statusCode: 404, payload: ["error": "Not found"])
             }
@@ -274,6 +294,166 @@ final class LocalAppBridgeServer {
     private func errorPayload(code: WebPageTranslationErrorCode, message: String) -> [String: WebPageTranslationError] {
         ["error": WebPageTranslationError(code: code, message: message)]
     }
+
+    private func setDomainRule(domain rawDomain: String, rule rawRule: String) -> DomainRuleResponsePayload {
+        let domain = normalizedDomain(rawDomain)
+        let rule = normalizedDomainRule(rawRule)
+        guard !domain.isEmpty else {
+            return DomainRuleResponsePayload(
+                domain: "",
+                rule: "ask",
+                autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
+                disabledDomains: appState.preferences.webPageTranslation.disabledDomains
+            )
+        }
+
+        appState.updatePreferences { preferences in
+            var autoDomains = self.normalizedDomains(preferences.webPageTranslation.autoTranslateDomains)
+            var disabledDomains = self.normalizedDomains(preferences.webPageTranslation.disabledDomains)
+            autoDomains.removeAll { $0 == domain }
+            disabledDomains.removeAll { $0 == domain }
+            switch rule {
+            case "alwaysTranslate":
+                autoDomains.append(domain)
+            case "neverTranslate":
+                disabledDomains.append(domain)
+            default:
+                break
+            }
+            preferences.webPageTranslation.autoTranslateDomains = self.normalizedDomains(autoDomains)
+            preferences.webPageTranslation.disabledDomains = self.normalizedDomains(disabledDomains)
+        }
+
+        return DomainRuleResponsePayload(
+            domain: domain,
+            rule: rule,
+            autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
+            disabledDomains: appState.preferences.webPageTranslation.disabledDomains
+        )
+    }
+
+    private func setDomainPageDefaults(
+        domain rawDomain: String,
+        readingMode rawReadingMode: String?,
+        translationQuality rawTranslationQuality: String?
+    ) -> DomainPageDefaultsResponsePayload {
+        let domain = normalizedDomain(rawDomain)
+        guard !domain.isEmpty else {
+            return DomainPageDefaultsResponsePayload(
+                domain: "",
+                domainReadingModes: domainReadingModePayload,
+                domainTranslationQualities: domainTranslationQualityPayload
+            )
+        }
+
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.domainReadingModes = self.normalizedReadingModeDefaults(
+                preferences.webPageTranslation.domainReadingModes
+            )
+            preferences.webPageTranslation.domainTranslationQualities = self.normalizedQualityDefaults(
+                preferences.webPageTranslation.domainTranslationQualities
+            )
+            if let rawReadingMode {
+                if let readingMode = WebPageReadingMode(rawValue: rawReadingMode) {
+                    preferences.webPageTranslation.domainReadingModes[domain] = readingMode
+                } else {
+                    preferences.webPageTranslation.domainReadingModes.removeValue(forKey: domain)
+                }
+            }
+            if let rawTranslationQuality {
+                if let translationQuality = WebPageTranslationQualityMode(rawValue: rawTranslationQuality) {
+                    preferences.webPageTranslation.domainTranslationQualities[domain] = translationQuality
+                } else {
+                    preferences.webPageTranslation.domainTranslationQualities.removeValue(forKey: domain)
+                }
+            }
+        }
+
+        return DomainPageDefaultsResponsePayload(
+            domain: domain,
+            domainReadingModes: domainReadingModePayload,
+            domainTranslationQualities: domainTranslationQualityPayload
+        )
+    }
+
+    private func setPendingIndicatorStyle(_ rawStyle: String) -> PendingIndicatorStyleResponsePayload {
+        let style = WebPagePendingIndicatorStyle(rawValue: rawStyle) ?? .loading
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.pendingIndicatorStyle = style
+        }
+        return PendingIndicatorStyleResponsePayload(pendingIndicatorStyle: style.rawValue)
+    }
+
+    private var domainReadingModePayload: [String: String] {
+        appState.preferences.webPageTranslation.domainReadingModes.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value.rawValue
+        }
+    }
+
+    private var domainTranslationQualityPayload: [String: String] {
+        appState.preferences.webPageTranslation.domainTranslationQualities.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value.rawValue
+        }
+    }
+
+    private func normalizedReadingModeDefaults(_ values: [String: WebPageReadingMode]) -> [String: WebPageReadingMode] {
+        values.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value
+        }
+    }
+
+    private func normalizedQualityDefaults(_ values: [String: WebPageTranslationQualityMode]) -> [String: WebPageTranslationQualityMode] {
+        values.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value
+        }
+    }
+
+    private func normalizedDomainRule(_ rule: String) -> String {
+        switch rule {
+        case "alwaysTranslate", "neverTranslate":
+            return rule
+        default:
+            return "ask"
+        }
+    }
+
+    private func normalizedDomains(_ domains: [String]) -> [String] {
+        Array(Set(domains.map(normalizedDomain).filter { !$0.isEmpty })).sorted()
+    }
+
+    private func normalizedDomain(_ value: String) -> String {
+        let trimmed = value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let withoutScheme = trimmed
+            .replacingOccurrences(of: #"^https?://"#, with: "", options: .regularExpression)
+        let host = withoutScheme
+            .split(separator: "/", maxSplits: 1)
+            .first?
+            .split(separator: ":", maxSplits: 1)
+            .first
+            .map(String.init) ?? ""
+        if host.hasPrefix("www.") {
+            return String(host.dropFirst(4))
+        }
+        return host
+    }
 }
 
 public struct LocalAppBridgeState: Codable, Sendable, Hashable {
@@ -305,10 +485,46 @@ private struct BridgeStatusPayload: Codable {
     var appLanguage: String
     var webPageTranslationEnabled: Bool
     var pendingIndicatorStyle: String
+    var autoTranslateDomains: [String]
+    var disabledDomains: [String]
+    var domainReadingModes: [String: String]
+    var domainTranslationQualities: [String: String]
 }
 
 private struct CancelJobPayload: Codable {
     var jobID: String
+}
+
+private struct SetDomainRulePayload: Codable {
+    var domain: String
+    var rule: String
+}
+
+private struct SetDomainPageDefaultsPayload: Codable {
+    var domain: String
+    var readingMode: String?
+    var translationQuality: String?
+}
+
+private struct SetPendingIndicatorStylePayload: Codable {
+    var pendingIndicatorStyle: String
+}
+
+private struct DomainRuleResponsePayload: Codable {
+    var domain: String
+    var rule: String
+    var autoTranslateDomains: [String]
+    var disabledDomains: [String]
+}
+
+private struct DomainPageDefaultsResponsePayload: Codable {
+    var domain: String
+    var domainReadingModes: [String: String]
+    var domainTranslationQualities: [String: String]
+}
+
+private struct PendingIndicatorStyleResponsePayload: Codable {
+    var pendingIndicatorStyle: String
 }
 
 private enum BridgeHTTPError: Error {

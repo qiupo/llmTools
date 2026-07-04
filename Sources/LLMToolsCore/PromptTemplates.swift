@@ -96,6 +96,7 @@ public enum PromptTemplates {
     public static func webPageBatchPrompt(
         segments: [WebPageTranslationSegment],
         targetLanguage: String,
+        qualityMode: WebPageTranslationQualityMode = .natural,
         isRetry: Bool
     ) throws -> String {
         let items = segments.map { WebPagePromptItem(id: $0.segmentID, text: $0.text) }
@@ -118,11 +119,23 @@ public enum PromptTemplates {
         - Preserve links, numbers, product names, keyboard shortcuts, and code-like tokens.
         - For buttons and short UI labels, use concise Chinese.
         - For paragraphs, use natural Chinese.
+        \(webPageQualityInstruction(qualityMode))
         - Do not add commentary.
 
         Items:
         \(json)
         """
+    }
+
+    private static func webPageQualityInstruction(_ mode: WebPageTranslationQualityMode) -> String {
+        switch mode {
+        case .natural:
+            return "- Prefer fluent, natural Simplified Chinese while preserving the source meaning."
+        case .literal:
+            return "- Prefer a more literal translation; preserve source sentence structure and terminology when it remains readable."
+        case .technical:
+            return "- Preserve technical terminology, API names, product names, code-like tokens, and UI labels; use standard technical Chinese where appropriate."
+        }
     }
 
     private static func webPageTranslationPrompt(inputText: String, isRetry: Bool) -> String {

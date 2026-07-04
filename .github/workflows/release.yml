@@ -1,0 +1,220 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, for example v0.2.0"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Package macOS release
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || github.event.inputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="${RELEASE_TAG}"
+          if [[ -z "$tag" ]]; then
+            echo "Release tag is required." >&2
+            exit 1
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must look like v0.2.0, got: $tag" >&2
+            exit 1
+          fi
+
+          app_version="${tag#v}"
+          plist_version="${app_version%%+*}"
+          plist_version="${plist_version%%-*}"
+          asset_prefix="llmTools-${tag}"
+          prerelease="false"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.prerelease || 'false' }}" == "true" ]]; then
+            prerelease="true"
+          fi
+          if [[ "$tag" == *"-"* ]]; then
+            prerelease="true"
+          fi
+
+          {
+            echo "RELEASE_TAG=$tag"
+            echo "APP_VERSION=$plist_version"
+            echo "APP_BUILD=${GITHUB_RUN_NUMBER}"
+            echo "ASSET_PREFIX=$asset_prefix"
+            echo "IS_PRERELEASE=$prerelease"
+          } >> "$GITHUB_ENV"
+
+      - name: Show toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          xcodebuild -version
+          swift --version
+          node --version
+          python3 --version
+          python3.12 --version || true
+
+      - name: Run Swift checks
+        shell: bash
+        run: swift run LLMToolsChecks
+
+      - name: Check browser extension scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for script in \
+            browser-extension/chromium/background.js \
+            browser-extension/chromium/contentScript.js \
+            scripts/check-browser-extension-dom.mjs \
+            scripts/check-browser-extension-install.mjs \
+            scripts/check-phase2-acceptance-status.mjs \
+            scripts/record-phase2-manual-check.mjs
+          do
+            if [[ -f "$script" ]]; then
+              node --check "$script"
+            else
+              echo "Skipping missing optional script: $script"
+            fi
+          done
+
+      - name: Install MLX runtime resource
+        shell: bash
+        run: |
+          set -euo pipefail
+          python_bin="$(command -v python3.12 || command -v python3.13 || command -v python3)"
+          "$python_bin" -m pip install --upgrade pip
+          "$python_bin" -m pip install --upgrade mlx
+          mlx_metallib_path="$("$python_bin" - <<'PY'
+          import importlib.util
+          import pathlib
+          import sys
+
+          spec = importlib.util.find_spec("mlx")
+          if spec is None or not spec.submodule_search_locations:
+              sys.exit("mlx Python package was installed but not importable")
+
+          for root in spec.submodule_search_locations:
+              candidate = pathlib.Path(root) / "lib" / "mlx.metallib"
+              if candidate.is_file():
+                  print(candidate)
+                  break
+          else:
+              sys.exit("mlx.metallib was not found in the mlx Python package")
+          PY
+          )"
+          echo "MLX_METALLIB_PATH=$mlx_metallib_path" >> "$GITHUB_ENV"
+          echo "Using mlx.metallib at $mlx_metallib_path"
+
+      - name: Package app
+        shell: bash
+        run: ./scripts/package-app.sh
+
+      - name: Verify packaged app
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x dist/llmTools.app/Contents/MacOS/llmTools
+          test -x dist/llmTools.app/Contents/MacOS/LLMToolsNativeHost
+          test -f dist/llmTools.app/Contents/Resources/AppIcon.icns
+          test -d dist/llmTools.app/Contents/Resources/browser-extension/chromium
+          test -f dist/llmTools.app/Contents/MacOS/mlx.metallib
+          codesign --verify --deep --strict --verbose=2 dist/llmTools.app
+          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" dist/llmTools.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" dist/llmTools.app/Contents/Info.plist
+
+      - name: Create release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_asset="${ASSET_PREFIX}-macos-arm64.zip"
+          extension_asset="${ASSET_PREFIX}-chromium-extension.zip"
+
+          ditto -c -k --keepParent dist/llmTools.app "dist/${app_asset}"
+          (
+            cd browser-extension
+            ditto -c -k --keepParent chromium "../dist/${extension_asset}"
+          )
+
+          (
+            cd dist
+            shasum -a 256 "${app_asset}" > "${app_asset}.sha256"
+            shasum -a 256 "${extension_asset}" > "${extension_asset}.sha256"
+          )
+
+          cat > dist/release-notes.md <<EOF
+          ## llmTools ${RELEASE_TAG}
+
+          ### Assets
+
+          - \`${app_asset}\`: macOS arm64 app bundle, ad-hoc signed.
+          - \`${app_asset}.sha256\`: checksum for the macOS app archive.
+          - \`${extension_asset}\`: Chromium development extension source for manual unpacked loading.
+          - \`${extension_asset}.sha256\`: checksum for the Chromium extension archive.
+
+          ### Install
+
+          1. Download and unzip \`${app_asset}\`.
+          2. Move \`llmTools.app\` to \`/Applications\` or another trusted folder.
+          3. Launch the app and grant Accessibility permission if selected-text capture is needed.
+          4. For webpage translation, open Settings -> \`网页翻译\`, repair the browser bridge, and load the unpacked Chromium extension folder shown by the app.
+
+          This build is ad-hoc signed and not notarized.
+          EOF
+
+          ls -lh dist/*.zip dist/*.sha256
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          name: llmTools ${{ env.RELEASE_TAG }}
+          body_path: dist/release-notes.md
+          prerelease: ${{ env.IS_PRERELEASE }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/${{ env.ASSET_PREFIX }}-macos-arm64.zip
+            dist/${{ env.ASSET_PREFIX }}-macos-arm64.zip.sha256
+            dist/${{ env.ASSET_PREFIX }}-chromium-extension.zip
+            dist/${{ env.ASSET_PREFIX }}-chromium-extension.zip.sha256
+
+      - name: Write summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## llmTools ${RELEASE_TAG}"
+            echo
+            echo "- App: \`${ASSET_PREFIX}-macos-arm64.zip\`"
+            echo "- Chromium extension: \`${ASSET_PREFIX}-chromium-extension.zip\`"
+            echo "- Prerelease: \`${IS_PRERELEASE}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTools Dashboard Table Fixture</title>
+  <style>
+    body {
+      max-width: 1120px;
+      margin: 32px auto;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #202124;
+      background: #f7f9fb;
+    }
+    main {
+      background: #fff;
+      border: 1px solid #dbe2ea;
+      border-radius: 8px;
+      padding: 18px;
+    }
+    .table-wrap {
+      max-height: 720px;
+      overflow: auto;
+      border: 1px solid #cfd8e3;
+    }
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    thead th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      background: #e8eef5;
+    }
+    th,
+    td {
+      border: 1px solid #d6dde6;
+      padding: 7px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+    tbody tr:nth-child(even) td {
+      background: #fbfdff;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Operations dashboard translation route</h1>
+    <p>Large table pages should remain readable while translating many dashboard cells.</p>
+    <div class="table-wrap">
+      <table data-dashboard-table>
+        <thead>
+          <tr>
+            <th>Metric name</th>
+            <th>Current value</th>
+            <th>Risk summary</th>
+            <th>Recommended action</th>
+          </tr>
+        </thead>
+        <tbody id="dashboard-body"></tbody>
+      </table>
+    </div>
+  </main>
+  <script>
+    const body = document.getElementById("dashboard-body");
+    for (let index = 1; index <= 240; index += 1) {
+      const row = document.createElement("tr");
+      row.dataset.dashboardRow = String(index);
+      const cells = [
+        `Queue depth backlog ${index}`,
+        `Current value sample ${index} requires dashboard review.`,
+        `Revenue protection signal ${index} needs careful monitoring.`,
+        `Recommended action ${index} requires owner follow up.`
+      ];
+      for (const text of cells) {
+        const cell = document.createElement("td");
+        cell.textContent = text;
+        row.appendChild(cell);
+      }
+      body.appendChild(row);
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTools Long Page Fixture</title>
+  <style>
+    body {
+      max-width: 760px;
+      margin: 40px auto;
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    section {
+      padding: 10px 0;
+      border-bottom: 1px solid #e4e8ed;
+    }
+  </style>
+</head>
+<body>
+  <main id="long-content">
+    <h1>Long knowledge base route</h1>
+  </main>
+  <script>
+    const main = document.getElementById("long-content");
+    for (let index = 1; index <= 520; index += 1) {
+      const section = document.createElement("section");
+      const heading = document.createElement("h2");
+      heading.textContent = `Documentation section ${index}`;
+      const paragraph = document.createElement("p");
+      paragraph.textContent = `Long page paragraph ${index} should be discoverable without blocking restore behavior.`;
+      section.append(heading, paragraph);
+      main.append(section);
+    }
+  </script>
+</body>
+</html>

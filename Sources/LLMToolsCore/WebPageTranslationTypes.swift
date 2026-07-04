@@ -8,6 +8,22 @@ public enum WebPagePendingIndicatorStyle: String, Codable, Sendable, Hashable, C
     public var id: String { rawValue }
 }
 
+public enum WebPageTranslationQualityMode: String, Codable, Sendable, Hashable, CaseIterable, Identifiable {
+    case natural
+    case literal
+    case technical
+
+    public var id: String { rawValue }
+}
+
+public enum WebPageReadingMode: String, Codable, Sendable, Hashable, CaseIterable, Identifiable {
+    case replace
+    case bilingual
+    case original
+
+    public var id: String { rawValue }
+}
+
 public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public static let minimumLocalConcurrentTranslationRequests = 1
     public static let maximumLocalConcurrentTranslationRequests = 1
@@ -19,6 +35,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public var pendingIndicatorStyle: WebPagePendingIndicatorStyle
     public var autoTranslateDomains: [String]
     public var disabledDomains: [String]
+    public var domainReadingModes: [String: WebPageReadingMode]
+    public var domainTranslationQualities: [String: WebPageTranslationQualityMode]
     public var persistWebHistory: Bool
     public var maxSegmentsPerBatch: Int
     public var maxCharactersPerBatch: Int
@@ -32,6 +50,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         pendingIndicatorStyle: WebPagePendingIndicatorStyle = .loading,
         autoTranslateDomains: [String] = [],
         disabledDomains: [String] = [],
+        domainReadingModes: [String: WebPageReadingMode] = [:],
+        domainTranslationQualities: [String: WebPageTranslationQualityMode] = [:],
         persistWebHistory: Bool = false,
         maxSegmentsPerBatch: Int = 20,
         maxCharactersPerBatch: Int = 2_000,
@@ -44,6 +64,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         self.pendingIndicatorStyle = pendingIndicatorStyle
         self.autoTranslateDomains = autoTranslateDomains
         self.disabledDomains = disabledDomains
+        self.domainReadingModes = domainReadingModes
+        self.domainTranslationQualities = domainTranslationQualities
         self.persistWebHistory = persistWebHistory
         self.maxSegmentsPerBatch = maxSegmentsPerBatch
         self.maxCharactersPerBatch = maxCharactersPerBatch
@@ -65,6 +87,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         case pendingIndicatorStyle
         case autoTranslateDomains
         case disabledDomains
+        case domainReadingModes
+        case domainTranslationQualities
         case persistWebHistory
         case maxSegmentsPerBatch
         case maxCharactersPerBatch
@@ -80,6 +104,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         pendingIndicatorStyle = try container.decodeIfPresent(WebPagePendingIndicatorStyle.self, forKey: .pendingIndicatorStyle) ?? .loading
         autoTranslateDomains = try container.decodeIfPresent([String].self, forKey: .autoTranslateDomains) ?? []
         disabledDomains = try container.decodeIfPresent([String].self, forKey: .disabledDomains) ?? []
+        domainReadingModes = try container.decodeIfPresent([String: WebPageReadingMode].self, forKey: .domainReadingModes) ?? [:]
+        domainTranslationQualities = try container.decodeIfPresent([String: WebPageTranslationQualityMode].self, forKey: .domainTranslationQualities) ?? [:]
         persistWebHistory = try container.decodeIfPresent(Bool.self, forKey: .persistWebHistory) ?? false
         maxSegmentsPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxSegmentsPerBatch) ?? 20
         maxCharactersPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxCharactersPerBatch) ?? 2_000
@@ -107,6 +133,7 @@ public struct BrowserIntegrationState: Codable, Sendable, Hashable, Identifiable
     public var name: String
     public var bundleID: String
     public var appPath: String?
+    public var extensionChannel: String?
     public var extensionID: String?
     public var extensionVersion: String?
     public var nativeHostManifestPath: String?
@@ -121,6 +148,7 @@ public struct BrowserIntegrationState: Codable, Sendable, Hashable, Identifiable
         name: String,
         bundleID: String,
         appPath: String? = nil,
+        extensionChannel: String? = nil,
         extensionID: String? = nil,
         extensionVersion: String? = nil,
         nativeHostManifestPath: String? = nil,
@@ -134,6 +162,7 @@ public struct BrowserIntegrationState: Codable, Sendable, Hashable, Identifiable
         self.name = name
         self.bundleID = bundleID
         self.appPath = appPath
+        self.extensionChannel = extensionChannel
         self.extensionID = extensionID
         self.extensionVersion = extensionVersion
         self.nativeHostManifestPath = nativeHostManifestPath
@@ -222,6 +251,7 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
     public var jobID: String
     public var sourceLanguage: String
     public var targetLanguage: String
+    public var translationQuality: WebPageTranslationQualityMode
     public var urlHash: String?
     public var title: String?
     public var segments: [WebPageTranslationSegment]
@@ -230,6 +260,7 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
         jobID: String,
         sourceLanguage: String = "en",
         targetLanguage: String = "zh-Hans",
+        translationQuality: WebPageTranslationQualityMode = .natural,
         urlHash: String? = nil,
         title: String? = nil,
         segments: [WebPageTranslationSegment]
@@ -237,9 +268,31 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
         self.jobID = jobID
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
+        self.translationQuality = translationQuality
         self.urlHash = urlHash
         self.title = title
         self.segments = segments
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case jobID
+        case sourceLanguage
+        case targetLanguage
+        case translationQuality
+        case urlHash
+        case title
+        case segments
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        jobID = try container.decode(String.self, forKey: .jobID)
+        sourceLanguage = try container.decodeIfPresent(String.self, forKey: .sourceLanguage) ?? "en"
+        targetLanguage = try container.decodeIfPresent(String.self, forKey: .targetLanguage) ?? "zh-Hans"
+        translationQuality = try container.decodeIfPresent(WebPageTranslationQualityMode.self, forKey: .translationQuality) ?? .natural
+        urlHash = try container.decodeIfPresent(String.self, forKey: .urlHash)
+        title = try container.decodeIfPresent(String.self, forKey: .title)
+        segments = try container.decode([WebPageTranslationSegment].self, forKey: .segments)
     }
 }
 

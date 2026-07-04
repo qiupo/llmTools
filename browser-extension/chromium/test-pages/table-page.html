@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTools Table Fixture</title>
+  <style>
+    body {
+      max-width: 920px;
+      margin: 40px auto;
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #eef3f8;
+    }
+    th,
+    td {
+      border: 1px solid #cfd6dd;
+      padding: 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Dashboard table translation route</h1>
+    <table data-table-heavy>
+      <thead>
+        <tr>
+          <th>Metric name</th>
+          <th>Current value</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Average response latency</td>
+          <td>Healthy service threshold</td>
+        </tr>
+        <tr>
+          <td>Checkout conversion rate</td>
+          <td>Requires weekly review</td>
+        </tr>
+      </tbody>
+    </table>
+  </main>
+</body>
+</html>

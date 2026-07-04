@@ -441,6 +441,7 @@ public actor TaskEngine {
             inputText: try PromptTemplates.webPageBatchPrompt(
                 segments: segments,
                 targetLanguage: payload.targetLanguage,
+                qualityMode: payload.translationQuality,
                 isRetry: isRetry
             ),
             sourceLanguage: payload.sourceLanguage,

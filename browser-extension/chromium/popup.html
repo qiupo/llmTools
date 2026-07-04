@@ -40,6 +40,48 @@
       min-height: 18px;
       line-height: 1.35;
     }
+    .diagnostics {
+      color: #6f7479;
+      font-size: 11px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
+    .site-rule {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid #e8eaed;
+      border-radius: 6px;
+      padding: 7px 8px;
+    }
+    .site {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #3c4043;
+      font-weight: 500;
+    }
+    select {
+      max-width: 145px;
+      border: 1px solid #dadce0;
+      border-radius: 6px;
+      background: #fff;
+      color: #202124;
+      padding: 5px 7px;
+      font: inherit;
+    }
+    .control-stack {
+      display: grid;
+      gap: 5px;
+      justify-items: end;
+    }
+    .site-default {
+      padding: 4px 7px;
+      font-size: 11px;
+      line-height: 1.2;
+    }
     .progress {
       height: 6px;
       border-radius: 999px;
@@ -59,6 +101,12 @@
     }
     button.wide {
       grid-column: 1 / -1;
+    }
+    .cache-actions {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
     }
     button {
       border: 1px solid #dadce0;
@@ -90,13 +138,64 @@
       </div>
     </div>
     <div id="status" class="status">就绪</div>
+    <div id="diagnostics" class="diagnostics" hidden></div>
+    <div class="site-rule">
+      <div id="domain" class="site">当前网站</div>
+      <select id="domainRule">
+        <option value="ask">手动翻译</option>
+        <option value="alwaysTranslate">自动翻译此网站</option>
+        <option value="neverTranslate">不翻译此网站</option>
+      </select>
+    </div>
+    <div class="site-rule">
+      <div class="site">阅读模式</div>
+      <div class="control-stack">
+        <select id="readingMode" aria-label="阅读模式">
+          <option value="replace">替换译文</option>
+          <option value="bilingual">双语对照</option>
+          <option value="original">原文</option>
+        </select>
+        <button id="saveReadingDefault" class="site-default" title="保存为当前网站默认阅读模式">站点默认</button>
+      </div>
+    </div>
+    <div class="site-rule">
+      <div class="site">翻译范围</div>
+      <select id="discoveryScope" aria-label="翻译范围">
+        <option value="visible">可视区域优先</option>
+        <option value="page">全页预翻译</option>
+      </select>
+    </div>
+    <div class="site-rule">
+      <div class="site">翻译质量</div>
+      <div class="control-stack">
+        <select id="translationQuality" aria-label="翻译质量">
+          <option value="natural">自然</option>
+          <option value="literal">直译</option>
+          <option value="technical">技术术语</option>
+        </select>
+        <button id="saveQualityDefault" class="site-default" title="保存为当前网站默认翻译质量">站点默认</button>
+      </div>
+    </div>
+    <div class="site-rule">
+      <div class="site">待翻译样式</div>
+      <select id="pendingIndicatorStyle" aria-label="待翻译样式">
+        <option value="loading">Loading</option>
+        <option value="flipText">翻牌</option>
+        <option value="none">无样式</option>
+      </select>
+    </div>
     <div class="progress"><div id="bar" class="bar"></div></div>
     <div class="actions">
       <button id="translate" class="primary">翻译页面</button>
+      <button id="retranslate">重译</button>
       <button id="restore">恢复原文</button>
       <button id="cancel">取消</button>
       <button id="statusBtn">测试</button>
-      <button id="clearCache" class="wide" title="清除当前页面的缓存译文">清除缓存</button>
+      <div class="cache-actions">
+        <button id="clearPageCache" title="清除当前页面的缓存译文">清页</button>
+        <button id="clearDomainCache" title="清除当前网站的缓存译文">清站</button>
+        <button id="clearAllCache" title="清除全部网页缓存译文">清全</button>
+      </div>
     </div>
   </div>
   <script src="popup.js"></script>

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>llmTools Iframe Fixture</title>
+  <style>
+    body {
+      max-width: 760px;
+      margin: 40px auto;
+      font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    iframe {
+      display: block;
+      width: 420px;
+      height: 180px;
+      border: 1px solid #cfd6dd;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Iframe translation route</h1>
+    <p>The main page text should translate together with accessible frame text.</p>
+    <iframe
+      data-same-origin-frame
+      title="Same origin frame"
+      srcdoc="&lt;!doctype html&gt;&lt;html&gt;&lt;body&gt;&lt;main&gt;&lt;p data-frame-copy='true'&gt;Same origin iframe text should be translated.&lt;/p&gt;&lt;code&gt;iframe code should stay as source text&lt;/code&gt;&lt;/main&gt;&lt;/body&gt;&lt;/html&gt;">
+    </iframe>
+  </main>
+</body>
+</html>

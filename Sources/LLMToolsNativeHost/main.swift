@@ -48,6 +48,12 @@ final class NativeMessagingHost: @unchecked Sendable {
                 return try bridgeResponse(for: request, path: "/translateSegments")
             case "cancelJob":
                 return try bridgeResponse(for: request, path: "/cancelJob")
+            case "setDomainRule":
+                return try bridgeResponse(for: request, path: "/setDomainRule")
+            case "setDomainPageDefaults":
+                return try bridgeResponse(for: request, path: "/setDomainPageDefaults")
+            case "setPendingIndicatorStyle":
+                return try bridgeResponse(for: request, path: "/setPendingIndicatorStyle")
             case "openSettings":
                 return try statusResponse(for: request)
             default:
