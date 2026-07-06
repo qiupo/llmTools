@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         menu.addItem(statusMenuItem)
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "打开快捷操作", action: #selector(openQuickAction), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "图片 OCR", action: #selector(openImageOCR), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "打开悬浮组件", action: #selector(openFloatingWidget), keyEquivalent: "w"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "模型", action: #selector(openSettings), keyEquivalent: ","))
@@ -134,6 +135,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     @objc private func openQuickAction() {
+        appState.quickActionMode = .text
+        openQuickActionWindow(nearSelection: false)
+    }
+
+    @objc private func openImageOCR() {
+        appState.quickActionMode = .image
         openQuickActionWindow(nearSelection: false)
     }
 
@@ -482,6 +489,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             switch item.action {
             case #selector(openQuickAction):
                 item.title = L10n.text("Open Quick Action", language: appState.preferences.appLanguage)
+            case #selector(openImageOCR):
+                item.title = L10n.text("Image OCR", language: appState.preferences.appLanguage)
             case #selector(openFloatingWidget):
                 item.title = L10n.text("Open Floating Widget", language: appState.preferences.appLanguage)
             case #selector(openSettings):
@@ -515,7 +524,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func openQuickActionWindow(nearSelection: Bool) {
-        quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
+        quickActionWindowController?.window?.title = appState.quickActionMode == .image
+            ? L10n.text("Image OCR", language: appState.preferences.appLanguage)
+            : appState.selectedTask.title(language: appState.preferences.appLanguage)
         if nearSelection {
             positionQuickActionWindowNearSelectionIfPossible()
         }
@@ -531,6 +542,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         guard tasks.indices.contains(shortcutIndex) else {
             return
         }
+        appState.quickActionMode = .text
         appState.selectedTask = tasks[shortcutIndex]
         quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
     }

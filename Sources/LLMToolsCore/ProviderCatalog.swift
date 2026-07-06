@@ -144,6 +144,10 @@ public enum ProviderRequestOptions {
 
     private static func siliconFlowSupportsThinkingToggle(modelID: String) -> Bool {
         let trimmed = modelID.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = trimmed.lowercased()
+        if normalized.contains("qwen3-vl") || normalized.contains("-vl-") {
+            return false
+        }
         let supportedPrefixes = [
             "Qwen/Qwen3-",
             "Qwen/Qwen3.5-",

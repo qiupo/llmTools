@@ -62,6 +62,7 @@ public actor TaskEngine {
         if snapshot.preferences.defaultModelID == nil {
             snapshot.preferences.defaultModelID = descriptor.id
         }
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
         return descriptor
     }
@@ -122,6 +123,7 @@ public actor TaskEngine {
         if snapshot.preferences.defaultModelID == nil {
             snapshot.preferences.defaultModelID = descriptor.id
         }
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
         return descriptor
     }
@@ -177,6 +179,7 @@ public actor TaskEngine {
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "\(preset.name) · \(trimmedModelID)"
             : name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let previousCapabilities = snapshot.models[index].capabilities
         let configuration = ProviderConfiguration(
             providerID: providerID,
             apiStyle: preset.apiStyle,
@@ -199,6 +202,13 @@ public actor TaskEngine {
         snapshot.models[index].validationState = .valid
         snapshot.models[index].lastErrorMessage = nil
         snapshot.models[index].providerConfiguration = configuration
+        if previousCapabilities.source != .manual {
+            snapshot.models[index].capabilities = ModelCapabilities.inferred(
+                format: snapshot.models[index].format,
+                providerConfiguration: configuration
+            )
+        }
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
         return snapshot.models[index]
     }
@@ -233,17 +243,134 @@ public actor TaskEngine {
         if snapshot.preferences.webPageTranslation.modelID == id {
             snapshot.preferences.webPageTranslation.modelID = nil
         }
+        if snapshot.preferences.ocr.modelID == id {
+            snapshot.preferences.ocr.modelID = nil
+        }
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
     }
 
     public func updatePreferences(_ transform: (inout AppPreferences) -> Void) async throws {
         transform(&snapshot.preferences)
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
     }
 
     public func setPreferences(_ preferences: AppPreferences) async throws {
         snapshot.preferences = preferences
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
+    }
+
+    public func visionCapableModels() -> [ModelDescriptor] {
+        snapshot.models.filter { $0.enabled && $0.capabilities.supportsImage }
+    }
+
+    public func markModelVisionCapable(id: UUID) async throws -> ModelDescriptor {
+        try await updateModelCapabilities(
+            id: id,
+            capabilities: ModelCapabilities.vision(
+                source: .manual,
+                confidence: 1,
+                note: "Manually marked vision-capable."
+            )
+        )
+    }
+
+    public func markModelTextOnly(id: UUID) async throws -> ModelDescriptor {
+        try await updateModelCapabilities(
+            id: id,
+            capabilities: ModelCapabilities.textOnly(
+                source: .manual,
+                note: "Manually marked text-only."
+            )
+        )
+    }
+
+    public func resetModelCapabilities(id: UUID) async throws -> ModelDescriptor {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        let model = snapshot.models[index]
+        return try await updateModelCapabilities(
+            id: id,
+            capabilities: ModelCapabilities.inferred(
+                format: model.format,
+                providerConfiguration: model.providerConfiguration
+            )
+        )
+    }
+
+    public func testVisionCapability(id: UUID) async throws -> VisionCapabilityProbeResult {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        var model = snapshot.models[index]
+        guard model.enabled else {
+            throw RunnerError.unsupportedConfiguration("Model is disabled.")
+        }
+        let runner = try runner(for: model)
+        guard let visionRunner = runner as? any VisionModelRunner else {
+            let message = "\(model.name) does not support the Phase 3 OpenAI-compatible vision payload."
+            snapshot.models[index].capabilities = ModelCapabilities(
+                inputs: [.text],
+                source: .failedProbe,
+                confidence: 0.9,
+                note: "Vision probe failed before provider call.",
+                lastCheckedAt: .now,
+                lastFailureMessage: message
+            )
+            sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+            try await registryStore.save(snapshot)
+            throw OCRTaskError.unsupportedVisionRunner(model.name)
+        }
+
+        do {
+            if await runner.loadedModelID() != model.id {
+                await runner.unload()
+                try await runner.load(model: model)
+            }
+            let request = OCRTaskRequest(
+                image: OCRImagePreprocessor.probeImage,
+                mode: .explainImage,
+                prompt: PromptTemplates.visionProbePrompt()
+            )
+            let result = try await visionRunner.generateOCR(
+                request: request,
+                preferences: snapshot.preferences
+            )
+            let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                throw RunnerError.emptyResult
+            }
+            model.capabilities = ModelCapabilities.vision(
+                source: .probePassed,
+                confidence: 1,
+                note: "Vision probe passed."
+            )
+            model.capabilities.lastCheckedAt = .now
+            snapshot.models[index] = model
+            sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+            try await registryStore.save(snapshot)
+            return VisionCapabilityProbeResult(
+                modelID: model.id,
+                modelName: model.name,
+                ok: true,
+                message: text
+            )
+        } catch {
+            snapshot.models[index].capabilities = ModelCapabilities(
+                inputs: [.text],
+                source: .failedProbe,
+                confidence: 0.9,
+                note: "Vision probe failed.",
+                lastCheckedAt: .now,
+                lastFailureMessage: error.localizedDescription
+            )
+            sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+            try? await registryStore.save(snapshot)
+            throw error
+        }
     }
 
     public func setRunner(_ runner: any ModelRunner, for format: ModelFormat) {
@@ -272,6 +399,79 @@ public actor TaskEngine {
         let result = try await runner.generate(request: request, preferences: snapshot.preferences)
         if persistHistory {
             appendHistory(model: model, result: result, request: request)
+        }
+        return result
+    }
+
+    public func runOCR(
+        image: OCRImageInput,
+        mode: OCRMode,
+        modelID: UUID? = nil,
+        persistHistory: Bool? = nil
+    ) async throws -> TaskResult {
+        guard snapshot.preferences.ocr.enabled else {
+            throw OCRTaskError.disabled
+        }
+        let model = try resolveOCRModel(for: modelID)
+        guard model.capabilities.supportsImage else {
+            throw OCRTaskError.modelNotVisionCapable(model.name)
+        }
+        let runner = try runner(for: model)
+        guard let visionRunner = runner as? any VisionModelRunner else {
+            throw OCRTaskError.unsupportedVisionRunner(model.name)
+        }
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+
+        let prompt = PromptTemplates.ocrPrompt(
+            mode: mode,
+            targetLanguage: snapshot.preferences.defaultTranslationTarget
+        )
+        let ocrResult = try await visionRunner.generateOCR(
+            request: OCRTaskRequest(image: image, mode: mode, prompt: prompt),
+            preferences: snapshot.preferences
+        )
+        let rawModelText = ocrResult.rawModelText ?? ocrResult.text
+        let visibleOCRText = ocrResult.structuredMarkdown ?? ocrResult.text
+        let finalText: String
+        let finalRawText: String
+        let finalModelName: String
+
+        if mode == .extractThenTranslate && !isNoReadableText(visibleOCRText) {
+            let translation = try await run(
+                request: TaskRequest(
+                    task: .translate,
+                    inputText: visibleOCRText,
+                    targetLanguage: snapshot.preferences.defaultTranslationTarget
+                ),
+                modelID: nil,
+                persistHistory: false
+            )
+            finalText = translation.text
+            finalRawText = """
+            OCR raw output:
+            \(rawModelText)
+
+            Translation raw output:
+            \(translation.rawText)
+            """
+            finalModelName = "\(ocrResult.modelName ?? model.name) -> \(translation.modelName)"
+        } else {
+            finalText = visibleOCRText
+            finalRawText = rawModelText
+            finalModelName = ocrResult.modelName ?? model.name
+        }
+
+        let result = TaskResult(
+            text: finalText,
+            rawText: finalRawText,
+            modelName: finalModelName,
+            task: .ocr
+        )
+        if persistHistory ?? snapshot.preferences.ocr.persistHistory {
+            appendOCRHistory(model: model, result: result, image: image)
         }
         return result
     }
@@ -383,6 +583,17 @@ public actor TaskEngine {
             return firstEnabled
         }
         throw RunnerError.unsupportedConfiguration("No enabled model is registered.")
+    }
+
+    private func resolveOCRModel(for modelID: UUID?) throws -> ModelDescriptor {
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.enabled }) {
+            return model
+        }
+        if let preferred = snapshot.preferences.ocr.modelID,
+           let model = snapshot.models.first(where: { $0.id == preferred && $0.enabled }) {
+            return model
+        }
+        throw OCRTaskError.missingVisionModel
     }
 
     private func validateInputSize(_ request: TaskRequest, for model: ModelDescriptor) throws {
@@ -714,6 +925,35 @@ public actor TaskEngine {
         }
     }
 
+    @discardableResult
+    private func updateModelCapabilities(
+        id: UUID,
+        capabilities: ModelCapabilities
+    ) async throws -> ModelDescriptor {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        snapshot.models[index].capabilities = capabilities
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        try await registryStore.save(snapshot)
+        return snapshot.models[index]
+    }
+
+    private func sanitizePreferences(_ preferences: inout AppPreferences, models: [ModelDescriptor]) {
+        if let modelID = preferences.defaultModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled }) {
+            preferences.defaultModelID = models.first(where: { $0.enabled })?.id
+        }
+        if let modelID = preferences.webPageTranslation.modelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled }) {
+            preferences.webPageTranslation.modelID = nil
+        }
+        if let modelID = preferences.ocr.modelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
+            preferences.ocr.modelID = nil
+        }
+    }
+
     private func appendHistory(model: ModelDescriptor, result: TaskResult, request: TaskRequest) {
         let entry = HistoryItem(
             task: request.task,
@@ -730,6 +970,33 @@ public actor TaskEngine {
         Task {
             try? await historyStore.save(itemsToSave)
         }
+    }
+
+    private func appendOCRHistory(model: ModelDescriptor, result: TaskResult, image: OCRImageInput) {
+        let entry = HistoryItem(
+            task: .ocr,
+            modelName: model.name,
+            inputPreview: image.redactedHistoryPreview,
+            outputPreview: result.text.prefix(240).description
+        )
+        history.insert(entry, at: 0)
+        let limit = max(snapshot.preferences.recentHistoryLimit, 0)
+        if history.count > limit {
+            history = Array(history.prefix(limit))
+        }
+        let itemsToSave = history
+        Task {
+            try? await historyStore.save(itemsToSave)
+        }
+    }
+
+    private func isNoReadableText(_ text: String) -> Bool {
+        let normalized = text
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized == "no readable text detected."
+            || normalized == "未检测到可读文本。"
+            || normalized == "未检测到可读文本"
     }
 
     private func inferRole(format: ModelFormat, sizeClass: String) -> ModelRole {

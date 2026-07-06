@@ -21,6 +21,10 @@ let package = Package(
             targets: ["LLMToolsSmoke"]
         ),
         .executable(
+            name: "LLMToolsLiveOCRCheck",
+            targets: ["LLMToolsLiveOCRCheck"]
+        ),
+        .executable(
             name: "LLMToolsNativeHost",
             targets: ["LLMToolsNativeHost"]
         )
@@ -57,6 +61,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "LLMToolsSmoke",
+            dependencies: [
+                "LLMToolsCore"
+            ]
+        ),
+        .executableTarget(
+            name: "LLMToolsLiveOCRCheck",
             dependencies: [
                 "LLMToolsCore"
             ]

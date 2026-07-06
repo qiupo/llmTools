@@ -5,7 +5,7 @@
 ![macOS](https://img.shields.io/badge/macOS-14%2B-111111?logo=apple&logoColor=white)
 ![Chromium MV3](https://img.shields.io/badge/Chromium-MV3-4285F4?logo=googlechrome&logoColor=white)
 
-llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, and extracting TODOs from selected text or webpages. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
+llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, and running model-vision OCR on selected text, webpages, images, and screenshots. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
 
 ## Highlights
 
@@ -14,12 +14,14 @@ llmTools is a native macOS menu-bar assistant for translating, polishing, summar
 - Local model support for GGUF and MLX model folders.
 - Remote provider support for OpenAI-compatible endpoints and Anthropic Messages API.
 - Chromium webpage translation via Manifest V3 extension plus local native messaging host.
+- Native image OCR, structured extraction, translate-after-OCR, and screenshot/image explanation through explicitly configured vision-capable models.
+- Capability-aware model settings with text-only, vision-capable, inferred, probed, and manual override states.
 - Privacy-oriented webpage diagnostics: hashed page/domain identifiers, no raw page text in diagnostics by default.
 - Release workflow that packages a macOS `.app` bundle and publishes GitHub Release assets.
 
 ## Status
 
-llmTools is under active development. The desktop quick-action flow and local/remote model registry are usable. Chromium webpage translation is currently a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
+llmTools is under active development. The desktop quick-action flow, local/remote model registry, capability-aware model settings, and native model-vision OCR workflow are usable. Chromium webpage translation is currently a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
 
 ## Requirements
 
@@ -139,10 +141,14 @@ Current scope:
 
 - Implemented: Chrome page translation, site rules, cache controls, reading modes, quality modes, retranslate, privacy diagnostics, and Phase 1 regression checks.
 - Implemented for Edge: Settings detection, native manifest repair, `edge://extensions` launch, and reusable browser fixture runner.
+- Implemented in the native app: text-task prompt hardening, output follow-up actions, model capability badges and overrides, OCR settings, OpenAI-compatible model-vision OCR payloads, structured OCR, translate-after-OCR, and screenshot/image explanation.
 - Deferred from browser translation: Chrome Web Store distribution, production extension ID, Safari/Firefox support, browser PDF viewer translation, browser image/canvas OCR translation, form-writing assistance, and multi-tab bulk translation.
-- Planned next phase: native text-task polish plus image OCR through local Apple Vision, an explicitly configured vision-capable model, or a hybrid of both.
 
 Chrome cannot be silently installed, enabled, or confirmed by the app. Final extension loading and permission prompts stay under browser control.
+
+Native OCR requires a configured model that is marked vision-capable. Local GGUF and MLX runners remain text-only until a real multimodal local runner exists, so OCR uses provider models that accept image input through the implemented vision runner path.
+
+When a real OpenAI-compatible provider API key is configured, `swift run LLMToolsLiveOCRCheck` can be used as the live Phase 3 OCR gate. It reuses the existing provider configuration, adds or selects a vision-capable model, sets it as the OCR model, runs a vision probe, OCRs a generated text image, and runs screenshot/image explanation without storing raw source images in history.
 
 ## Development Commands
 
@@ -154,6 +160,8 @@ Chrome cannot be silently installed, enabled, or confirmed by the app. Final ext
 | Browser extension checks | `node scripts/check-browser-extension-dom.mjs` |
 | Package app | `./scripts/package-app.sh` |
 | Verify packaged code signature | `codesign --verify --deep --strict --verbose=2 dist/llmTools.app` |
+| Live OCR provider check | `swift run LLMToolsLiveOCRCheck` |
+| Phase 3 goal audit | `node scripts/check-phase3-goal-audit.mjs --run-checks --run-live-ocr` |
 | Phase 2 closure gate | `./scripts/check-phase2-closure.sh` |
 
 Run browser fixture checks against Edge or all configured Chromium browsers:

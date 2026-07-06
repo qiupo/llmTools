@@ -19,7 +19,7 @@ The app should default to local processing. Remote provider entries can exist in
 
 - Phase 1 native MVP is complete as of 2026-07-03.
 - Phase 1 should now be treated as the stable baseline for regression checks: selected-text processing, quick action, model registry, GGUF/MLX runners, task templates, floating widget, local packaging, and recent history.
-- Phase 2 is the active product phase, but the original implementation backlog has been mostly completed and is now in closure/acceptance planning.
+- Phase 2 implementation is complete and is now in closure/acceptance mode.
 - Phase 2.0 Chrome webpage translation baseline is complete: current-page translation, native bridge, real model translation, restore, cancel, dynamic scroll translation, cache, context-menu toggle, popup, overlay, Settings entry, and packaged-app workflow.
 - Phase 2.1 site/domain rules are implemented. The Chrome development extension and macOS Settings now share per-domain `ask` / `alwaysTranslate` / `neverTranslate` rules, popup rule editing, automatic translation for opted-in domains, `neverTranslate` blocking for automatic/context-menu translation, and page/site/all webpage cache controls.
 - Phase 2.2 is complete as a product decision for this phase: Chrome distribution remains development-only, with visible channel/version/manifest diagnostics and stable native-manifest validation. Chrome Web Store distribution is deferred to a later release/distribution track.
@@ -27,8 +27,8 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 2.4 current-page controls are implemented for replacement/bilingual/original reading modes, visible-first/full-page discovery scope, natural/literal/technical quality modes, pending translation style selection in the extension popup, current-page retranslate, and per-domain reading/quality defaults.
 - Phase 2.5 complex-page baseline is implemented for SPA route reset, stale page-session rejection, virtualized rows, same-origin iframes, open shadow roots, high-frequency mutations, table-heavy pages, protected/page-PDF unsupported states, and partial-support reporting for unsupported embedded content.
 - Phase 2.6 privacy, diagnostics, and release-QA baseline is implemented: redacted webpage diagnostics, explicit cache/history policy, default-off webpage Recent History, fixture matrix coverage, least-privilege manifest checks, browser runtime/console checks, and Phase 1 regression checks.
-- Remaining Phase 2 work is now limited to closure tasks: real Edge acceptance, packaged-app browser smoke on real sites, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, browser image/canvas OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
-- Phase 3 is the next product phase. It should close the remaining translation acceptance work, improve the existing polish/summarize/explain/TODO workflows, add explicit model capability metadata, and provide native image OCR through local Apple Vision, a user-selected vision-capable model, or a hybrid of both.
+- Remaining Phase 2 work is now limited to external/manual closure tasks: real Edge acceptance when Edge is available, real Chrome packaged-app smoke after the unpacked extension is loaded from this repo, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, browser image/canvas OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
+- Phase 3 implementation baseline is complete as of 2026-07-04: native text-task prompts and follow-up actions are hardened, model capability metadata is persisted and visible, and native model-vision OCR plus screenshot/image explanation are available through a user-selected vision-capable model.
 
 ## Confirmed Decisions
 
@@ -54,8 +54,8 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 2.0 uses a Chrome extension, native messaging host, and a local `127.0.0.1` app bridge protected by an app-generated token.
 - Development Chrome extension ID: `jednddlgkkohaebgoejcidfppddjegij`.
 - Phase 2.0 Chrome baseline is complete. Later Phase 2 work should not relitigate the Chrome MVP architecture unless a regression or browser policy change requires it.
-- Phase 3 OCR starts in the native app, not inside browser page translation. Browser image/canvas OCR remains a later browser feature after native OCR and normal DOM translation are stable.
-- Local Apple Vision OCR is allowed in Phase 3 as a deterministic macOS OCR service. It is separate from local multimodal LLM support.
+- Phase 3 OCR starts in the native app, not inside browser page translation. Browser image/canvas OCR remains a later browser feature after native model-vision OCR and normal DOM translation are stable.
+- Phase 3 does not use Apple Vision, VisionKit, or Apple-provided OCR/visual recognition APIs. Image recognition is performed by the configured vision-capable model.
 - OCR models must be chosen from models marked as vision-capable. When provider APIs cannot prove vision support, the app should expose confidence and allow a clear manual override instead of silently assuming support.
 - Local text-only GGUF and MLX models should remain unavailable for OCR until a real multimodal local runner exists.
 
@@ -266,9 +266,18 @@ Phase 2 completion checklist:
 
 ## Phase 3: Native Task Polish And Vision OCR
 
-Goal: turn the current task-first macOS assistant into a reliable everyday tool by closing translation acceptance, improving the existing text workflows, and adding native OCR paths for images through local Apple Vision, explicitly configured vision-capable models, and hybrid cleanup/structure workflows.
+Goal: turn the current task-first macOS assistant into a reliable everyday tool by closing translation acceptance, improving the existing text workflows, and adding native OCR and screenshot/image explanation through explicitly configured vision-capable models.
 
 Detailed PRD: `docs/phase-3-native-task-and-ocr-prd.md`.
+
+Implementation record:
+
+- Text tasks now have stricter task-specific prompt contracts for translation, polish, summarize, explain, and TODO extraction.
+- Settings exposes model capability state, source, confidence, failure detail, manual vision/text-only overrides, reset-to-automatic, and an explicit OCR/vision probe action.
+- OCR settings expose enablement, filtered OCR model selection, default OCR mode, model-recognition default, and OCR history opt-in.
+- The image workflow accepts file, paste, drop, and remote URL inputs, normalizes local image payloads, strips metadata, enforces size limits, and avoids passing remote URLs directly to providers.
+- OpenAI-compatible providers have the first implemented multimodal request path for OCR, structured extraction, translate-after-OCR, and image explanation.
+- Automated checks cover old-registry migration, prompt contracts, image preprocessing, capability filtering, text-only rejection before provider calls, stub vision execution, OCR history redaction, and OpenAI-compatible image payload encoding.
 
 Core capabilities:
 
@@ -278,11 +287,11 @@ Core capabilities:
 - clearer run/cancel/retry/error states across all native text tasks
 - model capability metadata for text-only and vision-capable models
 - capability detection through provider metadata where available, provider/model heuristics where necessary, and user-visible manual override when automatic detection is uncertain
-- local Apple Vision OCR for private, fast image text extraction
-- OCR engine modes for local-only, vision-model, and hybrid extraction
 - OCR model preference that only accepts vision-capable models
+- per-run model-recognition button, plus settings to make model recognition the default and choose the model used for it
 - native image OCR from image files, clipboard images, and screenshots
 - OCR output modes for plain text, key-value/table preservation, and optional translate-after-OCR
+- screenshot/image explanation using the configured vision-capable model
 - privacy controls that make remote OCR opt-in and avoid storing raw images by default
 - focused regression coverage for existing Phase 1 and Phase 2 behavior
 
@@ -291,7 +300,7 @@ Suggested scope:
 - Finish Phase 2 acceptance before broadening browser translation.
 - Improve existing text tasks before adding new document-assistant surfaces.
 - Start OCR in the native app with PNG, JPEG, WebP where decodable, and clipboard/screenshot input.
-- Use Apple Vision as the local OCR baseline, and provider-backed vision models for hard images, structure cleanup, and model-assisted extraction because the current local GGUF/MLX runners are text-only.
+- Use configured vision-capable models for OCR, structured extraction, and screenshot/image explanation; local preprocessing only handles decode, conversion, metadata stripping, temporary downloads, and size limits.
 - Keep browser image/canvas OCR, PDF translation, and document indexing out of this phase unless explicitly reprioritized.
 
 Primary acceptance:
@@ -300,8 +309,9 @@ Primary acceptance:
 - A user can run translate, polish, summarize, explain, and extract TODOs with task-specific output that is copyable, retryable, and predictable.
 - Settings clearly shows which models are text-only, vision-capable, unknown, or manually overridden.
 - A non-vision model cannot be selected as the OCR model.
-- A user can run local-only OCR without a remote model, or choose a vision-capable model for model/hybrid OCR.
+- A user can trigger model recognition from the image workflow and choose a vision-capable model as the default recognition model.
 - A user can drop or paste an image and get extracted text with preserved line/table structure where possible.
+- A user can ask llmTools to explain a screenshot/image when a vision-capable model is configured.
 - OCR failures explain whether the blocker is missing vision support, provider configuration, input format, network/API failure, or no readable text.
 
 ## Phase 4: File Drop And Document Intake
@@ -322,6 +332,10 @@ Core capabilities:
 - action item extraction
 - recent result history
 - clear running/error states
+
+Candidate Phase 4.x requirement under research:
+
+- browser live audio translation and subtitles for current-tab audio, with Chrome first, native-app model execution first, local processing by default, multilingual source detection with confidence, and Simplified Chinese translated subtitles. See `docs/phase-4-live-audio-subtitles-research.md`.
 
 Suggested scope:
 

@@ -58,6 +58,7 @@ struct SelectionActionView: View {
         case .summarize: return "doc.text"
         case .explain: return "questionmark.circle"
         case .extractTodos: return "list.bullet.clipboard"
+        case .ocr: return "text.viewfinder"
         }
     }
 
@@ -175,7 +176,9 @@ struct QuickActionView: View {
     @ObservedObject var appState: AppState
     var onClose: () -> Void = {}
     @State private var showFileImporter = false
+    @State private var showImageImporter = false
     @State private var showInput = true
+    @State private var imageURLDraft = ""
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -200,6 +203,11 @@ struct QuickActionView: View {
                 appState.loadInputFile(from: url)
             }
         }
+        .fileImporter(isPresented: $showImageImporter, allowedContentTypes: [.image, .item], allowsMultipleSelection: false) { result in
+            if case let .success(urls) = result, let url = urls.first {
+                appState.loadOCRImageFile(from: url)
+            }
+        }
         .onDrop(of: [.fileURL, .plainText, .text], isTargeted: nil) { providers in
             handleDrop(providers)
         }
@@ -207,32 +215,45 @@ struct QuickActionView: View {
 
     private var controlsBar: some View {
         HStack(spacing: 10) {
-            Picker("", selection: $appState.selectedTask) {
-                ForEach(TaskKind.interactiveCases) { task in
-                    Text(task.title(language: language)).tag(task)
-                }
+            Picker("", selection: $appState.quickActionMode) {
+                Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
+                Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
             }
             .labelsHidden()
-            .frame(width: 108)
-            .disabled(appState.isRunning)
+            .pickerStyle(.segmented)
+            .frame(width: 126)
+            .disabled(appState.isRunning || appState.isPreparingOCRImage)
+
+            if appState.quickActionMode == .text {
+                Picker("", selection: $appState.selectedTask) {
+                    ForEach(TaskKind.interactiveCases) { task in
+                        Text(task.title(language: language)).tag(task)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 108)
+                .disabled(appState.isRunning)
+            }
 
             modeOptions
                 .frame(minWidth: 220, alignment: .leading)
 
             Spacer()
 
-            Button {
-                showInput.toggle()
-            } label: {
-                HStack(spacing: 4) {
-                    Text(L10n.text(showInput ? "Hide source" : "Show source", language: language))
-                    Image(systemName: showInput ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
+            if appState.quickActionMode == .text {
+                Button {
+                    showInput.toggle()
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(L10n.text(showInput ? "Hide source" : "Show source", language: language))
+                        Image(systemName: showInput ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                    }
                 }
+                .buttonStyle(.borderless)
+                .disabled(appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .fixedSize(horizontal: true, vertical: false)
             }
-            .buttonStyle(.borderless)
-            .disabled(appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -240,63 +261,77 @@ struct QuickActionView: View {
 
     @ViewBuilder
     private var modeOptions: some View {
-        switch appState.selectedTask {
-        case .translate:
-            HStack(spacing: 8) {
-                Text(L10n.text("Auto detect", language: language))
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .frame(width: 68)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(.quaternary.opacity(0.45))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                Image(systemName: "arrow.right")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        if appState.quickActionMode == .image {
+            Picker("", selection: Binding(
+                get: { appState.ocrMode },
+                set: { appState.setOCRMode($0) }
+            )) {
+                ForEach(OCRMode.allCases) { mode in
+                    Text(L10n.ocrModeName(mode, language: language)).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 150)
+            .disabled(appState.isRunning || appState.isPreparingOCRImage)
+        } else {
+            switch appState.selectedTask {
+            case .translate:
+                HStack(spacing: 8) {
+                    Text(L10n.text("Auto detect", language: language))
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(width: 68)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(.quaternary.opacity(0.45))
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    Image(systemName: "arrow.right")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: Binding(
+                        get: { appState.preferences.defaultTranslationTarget },
+                        set: { newValue in
+                            appState.updatePreferences { $0.defaultTranslationTarget = newValue }
+                        }
+                    )) {
+                        Text(L10n.targetLanguageName("Chinese", language: language)).tag("Chinese")
+                        Text(L10n.targetLanguageName("English", language: language)).tag("English")
+                        Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
+                        Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
+                        Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
+                    }
+                    .labelsHidden()
+                    .frame(width: 118)
+                    .disabled(appState.isRunning)
+                }
+                .fixedSize(horizontal: true, vertical: false)
+            case .polish:
                 Picker("", selection: Binding(
-                    get: { appState.preferences.defaultTranslationTarget },
+                    get: { appState.preferences.defaultPolishStyle },
                     set: { newValue in
-                        appState.updatePreferences { $0.defaultTranslationTarget = newValue }
+                        appState.updatePreferences { $0.defaultPolishStyle = newValue }
                     }
                 )) {
-                    Text(L10n.targetLanguageName("Chinese", language: language)).tag("Chinese")
-                    Text(L10n.targetLanguageName("English", language: language)).tag("English")
-                    Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
-                    Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
-                    Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
+                    Text(L10n.polishStyleName("natural", language: language)).tag("natural")
+                    Text(L10n.polishStyleName("formal", language: language)).tag("formal")
+                    Text(L10n.polishStyleName("concise", language: language)).tag("concise")
+                    Text(L10n.polishStyleName("conversational", language: language)).tag("conversational")
+                    Text(L10n.polishStyleName("technical", language: language)).tag("technical")
                 }
                 .labelsHidden()
                 .frame(width: 118)
                 .disabled(appState.isRunning)
+            case .summarize:
+                modeBadge("Key points", systemImage: "list.bullet.rectangle")
+            case .explain:
+                modeBadge("Plain explanation", systemImage: "questionmark.circle")
+            case .extractTodos:
+                modeBadge("Action items", systemImage: "checklist")
+            case .webPageTranslate, .ocr:
+                EmptyView()
             }
-            .fixedSize(horizontal: true, vertical: false)
-        case .polish:
-            Picker("", selection: Binding(
-                get: { appState.preferences.defaultPolishStyle },
-                set: { newValue in
-                    appState.updatePreferences { $0.defaultPolishStyle = newValue }
-                }
-            )) {
-                Text(L10n.polishStyleName("natural", language: language)).tag("natural")
-                Text(L10n.polishStyleName("formal", language: language)).tag("formal")
-                Text(L10n.polishStyleName("concise", language: language)).tag("concise")
-                Text(L10n.polishStyleName("conversational", language: language)).tag("conversational")
-                Text(L10n.polishStyleName("technical", language: language)).tag("technical")
-            }
-            .labelsHidden()
-            .frame(width: 118)
-            .disabled(appState.isRunning)
-        case .summarize:
-            modeBadge("Key points", systemImage: "list.bullet.rectangle")
-        case .explain:
-            modeBadge("Plain explanation", systemImage: "questionmark.circle")
-        case .extractTodos:
-            modeBadge("Action items", systemImage: "checklist")
-        case .webPageTranslate:
-            EmptyView()
         }
     }
 
@@ -313,17 +348,149 @@ struct QuickActionView: View {
     }
 
     private var mainContent: some View {
-        VStack(spacing: 10) {
-            if showInput || appState.outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                inputPanel
-            }
-            resultPanel
-            if appState.hasDifferentRawOutput {
-                rawOutputToggle
+        Group {
+            if appState.quickActionMode == .image {
+                imageMainContent
+            } else {
+                VStack(spacing: 10) {
+                    if showInput || appState.outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        inputPanel
+                    }
+                    resultPanel
+                    if appState.hasDifferentRawOutput {
+                        rawOutputToggle
+                    }
+                }
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var imageMainContent: some View {
+        HStack(spacing: 10) {
+            imageInputPanel
+                .frame(width: 220)
+            VStack(spacing: 10) {
+                resultPanel
+                if appState.hasDifferentRawOutput {
+                    rawOutputToggle
+                }
+                ocrFollowUpBar
+            }
+        }
+    }
+
+    private var imageInputPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(NSColor.textBackgroundColor))
+                if let preview = appState.ocrPreviewImage {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .scaledToFit()
+                        .padding(8)
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "photo")
+                            .font(.system(size: 28, weight: .medium))
+                            .foregroundStyle(.secondary)
+                        Text(L10n.text("Drop or paste an image.", language: language))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(12)
+                }
+            }
+            .frame(height: 142)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
+
+            if let image = appState.ocrImageInput {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(image.fileName ?? image.sourceDescription)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(image.redactedHistoryPreview)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+            }
+
+            HStack(spacing: 6) {
+                Button {
+                    showImageImporter = true
+                } label: {
+                    Label(L10n.text("Choose Image", language: language), systemImage: "photo.badge.plus")
+                }
+                .controlSize(.small)
+
+                Button {
+                    appState.loadOCRImageFromPasteboard()
+                } label: {
+                    Label(L10n.text("Paste Image", language: language), systemImage: "doc.on.clipboard")
+                }
+                .controlSize(.small)
+            }
+
+            HStack(spacing: 6) {
+                CommandFriendlyTextField(
+                    text: $imageURLDraft,
+                    placeholder: L10n.text("Image URL", language: language)
+                )
+                Button {
+                    appState.loadOCRImageFromRemoteURL(imageURLDraft)
+                } label: {
+                    Image(systemName: "arrow.down.doc")
+                        .frame(width: 24, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .help(L10n.text("Load URL", language: language))
+                .disabled(appState.isPreparingOCRImage || imageURLDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+
+            ocrModelPicker
+
+            if appState.ocrImageInput != nil {
+                Button(role: .destructive) {
+                    appState.clearOCRImage()
+                } label: {
+                    Label(L10n.text("Clear Image", language: language), systemImage: "trash")
+                }
+                .controlSize(.small)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.65))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var ocrModelPicker: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(L10n.text("OCR model", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("", selection: Binding<UUID?>(
+                get: { appState.preferences.ocr.modelID },
+                set: { newValue in
+                    appState.updatePreferences { $0.ocr.modelID = newValue }
+                }
+            )) {
+                Text(L10n.text("No model", language: language)).tag(UUID?.none)
+                ForEach(appState.visionCapableModels) { model in
+                    Text(modelPickerTitle(model)).tag(Optional(model.id))
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .disabled(appState.visionCapableModels.isEmpty || appState.isRunning)
+        }
     }
 
     private var inputPanel: some View {
@@ -388,16 +555,21 @@ struct QuickActionView: View {
             Button {
                 if appState.isRunning {
                     appState.cancelCurrentTask(unloadModel: true)
+                } else if appState.quickActionMode == .image {
+                    appState.runCurrentOCR()
                 } else {
                     appState.runCurrentTask()
                 }
             } label: {
                 if appState.isRunning {
                     Label(L10n.text("Cancel", language: language), systemImage: "stop.fill")
+                } else if appState.quickActionMode == .image {
+                    Label(ocrRunButtonTitle, systemImage: ocrRunButtonIcon)
                 } else {
                     Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
                 }
             }
+            .disabled(appState.quickActionMode == .image && !canRunOCR)
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -423,6 +595,58 @@ struct QuickActionView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
+    }
+
+    private var canRunOCR: Bool {
+        appState.ocrImageInput != nil
+            && appState.preferences.ocr.modelID != nil
+            && !appState.isPreparingOCRImage
+    }
+
+    private var ocrRunButtonTitle: String {
+        if appState.outputText.isEmpty {
+            return appState.ocrMode == .explainImage
+                ? L10n.text("Explain Image", language: language)
+                : L10n.text("Recognize", language: language)
+        }
+        return L10n.text("Regenerate", language: language)
+    }
+
+    private var ocrRunButtonIcon: String {
+        if !appState.outputText.isEmpty {
+            return "arrow.clockwise"
+        }
+        return appState.ocrMode == .explainImage ? "eye" : "text.viewfinder"
+    }
+
+    private var ocrFollowUpBar: some View {
+        HStack(spacing: 6) {
+            Text(L10n.text("Follow up", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(TaskKind.interactiveCases) { task in
+                Button {
+                    appState.sendOutputToTask(task)
+                } label: {
+                    Label(task.title(language: language), systemImage: followUpIcon(for: task))
+                }
+                .controlSize(.small)
+                .disabled(displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func followUpIcon(for task: TaskKind) -> String {
+        switch task {
+        case .translate: return "character.book.closed"
+        case .polish: return "wand.and.stars"
+        case .summarize: return "doc.text"
+        case .explain: return "questionmark.circle"
+        case .extractTodos: return "list.bullet.clipboard"
+        case .webPageTranslate, .ocr: return "arrow.right"
+        }
     }
 
     private var rawOutputToggle: some View {
@@ -456,10 +680,15 @@ struct QuickActionView: View {
             return L10n.text("Paste text to explain.", language: language)
         case .extractTodos:
             return L10n.text("Paste text to extract TODOs.", language: language)
+        case .ocr:
+            return L10n.text("Drop or paste an image.", language: language)
         }
     }
 
     private var resultPlaceholder: String {
+        if appState.quickActionMode == .image {
+            return L10n.text("Image result will appear here.", language: language)
+        }
         switch appState.selectedTask {
         case .translate:
             return L10n.text("Translation will appear here.", language: language)
@@ -473,11 +702,23 @@ struct QuickActionView: View {
             return L10n.text("Explanation will appear here.", language: language)
         case .extractTodos:
             return L10n.text("TODOs will appear here.", language: language)
+        case .ocr:
+            return L10n.text("Image result will appear here.", language: language)
         }
     }
 
+    private func modelPickerTitle(_ model: ModelDescriptor) -> String {
+        if model.isRemoteProvider {
+            return "\(model.name) · \(model.providerDisplayName)"
+        }
+        return "\(model.name) · \(model.format.rawValue.uppercased()) · \(model.sizeClass)"
+    }
+
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        handleTextDrop(providers) || handleFileDrop(providers)
+        if appState.quickActionMode == .image {
+            return handleImageDrop(providers) || handleTextDrop(providers) || handleFileDrop(providers)
+        }
+        return handleTextDrop(providers) || handleImageDrop(providers) || handleFileDrop(providers)
     }
 
     private func handleTextDrop(_ providers: [NSItemProvider]) -> Bool {
@@ -489,8 +730,30 @@ struct QuickActionView: View {
                 return
             }
             DispatchQueue.main.async {
-                appState.setInputText(text, origin: .manual)
-                appState.statusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
+                if appState.quickActionMode == .image,
+                   text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("http") {
+                    imageURLDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    appState.loadOCRImageFromRemoteURL(imageURLDraft)
+                } else {
+                    appState.setInputText(text, origin: .manual)
+                    appState.statusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
+                }
+            }
+        }
+        return true
+    }
+
+    private func handleImageDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSImage.self) }) else {
+            return false
+        }
+        provider.loadObject(ofClass: NSImage.self) { item, _ in
+            guard let image = item as? NSImage,
+                  let data = image.tiffRepresentation else {
+                return
+            }
+            DispatchQueue.main.async {
+                appState.loadOCRImageData(data, fileName: "dropped-image.tiff", sourceDescription: "Dropped image")
             }
         }
         return true
@@ -511,10 +774,21 @@ struct QuickActionView: View {
                 return
             }
             DispatchQueue.main.async {
-                appState.loadInputFile(from: url)
+                if isImageFile(url) {
+                    appState.loadOCRImageFile(from: url)
+                } else {
+                    appState.loadInputFile(from: url)
+                }
             }
         }
         return true
+    }
+
+    private func isImageFile(_ url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.pathExtension) else {
+            return false
+        }
+        return type.conforms(to: .image)
     }
 }
 
@@ -1033,6 +1307,7 @@ private enum SettingsTab: CaseIterable, Identifiable {
     case general
     case shortcuts
     case models
+    case ocr
     case webPage
     case defaults
     case about
@@ -1047,6 +1322,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return "keyboard"
         case .models:
             return "cpu"
+        case .ocr:
+            return "text.viewfinder"
         case .webPage:
             return "safari"
         case .defaults:
@@ -1064,6 +1341,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Shortcuts", language: language)
         case .models:
             return L10n.text("Models", language: language)
+        case .ocr:
+            return L10n.text("OCR", language: language)
         case .webPage:
             return L10n.text("Web Page Translation", language: language)
         case .defaults:
@@ -1077,6 +1356,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
         switch self {
         case .webPage:
             return L10n.text("Webpage", language: language)
+        case .ocr:
+            return L10n.text("OCR", language: language)
         default:
             return title(language: language)
         }
@@ -1098,7 +1379,6 @@ private enum WebPageDomainRuleKind {
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @State private var selectedTab: SettingsTab = .general
-    @State private var showImporter = false
     @State private var providerDraftID: ModelProviderID = .siliconFlow
     @State private var providerDraftName = ""
     @State private var providerDraftModelID = ""
@@ -1141,11 +1421,6 @@ struct SettingsView: View {
                 }
             )
             .frame(width: 0, height: 0)
-        }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.folder, .item], allowsMultipleSelection: false) { result in
-            if case let .success(urls) = result, let url = urls.first {
-                appState.addModel(from: url)
-            }
         }
         .fileImporter(isPresented: $showSelectionLimitAppImporter, allowedContentTypes: [.applicationBundle, .application, .item], allowsMultipleSelection: false) { result in
             if case let .success(urls) = result, let url = urls.first {
@@ -1206,6 +1481,8 @@ struct SettingsView: View {
             shortcutSettingsPage
         case .models:
             modelSettingsPage
+        case .ocr:
+            ocrSettingsPage
         case .webPage:
             webPageTranslationPage
         case .defaults:
@@ -1447,7 +1724,7 @@ struct SettingsView: View {
             statusBadge(modelCountText, systemImage: "shippingbox")
             Spacer()
             Button {
-                showImporter = true
+                openLocalModelPanel()
             } label: {
                 Label(L10n.text("Add Local Model", language: language), systemImage: "externaldrive.badge.plus")
             }
@@ -1622,6 +1899,113 @@ struct SettingsView: View {
                 pathText(BrowserIntegrationService.shared.extensionFolderPath())
             }
         }
+    }
+
+    private var ocrSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Image OCR", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Enable image OCR", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.ocr.enabled },
+                            set: { newValue in
+                                appState.updatePreferences { $0.ocr.enabled = newValue }
+                            }
+                        )
+                    )
+                    checkboxLine(
+                        title: L10n.text("Use model recognition by default", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.ocr.useModelRecognitionByDefault },
+                            set: { newValue in
+                                appState.updatePreferences { $0.ocr.useModelRecognitionByDefault = newValue }
+                            }
+                        )
+                    )
+                }
+            }
+
+            settingRow(title: L10n.text("OCR model", language: language)) {
+                VStack(alignment: .leading, spacing: 7) {
+                    ocrSettingsModelPicker
+                    if let model = appState.selectedOCRModel {
+                        HStack(spacing: 8) {
+                            statusBadge(capabilityName(model.capabilities), systemImage: capabilityIcon(model.capabilities))
+                            if model.isRemoteProvider {
+                                statusBadge(model.providerDisplayName, systemImage: "network")
+                            }
+                        }
+                        capabilityDetails(model.capabilities)
+                    } else {
+                        Text(L10n.text("Choose a vision-capable OCR model in Settings.", language: language))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("OCR mode", language: language)) {
+                Picker("", selection: Binding(
+                    get: { appState.preferences.ocr.defaultMode },
+                    set: { newValue in
+                        appState.setOCRMode(newValue)
+                    }
+                )) {
+                    ForEach(OCRMode.allCases) { mode in
+                        Text(L10n.ocrModeName(mode, language: language)).tag(mode)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 190, alignment: .leading)
+            }
+
+            settingRow(title: L10n.text("OCR history", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Save OCR results to recent history", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.ocr.persistHistory },
+                            set: { newValue in
+                                appState.updatePreferences { $0.ocr.persistHistory = newValue }
+                            }
+                        )
+                    )
+                    Text(L10n.text("Raw images are never saved to recent history.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: L10n.text("Privacy", language: language)) {
+                webPagePrivacyLine(
+                    systemImage: "lock.doc",
+                    title: L10n.text("Remote provider image payload", language: language),
+                    body: L10n.text("When the OCR model is remote, the normalized local image payload is sent to that configured provider. Remote image URLs are downloaded locally first and are not passed through.", language: language)
+                )
+            }
+        }
+    }
+
+    private var ocrSettingsModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.ocr.modelID },
+            set: { newValue in
+                appState.updatePreferences { $0.ocr.modelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.visionCapableModels) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 260, alignment: .leading)
+        .disabled(appState.visionCapableModels.isEmpty)
     }
 
     private var browserIntegrationList: some View {
@@ -2067,7 +2451,7 @@ struct SettingsView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             Button {
-                showImporter = true
+                openLocalModelPanel()
             } label: {
                 Label(L10n.text("Add Local Model", language: language), systemImage: "externaldrive.badge.plus")
             }
@@ -2211,6 +2595,42 @@ struct SettingsView: View {
             )
         }
         resetProviderDraft()
+    }
+
+    private func openLocalModelPanel() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("Add Local Model", language: language)
+        panel.prompt = L10n.text("Add", language: language)
+        panel.message = localModelPanelMessage
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            appState.addModel(from: url)
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private var localModelPanelMessage: String {
+        switch language {
+        case .chinese:
+            return "选择 GGUF 文件、MLX 模型目录或其他本地模型文件。"
+        case .english:
+            return "Choose a GGUF file, MLX model folder, or another local model file."
+        }
     }
 
     private func editProviderDraft(_ model: ModelDescriptor) {
@@ -2661,6 +3081,7 @@ struct SettingsView: View {
     private func modelCard(_ model: ModelDescriptor) -> some View {
         let isDefault = model.id == appState.preferences.defaultModelID
         let isTestingThisProvider = appState.providerTestModelID == model.id
+        let isTestingVision = appState.visionProbeModelID == model.id
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top, spacing: 12) {
@@ -2687,6 +3108,10 @@ struct SettingsView: View {
                         if isDefault {
                             formatBadge(L10n.text("Default", language: language), tint: .green)
                         }
+                        formatBadge(capabilityName(model.capabilities), tint: capabilityTint(model.capabilities))
+                        if model.capabilities.source == .manual {
+                            formatBadge(L10n.text("Manual", language: language), tint: .purple)
+                        }
                     }
 
                     Text(model.displayPath)
@@ -2706,9 +3131,12 @@ struct SettingsView: View {
                     metaChip("\(L10n.text("Size", language: language)): \(model.sizeClass)", systemImage: "externaldrive")
                 }
                 metaChip("\(L10n.text("Ctx", language: language)): \(model.contextLength)", systemImage: "text.alignleft")
+                metaChip("\(L10n.text("Capability source", language: language)): \(capabilitySourceName(model.capabilities.source))", systemImage: capabilityIcon(model.capabilities))
                 Spacer(minLength: 8)
                 statusBadge(modelValidationBadgeText(model), systemImage: validationIcon(model.validationState))
             }
+
+            capabilityDetails(model.capabilities)
 
             if let message = model.lastErrorMessage, !message.isEmpty {
                 Text(message)
@@ -2736,6 +3164,44 @@ struct SettingsView: View {
                         isDisabled: isTestingThisProvider
                     ) {
                         appState.testProviderModel(id: model.id)
+                    }
+
+                    iconToolButton(
+                        systemImage: isTestingVision ? "clock" : "eye",
+                        help: isTestingVision
+                            ? L10n.text("Testing vision", language: language)
+                            : L10n.text("Test vision", language: language),
+                        isDisabled: isTestingThisProvider || isTestingVision
+                    ) {
+                        appState.testVisionCapability(id: model.id)
+                    }
+                }
+
+                if model.capabilities.supportsImage {
+                    iconToolButton(
+                        systemImage: "textformat",
+                        help: L10n.text("Mark text-only", language: language),
+                        isDisabled: isTestingThisProvider || isTestingVision
+                    ) {
+                        appState.markModelTextOnly(id: model.id)
+                    }
+                } else if model.isRemoteProvider {
+                    iconToolButton(
+                        systemImage: "photo.badge.plus",
+                        help: L10n.text("Mark vision-capable", language: language),
+                        isDisabled: isTestingThisProvider || isTestingVision
+                    ) {
+                        appState.markModelVisionCapable(id: model.id)
+                    }
+                }
+
+                if model.capabilities.source == .manual || model.capabilities.source == .failedProbe {
+                    iconToolButton(
+                        systemImage: "arrow.counterclockwise",
+                        help: L10n.text("Reset capability", language: language),
+                        isDisabled: isTestingThisProvider || isTestingVision
+                    ) {
+                        appState.resetModelCapabilities(id: model.id)
                     }
                 }
 
@@ -2784,6 +3250,33 @@ struct SettingsView: View {
             .padding(.vertical, 3)
             .background(tint.opacity(0.12))
             .clipShape(Capsule())
+    }
+
+    private func capabilityDetails(_ capabilities: ModelCapabilities) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 8) {
+                Text("\(L10n.text("Confidence", language: language)): \(Int(capabilities.confidence * 100))%")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let lastCheckedAt = capabilities.lastCheckedAt {
+                    Text(browserDiagnosticDateFormatter.string(from: lastCheckedAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if let note = capabilities.note, !note.isEmpty {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            if let failure = capabilities.lastFailureMessage, !failure.isEmpty {
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+        }
     }
 
     private func metaChip(_ text: String, systemImage: String) -> some View {
@@ -2876,6 +3369,46 @@ struct SettingsView: View {
             return "clock"
         case .unknown:
             return "questionmark.circle"
+        }
+    }
+
+    private func capabilityName(_ capabilities: ModelCapabilities) -> String {
+        if capabilities.supportsImage {
+            return L10n.text("Vision", language: language)
+        }
+        return L10n.text("Text only", language: language)
+    }
+
+    private func capabilityIcon(_ capabilities: ModelCapabilities) -> String {
+        if capabilities.supportsImage {
+            return "eye"
+        }
+        return "textformat"
+    }
+
+    private func capabilityTint(_ capabilities: ModelCapabilities) -> Color {
+        if capabilities.supportsImage {
+            return .teal
+        }
+        return .secondary
+    }
+
+    private func capabilitySourceName(_ source: ModelCapabilitySource) -> String {
+        switch (language, source) {
+        case (.chinese, .detected):
+            return "已检测"
+        case (.chinese, .inferred):
+            return "推断"
+        case (.chinese, .probePassed):
+            return "探测通过"
+        case (.chinese, .failedProbe):
+            return "探测失败"
+        case (.chinese, .manual):
+            return "手动"
+        case (.chinese, .unknown):
+            return "未知"
+        case (.english, _):
+            return source.rawValue
         }
     }
 

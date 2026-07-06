@@ -97,6 +97,20 @@ enum L10n {
         }
     }
 
+    static func ocrModeName(_ mode: OCRMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            return mode.title
+        case .chinese:
+            switch mode {
+            case .plainText: return "提取文字"
+            case .structured: return "结构化提取"
+            case .extractThenTranslate: return "提取后翻译"
+            case .explainImage: return "解释图片"
+            }
+        }
+    }
+
     private static let chinese: [String: String] = [
         "Quick Action": "快捷操作",
         "Selection Actions": "选择操作",
@@ -132,6 +146,53 @@ enum L10n {
         "Settings": "设置",
         "Preferences": "偏好设置",
         "Defaults": "默认值",
+        "OCR": "图片识别",
+        "Image": "图片",
+        "Text mode": "文本",
+        "Image mode": "图片",
+        "Image OCR": "图片 OCR",
+        "Privacy": "隐私",
+        "Enable image OCR": "启用图片识别",
+        "Use model recognition by default": "默认使用模型识别",
+        "OCR model": "识别模型",
+        "OCR mode": "识别模式",
+        "OCR history": "图片识别历史",
+        "Save OCR results to recent history": "图片识别写入最近历史",
+        "Raw images are never saved to recent history.": "原始图片不会写入最近历史。",
+        "Choose Image": "选择图片",
+        "Paste Image": "粘贴图片",
+        "Load URL": "加载 URL",
+        "Image URL": "图片 URL",
+        "Recognize": "识别",
+        "Explain Image": "解释图片",
+        "Image result will appear here.": "图片识别结果会显示在这里。",
+        "Drop or paste an image.": "拖入或粘贴图片。",
+        "Clipboard does not contain an image.": "剪贴板里没有图片。",
+        "Enter an image URL first.": "请先输入图片 URL。",
+        "Downloading image": "正在下载图片",
+        "Loaded image": "已加载图片",
+        "Failed to load image": "加载图片失败",
+        "Clear Image": "清除图片",
+        "Follow up": "继续处理",
+        "Vision": "视觉",
+        "Text only": "仅文本",
+        "Manual": "手动",
+        "Capability": "能力",
+        "Marked vision-capable": "已标记为支持视觉",
+        "Marked text-only": "已标记为仅文本",
+        "Capability reset": "能力已重置",
+        "Testing vision": "正在测试视觉能力",
+        "Vision test succeeded": "视觉测试成功",
+        "Vision test failed": "视觉测试失败",
+        "Mark vision-capable": "标记为支持视觉",
+        "Mark text-only": "标记为仅文本",
+        "Reset capability": "重置能力",
+        "Test vision": "测试视觉",
+        "Capability source": "能力来源",
+        "Confidence": "置信度",
+        "Remote provider image payload": "远程 Provider 图片载荷",
+        "When the OCR model is remote, the normalized local image payload is sent to that configured provider. Remote image URLs are downloaded locally first and are not passed through.": "当识别模型是远程 Provider 时，会把规范化后的本地图片载荷发送给该 Provider。远程图片 URL 会先下载到本地，不会直接透传。",
+        "Choose a vision-capable OCR model in Settings.": "请在设置里选择支持视觉的识别模型。",
         "Web Page Translation": "网页翻译",
         "Enable webpage translation": "启用网页翻译",
         "Translation model": "翻译模型",
@@ -293,6 +354,7 @@ enum L10n {
         "Loaded": "已加载",
         "Running": "正在运行",
         "Cancelled": "已取消",
+        "Finished": "已完成",
         "finished": "已完成",
         "Open Quick Action": "打开快捷操作",
         "Open Floating Widget": "打开悬浮组件",

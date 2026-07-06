@@ -32,3 +32,7 @@ public protocol ModelRunner: Actor, Sendable {
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult
     func unload() async
 }
+
+public protocol VisionModelRunner: ModelRunner {
+    func generateOCR(request: OCRTaskRequest, preferences: AppPreferences) async throws -> OCRTaskResult
+}

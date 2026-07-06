@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import ImageIO
 import LLMToolsCore
 
 @main
@@ -10,13 +11,21 @@ struct LLMToolsChecks {
         try await checkModelDisplayName()
         try await checkProviderModelRegistration()
         try await checkProviderModelUpdate()
+        try checkProviderRequestOptions()
         try await checkHistoryLimit()
         try await checkPhase1InteractiveNativeTasks()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
+        try checkOCRCapabilityDefaultsDecodeFromOlderRegistry()
+        try checkOCRPrompts()
+        try checkOCRImagePreprocessor()
+        try await checkOCRModelPreferenceClearsTextOnlyModel()
+        try await checkTextOnlyModelRejectsOCRBeforeRunnerCall()
+        try await checkStubVisionOCRAndHistoryRedaction()
         try checkBrowserIntegrationStateDecodesWithoutExtensionChannel()
         try checkBrowserNativeMessagingManifestDiagnostics()
         try await checkTaskEngineReturnsRawModelOutput()
         try await checkOpenAICompatibleRunnerUsesChatCompletions()
+        try await checkOpenAICompatibleRunnerUsesImagePayloadForOCR()
         try await checkProviderConnectivityTest()
         try await checkWebPageTranslationBatchSkipsHistoryByDefault()
         try await checkWebPageTranslationBatchPersistsHistoryWhenEnabled()
@@ -179,6 +188,28 @@ struct LLMToolsChecks {
         }
     }
 
+    private static func checkProviderRequestOptions() throws {
+        let qwen3Text = ProviderConfiguration(
+            providerID: .siliconFlow,
+            apiStyle: .openAICompatible,
+            modelID: "Qwen/Qwen3-8B"
+        )
+        try require(
+            ProviderRequestOptions.enableThinking(for: qwen3Text) == false,
+            "Expected SiliconFlow Qwen3 text models to disable thinking explicitly."
+        )
+
+        let qwen3Vision = ProviderConfiguration(
+            providerID: .siliconFlow,
+            apiStyle: .openAICompatible,
+            modelID: "Qwen/Qwen3-VL-8B-Instruct"
+        )
+        try require(
+            ProviderRequestOptions.enableThinking(for: qwen3Vision) == nil,
+            "Expected SiliconFlow Qwen3-VL models not to receive unsupported enable_thinking."
+        )
+    }
+
     private static func checkHistoryLimit() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -252,6 +283,7 @@ struct LLMToolsChecks {
             TaskRequest(task: .extractTodos, inputText: "Alice must send the report by Friday.")
         ]
         try require(requests.map(\.task) == TaskKind.interactiveCases, "Expected Phase 1 regression to cover every interactive task.")
+        try require(!TaskKind.interactiveCases.contains(.ocr), "OCR must stay outside text-only interactive tasks.")
 
         var outputs: [String] = []
         for request in requests {
@@ -362,6 +394,175 @@ struct LLMToolsChecks {
         }
         """.utf8))
         try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
+    }
+
+    private static func checkOCRCapabilityDefaultsDecodeFromOlderRegistry() throws {
+        let preferences = try JSONDecoder().decode(AppPreferences.self, from: Data("""
+        {
+          "defaultTranslationTarget": "English"
+        }
+        """.utf8))
+        try require(preferences.ocr.enabled, "Expected OCR preferences to default enabled.")
+        try require(preferences.ocr.modelID == nil, "Expected OCR model to default empty.")
+        try require(preferences.ocr.defaultMode == .plainText, "Expected OCR mode to default to plain text.")
+        try require(!preferences.ocr.persistHistory, "Expected OCR history to default off.")
+        try require(!preferences.ocr.useModelRecognitionByDefault, "Expected model recognition default to stay explicit.")
+
+        let localDescriptor = try JSONDecoder().decode(ModelDescriptor.self, from: Data("""
+        {
+          "id": "11111111-1111-1111-1111-111111111111",
+          "name": "Qwen local",
+          "sourcePath": "file:///tmp/qwen",
+          "format": "mlx",
+          "sizeClass": "4b",
+          "role": "default",
+          "contextLength": 8192,
+          "enabled": true,
+          "validationState": "valid"
+        }
+        """.utf8))
+        try require(localDescriptor.capabilities.supportsText, "Expected older local model to support text.")
+        try require(!localDescriptor.capabilities.supportsImage, "Expected older local model to decode as text-only.")
+
+        let providerDescriptor = ModelDescriptor(
+            name: "OpenAI vision",
+            sourcePath: URL(string: "https://api.openai.com/v1")!,
+            format: .openAICompatible,
+            sizeClass: "remote",
+            role: .default,
+            contextLength: 128000,
+            providerConfiguration: ProviderConfiguration(
+                providerID: .openAI,
+                apiStyle: .openAICompatible,
+                baseURL: URL(string: "https://api.openai.com/v1")!,
+                modelID: "gpt-4o-mini"
+            )
+        )
+        try require(providerDescriptor.capabilities.supportsImage, "Expected known OpenAI vision model to infer image support.")
+        try require(providerDescriptor.capabilities.source == .inferred, "Expected inferred capability source.")
+    }
+
+    private static func checkOCRPrompts() throws {
+        let plain = PromptTemplates.ocrPrompt(mode: .plainText)
+        try require(plain.contains("Output only text that is visible in the image."), "Expected OCR prompt to restrict output to visible text.")
+        try require(plain.contains("No readable text detected."), "Expected OCR prompt to define no-text output.")
+        try require(!plain.localizedCaseInsensitiveContains("Apple Vision"), "OCR prompt must not reference Apple Vision.")
+
+        let explain = PromptTemplates.ocrPrompt(mode: .explainImage)
+        try require(explain.contains("Explain the screenshot or image"), "Expected image explanation prompt.")
+        let probe = PromptTemplates.visionProbePrompt()
+        try require(probe.contains("VISION_OK"), "Expected deterministic vision probe output.")
+    }
+
+    private static func checkOCRImagePreprocessor() throws {
+        guard CGImageSourceCreateWithData(OCRImagePreprocessor.probeImage.data as CFData, nil) != nil else {
+            throw CheckError("Expected probe image to be a decodable PNG.")
+        }
+        let image = try OCRImagePreprocessor.normalizeImageData(
+            OCRImagePreprocessor.probeImage.data,
+            preferences: OCRPreferences(),
+            fileName: "fixture.png",
+            sourceDescription: "Fixture image"
+        )
+        try require(image.mimeType == "image/png" || image.mimeType == "image/jpeg", "Expected provider-safe image MIME type.")
+        try require(image.pixelWidth == 64 && image.pixelHeight == 64, "Expected fixture image dimensions to survive normalization.")
+        try require(image.dataURL.hasPrefix("data:\(image.mimeType);base64,"), "Expected image data URL to use normalized local bytes.")
+        try require(!image.dataURL.contains("http://") && !image.dataURL.contains("https://"), "Image data URL must not pass through a remote URL.")
+    }
+
+    private static func checkOCRModelPreferenceClearsTextOnlyModel() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+
+        let descriptor = try await engine.addProviderModel(
+            providerID: .openAI,
+            name: "Vision model",
+            modelID: "gpt-4o-mini",
+            apiKey: "test-key",
+            baseURL: "https://api.openai.com/v1",
+            contextLength: 128000
+        )
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = descriptor.id
+        }
+        let selectablePreference = await engine.registry().preferences.ocr.modelID
+        try require(selectablePreference == descriptor.id, "Expected vision-capable model to remain selectable for OCR.")
+
+        _ = try await engine.markModelTextOnly(id: descriptor.id)
+        let clearedPreference = await engine.registry().preferences.ocr.modelID
+        try require(clearedPreference == nil, "Expected OCR preference to clear when selected model becomes text-only.")
+    }
+
+    private static func checkTextOnlyModelRejectsOCRBeforeRunnerCall() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubVisionRunner()
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.openAICompatible: runner]
+        )
+        let descriptor = try await engine.addProviderModel(
+            providerID: .customOpenAICompatible,
+            name: "Text provider",
+            modelID: "text-only-model",
+            apiKey: "test-key",
+            baseURL: "https://example.com/v1",
+            contextLength: 8192
+        )
+        do {
+            _ = try await engine.runOCR(
+                image: OCRImagePreprocessor.probeImage,
+                mode: .plainText,
+                modelID: descriptor.id
+            )
+            throw CheckError("Expected text-only model to reject OCR.")
+        } catch let error as OCRTaskError {
+            try require(error == .modelNotVisionCapable("Text provider"), "Expected model-not-vision-capable error.")
+        }
+        let ocrRequestCount = await runner.ocrRequestCount()
+        try require(ocrRequestCount == 0, "Expected OCR to fail before provider call.")
+    }
+
+    private static func checkStubVisionOCRAndHistoryRedaction() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let runner = StubVisionRunner(output: "VISIBLE OCR TEXT")
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.openAICompatible: runner]
+        )
+        let descriptor = try await engine.addProviderModel(
+            providerID: .openAI,
+            name: "Vision provider",
+            modelID: "gpt-4o-mini",
+            apiKey: "test-key",
+            baseURL: "https://api.openai.com/v1",
+            contextLength: 128000
+        )
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = descriptor.id
+            preferences.ocr.persistHistory = true
+        }
+        let result = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .plainText
+        )
+        try require(result.text == "VISIBLE OCR TEXT", "Expected stub OCR output.")
+        try require(result.task == .ocr, "Expected OCR task result.")
+        let history = await engine.recentHistory()
+        try require(history.count == 1, "Expected opted-in OCR history entry.")
+        try require(history.first?.task == .ocr, "Expected OCR history task.")
+        try require(history.first?.inputPreview.contains("data:") == false, "OCR history must not contain base64 data URLs.")
+        try require(history.first?.inputPreview.contains("Probe image") == true, "OCR history should use a redacted image descriptor.")
     }
 
     private static func checkBrowserIntegrationStateDecodesWithoutExtensionChannel() throws {
@@ -788,6 +989,50 @@ struct LLMToolsChecks {
         try require(result.text == "你好", "Expected chat completions response text.")
     }
 
+    private static func checkOpenAICompatibleRunnerUsesImagePayloadForOCR() async throws {
+        let server = try await HTTPStubServer.start { request in
+            try require(request.path == "/v1/chat/completions", "Expected /v1/chat/completions, got \(request.path).")
+            try require(request.authorization == "Bearer test-key", "Expected bearer auth header.")
+            try require(request.body.contains("\"model\":\"gpt-4o-mini\""), "Expected OCR model in request body.")
+            try require(request.body.contains("\"type\":\"image_url\""), "Expected image_url content block.")
+            try require(
+                request.body.contains("data:image/png;base64,") || request.body.contains("data:image\\/png;base64,"),
+                "Expected normalized local image data URL."
+            )
+            try require(!request.body.contains("https://example.com/image.png"), "Provider payload must not contain the original remote image URL.")
+            return """
+            {
+              "choices": [
+                { "message": { "role": "assistant", "content": "OCR result" } }
+              ]
+            }
+            """
+        }
+        defer { server.stop() }
+
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+        let descriptor = try await engine.addProviderModel(
+            providerID: .openAI,
+            name: "OpenAI Vision",
+            modelID: "gpt-4o-mini",
+            apiKey: "test-key",
+            baseURL: server.baseURL.absoluteString,
+            contextLength: 128000
+        )
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = descriptor.id
+        }
+        let result = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured
+        )
+        try require(result.text == "OCR result", "Expected OCR response text.")
+    }
+
     private static func checkProviderConnectivityTest() async throws {
         final class RequestCounter: @unchecked Sendable {
             var chatRequestCount = 0
@@ -938,6 +1183,58 @@ private actor StubRunner: ModelRunner {
 
     func recordedRequests() -> [TaskRequest] {
         requests
+    }
+}
+
+private actor StubVisionRunner: VisionModelRunner {
+    private var loadedID: UUID?
+    private var output: String
+    private var ocrCount = 0
+
+    init(output: String = "OCR stub result") {
+        self.output = output
+    }
+
+    func modelFormat() async -> ModelFormat {
+        .openAICompatible
+    }
+
+    func loadedState() async -> Bool {
+        loadedID != nil
+    }
+
+    func loadedModelID() async -> UUID? {
+        loadedID
+    }
+
+    func loadedModelName() async -> String? {
+        "Vision Stub"
+    }
+
+    func load(model: ModelDescriptor) async throws {
+        loadedID = model.id
+    }
+
+    func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
+        TaskResult(text: "text stub result", modelName: "Vision Stub", task: request.task)
+    }
+
+    func generateOCR(request: OCRTaskRequest, preferences: AppPreferences) async throws -> OCRTaskResult {
+        ocrCount += 1
+        return OCRTaskResult(
+            text: output,
+            rawModelText: output,
+            structuredMarkdown: request.mode == .structured ? output : nil,
+            modelName: "Vision Stub"
+        )
+    }
+
+    func unload() async {
+        loadedID = nil
+    }
+
+    func ocrRequestCount() -> Int {
+        ocrCount
     }
 }
 

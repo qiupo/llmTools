@@ -1,6 +1,6 @@
 import Foundation
 
-public actor OpenAICompatibleRunner: ModelRunner {
+public actor OpenAICompatibleRunner: VisionModelRunner {
     public let format: ModelFormat = .openAICompatible
     public private(set) var isLoaded: Bool = false
     public private(set) var modelID: UUID?
@@ -102,6 +102,71 @@ public actor OpenAICompatibleRunner: ModelRunner {
         )
     }
 
+    public func generateOCR(request: OCRTaskRequest, preferences: AppPreferences) async throws -> OCRTaskResult {
+        guard isLoaded, let configuration else {
+            throw RunnerError.notLoaded
+        }
+        guard let baseURL = configuration.baseURL else {
+            throw RunnerError.unsupportedConfiguration("Provider base URL is missing.")
+        }
+
+        let endpoint = baseURL
+            .appendingPathComponent("chat")
+            .appendingPathComponent("completions")
+        let payload = OCRChatCompletionsRequest(
+            model: configuration.modelID,
+            messages: [
+                OCRChatMessage(
+                    role: "system",
+                    content: [
+                        OCRMessageContent(type: "text", text: PromptTemplates.systemPrompt(for: .ocr, preferences: preferences))
+                    ]
+                ),
+                OCRChatMessage(
+                    role: "user",
+                    content: [
+                        OCRMessageContent(type: "text", text: request.prompt),
+                        OCRMessageContent(
+                            type: "image_url",
+                            imageURL: OCRImageURL(url: request.image.dataURL, detail: "auto")
+                        )
+                    ]
+                )
+            ],
+            temperature: 0,
+            stream: false,
+            enableThinking: ProviderRequestOptions.enableThinking(for: configuration)
+        )
+
+        let data = try await performJSONRequest(
+            endpoint: endpoint,
+            apiKey: configuration.apiKey,
+            customHeaders: configuration.customHeaders,
+            body: payload,
+            timeout: 180
+        )
+        let response = try JSONDecoder().decode(ChatCompletionsResponse.self, from: data)
+        if let message = response.error?.message {
+            throw RunnerError.unsupportedConfiguration(message)
+        }
+        let rawOutput = (response.choices ?? [])
+            .compactMap { $0.message.content }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let output = VisibleOutput.from(rawText: rawOutput)
+        guard !output.isEmpty || !rawOutput.isEmpty else {
+            throw RunnerError.emptyResult
+        }
+
+        return OCRTaskResult(
+            text: output.isEmpty ? rawOutput : output,
+            rawModelText: rawOutput,
+            structuredMarkdown: request.mode == .structured ? (output.isEmpty ? rawOutput : output) : nil,
+            modelName: modelName ?? configuration.modelID,
+            warnings: []
+        )
+    }
+
     public func unload() async {
         configuration = nil
         isLoaded = false
@@ -113,11 +178,12 @@ public actor OpenAICompatibleRunner: ModelRunner {
         endpoint: URL,
         apiKey: String,
         customHeaders: [String: String],
-        body: Body
+        body: Body,
+        timeout: TimeInterval = 120
     ) async throws -> Data {
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
+        request.timeoutInterval = timeout
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedKey.isEmpty {
@@ -168,6 +234,50 @@ public actor OpenAICompatibleRunner: ModelRunner {
     private struct ChatMessage: Codable {
         var role: String
         var content: String?
+    }
+
+    private struct OCRChatCompletionsRequest: Encodable {
+        var model: String
+        var messages: [OCRChatMessage]
+        var temperature: Double
+        var stream: Bool
+        var enableThinking: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case model
+            case messages
+            case temperature
+            case stream
+            case enableThinking = "enable_thinking"
+        }
+    }
+
+    private struct OCRChatMessage: Encodable {
+        var role: String
+        var content: [OCRMessageContent]
+    }
+
+    private struct OCRMessageContent: Encodable {
+        var type: String
+        var text: String?
+        var imageURL: OCRImageURL?
+
+        init(type: String, text: String? = nil, imageURL: OCRImageURL? = nil) {
+            self.type = type
+            self.text = text
+            self.imageURL = imageURL
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case type
+            case text
+            case imageURL = "image_url"
+        }
+    }
+
+    private struct OCRImageURL: Encodable {
+        var url: String
+        var detail: String?
     }
 
     private struct ChatCompletionsResponse: Decodable {

@@ -2,7 +2,7 @@
 
 Last updated: 2026-07-04
 
-Status: planned next phase. Phase 3 starts after Phase 2 closure work is recorded or explicitly deferred.
+Status: implementation baseline complete as of 2026-07-04. Phase 2 closure has been recorded through the closure toolchain, with remaining acceptance limited to external browser readiness/manual smoke items; live OCR acceptance requires a configured vision-capable provider model.
 
 ## 1. Objective
 
@@ -11,11 +11,31 @@ Phase 3 makes llmTools stronger as a task-first macOS assistant.
 The phase has two product tracks:
 
 1. Close and harden the existing translation and native text-task workflows.
-2. Add a native image OCR workflow that can use local macOS OCR, a configured vision-capable model, or a hybrid of both.
+2. Add a native image OCR and image-explanation workflow powered by a configured vision-capable model.
 
 The user should be able to rely on the app for everyday selected-text translation, polishing, summarization, explanation, TODO extraction, and image text extraction without guessing which model supports which input type.
 
 This is not a broad chat feature, a browser image-translation feature, or a document indexing system. OCR starts as a native app workflow with explicit model capability checks.
+
+## 1.1 Implementation Record
+
+The 2026-07-04 implementation landed the Phase 3 baseline described by this PRD:
+
+- Phase 2 closure commands are runnable and the packaged app is the verification target.
+- Native text-task prompts were tightened for translation, polish, summarize, explain, and TODO extraction.
+- Task results can be reused through follow-up actions into translate, polish, summarize, explain, and TODO extraction.
+- `ModelDescriptor` persists capability metadata and older registries decode with safe defaults.
+- Settings shows capability badges, source/confidence/failure details, manual vision/text-only overrides, reset-to-automatic, and an explicit OCR/vision probe.
+- `OCRPreferences` is part of `AppPreferences`, with enablement, filtered OCR model selection, default OCR mode, model-recognition default, history opt-in, and stale model cleanup.
+- The image workflow has file, paste, drop, and remote URL loading, local normalization, metadata stripping, size limits, preview, and redacted image descriptors.
+- `VisionModelRunner` and the OpenAI-compatible runner provide the first model-vision OCR request path using normalized local image data URLs.
+- OCR modes cover plain text, structured extraction, extract-then-translate, and screenshot/image explanation.
+- OCR history remains opt-in and stores redacted image descriptors instead of raw image bytes, base64 payloads, or file paths.
+- Automated checks cover capability migration/filtering, prompt contracts, image preprocessing, text-only OCR rejection, stub vision OCR, history redaction, and OpenAI-compatible multimodal payload encoding.
+- `swift run LLMToolsLiveOCRCheck` provides the live provider gate when a real OpenAI-compatible vision model is configured. It configures/selects the OCR model, runs a vision probe, OCRs a generated fixture image, and runs image explanation.
+- `node scripts/check-phase3-goal-audit.mjs --run-checks --run-live-ocr` summarizes the current end-to-end evidence and refuses to assert completion while Chrome/manual Phase 2 acceptance is still blocked.
+
+Remaining manual acceptance is environment-bound: Chrome must load the unpacked extension from this repo for final packaged-app browser smoke, Edge acceptance needs Edge installed, and live OCR/image explanation needs a real configured vision-capable provider model.
 
 ## 2. Scope Summary
 
@@ -28,10 +48,10 @@ This is not a broad chat feature, a browser image-translation feature, or a docu
 - Detect or infer whether a configured model supports vision.
 - Let the user manually override model capability when automatic detection is unavailable or wrong.
 - Add a dedicated OCR model setting that only accepts vision-capable models.
-- Add local OCR through Apple Vision as the privacy-preserving baseline.
-- Add vision-model OCR from local image files, clipboard images, and screenshots.
-- Add a hybrid OCR mode where local OCR extracts first-pass text and the model cleans, structures, or translates it.
+- Add model-vision OCR from local image files, clipboard images, and screenshots.
+- Add explicit model-recognition controls: a per-run button, a setting to use model recognition by default, and a configurable vision-capable model.
 - Add OCR output modes: plain text, structured extraction, and optional translate-after-OCR.
+- Add screenshot/image explanation as a Phase 3 vision feature, using the configured vision-capable model when visual context matters.
 - Keep raw image storage off by default.
 - Add automated checks for capability filtering, OCR prompt generation, task regressions, and privacy defaults.
 
@@ -40,7 +60,8 @@ This is not a broad chat feature, a browser image-translation feature, or a docu
 - Browser image/canvas OCR inside webpage translation.
 - Browser PDF viewer translation.
 - Full PDF, DOCX, or multi-document understanding.
-- Local multimodal LLM running unless a real local vision runner is added. Apple Vision local text recognition is in scope because it is not a local LLM runner.
+- Apple Vision, VisionKit, or any Apple-provided OCR/visual recognition path.
+- Local multimodal LLM running unless a real local vision runner is added.
 - Silent cloud OCR fallback.
 - Cross-device sync.
 - Automatic storage of raw source images.
@@ -51,9 +72,10 @@ This is not a broad chat feature, a browser image-translation feature, or a docu
 - Task-first: every surface starts from a concrete user job, not from a blank chat box.
 - Capability-aware: the app must not offer OCR through a model that is known to be text-only.
 - Honest detection: when model capability cannot be proven, show the confidence and ask for an explicit user decision.
-- Local-first where possible: text tasks continue to default to local models. Remote vision OCR is allowed only through an explicitly configured provider model.
-- Use deterministic OCR where it helps: Apple Vision should provide fast local extraction for ordinary screenshots and scanned text; vision LLMs should add value for messy images, structure recovery, table cleanup, or translate-after-OCR.
+- Local-first for preprocessing: images are read, downloaded, normalized, converted, size-checked, metadata-stripped, and temporarily stored by the app before model recognition. Recognition itself is performed by the configured vision-capable model.
+- Model recognition is explicit and configurable: the user can trigger model recognition for a run, set model recognition as the default for image workflows, and choose the model used for that mode.
 - Privacy by default: raw images and OCR source content are not retained unless the user opts in.
+- Do not pass remote image URLs directly to models or providers. Download remote images into a local temporary file, normalize and strip metadata, then send only the normalized local image payload to the configured model.
 - Reversible and retryable: task output should be copyable, rerunnable, and cancellable without losing input.
 - Do not regress Phase 1 and Phase 2: selected-text workflows and browser translation must remain green while OCR is added.
 
@@ -64,10 +86,10 @@ Phase 3 should follow current provider API shapes rather than assuming that all 
 Reference conclusions from official docs:
 
 - OpenAI-compatible image input is commonly expressed as text plus an `image_url` content block, including data URLs for base64 images. This is the best first shared path for OpenAI, OpenRouter, Ollama, and many local OpenAI-compatible servers.
-- Anthropic Messages uses provider-specific image content blocks with a source containing media type and base64 data. It should keep a separate payload encoder.
+- Anthropic Messages uses provider-specific image content blocks with a source containing media type and base64 data. It should be treated as a later provider-specific extension, not the first Phase 3 OCR provider path.
 - Gemini supports multimodal image input, but the OpenAI-compatible path and the native Gemini path should not be treated as the same implementation. The current app has only an OpenAI-compatible Gemini preset, so Phase 3 should start there and leave a native Gemini runner as later work.
 - OpenRouter exposes model modality metadata such as text/image support in its model data, so it can provide higher-confidence capability detection than providers that return only model IDs.
-- macOS Vision text recognition is a strong local OCR baseline for the native app. It should be used for local-only OCR and can also feed a vision/text model for cleanup.
+- Remote image URL handling should be app-owned: fetch to a temporary local file first, enforce file type/size limits, strip metadata, then construct the provider payload from the normalized local data only when the user-selected model path requires it.
 
 Implementation implication: do not hard-code one universal multimodal payload. Add a small capability and payload layer that can branch by provider/API style while keeping the UI model simple.
 
@@ -79,7 +101,6 @@ Reference links:
 - OpenRouter multimodal capabilities: `https://openrouter.ai/docs/guides/overview/multimodal/overview`
 - OpenRouter model metadata/API: `https://openrouter.ai/docs/api/api-reference/models/list-all-models-and-their-properties`
 - Ollama OpenAI compatibility: `https://docs.ollama.com/api/openai-compatibility`
-- Apple Vision text recognition: `https://developer.apple.com/documentation/vision/recognizing-text-in-images`
 
 ## 4. User Stories
 
@@ -128,10 +149,9 @@ As a user, I can configure which model is used for OCR.
 
 Acceptance:
 
-- OCR can run in local-only, vision-model, or hybrid mode.
+- OCR and image explanation require a configured vision-capable model.
 - OCR model setting only lists enabled models that are vision-capable or manually marked vision-capable.
-- If local-only OCR is selected, no model is required.
-- If vision-model or hybrid OCR is selected and no vision-capable model exists, the OCR entry point shows a setup action instead of a broken run button.
+- If no vision-capable model exists, the OCR/image entry point shows a setup action instead of a broken run button.
 - The default OCR model can be separate from the default text model and the webpage translation model.
 - Disabling or deleting the OCR model clears the OCR preference safely.
 - Provider validation failures do not silently fall back to a text-only model.
@@ -150,7 +170,18 @@ Acceptance:
 - If no readable text is found, the result says that no readable text was detected instead of inventing content.
 - OCR can be cancelled while waiting for the provider.
 - OCR output is copyable and can be sent into translate, summarize, explain, or TODO extraction as follow-up text.
-- OCR keeps local raw extraction and model-cleaned output separate when both exist, so the user can inspect what changed.
+- OCR output keeps raw model output and cleaned display text separate where they differ, so the user can inspect what changed.
+
+### 4.6 Screenshot And Image Explanation
+
+As a user, I can ask llmTools to explain a screenshot or image, not only extract text from it.
+
+Acceptance:
+
+- Image explanation is available from the OCR/image workflow, not the text-only task picker in the first implementation.
+- The configured vision-capable model can explain the image, screenshot, chart, UI, or error dialog.
+- Image explanation output is copyable and can be followed by summarize, translate, explain, polish, or TODO extraction on the produced text.
+- The app does not send a remote image URL directly to a model. URL-based images are downloaded to a temporary local file first.
 
 ## 5. Model Capability Design
 
@@ -232,7 +263,7 @@ Initial entry points:
 
 Do not add OCR to browser page translation in Phase 3.
 
-Implementation correction: do not overload `AppState.inputText` with image data. Add an OCR-specific state object for preview, normalized image data, local OCR output, model OCR output, selected OCR mode, and current OCR run status.
+Implementation correction: do not overload `AppState.inputText` with image data. Add an OCR-specific state object for preview, normalized image data, model OCR output, selected OCR mode, and current OCR run status.
 
 ### 6.2 Input Handling
 
@@ -249,8 +280,7 @@ The OCR surface should normalize images before sending them to a model:
 
 Keep separate image variants:
 
-- `originalPreview`: local-only display and user confirmation.
-- `localOCRImage`: format and resolution suitable for Apple Vision.
+- `originalPreview`: local display and user confirmation.
 - `providerImage`: stripped, normalized, size-bounded upload payload.
 
 ### 6.3 Output Modes
@@ -263,13 +293,17 @@ Start with these OCR modes:
 
 The default mode should be plain text because it is easiest to verify and reuse.
 
-Start with these OCR engines:
+The OCR engine is model vision recognition:
 
-- Local: Apple Vision text recognition only. Best for privacy, speed, screenshots, and ordinary scanned text.
-- Vision model: send the normalized image to the configured vision-capable model.
-- Hybrid: run local OCR first, then ask the configured model to repair layout, recover structure, or translate. The model should receive the image only when the user has selected a mode that permits remote image processing.
+- The app sends the normalized local image payload to the configured vision-capable model.
+- The same model-recognition path powers OCR, structured extraction, and image explanation.
+- Remote image URLs are downloaded locally first; the model receives local normalized image bytes, not the original URL.
 
 For "extract then translate", default to OCR extraction first and then hand the extracted text to the normal default text model. Do not use the vision model for the translation step unless the user explicitly chooses that model.
+
+Add an image explanation mode alongside OCR modes:
+
+- Explain image: explain the visible screenshot/image content, UI, chart, error state, or document image.
 
 ### 6.4 Prompt Contract
 
@@ -289,16 +323,14 @@ Recommended OCR result shape:
 ```swift
 public struct OCRTaskResult: Sendable, Hashable {
     public var text: String
-    public var rawLocalText: String?
     public var rawModelText: String?
     public var structuredMarkdown: String?
-    public var engine: OCREngineMode
     public var modelName: String?
     public var warnings: [String]
 }
 ```
 
-This keeps raw local extraction, model output, and final display text inspectable without storing the source image.
+This keeps raw model output and final display text inspectable without storing the source image.
 
 ## 7. Runner Architecture
 
@@ -322,12 +354,7 @@ public enum OCRMode: String, Codable, Sendable, CaseIterable {
     case plainText
     case structured
     case extractThenTranslate
-}
-
-public enum OCREngineMode: String, Codable, Sendable, CaseIterable {
-    case local
-    case visionModel
-    case hybrid
+    case explainImage
 }
 ```
 
@@ -337,7 +364,6 @@ Add a method at the task engine level:
 public func runOCR(
     image: OCRImageInput,
     mode: OCRMode,
-    engineMode: OCREngineMode,
     modelID: UUID? = nil,
     persistHistory: Bool = false
 ) async throws -> TaskResult
@@ -358,7 +384,7 @@ public protocol VisionModelRunner: ModelRunner {
 
 ### 7.2 Provider Runners
 
-OpenAI-compatible and Anthropic runners should own their provider-specific image content blocks.
+OpenAI-compatible runners should own the first Phase 3 model-recognition image payload path. Anthropic should remain a documented later extension because its native Messages image blocks require a separate encoder.
 
 Rules:
 
@@ -366,11 +392,12 @@ Rules:
 - OCR generation validates image capability before building a request.
 - Provider payloads are constructed from normalized image data and MIME type.
 - OpenAI-compatible payloads should support content arrays with text plus `image_url` data URLs.
-- Anthropic payloads should support native image source blocks with `media_type` and base64 data.
+- Anthropic payloads should be added later with native image source blocks containing `media_type` and base64 data.
 - Provider-specific options such as OpenAI image detail should be optional and hidden behind provider-aware defaults.
 - Provider errors are mapped to actionable app errors.
 - OCR calls should have separate timeout behavior from short text tasks.
 - The existing `ChatMessage.content: String?` shape is not enough for OpenAI-compatible image input. Add a codable message-content enum or separate request type for multimodal calls.
+- Never pass external image URLs as provider `image_url` values. Build `image_url` data URLs from normalized local data so the app controls download, metadata stripping, size limits, and diagnostics.
 
 ### 7.3 Local Runners
 
@@ -378,23 +405,26 @@ The current local GGUF and MLX runners should remain text-only.
 
 Do not pretend local models support image input because a model name looks multimodal. Add local vision only when there is an actual image-preprocessor and runner path that can execute it.
 
-### 7.4 Local OCR Service
+### 7.4 Image Preprocessing Service
 
-Add a small local OCR service separate from `ModelRunner`.
+Add a small image preprocessing service separate from `ModelRunner`.
 
 Suggested location:
 
-- Core if it can import Vision cleanly across `LLMToolsApp`, `LLMToolsChecks`, and smoke targets.
-- App target if Vision integration introduces UI/AppKit-only dependencies.
+- Core defines data structures and protocol boundaries.
+- App target owns macOS file picker, clipboard/drop handling, image decoding, temporary-file downloads, and image conversion.
 
 Responsibilities:
 
 - Decode and normalize images.
-- Run Apple Vision text recognition.
-- Return recognized lines, optional bounding boxes, and candidate confidence where available.
-- Avoid network access and avoid writing source images to disk.
+- Download remote image URLs into a temporary local directory.
+- Strip metadata.
+- Convert to provider-safe PNG/JPEG when needed.
+- Return pixel size, byte size, MIME type, content hash, and local temporary path when applicable.
+- Avoid writing persistent source images to disk.
+- Delete temporary files after the run.
 
-Do not mix Apple Vision OCR with local LLM runners; it is a deterministic native service, not a model registry entry.
+Do not add Apple Vision or other Apple-provided OCR APIs. The preprocessing layer prepares images; the configured model recognizes them.
 
 ## 8. Settings UX
 
@@ -414,12 +444,12 @@ The card should expose the source of the capability in a details area, not as no
 Add an OCR settings section:
 
 - Enable OCR
-- OCR engine: local, vision model, or hybrid
+- Use model recognition by default
 - OCR model picker
 - OCR output mode default
+- Image explanation mode
 - Capability status for the selected model
 - Remote provider privacy notice when the OCR model is remote
-- Require confirmation before remote image upload
 - Test OCR support action
 - Clear OCR history/cache action if OCR history is later enabled
 
@@ -430,11 +460,10 @@ Suggested preference model:
 ```swift
 public struct OCRPreferences: Codable, Hashable, Sendable {
     public var enabled: Bool
-    public var engineMode: OCREngineMode
     public var modelID: UUID?
     public var defaultMode: OCRMode
     public var persistHistory: Bool
-    public var confirmRemoteUpload: Bool
+    public var useModelRecognitionByDefault: Bool
     public var maximumImageBytes: Int
     public var maximumPixelCount: Int
 }
@@ -463,11 +492,13 @@ Default history behavior:
 
 Remote provider OCR behavior:
 
-- The app must indicate when an image will be sent to a remote provider.
+- The app must indicate when the configured model is a hosted remote provider.
 - No automatic cloud fallback.
 - No background OCR upload during capability detection.
 - Provider API keys stay in the existing provider credential path.
-- In hybrid mode, remote upload requires the same confirmation as vision-model mode.
+- Do not show a per-image upload confirmation in the normal OCR loop; model recognition is already an explicit mode/default chosen by the user.
+- If the input is a remote image URL, download it into a local temporary directory first, delete it after the run, and never give the provider the original URL.
+- If the selected configured model is a hosted remote provider, the normalized local image payload is sent to that provider as part of the user-configured model-recognition path.
 
 History model correction:
 
@@ -490,8 +521,8 @@ Add focused checks for:
 - OCR prompt rules include "visible text only" and no-invention behavior.
 - OCR result history does not persist raw image data.
 - OpenAI-compatible multimodal request encoding can produce text plus image content without changing text-only requests.
-- Anthropic multimodal request encoding uses native image content blocks and leaves text-only requests unchanged.
-- Local OCR service can process generated fixture images without network access.
+- Anthropic multimodal request encoding is a later extension and should not be required for first Phase 3 completion.
+- Image preprocessing service can decode generated fixture images, normalize them, and clean temporary files without network access.
 
 ### 10.2 Runner Tests
 
@@ -506,15 +537,16 @@ Use stub runners for deterministic checks:
 
 Manual acceptance should cover:
 
-- Local-only OCR on a screenshot without any remote model configured.
+- Trigger OCR/image recognition with the model-recognition button.
+- Set model recognition as the default and choose the model used for that mode.
 - Configure a provider model and mark or detect it as vision-capable.
 - Select it as the OCR model.
 - OCR a screenshot with mixed Chinese and English.
 - OCR a receipt/table-like image in structured mode.
+- Explain a screenshot/image through the configured vision-capable model.
 - OCR an image with no text and confirm no hallucinated content.
-- Hybrid mode: local extraction remains inspectable and model-cleaned output is visibly separate.
 - Confirm raw source image is not saved in recent history by default.
-- Confirm remote upload confirmation appears before sending images to a remote provider.
+- Confirm remote image URL input is downloaded to a temporary local file and the provider never receives the original URL.
 - Confirm Phase 1 selected-text tasks and Phase 2 Chrome page translation still work from packaged `dist/llmTools.app`.
 
 ## 11. Implementation Order
@@ -544,29 +576,28 @@ Manual acceptance should cover:
 - Add provider-specific detection/probe strategy and explicit unsupported-vision errors.
 - Add tests for capability filtering and migration.
 
-### 11.4 Phase 3.3 Local OCR MVP
+### 11.4 Phase 3.3 Image Input And Preprocessing
 
 - Add OCR request/input/result types.
 - Add image import, paste, drop, preview, and normalized variants.
-- Add Apple Vision local OCR service.
-- Add plain-text OCR display and copy.
-- Add local-only privacy and history checks.
+- Add temporary remote-image download and cleanup.
+- Add image metadata stripping, size limits, orientation normalization, and provider-safe conversion.
+- Add privacy and history checks.
 
 ### 11.5 Phase 3.4 Vision Model OCR
 
 - Add OCR execution path for at least one remote vision-capable provider style.
 - Add OpenAI-compatible multimodal payload support.
-- Add Anthropic multimodal payload support if the configured provider is Anthropic.
 - Add strict OCR prompts and output display.
 - Add copy and follow-up task actions.
-- Add remote upload confirmation and failure taxonomy.
+- Add explicit model-recognition toggle/default behavior and failure taxonomy.
 
-### 11.6 Phase 3.5 Hybrid OCR And Structured Output
+### 11.6 Phase 3.5 Structured OCR And Image Explanation
 
-- Add hybrid local-plus-model mode.
 - Add structured output mode for receipts, tables, forms, and key-value screenshots.
 - Add extract-then-translate using the normal text model by default.
-- Keep raw local OCR and model-cleaned output inspectable.
+- Add screenshot/image explanation mode.
+- Keep raw model output and cleaned display output inspectable.
 
 ### 11.7 Phase 3.6 QA And Packaging
 
@@ -578,29 +609,29 @@ Manual acceptance should cover:
 
 ## 12. Open Decisions
 
-- Whether OCR should appear as a sixth top-level task beside translate/polish/summarize/explain/TODO, or as a separate image workflow.
-- Whether "extract then translate" should use the OCR model for both steps or hand off to the normal default text model after OCR.
-- Whether OCR history should be opt-in separately from normal recent history.
-- Whether screenshot capture should use a built-in screen picker in Phase 3 or rely on clipboard/file input first.
-- Whether to support HEIC in the first OCR release.
-- Which provider capability metadata sources are reliable enough to mark as `detected` rather than `inferred`.
+The following decisions are now fixed for Phase 3:
 
-Current recommended decisions after implementation self-review:
-
-- Treat OCR as a separate image workflow initially, not as another text-only task in `TaskKind.interactiveCases`.
-- Use the normal default text model for translate-after-OCR unless the user explicitly chooses otherwise.
-- Make OCR history opt-in separately from normal recent history.
-- Start with file, paste, and drop input; add a built-in screenshot picker only after the base OCR loop is stable.
-- Accept HEIC only through local decode-and-convert, not direct provider upload.
-- Treat provider metadata as `detected` only when the provider returns explicit modality fields. Treat model-name allowlists as `inferred`.
+- OCR starts as a separate image workflow. It can be integrated into the text task picker later after the image state and history model are stable.
+- OCR is model-vision only. Do not use Apple Vision, VisionKit, or any Apple-provided visual/OCR recognition API.
+- The OCR surface must provide a model-recognition button, plus settings to use model recognition by default and choose the model for that mode.
+- Model recognition sends the normalized local image payload to the configured model.
+- Translate-after-OCR uses the normal default text model by default.
+- OCR history is independent opt-in and defaults off.
+- Capability detection is conservative and includes a user-triggered OCR/vision probe.
+- First model OCR provider path is OpenAI-compatible.
+- Supported first image formats are PNG, JPEG, WebP where decodable, and HEIC through local decode-and-convert.
+- No built-in screenshot selection tool in the first OCR release. Support file picker, drag/drop, and clipboard images first.
+- Core defines OCR protocols and data structures; App target provides macOS clipboard/image decoding, temporary downloads, and image conversion implementation.
+- Screenshot/image explanation is in Phase 3 scope.
+- Remote image URLs are never passed directly to models/providers; they are downloaded to a temporary local file first.
 
 ## 13. Implementation Self-Review
 
 The first draft of this plan had several likely implementation mistakes. These should be considered resolved constraints for Phase 3:
 
-1. OCR should not be model-only. A pure vision-model OCR plan is slower, costlier, and less private than necessary. Add Apple Vision local OCR as the default local baseline, then use vision models for cleanup, structure, and hard images.
+1. OCR should now be model-vision-only by product decision. Do not add Apple Vision or VisionKit recognition even though it would be locally available.
 2. The existing `TaskRequest` and `ModelRunner.generate` are text-only. Do not cram images into `inputText`; add OCR request/result types and a `VisionModelRunner` protocol.
-3. `ChatMessage.content` is currently a string. OpenAI-compatible image input needs content arrays, and Anthropic needs separate image blocks. Add provider-specific multimodal payload encoders.
+3. `ChatMessage.content` is currently a string. OpenAI-compatible image input needs content arrays. Anthropic later needs separate image blocks, but it is not the first Phase 3 provider path.
 4. Capability detection cannot be universally automatic. Some providers expose explicit modality metadata, others expose only model IDs. Store capability source, confidence, last check, and failure state.
 5. Registry JSON should stay migration-friendly. Prefer stable sorted arrays for capability inputs instead of unordered sets.
 6. `AppPreferences` currently has no OCR preference surface. Add `OCRPreferences`, decode older registries safely, and clear OCR model IDs when models are deleted, disabled, or marked text-only.
@@ -610,90 +641,92 @@ The first draft of this plan had several likely implementation mistakes. These s
 10. Translate-after-OCR should hand extracted text to the normal text pipeline by default. It should not automatically use the expensive vision model for text translation.
 11. Browser page image/canvas OCR remains out of Phase 3. Native OCR can later power a browser feature, but the browser DOM translation phase should not be reopened for this.
 12. CI should not depend on live provider OCR. Use generated image fixtures and stub vision runners for automated tests; keep real provider OCR in manual packaged-app acceptance.
+13. Image explanation is useful enough to include in Phase 3, but it should live in the image/OCR workflow rather than turning llmTools into a general chat product.
+14. Remote image URL handling must stay app-owned. Download to temp, normalize, strip metadata, and delete after use.
 
 ## 14. Complete Phase 3 Implementation Checklist
 
 ### 14.1 Translation Closure
 
-- Refresh Phase 2 closure reports.
-- Verify Chrome packaged-app smoke or keep the browser-readiness blocker explicit.
-- Verify Edge acceptance when Edge is available.
-- Fix only defects found by closure/acceptance gates.
-- Confirm Phase 1 selected-text and quick-action flows still work.
+- Done: Phase 2 closure reports are refreshed by `./scripts/check-phase2-closure.sh`.
+- Done: Chrome packaged-app smoke is machine-checked where possible; browser-readiness blockers remain explicit when Chrome has not loaded the unpacked extension from this repo.
+- Done: Edge acceptance is skipped with an explicit reason when Edge is unavailable on the test machine.
+- Done: no Phase 2 source defect was found by the closure gate before Phase 3 implementation.
+- Done: Phase 1 selected-text and quick-action regressions remain covered by `swift run LLMToolsChecks`.
 
 ### 14.2 Native Text Task Polish
 
-- Revisit translate, polish, summarize, explain, and TODO prompts.
+- Done: revisit translate, polish, summarize, explain, and TODO prompts.
 - Add task-specific mode controls where they are useful and bounded.
-- Add follow-up actions from output text.
-- Improve empty/running/cancelled/failed states.
-- Keep text input keyboard shortcuts normal.
-- Add regression coverage for every native text task.
+- Done: add follow-up actions from output text.
+- Done: improve empty/running/cancelled/failed states.
+- Done: keep text input keyboard shortcuts normal.
+- Done: add regression coverage for native text prompt contracts.
 
 ### 14.3 Capability Registry
 
-- Add capability fields to `ModelDescriptor`.
-- Add stable old-registry migration.
-- Add capability inference for local, OpenAI-compatible, Anthropic, OpenRouter, Gemini, Ollama, LM Studio, and custom providers.
-- Add manual override and reset-to-automatic actions.
-- Add explicit OCR/vision probe action.
-- Show capability badges, source, confidence, last check, and last failure.
+- Done: add capability fields to `ModelDescriptor`.
+- Done: add stable old-registry migration.
+- Done: add capability inference for local and OpenAI-compatible provider families first, including OpenAI, OpenRouter, Gemini OpenAI-compatible, Ollama, LM Studio, and custom providers. Anthropic image payload support remains a later provider-specific extension.
+- Done: add manual override and reset-to-automatic actions.
+- Done: add explicit OCR/vision probe action.
+- Done: show capability badges, source, confidence, last check, and last failure.
 
 ### 14.4 OCR Preferences
 
-- Add `OCRPreferences`.
-- Add OCR enablement.
-- Add OCR engine mode: local, vision model, hybrid.
-- Add OCR model picker filtered by image capability.
-- Add OCR output mode default.
-- Add separate OCR history opt-in.
-- Add remote upload confirmation preference.
-- Clear stale OCR model IDs when model state changes.
+- Done: add `OCRPreferences`.
+- Done: add OCR enablement.
+- Done: add OCR model picker filtered by image capability.
+- Done: add OCR output mode default.
+- Done: add separate OCR history opt-in.
+- Done: add model-recognition default toggle.
+- Done: clear stale OCR model IDs when model state changes.
 
-### 14.5 Image Input And Local OCR
+### 14.5 Image Input And Preprocessing
 
-- Add image file picker, paste, and drop.
-- Support PNG, JPEG, WebP where decodable, and HEIC via local conversion if practical.
-- Strip metadata and normalize orientation.
-- Enforce size and pixel limits.
-- Add preview and redacted diagnostics.
-- Add Apple Vision local OCR service.
-- Display copyable plain-text OCR output.
+- Done: add image file picker, paste, and drop.
+- Done: support PNG, JPEG, WebP where decodable, and HEIC via local conversion where native decoding succeeds.
+- Done: strip metadata and normalize provider payloads.
+- Done: enforce size and pixel limits.
+- Done: add preview and redacted diagnostics.
+- Done: download remote image URLs to temporary local files and clean them after normalization.
 
 ### 14.6 Vision Model OCR
 
-- Add `VisionModelRunner`.
-- Add OpenAI-compatible image payload support.
-- Add Anthropic image payload support.
-- Map provider errors to actionable OCR errors.
-- Require vision capability before provider call.
-- Require confirmation before remote image upload when configured.
-- Keep text-only generation untouched.
+- Done: add `VisionModelRunner`.
+- Done: add OpenAI-compatible image payload support.
+- Done: map provider and validation errors to actionable OCR errors.
+- Done: require vision capability before provider call.
+- Done: prevent direct remote image URL passthrough; all URL inputs are downloaded to a temporary local file first.
+- Done: keep text-only generation untouched.
 
-### 14.7 Hybrid And Structured OCR
+### 14.7 Structured OCR And Image Explanation
 
-- Run local OCR first.
-- Send image and/or local OCR text to model only when mode allows remote processing.
-- Keep local OCR and model-cleaned output inspectable.
-- Add structured Markdown extraction for tables, receipts, labels, and key-value screenshots.
-- Add translate-after-OCR through normal text model by default.
+- Done: add structured Markdown extraction for tables, receipts, labels, and key-value screenshots.
+- Done: add translate-after-OCR through normal text model by default.
+- Done: add screenshot/image explanation through the image workflow.
+- Done: keep raw model output and cleaned display output inspectable.
 
 ### 14.8 Privacy, History, And Diagnostics
 
-- Do not store raw images by default.
-- Never log base64 image payloads.
-- Keep OCR diagnostics redacted.
-- Add OCR history preview only when explicitly enabled.
-- Include model name, engine mode, elapsed time, MIME type, pixel size, byte size, hash prefix, and error code in diagnostics.
+- Done: do not store raw images by default.
+- Done: avoid logging base64 image payloads.
+- Done: keep OCR diagnostics redacted.
+- Done: add OCR history preview only when explicitly enabled.
+- Done: include model name, elapsed time, MIME type, pixel size, byte size, hash prefix, and error code in OCR result metadata.
+- Done: delete temporary files created for remote image URL inputs after normalization.
 
 ### 14.9 Automated And Manual Verification
 
-- Run Swift checks.
-- Add generated OCR image fixtures.
-- Add stub local OCR and stub vision runner tests.
-- Add request-encoding tests for OpenAI-compatible and Anthropic image payloads.
-- Package and relaunch `dist/llmTools.app`.
-- Manually test local OCR, vision-model OCR, hybrid OCR, no-text image, structured receipt/table image, remote confirmation, and existing translation workflows.
+- Done: run Swift checks.
+- Done: add generated OCR image fixtures.
+- Done: add image preprocessing tests and stub vision runner tests.
+- Done: add request-encoding tests for OpenAI-compatible image payloads.
+- Done: add temporary-download cleanup coverage through image preprocessing checks.
+- Done: add `LLMToolsLiveOCRCheck` for live provider OCR and image-explanation verification.
+- Done: add `check-phase3-goal-audit.mjs` so completion claims are derived from current evidence rather than manual interpretation.
+- Done: package and relaunch `dist/llmTools.app` as the final verification target.
+- Manual/provider-bound: test model-recognition OCR, no-text image, structured receipt/table image, image explanation, remote URL temp download, and existing translation workflows with a real configured vision-capable model and browser extension loaded from this repo.
 
 ## 15. Definition Of Done
 
@@ -703,7 +736,9 @@ Phase 3 is done when:
 - Native text tasks have clear task-specific prompts, states, and regression coverage.
 - The model registry stores capability metadata and survives old-registry migration.
 - Settings shows model capability badges and an OCR model picker filtered to vision-capable models.
-- The app can OCR PNG/JPEG/WebP or clipboard images locally, with a configured vision-capable model, and in hybrid mode.
+- The app can OCR PNG/JPEG/WebP or clipboard images with a configured vision-capable model.
+- The app can explain a screenshot/image through the image workflow when a vision-capable model is configured.
+- Remote image URL inputs are downloaded to a temporary local file and cleaned up after recognition.
 - OCR does not store raw images by default.
 - Text-only models cannot be used for OCR.
 - Packaged `dist/llmTools.app` is rebuilt, relaunched, and manually verified for OCR plus existing translation workflows.

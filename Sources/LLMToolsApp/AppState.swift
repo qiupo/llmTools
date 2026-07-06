@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import ServiceManagement
 import SwiftUI
@@ -13,9 +14,15 @@ final class AppState: ObservableObject {
         case file
     }
 
+    enum QuickActionMode: String, Equatable {
+        case text
+        case image
+    }
+
     @Published var models: [ModelDescriptor] = []
     @Published var preferences = AppPreferences()
     @Published var history: [HistoryItem] = []
+    @Published var quickActionMode: QuickActionMode = .text
     @Published var selectedTask: TaskKind = .translate
     @Published var inputText: String = ""
     @Published var inputOrigin: InputOrigin = .manual
@@ -26,8 +33,13 @@ final class AppState: ObservableObject {
     @Published var statusMessage: String = L10n.text("Ready", language: .chinese)
     @Published var selectedModelID: UUID?
     @Published var isRunning: Bool = false
+    @Published var isPreparingOCRImage: Bool = false
     @Published var validationError: String?
     @Published var providerTestModelID: UUID?
+    @Published var visionProbeModelID: UUID?
+    @Published var ocrImageInput: OCRImageInput?
+    @Published var ocrPreviewImage: NSImage?
+    @Published var ocrMode: OCRMode = .plainText
 
     let engine: TaskEngine
     private var preferenceSaveRevision = 0
@@ -45,8 +57,10 @@ final class AppState: ObservableObject {
         let snapshot = await engine.registry()
         var preferences = snapshot.preferences
         clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
+        clearMissingOCRModelPreference(&preferences, models: snapshot.models)
         self.models = snapshot.models
         self.preferences = preferences
+        self.ocrMode = preferences.ocr.defaultMode
         self.selectedModelID = preferences.defaultModelID ?? snapshot.models.first?.id
         self.history = await engine.recentHistory()
         self.statusMessage = snapshot.models.isEmpty
@@ -78,8 +92,12 @@ final class AppState: ObservableObject {
         let currentModelID = selectedModelID
         var preferences = snapshot.preferences
         clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
+        clearMissingOCRModelPreference(&preferences, models: snapshot.models)
         models = snapshot.models
         self.preferences = preferences
+        if !OCRMode.allCases.contains(ocrMode) {
+            ocrMode = preferences.ocr.defaultMode
+        }
         if let currentModelID, snapshot.models.contains(where: { $0.id == currentModelID }) {
             selectedModelID = currentModelID
         } else {
@@ -200,6 +218,88 @@ final class AppState: ObservableObject {
         }
     }
 
+    func markModelVisionCapable(id: UUID) {
+        Task {
+            do {
+                _ = try await engine.markModelVisionCapable(id: id)
+                await reloadSnapshot()
+                await MainActor.run {
+                    validationError = nil
+                    statusMessage = t("Marked vision-capable")
+                }
+            } catch {
+                await MainActor.run {
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed")
+                }
+            }
+        }
+    }
+
+    func markModelTextOnly(id: UUID) {
+        Task {
+            do {
+                _ = try await engine.markModelTextOnly(id: id)
+                await reloadSnapshot()
+                await MainActor.run {
+                    validationError = nil
+                    statusMessage = t("Marked text-only")
+                }
+            } catch {
+                await MainActor.run {
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed")
+                }
+            }
+        }
+    }
+
+    func resetModelCapabilities(id: UUID) {
+        Task {
+            do {
+                _ = try await engine.resetModelCapabilities(id: id)
+                await reloadSnapshot()
+                await MainActor.run {
+                    validationError = nil
+                    statusMessage = t("Capability reset")
+                }
+            } catch {
+                await MainActor.run {
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed")
+                }
+            }
+        }
+    }
+
+    func testVisionCapability(id: UUID) {
+        guard visionProbeModelID == nil else {
+            return
+        }
+        visionProbeModelID = id
+        validationError = nil
+        statusMessage = t("Testing vision")
+
+        Task {
+            do {
+                _ = try await engine.testVisionCapability(id: id)
+                await reloadSnapshot()
+                await MainActor.run {
+                    visionProbeModelID = nil
+                    validationError = nil
+                    statusMessage = t("Vision test succeeded")
+                }
+            } catch {
+                await reloadSnapshot()
+                await MainActor.run {
+                    visionProbeModelID = nil
+                    validationError = error.localizedDescription
+                    statusMessage = t("Vision test failed")
+                }
+            }
+        }
+    }
+
     func loadInputFile(from url: URL) {
         do {
             let resourceAccess = url.startAccessingSecurityScopedResource()
@@ -216,6 +316,90 @@ final class AppState: ObservableObject {
         } catch {
             validationError = "Could not read \(url.lastPathComponent): \(error.localizedDescription)"
             statusMessage = t("Failed to load file")
+        }
+    }
+
+    func loadOCRImageFile(from url: URL) {
+        do {
+            let resourceAccess = url.startAccessingSecurityScopedResource()
+            defer {
+                if resourceAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            let image = try OCRImagePreprocessor.normalizeImageFile(
+                at: url,
+                preferences: preferences.ocr
+            )
+            setOCRImage(image)
+            statusMessage = "\(t("Loaded")) \(url.lastPathComponent)"
+        } catch {
+            validationError = error.localizedDescription
+            statusMessage = t("Failed to load image")
+        }
+    }
+
+    func loadOCRImageData(_ data: Data, fileName: String? = nil, sourceDescription: String = "Image") {
+        do {
+            let image = try OCRImagePreprocessor.normalizeImageData(
+                data,
+                preferences: preferences.ocr,
+                fileName: fileName,
+                sourceDescription: sourceDescription
+            )
+            setOCRImage(image)
+            statusMessage = t("Loaded image")
+        } catch {
+            validationError = error.localizedDescription
+            statusMessage = t("Failed to load image")
+        }
+    }
+
+    func loadOCRImageFromPasteboard() {
+        let pasteboard = NSPasteboard.general
+        if let data = pasteboard.data(forType: .png) {
+            loadOCRImageData(data, fileName: "clipboard.png", sourceDescription: "Clipboard image")
+            return
+        }
+        if let data = pasteboard.data(forType: .tiff) {
+            loadOCRImageData(data, fileName: "clipboard.tiff", sourceDescription: "Clipboard image")
+            return
+        }
+        if let url = NSURL(from: pasteboard) as URL? {
+            loadOCRImageFile(from: url)
+            return
+        }
+        validationError = t("Clipboard does not contain an image.")
+        statusMessage = t("Failed to load image")
+    }
+
+    func loadOCRImageFromRemoteURL(_ value: String) {
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            validationError = t("Enter an image URL first.")
+            return
+        }
+        isPreparingOCRImage = true
+        validationError = nil
+        statusMessage = t("Downloading image")
+        Task {
+            do {
+                let image = try await OCRImagePreprocessor.downloadAndNormalizeRemoteImage(
+                    from: value,
+                    preferences: preferences.ocr
+                )
+                await MainActor.run {
+                    setOCRImage(image)
+                    isPreparingOCRImage = false
+                    statusMessage = t("Loaded image")
+                }
+            } catch {
+                await MainActor.run {
+                    isPreparingOCRImage = false
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed to load image")
+                }
+            }
         }
     }
 
@@ -271,6 +455,7 @@ final class AppState: ObservableObject {
     }
 
     func setInputText(_ text: String, origin: InputOrigin) {
+        quickActionMode = .text
         inputText = text
         inputOrigin = origin
         outputText = ""
@@ -281,6 +466,37 @@ final class AppState: ObservableObject {
         if origin != .selection {
             SelectedTextService.clearCapturedSelectionSource()
         }
+    }
+
+    func setOCRMode(_ mode: OCRMode) {
+        ocrMode = mode
+        updatePreferences { $0.ocr.defaultMode = mode }
+    }
+
+    func clearOCRImage() {
+        ocrImageInput = nil
+        ocrPreviewImage = nil
+        outputText = ""
+        rawOutputText = ""
+        showsRawOutput = false
+        validationError = nil
+        statusMessage = t("Ready")
+    }
+
+    func sendOutputToTask(_ task: TaskKind) {
+        let text = displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, TaskKind.interactiveCases.contains(task) else {
+            return
+        }
+        quickActionMode = .text
+        selectedTask = task
+        inputText = text
+        inputOrigin = .manual
+        outputText = ""
+        rawOutputText = ""
+        showsRawOutput = false
+        validationError = nil
+        statusMessage = t("Ready")
     }
 
     func prepareAutomaticSelectionText(_ text: String) -> Bool {
@@ -429,6 +645,78 @@ final class AppState: ObservableObject {
         }
     }
 
+    func runCurrentOCR() {
+        guard let image = ocrImageInput else {
+            validationError = OCRTaskError.missingImage.localizedDescription
+            return
+        }
+        guard preferences.ocr.enabled else {
+            validationError = OCRTaskError.disabled.localizedDescription
+            return
+        }
+        guard preferences.ocr.modelID != nil else {
+            validationError = OCRTaskError.missingVisionModel.localizedDescription
+            return
+        }
+
+        currentRunTask?.cancel()
+        cancelScheduledModelUnload()
+        runRevision += 1
+        let revision = runRevision
+        let mode = ocrMode
+        let modelID = preferences.ocr.modelID
+        isRunning = true
+        validationError = nil
+        outputText = ""
+        rawOutputText = ""
+        showsRawOutput = false
+        statusMessage = "\(t("Running")) \(L10n.ocrModeName(mode, language: preferences.appLanguage))..."
+        currentRunTask = Task {
+            do {
+                let result = try await engine.runOCR(
+                    image: image,
+                    mode: mode,
+                    modelID: modelID
+                )
+                try Task.checkCancellation()
+                await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
+                    outputText = result.text
+                    rawOutputText = result.rawText
+                    showsRawOutput = false
+                    statusMessage = t("Finished")
+                    isRunning = false
+                    currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
+                }
+                await reloadSnapshot()
+            } catch is CancellationError {
+                await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
+                    statusMessage = t("Cancelled")
+                    isRunning = false
+                    currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
+                }
+            } catch {
+                await MainActor.run {
+                    guard revision == runRevision else {
+                        return
+                    }
+                    validationError = error.localizedDescription
+                    statusMessage = t("Failed")
+                    isRunning = false
+                    currentRunTask = nil
+                    scheduleModelUnloadIfIdle()
+                }
+            }
+        }
+    }
+
     func cancelCurrentTask(unloadModel: Bool = false) {
         currentRunTask?.cancel()
         currentRunTask = nil
@@ -546,6 +834,31 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func clearMissingOCRModelPreference(
+        _ preferences: inout AppPreferences,
+        models: [ModelDescriptor]
+    ) {
+        guard let modelID = preferences.ocr.modelID else {
+            return
+        }
+        if !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
+            preferences.ocr.modelID = nil
+        }
+    }
+
+    private func setOCRImage(_ image: OCRImageInput) {
+        quickActionMode = .image
+        ocrImageInput = image
+        ocrPreviewImage = NSImage(data: image.data)
+        outputText = ""
+        rawOutputText = ""
+        showsRawOutput = false
+        validationError = nil
+        if preferences.ocr.useModelRecognitionByDefault {
+            ocrMode = preferences.ocr.defaultMode
+        }
+    }
+
     private var selectedModelContextLength: Int? {
         if let selectedModelID,
            let model = models.first(where: { $0.id == selectedModelID && $0.enabled }) {
@@ -625,6 +938,22 @@ final class AppState: ObservableObject {
         let resolvedName = webPageTranslationModelID.flatMap { modelID in
             models.first(where: { $0.id == modelID })?.name
         } ?? t("No model configured")
+        return Self.condensedModelName(resolvedName, limit: limit)
+    }
+
+    var visionCapableModels: [ModelDescriptor] {
+        models.filter { $0.enabled && $0.capabilities.supportsImage }
+    }
+
+    var selectedOCRModel: ModelDescriptor? {
+        guard let modelID = preferences.ocr.modelID else {
+            return nil
+        }
+        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }
+    }
+
+    func ocrModelDisplayName(limit: Int = 18) -> String {
+        let resolvedName = selectedOCRModel?.name ?? t("No model configured")
         return Self.condensedModelName(resolvedName, limit: limit)
     }
 

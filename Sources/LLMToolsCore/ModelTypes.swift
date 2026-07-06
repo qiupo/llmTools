@@ -23,6 +23,140 @@ public enum ModelValidationState: String, Codable, Sendable, CaseIterable {
     case failed
 }
 
+public enum ModelInputCapability: String, Codable, Sendable, CaseIterable, Hashable {
+    case text
+    case image
+}
+
+public enum ModelCapabilitySource: String, Codable, Sendable, CaseIterable, Hashable {
+    case detected
+    case inferred
+    case probePassed
+    case failedProbe
+    case manual
+    case unknown
+}
+
+public struct ModelCapabilities: Codable, Hashable, Sendable {
+    public var inputs: [ModelInputCapability]
+    public var source: ModelCapabilitySource
+    public var confidence: Double
+    public var note: String?
+    public var lastCheckedAt: Date?
+    public var lastFailureMessage: String?
+
+    public init(
+        inputs: [ModelInputCapability] = [.text],
+        source: ModelCapabilitySource = .unknown,
+        confidence: Double = 0.5,
+        note: String? = nil,
+        lastCheckedAt: Date? = nil,
+        lastFailureMessage: String? = nil
+    ) {
+        self.inputs = ModelCapabilities.normalizedInputs(inputs)
+        self.source = source
+        self.confidence = min(max(confidence, 0), 1)
+        self.note = note
+        self.lastCheckedAt = lastCheckedAt
+        self.lastFailureMessage = lastFailureMessage
+    }
+
+    public func supports(_ capability: ModelInputCapability) -> Bool {
+        inputs.contains(capability)
+    }
+
+    public var supportsText: Bool {
+        supports(.text)
+    }
+
+    public var supportsImage: Bool {
+        supports(.image)
+    }
+
+    public static func textOnly(source: ModelCapabilitySource = .inferred, note: String? = nil) -> ModelCapabilities {
+        ModelCapabilities(
+            inputs: [.text],
+            source: source,
+            confidence: source == .unknown ? 0.35 : 1,
+            note: note
+        )
+    }
+
+    public static func vision(source: ModelCapabilitySource, confidence: Double, note: String? = nil) -> ModelCapabilities {
+        ModelCapabilities(
+            inputs: [.text, .image],
+            source: source,
+            confidence: confidence,
+            note: note
+        )
+    }
+
+    public static func inferred(
+        format: ModelFormat,
+        providerConfiguration: ProviderConfiguration?
+    ) -> ModelCapabilities {
+        switch format {
+        case .gguf, .mlx:
+            return textOnly(source: .inferred, note: "Local text runner.")
+        case .openAICompatible:
+            guard let providerConfiguration else {
+                return textOnly(source: .unknown, note: "Missing provider configuration.")
+            }
+            return inferOpenAICompatibleCapabilities(providerConfiguration)
+        case .anthropicMessages:
+            return textOnly(source: .unknown, note: "Anthropic vision payload is not implemented in Phase 3.")
+        case .unknown:
+            return textOnly(source: .unknown, note: "Unknown model format.")
+        }
+    }
+
+    private static func inferOpenAICompatibleCapabilities(_ configuration: ProviderConfiguration) -> ModelCapabilities {
+        let modelID = configuration.modelID
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let providerID = configuration.providerID
+
+        let visionFragments = [
+            "vision",
+            "vl",
+            "llava",
+            "minicpm-v",
+            "internvl",
+            "qwen-vl",
+            "qwen2-vl",
+            "qwen2.5-vl",
+            "qwen3-vl",
+            "pixtral",
+            "moondream",
+            "gemma-3",
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4.5",
+            "o4-mini",
+            "gemini-1.5",
+            "gemini-2",
+            "gemini-2.5"
+        ]
+        if visionFragments.contains(where: { modelID.contains($0) }) {
+            return vision(
+                source: .inferred,
+                confidence: providerID == .customOpenAICompatible ? 0.55 : 0.7,
+                note: "Inferred from provider family or model ID."
+            )
+        }
+
+        return textOnly(
+            source: .unknown,
+            note: "No image capability metadata or known vision model pattern."
+        )
+    }
+
+    private static func normalizedInputs(_ inputs: [ModelInputCapability]) -> [ModelInputCapability] {
+        let unique = Set(inputs)
+        return ModelInputCapability.allCases.filter { unique.contains($0) }
+    }
+}
+
 public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var id: UUID
     public var name: String
@@ -36,6 +170,7 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var validationState: ModelValidationState
     public var lastErrorMessage: String?
     public var providerConfiguration: ProviderConfiguration?
+    public var capabilities: ModelCapabilities
 
     public init(
         id: UUID = UUID(),
@@ -49,7 +184,8 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         enabled: Bool = true,
         validationState: ModelValidationState = .unknown,
         lastErrorMessage: String? = nil,
-        providerConfiguration: ProviderConfiguration? = nil
+        providerConfiguration: ProviderConfiguration? = nil,
+        capabilities: ModelCapabilities? = nil
     ) {
         self.id = id
         self.name = name
@@ -63,6 +199,44 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         self.validationState = validationState
         self.lastErrorMessage = lastErrorMessage
         self.providerConfiguration = providerConfiguration
+        self.capabilities = capabilities ?? ModelCapabilities.inferred(
+            format: format,
+            providerConfiguration: providerConfiguration
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case sourcePath
+        case resolvedPath
+        case format
+        case sizeClass
+        case role
+        case contextLength
+        case enabled
+        case validationState
+        case lastErrorMessage
+        case providerConfiguration
+        case capabilities
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        sourcePath = try container.decode(URL.self, forKey: .sourcePath)
+        resolvedPath = try container.decodeIfPresent(URL.self, forKey: .resolvedPath)
+        format = try container.decode(ModelFormat.self, forKey: .format)
+        sizeClass = try container.decode(String.self, forKey: .sizeClass)
+        role = try container.decode(ModelRole.self, forKey: .role)
+        contextLength = try container.decode(Int.self, forKey: .contextLength)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        validationState = try container.decodeIfPresent(ModelValidationState.self, forKey: .validationState) ?? .unknown
+        lastErrorMessage = try container.decodeIfPresent(String.self, forKey: .lastErrorMessage)
+        providerConfiguration = try container.decodeIfPresent(ProviderConfiguration.self, forKey: .providerConfiguration)
+        capabilities = try container.decodeIfPresent(ModelCapabilities.self, forKey: .capabilities)
+            ?? ModelCapabilities.inferred(format: format, providerConfiguration: providerConfiguration)
     }
 
     public var displayPath: String {
@@ -86,6 +260,77 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
 
     public var isRemoteProvider: Bool {
         providerConfiguration?.isRemote ?? false
+    }
+
+    public var supportsImageInput: Bool {
+        enabled && capabilities.supportsImage
+    }
+}
+
+public enum OCRMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
+    case plainText
+    case structured
+    case extractThenTranslate
+    case explainImage
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .plainText: return "Plain text"
+        case .structured: return "Structured"
+        case .extractThenTranslate: return "Extract then translate"
+        case .explainImage: return "Explain image"
+        }
+    }
+}
+
+public struct OCRPreferences: Codable, Hashable, Sendable {
+    public var enabled: Bool
+    public var modelID: UUID?
+    public var defaultMode: OCRMode
+    public var persistHistory: Bool
+    public var useModelRecognitionByDefault: Bool
+    public var maximumImageBytes: Int
+    public var maximumPixelCount: Int
+
+    public init(
+        enabled: Bool = true,
+        modelID: UUID? = nil,
+        defaultMode: OCRMode = .plainText,
+        persistHistory: Bool = false,
+        useModelRecognitionByDefault: Bool = false,
+        maximumImageBytes: Int = 8_000_000,
+        maximumPixelCount: Int = 16_000_000
+    ) {
+        self.enabled = enabled
+        self.modelID = modelID
+        self.defaultMode = defaultMode
+        self.persistHistory = persistHistory
+        self.useModelRecognitionByDefault = useModelRecognitionByDefault
+        self.maximumImageBytes = maximumImageBytes
+        self.maximumPixelCount = maximumPixelCount
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case modelID
+        case defaultMode
+        case persistHistory
+        case useModelRecognitionByDefault
+        case maximumImageBytes
+        case maximumPixelCount
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+        modelID = try container.decodeIfPresent(UUID.self, forKey: .modelID)
+        defaultMode = try container.decodeIfPresent(OCRMode.self, forKey: .defaultMode) ?? .plainText
+        persistHistory = try container.decodeIfPresent(Bool.self, forKey: .persistHistory) ?? false
+        useModelRecognitionByDefault = try container.decodeIfPresent(Bool.self, forKey: .useModelRecognitionByDefault) ?? false
+        maximumImageBytes = max(try container.decodeIfPresent(Int.self, forKey: .maximumImageBytes) ?? 8_000_000, 128_000)
+        maximumPixelCount = max(try container.decodeIfPresent(Int.self, forKey: .maximumPixelCount) ?? 16_000_000, 1_000_000)
     }
 }
 
@@ -160,6 +405,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultPolishStyle: String
     public var recentHistoryLimit: Int
     public var webPageTranslation: WebPageTranslationPreferences
+    public var ocr: OCRPreferences
     public var quickActionShortcut: KeyboardShortcutPreference
     public var quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
 
@@ -181,6 +427,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         defaultPolishStyle: String = "natural",
         recentHistoryLimit: Int = 20,
         webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
+        ocr: OCRPreferences = OCRPreferences(),
         quickActionShortcut: KeyboardShortcutPreference = .optionSpace,
         quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace
     ) {
@@ -199,6 +446,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.defaultPolishStyle = defaultPolishStyle
         self.recentHistoryLimit = recentHistoryLimit
         self.webPageTranslation = webPageTranslation
+        self.ocr = ocr
         self.quickActionShortcut = quickActionShortcut
         self.quickActionWithoutSelectionShortcut = quickActionWithoutSelectionShortcut
     }
@@ -220,6 +468,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case defaultPolishStyle
         case recentHistoryLimit
         case webPageTranslation
+        case ocr
         case quickActionShortcut
         case quickActionWithoutSelectionShortcut
     }
@@ -254,6 +503,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
         recentHistoryLimit = try container.decodeIfPresent(Int.self, forKey: .recentHistoryLimit) ?? 20
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
+        ocr = try container.decodeIfPresent(OCRPreferences.self, forKey: .ocr) ?? OCRPreferences()
         quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
         quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
     }
@@ -275,6 +525,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(defaultPolishStyle, forKey: .defaultPolishStyle)
         try container.encode(recentHistoryLimit, forKey: .recentHistoryLimit)
         try container.encode(webPageTranslation, forKey: .webPageTranslation)
+        try container.encode(ocr, forKey: .ocr)
         try container.encode(quickActionShortcut, forKey: .quickActionShortcut)
         try container.encode(quickActionWithoutSelectionShortcut, forKey: .quickActionWithoutSelectionShortcut)
     }
@@ -312,6 +563,7 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
     case summarize
     case explain
     case extractTodos
+    case ocr
 
     public var id: String { rawValue }
 
@@ -327,6 +579,7 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
         case .summarize: return "Summarize"
         case .explain: return "Explain"
         case .extractTodos: return "Extract TODOs"
+        case .ocr: return "OCR Image"
         }
     }
 
@@ -340,6 +593,7 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
             case .summarize: return "总结"
             case .explain: return "解释"
             case .extractTodos: return "提取待办"
+            case .ocr: return "图片识别"
             }
         case .english:
             return title
