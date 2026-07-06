@@ -179,6 +179,8 @@ struct QuickActionView: View {
     @State private var showImageImporter = false
     @State private var showInput = true
     @State private var imageURLDraft = ""
+    @State private var isImagePreviewPresented = false
+    @State private var showsMarkdownSource = false
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -188,16 +190,53 @@ struct QuickActionView: View {
         appState.displayedOutputText
     }
 
+    private var markdownPreviewAvailable: Bool {
+        guard !appState.showsRawOutput,
+              MarkdownResultPreview.looksLikeMarkdown(displayedOutputText) else {
+            return false
+        }
+        switch appState.quickActionMode {
+        case .text:
+            return appState.selectedTask != .translate && appState.selectedTask != .webPageTranslate
+        case .image:
+            switch appState.ocrMode {
+            case .structured, .explainImage:
+                return true
+            case .plainText, .extractThenTranslate:
+                return false
+            }
+        }
+    }
+
+    private var shouldRenderMarkdownPreview: Bool {
+        markdownPreviewAvailable && !showsMarkdownSource
+    }
+
+    private var imagePreviewPresentation: Binding<Bool> {
+        Binding(
+            get: { isImagePreviewPresented && appState.ocrImageInput != nil },
+            set: { isImagePreviewPresented = $0 }
+        )
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             controlsBar
+                .layoutPriority(2)
             Divider()
             mainContent
+                .layoutPriority(1)
             Divider()
             bottomBar
+                .layoutPriority(2)
         }
-        .frame(minWidth: 560, minHeight: 380)
+        .frame(minWidth: 560)
         .background(Color(NSColor.windowBackgroundColor))
+        .sheet(isPresented: imagePreviewPresentation) {
+            if let image = appState.ocrImageInput {
+                OCRImagePreviewSheet(input: image, language: language)
+            }
+        }
         .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.plainText, .text, .item], allowsMultipleSelection: false) { result in
             if case let .success(urls) = result, let url = urls.first {
                 appState.loadInputFile(from: url)
@@ -208,37 +247,56 @@ struct QuickActionView: View {
                 appState.loadOCRImageFile(from: url)
             }
         }
-        .onDrop(of: [.fileURL, .plainText, .text], isTargeted: nil) { providers in
+        .onDrop(of: [.fileURL, .plainText, .text, .image], isTargeted: nil) { providers in
             handleDrop(providers)
+        }
+        .onChange(of: appState.outputText) { _, _ in
+            showsMarkdownSource = false
+        }
+        .onChange(of: appState.selectedTask) { _, _ in
+            showsMarkdownSource = false
+        }
+        .onChange(of: appState.quickActionMode) { _, _ in
+            showsMarkdownSource = false
+        }
+        .onChange(of: appState.ocrMode) { _, _ in
+            showsMarkdownSource = false
         }
     }
 
     private var controlsBar: some View {
-        HStack(spacing: 10) {
-            Picker("", selection: $appState.quickActionMode) {
-                Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
-                Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            .frame(width: 126)
-            .disabled(appState.isRunning || appState.isPreparingOCRImage)
-
-            if appState.quickActionMode == .text {
-                Picker("", selection: $appState.selectedTask) {
-                    ForEach(TaskKind.interactiveCases) { task in
-                        Text(task.title(language: language)).tag(task)
-                    }
+        HStack(spacing: 8) {
+            HStack(spacing: controlsBarPrimaryOptionSpacing) {
+                Picker("", selection: $appState.quickActionMode) {
+                    Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
+                    Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
                 }
                 .labelsHidden()
-                .frame(width: 108)
-                .disabled(appState.isRunning)
+                .pickerStyle(.segmented)
+                .frame(width: 108, alignment: .leading)
+                .disabled(appState.isRunning || appState.isPreparingOCRImage)
+
+                if appState.quickActionMode == .text {
+                    Picker("", selection: $appState.selectedTask) {
+                        ForEach(TaskKind.interactiveCases) { task in
+                            Text(task.title(language: language)).tag(task)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 108)
+                    .disabled(appState.isRunning)
+                } else {
+                    modeOptions
+                        .frame(width: 126, alignment: .leading)
+                }
             }
 
-            modeOptions
-                .frame(minWidth: 220, alignment: .leading)
+            if appState.quickActionMode == .text {
+                modeOptions
+                    .frame(width: 190, alignment: .leading)
+            }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             if appState.quickActionMode == .text {
                 Button {
@@ -246,17 +304,28 @@ struct QuickActionView: View {
                 } label: {
                     HStack(spacing: 4) {
                         Text(L10n.text(showInput ? "Hide source" : "Show source", language: language))
+                            .lineLimit(1)
                         Image(systemName: showInput ? "chevron.up" : "chevron.down")
                             .font(.caption2)
+                            .frame(width: 10)
                     }
+                    .frame(width: 76, alignment: .center)
                 }
                 .buttonStyle(.borderless)
                 .disabled(appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .fixedSize(horizontal: true, vertical: false)
             }
         }
-        .padding(.horizontal, 14)
+        .padding(.leading, controlsBarLeadingPadding)
+        .padding(.trailing, 14)
         .padding(.vertical, 10)
+    }
+
+    private var controlsBarLeadingPadding: CGFloat {
+        appState.quickActionMode == .text ? 10 : 11
+    }
+
+    private var controlsBarPrimaryOptionSpacing: CGFloat {
+        appState.quickActionMode == .text ? 10 : 6
     }
 
     @ViewBuilder
@@ -271,19 +340,19 @@ struct QuickActionView: View {
                 }
             }
             .labelsHidden()
-            .frame(width: 150)
+            .frame(width: 126)
             .disabled(appState.isRunning || appState.isPreparingOCRImage)
         } else {
             switch appState.selectedTask {
             case .translate:
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text(L10n.text("Auto detect", language: language))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
-                        .frame(width: 68)
-                        .padding(.horizontal, 10)
+                        .frame(width: 56)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 5)
                         .background(.quaternary.opacity(0.45))
                         .clipShape(RoundedRectangle(cornerRadius: 6))
@@ -303,7 +372,7 @@ struct QuickActionView: View {
                         Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
                     }
                     .labelsHidden()
-                    .frame(width: 118)
+                    .frame(width: 108)
                     .disabled(appState.isRunning)
                 }
                 .fixedSize(horizontal: true, vertical: false)
@@ -324,27 +393,69 @@ struct QuickActionView: View {
                 .frame(width: 118)
                 .disabled(appState.isRunning)
             case .summarize:
-                modeBadge("Key points", systemImage: "list.bullet.rectangle")
+                summaryModePicker
             case .explain:
-                modeBadge("Plain explanation", systemImage: "questionmark.circle")
+                explanationModePicker
             case .extractTodos:
-                modeBadge("Action items", systemImage: "checklist")
+                todoExtractionModePicker
             case .webPageTranslate, .ocr:
                 EmptyView()
             }
         }
     }
 
-    private func modeBadge(_ key: String, systemImage: String) -> some View {
-        Label(L10n.text(key, language: language), systemImage: systemImage)
-            .font(.subheadline)
-            .foregroundStyle(.secondary)
-            .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(.quaternary.opacity(0.45))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
+    private var summaryModePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultSummaryMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultSummaryMode = newValue }
+            }
+        )) {
+            ForEach(SummaryMode.allCases) { mode in
+                Text(L10n.summaryModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 142)
+        .disabled(appState.isRunning)
+        .help(L10n.text("Summary mode", language: language))
+    }
+
+    private var explanationModePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultExplanationMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultExplanationMode = newValue }
+            }
+        )) {
+            ForEach(ExplanationMode.allCases) { mode in
+                Text(L10n.explanationModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 142)
+        .disabled(appState.isRunning)
+        .help(L10n.text("Explanation mode", language: language))
+    }
+
+    private var todoExtractionModePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultTodoExtractionMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultTodoExtractionMode = newValue }
+            }
+        )) {
+            ForEach(TodoExtractionMode.allCases) { mode in
+                Text(L10n.todoExtractionModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 142)
+        .disabled(appState.isRunning)
+        .help(L10n.text("TODO mode", language: language))
     }
 
     private var mainContent: some View {
@@ -357,8 +468,8 @@ struct QuickActionView: View {
                         inputPanel
                     }
                     resultPanel
-                    if appState.hasDifferentRawOutput {
-                        rawOutputToggle
+                    if markdownPreviewAvailable || appState.hasDifferentRawOutput {
+                        outputDisplayOptions
                     }
                 }
             }
@@ -373,8 +484,8 @@ struct QuickActionView: View {
                 .frame(width: 220)
             VStack(spacing: 10) {
                 resultPanel
-                if appState.hasDifferentRawOutput {
-                    rawOutputToggle
+                if markdownPreviewAvailable || appState.hasDifferentRawOutput {
+                    outputDisplayOptions
                 }
                 ocrFollowUpBar
             }
@@ -383,28 +494,7 @@ struct QuickActionView: View {
 
     private var imageInputPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color(NSColor.textBackgroundColor))
-                if let preview = appState.ocrPreviewImage {
-                    Image(nsImage: preview)
-                        .resizable()
-                        .scaledToFit()
-                        .padding(8)
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "photo")
-                            .font(.system(size: 28, weight: .medium))
-                            .foregroundStyle(.secondary)
-                        Text(L10n.text("Drop or paste an image.", language: language))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(12)
-                }
-            }
-            .frame(height: 142)
-            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
+            imagePreviewArea
 
             if let image = appState.ocrImageInput {
                 VStack(alignment: .leading, spacing: 4) {
@@ -418,22 +508,6 @@ struct QuickActionView: View {
                         .lineLimit(2)
                         .truncationMode(.middle)
                 }
-            }
-
-            HStack(spacing: 6) {
-                Button {
-                    showImageImporter = true
-                } label: {
-                    Label(L10n.text("Choose Image", language: language), systemImage: "photo.badge.plus")
-                }
-                .controlSize(.small)
-
-                Button {
-                    appState.loadOCRImageFromPasteboard()
-                } label: {
-                    Label(L10n.text("Paste Image", language: language), systemImage: "doc.on.clipboard")
-                }
-                .controlSize(.small)
             }
 
             HStack(spacing: 6) {
@@ -453,22 +527,102 @@ struct QuickActionView: View {
             }
 
             ocrModelPicker
-
-            if appState.ocrImageInput != nil {
-                Button(role: .destructive) {
-                    appState.clearOCRImage()
-                } label: {
-                    Label(L10n.text("Clear Image", language: language), systemImage: "trash")
-                }
-                .controlSize(.small)
-            }
-
-            Spacer(minLength: 0)
         }
         .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.65))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var imagePreviewHeight: CGFloat {
+        appState.ocrImageInput == nil ? 148 : 126
+    }
+
+    private var imagePreviewArea: some View {
+        ZStack(alignment: .topTrailing) {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(NSColor.textBackgroundColor))
+            imagePreviewContent
+            if appState.ocrImageInput != nil {
+                clearImageButton
+            }
+        }
+        .frame(height: imagePreviewHeight, alignment: .center)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
+    }
+
+    @ViewBuilder
+    private var imagePreviewContent: some View {
+        if let preview = appState.ocrPreviewImage {
+            Button {
+                isImagePreviewPresented = true
+            } label: {
+                ZStack(alignment: .bottomTrailing) {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .scaledToFit()
+                        .padding(8)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .background(Color(NSColor.windowBackgroundColor).opacity(0.94), in: Circle())
+                        .overlay(Circle().stroke(Color.secondary.opacity(0.22)))
+                        .padding(6)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(L10n.text("Open Image Preview", language: language))
+        } else {
+            VStack(spacing: 8) {
+                addImageButton
+                Text(L10n.text("Drop or paste an image.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+        }
+    }
+
+    private var addImageButton: some View {
+        Button {
+            showImageImporter = true
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 24, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: 38, height: 38)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text("Choose Image", language: language))
+        .disabled(appState.isRunning || appState.isPreparingOCRImage)
+    }
+
+    private var clearImageButton: some View {
+        Button(role: .destructive) {
+            isImagePreviewPresented = false
+            appState.clearOCRImage()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .background(Color(NSColor.windowBackgroundColor).opacity(0.94), in: Circle())
+                .overlay(Circle().stroke(Color.secondary.opacity(0.22)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text("Clear Image", language: language))
+        .disabled(appState.isRunning)
+        .padding(6)
     }
 
     private var ocrModelPicker: some View {
@@ -530,10 +684,24 @@ struct QuickActionView: View {
                         .foregroundStyle(.secondary)
                 }
                 .padding(12)
+            } else if displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      let error = appState.validationError,
+                      appState.quickActionMode == .image {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(L10n.text("Failed", language: language), systemImage: "exclamationmark.triangle.fill")
+                        .font(.headline)
+                        .foregroundStyle(.red)
+                    Text(error)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                .padding(12)
             } else if displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Text(resultPlaceholder)
                     .foregroundStyle(.secondary)
                     .padding(12)
+            } else if shouldRenderMarkdownPreview {
+                MarkdownResultPreview(markdown: displayedOutputText)
             } else {
                 ReadOnlyTextView(text: displayedOutputText)
             }
@@ -569,7 +737,7 @@ struct QuickActionView: View {
                     Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
                 }
             }
-            .disabled(appState.quickActionMode == .image && !canRunOCR)
+            .disabled(appState.quickActionMode == .image && !appState.isRunning && !canRunOCR)
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -599,7 +767,8 @@ struct QuickActionView: View {
 
     private var canRunOCR: Bool {
         appState.ocrImageInput != nil
-            && appState.preferences.ocr.modelID != nil
+            && appState.preferences.ocr.enabled
+            && appState.selectedOCRModel != nil
             && !appState.isPreparingOCRImage
     }
 
@@ -629,8 +798,11 @@ struct QuickActionView: View {
                     appState.sendOutputToTask(task)
                 } label: {
                     Label(task.title(language: language), systemImage: followUpIcon(for: task))
+                        .labelStyle(.iconOnly)
+                        .frame(width: 26, height: 22)
                 }
                 .controlSize(.small)
+                .help(task.title(language: language))
                 .disabled(displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             Spacer(minLength: 0)
@@ -649,20 +821,37 @@ struct QuickActionView: View {
         }
     }
 
-    private var rawOutputToggle: some View {
-        HStack {
+    private var outputDisplayOptions: some View {
+        HStack(spacing: 10) {
             Spacer()
-            Button {
-                appState.showsRawOutput.toggle()
-            } label: {
-                Label(
-                    L10n.text(appState.showsRawOutput ? "Show result" : "Show raw output", language: language),
-                    systemImage: appState.showsRawOutput ? "text.badge.checkmark" : "curlybraces"
-                )
+            if markdownPreviewAvailable {
+                Button {
+                    showsMarkdownSource.toggle()
+                } label: {
+                    Label(
+                        L10n.text(showsMarkdownSource ? "Show Markdown preview" : "Show Markdown source", language: language),
+                        systemImage: showsMarkdownSource ? "doc.richtext" : "curlybraces"
+                    )
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .foregroundStyle(.secondary)
+
+            if appState.hasDifferentRawOutput {
+                Button {
+                    appState.showsRawOutput.toggle()
+                    showsMarkdownSource = false
+                } label: {
+                    Label(
+                        L10n.text(appState.showsRawOutput ? "Show result" : "Show raw output", language: language),
+                        systemImage: appState.showsRawOutput ? "text.badge.checkmark" : "curlybraces"
+                    )
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -792,6 +981,87 @@ struct QuickActionView: View {
     }
 }
 
+private struct OCRImagePreviewSheet: View {
+    let input: OCRImageInput
+    let language: AppLanguage
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var previewImage: NSImage? {
+        NSImage(data: input.data)
+    }
+
+    private var title: String {
+        input.fileName ?? input.sourceDescription
+    }
+
+    private var metadataText: String {
+        var pieces: [String] = []
+        if let pixelWidth = input.pixelWidth,
+           let pixelHeight = input.pixelHeight {
+            pieces.append("\(pixelWidth)x\(pixelHeight)")
+        }
+        pieces.append(input.mimeType)
+        pieces.append(ByteCountFormatter.string(fromByteCount: Int64(input.byteCount), countStyle: .file))
+        return pieces.joined(separator: " | ")
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(metadataText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 12)
+
+                Button {
+                    dismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 12, weight: .semibold))
+                        .frame(width: 26, height: 26)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .help(L10n.text("Close", language: language))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+
+            Divider()
+
+            ZStack {
+                Color(NSColor.textBackgroundColor)
+
+                if let previewImage {
+                    GeometryReader { proxy in
+                        Image(nsImage: previewImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: proxy.size.width, height: proxy.size.height, alignment: .center)
+                    }
+                    .padding(14)
+                } else {
+                    Text(L10n.text("Image preview unavailable.", language: language))
+                        .foregroundStyle(.secondary)
+                        .padding(24)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(minWidth: 760, idealWidth: 900, minHeight: 540, idealHeight: 680)
+        .background(Color(NSColor.windowBackgroundColor))
+    }
+}
+
 struct EditableTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: (() -> Void)? = nil
@@ -872,12 +1142,13 @@ struct ReadOnlyTextView: NSViewRepresentable {
     var text: String
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = CommandFriendlyTextScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .noBorder
 
         let textView = CommandFriendlyTextView()
+        textView.copyFallbackText = text
         textView.string = text
         textView.font = .systemFont(ofSize: NSFont.systemFontSize)
         textView.textColor = .labelColor
@@ -912,6 +1183,420 @@ struct ReadOnlyTextView: NSViewRepresentable {
             textView.string = text
             textView.selectedRanges = selectedRanges
         }
+        if let textView = textView as? CommandFriendlyTextView {
+            textView.copyFallbackText = text
+        }
+    }
+}
+
+private struct MarkdownResultPreview: View {
+    var markdown: String
+
+    private enum Block {
+        case heading(level: Int, text: String)
+        case paragraph(String)
+        case bullet(indent: Int, text: String)
+        case numbered(indent: Int, marker: String, text: String)
+        case quote(String)
+        case code(language: String?, text: String)
+        case table(rows: [[String]])
+    }
+
+    private var blocks: [Block] {
+        Self.parse(markdown)
+    }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    blockView(block)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .textSelection(.enabled)
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: Block) -> some View {
+        switch block {
+        case .heading(let level, let text):
+            Self.inlineText(text)
+                .font(headingFont(level: level))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, level <= 2 ? 4 : 2)
+        case .paragraph(let text):
+            Self.inlineText(text)
+                .font(.system(size: 13))
+                .lineSpacing(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        case .bullet(let indent, let text):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text("•")
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 10, alignment: .trailing)
+                Self.inlineText(text)
+                    .font(.system(size: 13))
+                    .lineSpacing(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, CGFloat(indent) * 16)
+        case .numbered(let indent, let marker, let text):
+            HStack(alignment: .firstTextBaseline, spacing: 7) {
+                Text(marker)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 28, alignment: .trailing)
+                Self.inlineText(text)
+                    .font(.system(size: 13))
+                    .lineSpacing(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.leading, CGFloat(indent) * 16)
+        case .quote(let text):
+            HStack(alignment: .top, spacing: 8) {
+                Rectangle()
+                    .fill(Color.secondary.opacity(0.35))
+                    .frame(width: 3)
+                    .clipShape(Capsule())
+                Self.inlineText(text)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineSpacing(3)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(.vertical, 2)
+        case .code(let language, let text):
+            VStack(alignment: .leading, spacing: 5) {
+                if let language {
+                    Text(language)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                ScrollView(.horizontal) {
+                    Text(text.isEmpty ? " " : text)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.12)))
+        case .table(let rows):
+            MarkdownTablePreview(rows: rows)
+        }
+    }
+
+    private func headingFont(level: Int) -> Font {
+        switch level {
+        case 1:
+            return .system(size: 18, weight: .semibold)
+        case 2:
+            return .system(size: 16, weight: .semibold)
+        case 3:
+            return .system(size: 14, weight: .semibold)
+        default:
+            return .system(size: 13, weight: .semibold)
+        }
+    }
+
+    static func looksLikeMarkdown(_ source: String) -> Bool {
+        let lines = normalizedLines(source)
+        for index in lines.indices {
+            let trimmed = lines[index].trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                continue
+            }
+            if parseHeadingLine(trimmed) != nil ||
+                parseBulletLine(lines[index]) != nil ||
+                parseNumberedLine(lines[index]) != nil ||
+                trimmed.hasPrefix("> ") ||
+                trimmed.hasPrefix("```") ||
+                trimmed.contains("**") ||
+                trimmed.contains("__") ||
+                trimmed.contains("`") {
+                return true
+            }
+            if index + 1 < lines.count,
+               isTableCandidate(trimmed),
+               isTableDivider(lines[index + 1]) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func parse(_ source: String) -> [Block] {
+        let lines = normalizedLines(source)
+        var blocks: [Block] = []
+        var paragraphLines: [String] = []
+        var index = 0
+
+        func flushParagraph() {
+            let text = paragraphLines
+                .joined(separator: "\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                blocks.append(.paragraph(text))
+            }
+            paragraphLines.removeAll()
+        }
+
+        while index < lines.count {
+            let line = lines[index]
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.isEmpty {
+                flushParagraph()
+                index += 1
+                continue
+            }
+
+            if trimmed.hasPrefix("```") {
+                flushParagraph()
+                let fenceInfo = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                let language = fenceInfo.isEmpty ? nil : fenceInfo
+                var codeLines: [String] = []
+                index += 1
+                while index < lines.count {
+                    let codeLine = lines[index]
+                    if codeLine.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                        index += 1
+                        break
+                    }
+                    codeLines.append(codeLine)
+                    index += 1
+                }
+                blocks.append(.code(language: language, text: codeLines.joined(separator: "\n")))
+                continue
+            }
+
+            if let table = parseTable(at: index, in: lines) {
+                flushParagraph()
+                blocks.append(.table(rows: table.rows))
+                index = table.nextIndex
+                continue
+            }
+
+            if let heading = parseHeadingLine(trimmed) {
+                flushParagraph()
+                blocks.append(.heading(level: heading.level, text: heading.text))
+                index += 1
+                continue
+            }
+
+            if let bullet = parseBulletLine(line) {
+                flushParagraph()
+                blocks.append(.bullet(indent: bullet.indent, text: bullet.text))
+                index += 1
+                continue
+            }
+
+            if let numbered = parseNumberedLine(line) {
+                flushParagraph()
+                blocks.append(.numbered(indent: numbered.indent, marker: numbered.marker, text: numbered.text))
+                index += 1
+                continue
+            }
+
+            if trimmed.hasPrefix(">") {
+                flushParagraph()
+                var quoteLines: [String] = []
+                while index < lines.count {
+                    let quoteLine = lines[index].trimmingCharacters(in: .whitespaces)
+                    guard quoteLine.hasPrefix(">") else {
+                        break
+                    }
+                    quoteLines.append(String(quoteLine.dropFirst()).trimmingCharacters(in: .whitespaces))
+                    index += 1
+                }
+                blocks.append(.quote(quoteLines.joined(separator: "\n")))
+                continue
+            }
+
+            paragraphLines.append(line)
+            index += 1
+        }
+
+        flushParagraph()
+        return blocks
+    }
+
+    private static func normalizedLines(_ source: String) -> [String] {
+        source
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: "\n")
+    }
+
+    private static func parseHeadingLine(_ line: String) -> (level: Int, text: String)? {
+        var index = line.startIndex
+        var level = 0
+        while index < line.endIndex, line[index] == "#" {
+            level += 1
+            index = line.index(after: index)
+        }
+        guard level > 0,
+              level <= 6,
+              index < line.endIndex,
+              line[index].isWhitespace else {
+            return nil
+        }
+        let text = String(line[line.index(after: index)...])
+            .trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (level, text)
+    }
+
+    private static func parseBulletLine(_ line: String) -> (indent: Int, text: String)? {
+        let leadingWhitespace = line.prefix { character in
+            character == " " || character == "\t"
+        }.count
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        for marker in ["- ", "* ", "+ "] where trimmed.hasPrefix(marker) {
+            let text = String(trimmed.dropFirst(marker.count))
+                .trimmingCharacters(in: .whitespaces)
+            return text.isEmpty ? nil : (leadingWhitespace / 2, text)
+        }
+        return nil
+    }
+
+    private static func parseNumberedLine(_ line: String) -> (indent: Int, marker: String, text: String)? {
+        let leadingWhitespace = line.prefix { character in
+            character == " " || character == "\t"
+        }.count
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        var index = trimmed.startIndex
+        var digits = ""
+        while index < trimmed.endIndex, trimmed[index].isNumber {
+            digits.append(trimmed[index])
+            index = trimmed.index(after: index)
+        }
+        guard !digits.isEmpty,
+              index < trimmed.endIndex,
+              trimmed[index] == "." || trimmed[index] == ")" else {
+            return nil
+        }
+        let marker = "\(digits)\(trimmed[index])"
+        let afterMarker = trimmed.index(after: index)
+        guard afterMarker < trimmed.endIndex,
+              trimmed[afterMarker].isWhitespace else {
+            return nil
+        }
+        let textStart = trimmed.index(after: afterMarker)
+        let text = String(trimmed[textStart...]).trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : (leadingWhitespace / 2, marker, text)
+    }
+
+    private static func parseTable(
+        at index: Int,
+        in lines: [String]
+    ) -> (rows: [[String]], nextIndex: Int)? {
+        guard index + 1 < lines.count else {
+            return nil
+        }
+        let firstLine = lines[index].trimmingCharacters(in: .whitespaces)
+        guard isTableCandidate(firstLine),
+              isTableDivider(lines[index + 1]) else {
+            return nil
+        }
+
+        var rows = [parseTableRow(firstLine)]
+        var nextIndex = index + 2
+        while nextIndex < lines.count {
+            let line = lines[nextIndex].trimmingCharacters(in: .whitespaces)
+            guard isTableCandidate(line), !isTableDivider(line) else {
+                break
+            }
+            rows.append(parseTableRow(line))
+            nextIndex += 1
+        }
+
+        guard let columnCount = rows.map(\.count).max(), columnCount >= 2 else {
+            return nil
+        }
+        rows = rows.map { row in
+            row + Array(repeating: "", count: max(0, columnCount - row.count))
+        }
+        return (rows, nextIndex)
+    }
+
+    private static func isTableCandidate(_ line: String) -> Bool {
+        line.contains("|") && parseTableRow(line).count >= 2
+    }
+
+    private static func isTableDivider(_ line: String) -> Bool {
+        let cells = parseTableRow(line)
+        guard cells.count >= 2 else {
+            return false
+        }
+        return cells.allSatisfy { cell in
+            let compact = cell.replacingOccurrences(of: " ", with: "")
+            return compact.count >= 3 && compact.allSatisfy { character in
+                character == "-" || character == ":"
+            }
+        }
+    }
+
+    private static func parseTableRow(_ line: String) -> [String] {
+        var value = line.trimmingCharacters(in: .whitespaces)
+        if value.hasPrefix("|") {
+            value.removeFirst()
+        }
+        if value.hasSuffix("|") {
+            value.removeLast()
+        }
+        return value
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func inlineText(_ text: String) -> Text {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace
+        )
+        if let attributed = try? AttributedString(markdown: text, options: options) {
+            return Text(attributed)
+        }
+        return Text(text)
+    }
+
+    private struct MarkdownTablePreview: View {
+        var rows: [[String]]
+
+        private var columnCount: Int {
+            rows.map(\.count).max() ?? 0
+        }
+
+        var body: some View {
+            ScrollView(.horizontal) {
+                Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
+                    ForEach(rows.indices, id: \.self) { rowIndex in
+                        GridRow {
+                            ForEach(0..<columnCount, id: \.self) { columnIndex in
+                                let cell = columnIndex < rows[rowIndex].count ? rows[rowIndex][columnIndex] : ""
+                                MarkdownResultPreview.inlineText(cell.isEmpty ? " " : cell)
+                                    .font(.system(size: 12, weight: rowIndex == 0 ? .semibold : .regular))
+                                    .lineLimit(nil)
+                                    .frame(minWidth: 82, maxWidth: 180, alignment: .leading)
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 6)
+                                    .background(rowIndex == 0 ? Color.secondary.opacity(0.10) : Color.clear)
+                                    .overlay(
+                                        Rectangle()
+                                            .stroke(Color.secondary.opacity(0.16), lineWidth: 0.5)
+                                    )
+                            }
+                        }
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.18)))
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -944,6 +1629,7 @@ private struct CompactSwitch: View {
 
 final class CommandFriendlyTextView: NSTextView {
     var onSubmit: (() -> Void)?
+    var copyFallbackText: String?
 
     override func keyDown(with event: NSEvent) {
         if let onSubmit,
@@ -955,6 +1641,18 @@ final class CommandFriendlyTextView: NSTextView {
         }
 
         super.keyDown(with: event)
+    }
+
+    override func copy(_ sender: Any?) {
+        if let copyFallbackText,
+           !copyFallbackText.isEmpty,
+           !selectedRanges.contains(where: { $0.rangeValue.length > 0 }) {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(copyFallbackText, forType: .string)
+            return
+        }
+
+        super.copy(sender)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -982,6 +1680,38 @@ final class CommandFriendlyTextView: NSTextView {
             } else {
                 undoManager?.undo()
             }
+            return true
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
+    }
+}
+
+private final class CommandFriendlyTextScrollView: NSScrollView {
+    override var acceptsFirstResponder: Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if let textView = documentView as? NSTextView {
+            window?.makeFirstResponder(textView)
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command),
+              let characters = event.charactersIgnoringModifiers?.lowercased(),
+              let textView = documentView as? NSTextView else {
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch characters {
+        case "a":
+            textView.selectAll(nil)
+            return true
+        case "c":
+            textView.copy(nil)
             return true
         default:
             return super.performKeyEquivalent(with: event)
@@ -1295,9 +2025,48 @@ struct TaskOptionsView: View {
             }
             .pickerStyle(.menu)
             .disabled(appState.isRunning)
+        case .summarize:
+            Picker(L10n.text("Summary mode", language: language), selection: Binding(
+                get: { appState.preferences.defaultSummaryMode },
+                set: { newValue in
+                    appState.updatePreferences { $0.defaultSummaryMode = newValue }
+                }
+            )) {
+                ForEach(SummaryMode.allCases) { mode in
+                    Text(L10n.summaryModeName(mode, language: language)).tag(mode)
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(appState.isRunning)
+        case .explain:
+            Picker(L10n.text("Explanation mode", language: language), selection: Binding(
+                get: { appState.preferences.defaultExplanationMode },
+                set: { newValue in
+                    appState.updatePreferences { $0.defaultExplanationMode = newValue }
+                }
+            )) {
+                ForEach(ExplanationMode.allCases) { mode in
+                    Text(L10n.explanationModeName(mode, language: language)).tag(mode)
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(appState.isRunning)
+        case .extractTodos:
+            Picker(L10n.text("TODO mode", language: language), selection: Binding(
+                get: { appState.preferences.defaultTodoExtractionMode },
+                set: { newValue in
+                    appState.updatePreferences { $0.defaultTodoExtractionMode = newValue }
+                }
+            )) {
+                ForEach(TodoExtractionMode.allCases) { mode in
+                    Text(L10n.todoExtractionModeName(mode, language: language)).tag(mode)
+                }
+            }
+            .pickerStyle(.menu)
+            .disabled(appState.isRunning)
         case .webPageTranslate:
             EmptyView()
-        default:
+        case .ocr:
             EmptyView()
         }
     }
@@ -1310,6 +2079,7 @@ private enum SettingsTab: CaseIterable, Identifiable {
     case ocr
     case webPage
     case defaults
+    case prompts
     case about
 
     var id: Self { self }
@@ -1328,6 +2098,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return "safari"
         case .defaults:
             return "dial.low"
+        case .prompts:
+            return "text.quote"
         case .about:
             return "info.circle"
         }
@@ -1347,6 +2119,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Web Page Translation", language: language)
         case .defaults:
             return L10n.text("Defaults", language: language)
+        case .prompts:
+            return L10n.text("Prompts", language: language)
         case .about:
             return L10n.text("About", language: language)
         }
@@ -1358,17 +2132,38 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Webpage", language: language)
         case .ocr:
             return L10n.text("OCR", language: language)
+        case .prompts:
+            return L10n.text("Prompts", language: language)
         default:
             return title(language: language)
         }
     }
 }
 
-private enum ShortcutCaptureTarget: Identifiable {
+private enum ShortcutCaptureTarget: Identifiable, Hashable {
     case quickAction
     case quickActionWithoutSelection
+    case quickActionTextMode
+    case quickActionImageMode
+    case textTask(TaskKind)
+    case imageOCRMode(OCRMode)
 
-    var id: Self { self }
+    var id: String {
+        switch self {
+        case .quickAction:
+            return "quickAction"
+        case .quickActionWithoutSelection:
+            return "quickActionWithoutSelection"
+        case .quickActionTextMode:
+            return "quickActionTextMode"
+        case .quickActionImageMode:
+            return "quickActionImageMode"
+        case .textTask(let task):
+            return "textTask:\(task.rawValue)"
+        case .imageOCRMode(let mode):
+            return "imageOCRMode:\(mode.rawValue)"
+        }
+    }
 }
 
 private enum WebPageDomainRuleKind {
@@ -1487,6 +2282,8 @@ struct SettingsView: View {
             webPageTranslationPage
         case .defaults:
             defaultsSettingsPage
+        case .prompts:
+            promptSettingsPage
         case .about:
             aboutSettingsPage
         }
@@ -1568,13 +2365,56 @@ struct SettingsView: View {
                         shortcut: appState.preferences.quickActionWithoutSelectionShortcut,
                         target: .quickActionWithoutSelection
                     )
-                    if let shortcutRecorderMessage {
-                        Text(shortcutRecorderMessage)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: L10n.text("Quick Action mode shortcuts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    shortcutRecorderLine(
+                        title: L10n.text("Switch to text mode", language: language),
+                        shortcut: appState.preferences.quickActionPopupShortcuts.textMode,
+                        target: .quickActionTextMode
+                    )
+                    shortcutRecorderLine(
+                        title: L10n.text("Switch to image mode", language: language),
+                        shortcut: appState.preferences.quickActionPopupShortcuts.imageMode,
+                        target: .quickActionImageMode
+                    )
+                }
+            }
+
+            settingRow(title: L10n.text("Text action shortcuts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(TaskKind.interactiveCases) { task in
+                        if let shortcut = appState.preferences.quickActionPopupShortcuts.textTaskShortcut(for: task) {
+                            shortcutRecorderLine(
+                                title: task.title(language: language),
+                                shortcut: shortcut,
+                                target: .textTask(task)
+                            )
+                        }
                     }
                 }
+            }
+
+            settingRow(title: L10n.text("Image action shortcuts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(OCRMode.allCases) { mode in
+                        shortcutRecorderLine(
+                            title: L10n.ocrModeName(mode, language: language),
+                            shortcut: appState.preferences.quickActionPopupShortcuts.ocrModeShortcut(for: mode),
+                            target: .imageOCRMode(mode)
+                        )
+                    }
+                }
+            }
+
+            if let shortcutRecorderMessage {
+                Text(shortcutRecorderMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 108)
             }
         }
     }
@@ -2247,9 +3087,254 @@ struct SettingsView: View {
                 polishStylePicker
             }
 
+            settingRow(title: L10n.text("Summary", language: language)) {
+                summaryModeSettingsPicker
+            }
+
+            settingRow(title: L10n.text("Explanation", language: language)) {
+                explanationModeSettingsPicker
+            }
+
+            settingRow(title: L10n.text("TODOs", language: language)) {
+                todoExtractionModeSettingsPicker
+            }
+
             settingRow(title: L10n.text("History", language: language)) {
                 historyLimitControl
             }
+        }
+    }
+
+    private var promptSettingsPage: some View {
+        settingsForm(maxWidth: 640) {
+            settingRow(title: L10n.text("Text prompts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    promptVariablesLine(textPromptVariableText)
+                    ForEach(TaskKind.interactiveCases) { task in
+                        textPromptEditor(for: task)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("Image prompts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    promptVariablesLine(imagePromptVariableText)
+                    ocrSystemPromptEditor
+                    ForEach(OCRMode.allCases) { mode in
+                        ocrPromptEditor(for: mode)
+                    }
+                }
+            }
+        }
+    }
+
+    private func textPromptEditor(for task: TaskKind) -> some View {
+        let prompt = appState.preferences.promptTemplates.textPrompt(for: task)
+        let isCustom = prompt.hasCustomPrompt
+
+        return DisclosureGroup {
+            VStack(alignment: .leading, spacing: 10) {
+                promptTextEditor(
+                    title: L10n.text("System prompt", language: language),
+                    text: Binding(
+                        get: { appState.preferences.promptTemplates.textPrompt(for: task).systemPrompt },
+                        set: { newValue in
+                            appState.updatePreferences { $0.promptTemplates.setSystemPrompt(newValue, for: task) }
+                        }
+                    ),
+                    defaultText: PromptTemplates.defaultSystemPrompt(for: task),
+                    height: 86
+                )
+
+                promptTextEditor(
+                    title: L10n.text("User prompt", language: language),
+                    text: Binding(
+                        get: { appState.preferences.promptTemplates.textPrompt(for: task).userPrompt },
+                        set: { newValue in
+                            appState.updatePreferences { $0.promptTemplates.setUserPrompt(newValue, for: task) }
+                        }
+                    ),
+                    defaultText: defaultUserPromptPreview(for: task),
+                    height: 148
+                )
+            }
+            .padding(.top, 8)
+        } label: {
+            promptDisclosureLabel(
+                title: task.title(language: language),
+                systemImage: promptIcon(for: task),
+                isCustom: isCustom
+            )
+        }
+    }
+
+    private var ocrSystemPromptEditor: some View {
+        DisclosureGroup {
+            promptTextEditor(
+                title: L10n.text("System prompt", language: language),
+                text: Binding(
+                    get: { appState.preferences.promptTemplates.ocrSystemPrompt },
+                    set: { newValue in
+                        appState.updatePreferences { $0.promptTemplates.ocrSystemPrompt = newValue }
+                    }
+                ),
+                defaultText: PromptTemplates.defaultSystemPrompt(for: .ocr),
+                height: 86
+            )
+            .padding(.top, 8)
+        } label: {
+            promptDisclosureLabel(
+                title: L10n.text("Image recognition system", language: language),
+                systemImage: "text.viewfinder",
+                isCustom: appState.preferences.promptTemplates.hasCustomOCRSystemPrompt
+            )
+        }
+    }
+
+    private func ocrPromptEditor(for mode: OCRMode) -> some View {
+        DisclosureGroup {
+            promptTextEditor(
+                title: L10n.text("Mode prompt", language: language),
+                text: Binding(
+                    get: { appState.preferences.promptTemplates.ocrPrompt(for: mode) },
+                    set: { newValue in
+                        appState.updatePreferences { $0.promptTemplates.setOCRPrompt(newValue, for: mode) }
+                    }
+                ),
+                defaultText: PromptTemplates.defaultOCRPrompt(
+                    mode: mode,
+                    targetLanguage: appState.preferences.defaultTranslationTarget
+                ),
+                height: 148
+            )
+            .padding(.top, 8)
+        } label: {
+            promptDisclosureLabel(
+                title: L10n.ocrModeName(mode, language: language),
+                systemImage: ocrPromptIcon(for: mode),
+                isCustom: appState.preferences.promptTemplates.hasCustomOCRPrompt(for: mode)
+            )
+        }
+    }
+
+    private func promptTextEditor(
+        title: String,
+        text: Binding<String>,
+        defaultText: String,
+        height: CGFloat
+    ) -> some View {
+        let hasCustomValue = !text.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text(title)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button {
+                    text.wrappedValue = ""
+                } label: {
+                    Label(L10n.text("Use built-in default", language: language), systemImage: "arrow.counterclockwise")
+                }
+                .controlSize(.small)
+                .disabled(!hasCustomValue)
+            }
+
+            EditableTextView(text: text)
+                .frame(height: height)
+                .background(Color(NSColor.textBackgroundColor))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.18)))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text(L10n.text("Empty uses the built-in default.", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            DisclosureGroup(L10n.text("Built-in default", language: language)) {
+                ReadOnlyTextView(text: defaultText)
+                    .frame(height: min(max(height, 92), 170))
+                    .background(Color(NSColor.textBackgroundColor).opacity(0.72))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.14)))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .padding(.top, 5)
+            }
+            .font(.caption)
+        }
+    }
+
+    private func promptDisclosureLabel(title: String, systemImage: String, isCustom: Bool) -> some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline)
+            Spacer(minLength: 8)
+            if isCustom {
+                statusBadge(L10n.text("Custom", language: language), systemImage: "slider.horizontal.3")
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func promptVariablesLine(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var textPromptVariableText: String {
+        switch language {
+        case .chinese:
+            return "占位符：{input}、{targetLanguage}、{polishStyle}、{summaryMode}、{explanationMode}、{todoMode}、{retryInstruction}"
+        case .english:
+            return "Variables: {input}, {targetLanguage}, {polishStyle}, {summaryMode}, {explanationMode}, {todoMode}, {retryInstruction}"
+        }
+    }
+
+    private var imagePromptVariableText: String {
+        switch language {
+        case .chinese:
+            return "占位符：{targetLanguage}、{modeName}。图片本身会作为模型图片输入发送。"
+        case .english:
+            return "Variables: {targetLanguage}, {modeName}. The image is sent as the model image input."
+        }
+    }
+
+    private func defaultUserPromptPreview(for task: TaskKind) -> String {
+        PromptTemplates.defaultUserPrompt(
+            for: TaskRequest(task: task, inputText: "{input}"),
+            preferences: appState.preferences
+        )
+    }
+
+    private func promptIcon(for task: TaskKind) -> String {
+        switch task {
+        case .translate:
+            return "character.book.closed"
+        case .polish:
+            return "wand.and.stars"
+        case .summarize:
+            return "doc.text"
+        case .explain:
+            return "questionmark.circle"
+        case .extractTodos:
+            return "list.bullet.clipboard"
+        case .webPageTranslate:
+            return "safari"
+        case .ocr:
+            return "text.viewfinder"
+        }
+    }
+
+    private func ocrPromptIcon(for mode: OCRMode) -> String {
+        switch mode {
+        case .plainText:
+            return "text.viewfinder"
+        case .structured:
+            return "tablecells"
+        case .extractThenTranslate:
+            return "character.book.closed"
+        case .explainImage:
+            return "eye"
         }
     }
 
@@ -2392,6 +3477,54 @@ struct SettingsView: View {
         .frame(width: 150, alignment: .leading)
     }
 
+    private var summaryModeSettingsPicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultSummaryMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultSummaryMode = newValue }
+            }
+        )) {
+            ForEach(SummaryMode.allCases) { mode in
+                Text(L10n.summaryModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 170, alignment: .leading)
+    }
+
+    private var explanationModeSettingsPicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultExplanationMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultExplanationMode = newValue }
+            }
+        )) {
+            ForEach(ExplanationMode.allCases) { mode in
+                Text(L10n.explanationModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 170, alignment: .leading)
+    }
+
+    private var todoExtractionModeSettingsPicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultTodoExtractionMode },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultTodoExtractionMode = newValue }
+            }
+        )) {
+            ForEach(TodoExtractionMode.allCases) { mode in
+                Text(L10n.todoExtractionModeName(mode, language: language)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 170, alignment: .leading)
+    }
+
     private var historyLimitControl: some View {
         HStack(spacing: 10) {
             Text("\(appState.preferences.recentHistoryLimit)")
@@ -2487,7 +3620,7 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.2.0"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.3.0"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
     }
@@ -2531,7 +3664,7 @@ struct SettingsView: View {
                     .truncationMode(.tail)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             }
-            .frame(width: 82, height: 56)
+            .frame(width: 76, height: 56)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2863,6 +3996,14 @@ struct SettingsView: View {
                 preferences.quickActionShortcut = shortcut
             case .quickActionWithoutSelection:
                 preferences.quickActionWithoutSelectionShortcut = shortcut
+            case .quickActionTextMode:
+                preferences.quickActionPopupShortcuts.textMode = shortcut
+            case .quickActionImageMode:
+                preferences.quickActionPopupShortcuts.imageMode = shortcut
+            case .textTask(let task):
+                preferences.quickActionPopupShortcuts.setTextTaskShortcut(shortcut, for: task)
+            case .imageOCRMode(let mode):
+                preferences.quickActionPopupShortcuts.setOCRModeShortcut(shortcut, for: mode)
             }
         }
         shortcutRecorderMessage = nil
@@ -3017,20 +4158,56 @@ struct SettingsView: View {
     }
 
     private func isShortcutAlreadyAssigned(_ shortcut: KeyboardShortcutPreference, target: ShortcutCaptureTarget) -> Bool {
-        switch target {
-        case .quickAction:
-            return shortcut == appState.preferences.quickActionWithoutSelectionShortcut
-        case .quickActionWithoutSelection:
-            return shortcut == appState.preferences.quickActionShortcut
+        shortcutAssignments().contains { assignment in
+            assignment.target != target
+                && assignment.shortcut == shortcut
+                && !canShareShortcut(target, assignment.target)
+        }
+    }
+
+    private func shortcutAssignments() -> [(target: ShortcutCaptureTarget, shortcut: KeyboardShortcutPreference)] {
+        let popupShortcuts = appState.preferences.quickActionPopupShortcuts
+        var assignments: [(target: ShortcutCaptureTarget, shortcut: KeyboardShortcutPreference)] = [
+            (.quickAction, appState.preferences.quickActionShortcut),
+            (.quickActionWithoutSelection, appState.preferences.quickActionWithoutSelectionShortcut),
+            (.quickActionTextMode, popupShortcuts.textMode),
+            (.quickActionImageMode, popupShortcuts.imageMode)
+        ]
+        for task in TaskKind.interactiveCases {
+            if let shortcut = popupShortcuts.textTaskShortcut(for: task) {
+                assignments.append((.textTask(task), shortcut))
+            }
+        }
+        for mode in OCRMode.allCases {
+            assignments.append((.imageOCRMode(mode), popupShortcuts.ocrModeShortcut(for: mode)))
+        }
+        return assignments
+    }
+
+    private func canShareShortcut(_ lhs: ShortcutCaptureTarget, _ rhs: ShortcutCaptureTarget) -> Bool {
+        switch (lhs, rhs) {
+        case (.textTask, .imageOCRMode), (.imageOCRMode, .textTask):
+            return true
+        default:
+            return false
         }
     }
 
     private func defaultShortcut(for target: ShortcutCaptureTarget) -> KeyboardShortcutPreference {
+        let popupDefaults = QuickActionPopupShortcuts()
         switch target {
         case .quickAction:
             return .optionSpace
         case .quickActionWithoutSelection:
             return .optionShiftSpace
+        case .quickActionTextMode:
+            return popupDefaults.textMode
+        case .quickActionImageMode:
+            return popupDefaults.imageMode
+        case .textTask(let task):
+            return popupDefaults.textTaskShortcut(for: task) ?? .commandNumber(1)
+        case .imageOCRMode(let mode):
+            return popupDefaults.ocrModeShortcut(for: mode)
         }
     }
 
@@ -3185,7 +4362,7 @@ struct SettingsView: View {
                     ) {
                         appState.markModelTextOnly(id: model.id)
                     }
-                } else if model.isRemoteProvider {
+                } else {
                     iconToolButton(
                         systemImage: "photo.badge.plus",
                         help: L10n.text("Mark vision-capable", language: language),
@@ -3610,7 +4787,7 @@ private final class ShortcutCaptureNSView: NSView {
     }
 }
 
-private extension KeyboardShortcutPreference {
+extension KeyboardShortcutPreference {
     init?(event: NSEvent) {
         let keyCode = UInt32(event.keyCode)
         guard !Self.modifierKeyCodes.contains(keyCode) else {

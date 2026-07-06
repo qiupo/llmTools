@@ -57,6 +57,48 @@ public enum ModelDetection {
         throw ModelDetectionError.unsupported(url)
     }
 
+    public static func isLocalVisionModel(at url: URL) -> Bool {
+        guard let directory = localModelDirectory(for: url) else {
+            return false
+        }
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ), containsMLXFiles(in: contents) else {
+            return false
+        }
+        guard let config = jsonDictionary(at: directory.appendingPathComponent("config.json")) else {
+            return false
+        }
+
+        let hasVisionConfig = config["vision_config"] != nil
+            || config["image_token_id"] != nil
+            || config["vision_start_token_id"] != nil
+            || config["vision_end_token_id"] != nil
+        guard hasVisionConfig else {
+            return false
+        }
+
+        let processorFiles = [
+            "processor_config.json",
+            "preprocessor_config.json",
+            "video_preprocessor_config.json"
+        ]
+        let processorText = processorFiles
+            .compactMap { try? String(contentsOf: directory.appendingPathComponent($0), encoding: .utf8) }
+            .joined(separator: "\n")
+            .lowercased()
+        if processorText.contains("vlprocessor")
+            || processorText.contains("vision")
+            || processorText.contains("image_processor")
+            || processorText.contains("imageprocessor") {
+            return true
+        }
+
+        return false
+    }
+
     private static func containsMLXFiles(in contents: [URL]) -> Bool {
         let names = Set(contents.map { $0.lastPathComponent.lowercased() })
         let hasConfig = names.contains("config.json")
@@ -95,6 +137,23 @@ public enum ModelDetection {
 
     private static func isMMProjFile(_ url: URL) -> Bool {
         url.deletingPathExtension().lastPathComponent.lowercased().contains("mmproj")
+    }
+
+    private static func localModelDirectory(for url: URL) -> URL? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            return nil
+        }
+        return isDirectory.boolValue ? url : url.deletingLastPathComponent()
+    }
+
+    private static func jsonDictionary(at url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return nil
+        }
+        return dictionary
     }
 
     private static func containsBoundedToken(_ token: String, in text: String) -> Bool {

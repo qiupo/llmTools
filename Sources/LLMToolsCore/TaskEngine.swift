@@ -1,11 +1,16 @@
 import Foundation
 
 public actor TaskEngine {
+    private enum RunnerSlot: Hashable, Sendable {
+        case format(ModelFormat)
+        case mlxVision
+    }
+
     private let registryStore: RegistryStore
     private let historyStore: HistoryStore
     private var snapshot: RegistrySnapshot
     private var history: [HistoryItem]
-    private var runners: [ModelFormat: any ModelRunner]
+    private var runners: [RunnerSlot: any ModelRunner]
 
     public init(
         registryStore: RegistryStore = RegistryStore(),
@@ -16,7 +21,7 @@ public actor TaskEngine {
         self.historyStore = historyStore
         self.snapshot = .init()
         self.history = []
-        self.runners = runners
+        self.runners = Dictionary(uniqueKeysWithValues: runners.map { (.format($0.key), $0.value) })
     }
 
     public func bootstrap() async {
@@ -24,6 +29,10 @@ public actor TaskEngine {
             snapshot = try await registryStore.load()
         } catch {
             snapshot = .init()
+        }
+        if refreshDetectedLocalVisionCapabilities() {
+            sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+            try? await registryStore.save(snapshot)
         }
 
         do {
@@ -56,7 +65,12 @@ public actor TaskEngine {
             contextLength: inferredContext,
             enabled: true,
             validationState: .valid,
-            lastErrorMessage: nil
+            lastErrorMessage: nil,
+            capabilities: inferredCapabilities(
+                format: detection.format,
+                resolvedPath: detection.resolvedPath,
+                providerConfiguration: nil
+            )
         )
         snapshot.models.append(descriptor)
         if snapshot.preferences.defaultModelID == nil {
@@ -294,8 +308,9 @@ public actor TaskEngine {
         let model = snapshot.models[index]
         return try await updateModelCapabilities(
             id: id,
-            capabilities: ModelCapabilities.inferred(
+            capabilities: inferredCapabilities(
                 format: model.format,
+                resolvedPath: model.resolvedPath ?? model.sourcePath,
                 providerConfiguration: model.providerConfiguration
             )
         )
@@ -309,7 +324,7 @@ public actor TaskEngine {
         guard model.enabled else {
             throw RunnerError.unsupportedConfiguration("Model is disabled.")
         }
-        let runner = try runner(for: model)
+        let runner = try runner(for: model, requiringVision: true)
         guard let visionRunner = runner as? any VisionModelRunner else {
             let message = "\(model.name) does not support the Phase 3 OpenAI-compatible vision payload."
             snapshot.models[index].capabilities = ModelCapabilities(
@@ -374,7 +389,7 @@ public actor TaskEngine {
     }
 
     public func setRunner(_ runner: any ModelRunner, for format: ModelFormat) {
-        runners[format] = runner
+        runners[.format(format)] = runner
     }
 
     public func warmUpModel(id: UUID) async throws {
@@ -416,7 +431,7 @@ public actor TaskEngine {
         guard model.capabilities.supportsImage else {
             throw OCRTaskError.modelNotVisionCapable(model.name)
         }
-        let runner = try runner(for: model)
+        let runner = try runner(for: model, requiringVision: true)
         guard let visionRunner = runner as? any VisionModelRunner else {
             throw OCRTaskError.unsupportedVisionRunner(model.name)
         }
@@ -427,7 +442,8 @@ public actor TaskEngine {
 
         let prompt = PromptTemplates.ocrPrompt(
             mode: mode,
-            targetLanguage: snapshot.preferences.defaultTranslationTarget
+            targetLanguage: snapshot.preferences.defaultTranslationTarget,
+            preferences: snapshot.preferences
         )
         let ocrResult = try await visionRunner.generateOCR(
             request: OCRTaskRequest(image: image, mode: mode, prompt: prompt),
@@ -899,30 +915,89 @@ public actor TaskEngine {
         )
     }
 
-    private func runner(for model: ModelDescriptor) throws -> any ModelRunner {
-        if let runner = runners[model.format] {
+    private func runner(for model: ModelDescriptor, requiringVision: Bool = false) throws -> any ModelRunner {
+        let slot = runnerSlot(for: model, requiringVision: requiringVision)
+        if let runner = runners[slot] {
             return runner
         }
-        switch model.format {
-        case .gguf:
-            let runner = GGUFRunner()
-            runners[.gguf] = runner
+        switch slot {
+        case .mlxVision:
+            let runner = MLXVLMRunner()
+            runners[slot] = runner
             return runner
-        case .mlx:
-            let runner = MLXRunner()
-            runners[.mlx] = runner
-            return runner
-        case .openAICompatible:
-            let runner = OpenAICompatibleRunner()
-            runners[.openAICompatible] = runner
-            return runner
-        case .anthropicMessages:
-            let runner = AnthropicMessagesRunner()
-            runners[.anthropicMessages] = runner
-            return runner
-        case .unknown:
-            throw RunnerError.unsupportedFormat(model.format)
+        case .format(let format):
+            switch format {
+            case .gguf:
+                let runner = GGUFRunner()
+                runners[slot] = runner
+                return runner
+            case .mlx:
+                let runner = MLXRunner()
+                runners[slot] = runner
+                return runner
+            case .openAICompatible:
+                let runner = OpenAICompatibleRunner()
+                runners[slot] = runner
+                return runner
+            case .anthropicMessages:
+                let runner = AnthropicMessagesRunner()
+                runners[slot] = runner
+                return runner
+            case .unknown:
+                throw RunnerError.unsupportedFormat(format)
+            }
         }
+    }
+
+    private func runnerSlot(for model: ModelDescriptor, requiringVision: Bool) -> RunnerSlot {
+        if model.format == .mlx,
+           (ModelDetection.isLocalVisionModel(at: model.resolvedPath ?? model.sourcePath)
+               || (requiringVision && model.capabilities.supportsImage)) {
+            return .mlxVision
+        }
+        return .format(model.format)
+    }
+
+    private func inferredCapabilities(
+        format: ModelFormat,
+        resolvedPath: URL?,
+        providerConfiguration: ProviderConfiguration?
+    ) -> ModelCapabilities {
+        if format == .mlx,
+           let resolvedPath,
+           ModelDetection.isLocalVisionModel(at: resolvedPath) {
+            return ModelCapabilities.vision(
+                source: .detected,
+                confidence: 0.9,
+                note: "Detected local MLX vision-language model metadata."
+            )
+        }
+        return ModelCapabilities.inferred(
+            format: format,
+            providerConfiguration: providerConfiguration
+        )
+    }
+
+    private func refreshDetectedLocalVisionCapabilities() -> Bool {
+        var changed = false
+        for index in snapshot.models.indices {
+            let model = snapshot.models[index]
+            guard model.format == .mlx,
+                  model.capabilities.source != .manual,
+                  ModelDetection.isLocalVisionModel(at: model.resolvedPath ?? model.sourcePath) else {
+                continue
+            }
+            let capabilities = ModelCapabilities.vision(
+                source: .detected,
+                confidence: 0.9,
+                note: "Detected local MLX vision-language model metadata."
+            )
+            if model.capabilities != capabilities {
+                snapshot.models[index].capabilities = capabilities
+                changed = true
+            }
+        }
+        return changed
     }
 
     @discardableResult

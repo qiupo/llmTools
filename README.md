@@ -201,11 +201,11 @@ GitHub Actions release packaging lives in `.github/workflows/release.yml`.
 Trigger a release by pushing a version tag:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```
 
-The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.2.0`.
+The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.3.0`.
 
 The workflow:
 

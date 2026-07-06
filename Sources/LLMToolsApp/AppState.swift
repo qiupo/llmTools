@@ -2,6 +2,7 @@ import AppKit
 import Foundation
 import ServiceManagement
 import SwiftUI
+import UniformTypeIdentifiers
 import LLMToolsCore
 
 @MainActor
@@ -19,10 +20,23 @@ final class AppState: ObservableObject {
         case image
     }
 
+    private struct QuickActionOutputState {
+        var outputText: String = ""
+        var rawOutputText: String = ""
+        var showsRawOutput: Bool = false
+    }
+
     @Published var models: [ModelDescriptor] = []
     @Published var preferences = AppPreferences()
     @Published var history: [HistoryItem] = []
-    @Published var quickActionMode: QuickActionMode = .text
+    @Published var quickActionMode: QuickActionMode = .text {
+        didSet {
+            guard oldValue != quickActionMode else {
+                return
+            }
+            switchQuickActionOutputState(from: oldValue, to: quickActionMode)
+        }
+    }
     @Published var selectedTask: TaskKind = .translate
     @Published var inputText: String = ""
     @Published var inputOrigin: InputOrigin = .manual
@@ -47,6 +61,8 @@ final class AppState: ObservableObject {
     private var runRevision = 0
     private var activeExternalModelUseCount = 0
     private var scheduledModelUnloadTask: Task<Void, Never>?
+    private var textOutputState = QuickActionOutputState()
+    private var imageOutputState = QuickActionOutputState()
 
     init(engine: TaskEngine = TaskEngine()) {
         self.engine = engine
@@ -332,8 +348,7 @@ final class AppState: ObservableObject {
                 at: url,
                 preferences: preferences.ocr
             )
-            setOCRImage(image)
-            statusMessage = "\(t("Loaded")) \(url.lastPathComponent)"
+            finishLoadingOCRImage(image, statusMessage: "\(t("Loaded")) \(url.lastPathComponent)")
         } catch {
             validationError = error.localizedDescription
             statusMessage = t("Failed to load image")
@@ -348,8 +363,7 @@ final class AppState: ObservableObject {
                 fileName: fileName,
                 sourceDescription: sourceDescription
             )
-            setOCRImage(image)
-            statusMessage = t("Loaded image")
+            finishLoadingOCRImage(image, statusMessage: t("Loaded image"))
         } catch {
             validationError = error.localizedDescription
             statusMessage = t("Failed to load image")
@@ -366,12 +380,31 @@ final class AppState: ObservableObject {
             loadOCRImageData(data, fileName: "clipboard.tiff", sourceDescription: "Clipboard image")
             return
         }
+        if let image = NSImage(pasteboard: pasteboard),
+           let data = image.tiffRepresentation {
+            loadOCRImageData(data, fileName: "clipboard.tiff", sourceDescription: "Clipboard image")
+            return
+        }
         if let url = NSURL(from: pasteboard) as URL? {
             loadOCRImageFile(from: url)
             return
         }
         validationError = t("Clipboard does not contain an image.")
         statusMessage = t("Failed to load image")
+    }
+
+    func canLoadOCRImageFromPasteboard(_ pasteboard: NSPasteboard = .general) -> Bool {
+        if pasteboard.data(forType: .png) != nil || pasteboard.data(forType: .tiff) != nil {
+            return true
+        }
+        if NSImage(pasteboard: pasteboard) != nil {
+            return true
+        }
+        guard let url = NSURL(from: pasteboard) as URL?,
+              let type = UTType(filenameExtension: url.pathExtension) else {
+            return false
+        }
+        return type.conforms(to: .image)
     }
 
     func loadOCRImageFromRemoteURL(_ value: String) {
@@ -389,9 +422,8 @@ final class AppState: ObservableObject {
                     preferences: preferences.ocr
                 )
                 await MainActor.run {
-                    setOCRImage(image)
                     isPreparingOCRImage = false
-                    statusMessage = t("Loaded image")
+                    finishLoadingOCRImage(image, statusMessage: t("Loaded image"))
                 }
             } catch {
                 await MainActor.run {
@@ -500,6 +532,7 @@ final class AppState: ObservableObject {
     }
 
     func prepareAutomaticSelectionText(_ text: String) -> Bool {
+        quickActionMode = .text
         let characterCount = text.count
         let limit = automaticSelectionCharacterLimit
         guard characterCount <= limit else {
@@ -586,7 +619,10 @@ final class AppState: ObservableObject {
             task: selectedTask,
             inputText: text,
             targetLanguage: preferences.defaultTranslationTarget,
-            polishStyle: preferences.defaultPolishStyle
+            polishStyle: preferences.defaultPolishStyle,
+            summaryMode: preferences.defaultSummaryMode,
+            explanationMode: preferences.defaultExplanationMode,
+            todoExtractionMode: preferences.defaultTodoExtractionMode
         )
         let modelID = selectedModelID
         isRunning = true
@@ -651,11 +687,13 @@ final class AppState: ObservableObject {
             return
         }
         guard preferences.ocr.enabled else {
-            validationError = OCRTaskError.disabled.localizedDescription
+            validationError = t("OCR/image recognition is disabled.")
+            statusMessage = t("Failed")
             return
         }
-        guard preferences.ocr.modelID != nil else {
-            validationError = OCRTaskError.missingVisionModel.localizedDescription
+        guard let modelID = selectedOCRModel?.id else {
+            validationError = t("Choose a vision-capable OCR model in Settings.")
+            statusMessage = t("Failed")
             return
         }
 
@@ -664,7 +702,6 @@ final class AppState: ObservableObject {
         runRevision += 1
         let revision = runRevision
         let mode = ocrMode
-        let modelID = preferences.ocr.modelID
         isRunning = true
         validationError = nil
         outputText = ""
@@ -846,6 +883,38 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func switchQuickActionOutputState(from previousMode: QuickActionMode, to nextMode: QuickActionMode) {
+        storeCurrentOutputState(for: previousMode)
+        restoreOutputState(for: nextMode)
+    }
+
+    private func storeCurrentOutputState(for mode: QuickActionMode) {
+        let state = QuickActionOutputState(
+            outputText: outputText,
+            rawOutputText: rawOutputText,
+            showsRawOutput: showsRawOutput
+        )
+        switch mode {
+        case .text:
+            textOutputState = state
+        case .image:
+            imageOutputState = state
+        }
+    }
+
+    private func restoreOutputState(for mode: QuickActionMode) {
+        let state: QuickActionOutputState
+        switch mode {
+        case .text:
+            state = textOutputState
+        case .image:
+            state = imageOutputState
+        }
+        outputText = state.outputText
+        rawOutputText = state.rawOutputText
+        showsRawOutput = state.showsRawOutput
+    }
+
     private func setOCRImage(_ image: OCRImageInput) {
         quickActionMode = .image
         ocrImageInput = image
@@ -857,6 +926,22 @@ final class AppState: ObservableObject {
         if preferences.ocr.useModelRecognitionByDefault {
             ocrMode = preferences.ocr.defaultMode
         }
+    }
+
+    private func finishLoadingOCRImage(_ image: OCRImageInput, statusMessage loadedStatusMessage: String) {
+        setOCRImage(image)
+        statusMessage = loadedStatusMessage
+        runCurrentOCRIfDefaultRecognitionIsEnabled()
+    }
+
+    private func runCurrentOCRIfDefaultRecognitionIsEnabled() {
+        guard preferences.ocr.useModelRecognitionByDefault else {
+            return
+        }
+        guard !isRunning, !isPreparingOCRImage else {
+            return
+        }
+        runCurrentOCR()
     }
 
     private var selectedModelContextLength: Int? {

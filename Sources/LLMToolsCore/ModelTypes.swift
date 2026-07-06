@@ -334,6 +334,244 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
     }
 }
 
+public struct PromptTemplatePair: Codable, Hashable, Sendable {
+    public var systemPrompt: String
+    public var userPrompt: String
+
+    public init(systemPrompt: String = "", userPrompt: String = "") {
+        self.systemPrompt = systemPrompt
+        self.userPrompt = userPrompt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case systemPrompt
+        case userPrompt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        systemPrompt = try container.decodeIfPresent(String.self, forKey: .systemPrompt) ?? ""
+        userPrompt = try container.decodeIfPresent(String.self, forKey: .userPrompt) ?? ""
+    }
+
+    public var hasCustomSystemPrompt: Bool {
+        !systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var hasCustomUserPrompt: Bool {
+        !userPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public var hasCustomPrompt: Bool {
+        hasCustomSystemPrompt || hasCustomUserPrompt
+    }
+}
+
+public struct PromptTemplatePreferences: Codable, Hashable, Sendable {
+    public var translate: PromptTemplatePair
+    public var polish: PromptTemplatePair
+    public var summarize: PromptTemplatePair
+    public var explain: PromptTemplatePair
+    public var extractTodos: PromptTemplatePair
+    public var ocrSystemPrompt: String
+    public var ocrPlainTextPrompt: String
+    public var ocrStructuredPrompt: String
+    public var ocrExtractThenTranslatePrompt: String
+    public var ocrExplainImagePrompt: String
+
+    public init(
+        translate: PromptTemplatePair = PromptTemplatePair(),
+        polish: PromptTemplatePair = PromptTemplatePair(),
+        summarize: PromptTemplatePair = PromptTemplatePair(),
+        explain: PromptTemplatePair = PromptTemplatePair(),
+        extractTodos: PromptTemplatePair = PromptTemplatePair(),
+        ocrSystemPrompt: String = "",
+        ocrPlainTextPrompt: String = "",
+        ocrStructuredPrompt: String = "",
+        ocrExtractThenTranslatePrompt: String = "",
+        ocrExplainImagePrompt: String = ""
+    ) {
+        self.translate = translate
+        self.polish = polish
+        self.summarize = summarize
+        self.explain = explain
+        self.extractTodos = extractTodos
+        self.ocrSystemPrompt = ocrSystemPrompt
+        self.ocrPlainTextPrompt = ocrPlainTextPrompt
+        self.ocrStructuredPrompt = ocrStructuredPrompt
+        self.ocrExtractThenTranslatePrompt = ocrExtractThenTranslatePrompt
+        self.ocrExplainImagePrompt = ocrExplainImagePrompt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case translate
+        case polish
+        case summarize
+        case explain
+        case extractTodos
+        case ocrSystemPrompt
+        case ocrPlainTextPrompt
+        case ocrStructuredPrompt
+        case ocrExtractThenTranslatePrompt
+        case ocrExplainImagePrompt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = PromptTemplatePreferences()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        translate = try container.decodeIfPresent(PromptTemplatePair.self, forKey: .translate) ?? defaults.translate
+        polish = try container.decodeIfPresent(PromptTemplatePair.self, forKey: .polish) ?? defaults.polish
+        summarize = try container.decodeIfPresent(PromptTemplatePair.self, forKey: .summarize) ?? defaults.summarize
+        explain = try container.decodeIfPresent(PromptTemplatePair.self, forKey: .explain) ?? defaults.explain
+        extractTodos = try container.decodeIfPresent(PromptTemplatePair.self, forKey: .extractTodos) ?? defaults.extractTodos
+        ocrSystemPrompt = try container.decodeIfPresent(String.self, forKey: .ocrSystemPrompt) ?? defaults.ocrSystemPrompt
+        ocrPlainTextPrompt = try container.decodeIfPresent(String.self, forKey: .ocrPlainTextPrompt) ?? defaults.ocrPlainTextPrompt
+        ocrStructuredPrompt = try container.decodeIfPresent(String.self, forKey: .ocrStructuredPrompt) ?? defaults.ocrStructuredPrompt
+        ocrExtractThenTranslatePrompt = try container.decodeIfPresent(String.self, forKey: .ocrExtractThenTranslatePrompt) ?? defaults.ocrExtractThenTranslatePrompt
+        ocrExplainImagePrompt = try container.decodeIfPresent(String.self, forKey: .ocrExplainImagePrompt) ?? defaults.ocrExplainImagePrompt
+    }
+
+    public func textPrompt(for task: TaskKind) -> PromptTemplatePair {
+        switch task {
+        case .translate:
+            return translate
+        case .polish:
+            return polish
+        case .summarize:
+            return summarize
+        case .explain:
+            return explain
+        case .extractTodos:
+            return extractTodos
+        case .webPageTranslate, .ocr:
+            return PromptTemplatePair()
+        }
+    }
+
+    public mutating func setTextPrompt(_ prompt: PromptTemplatePair, for task: TaskKind) {
+        switch task {
+        case .translate:
+            translate = prompt
+        case .polish:
+            polish = prompt
+        case .summarize:
+            summarize = prompt
+        case .explain:
+            explain = prompt
+        case .extractTodos:
+            extractTodos = prompt
+        case .webPageTranslate, .ocr:
+            break
+        }
+    }
+
+    public mutating func setSystemPrompt(_ value: String, for task: TaskKind) {
+        var prompt = textPrompt(for: task)
+        prompt.systemPrompt = value
+        setTextPrompt(prompt, for: task)
+    }
+
+    public mutating func setUserPrompt(_ value: String, for task: TaskKind) {
+        var prompt = textPrompt(for: task)
+        prompt.userPrompt = value
+        setTextPrompt(prompt, for: task)
+    }
+
+    public func ocrPrompt(for mode: OCRMode) -> String {
+        switch mode {
+        case .plainText:
+            return ocrPlainTextPrompt
+        case .structured:
+            return ocrStructuredPrompt
+        case .extractThenTranslate:
+            return ocrExtractThenTranslatePrompt
+        case .explainImage:
+            return ocrExplainImagePrompt
+        }
+    }
+
+    public mutating func setOCRPrompt(_ value: String, for mode: OCRMode) {
+        switch mode {
+        case .plainText:
+            ocrPlainTextPrompt = value
+        case .structured:
+            ocrStructuredPrompt = value
+        case .extractThenTranslate:
+            ocrExtractThenTranslatePrompt = value
+        case .explainImage:
+            ocrExplainImagePrompt = value
+        }
+    }
+
+    public var hasCustomOCRSystemPrompt: Bool {
+        !ocrSystemPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    public func hasCustomOCRPrompt(for mode: OCRMode) -> Bool {
+        !ocrPrompt(for: mode).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+public enum SummaryMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
+    case keyPoints
+    case oneSentence
+    case detailed
+    case meetingNotes
+    case structured
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .keyPoints: return "Key points"
+        case .oneSentence: return "One sentence"
+        case .detailed: return "Detailed summary"
+        case .meetingNotes: return "Meeting notes"
+        case .structured: return "Structured summary"
+        }
+    }
+}
+
+public enum ExplanationMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
+    case plain
+    case technical
+    case errorDiagnosis
+    case code
+    case background
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .plain: return "Plain explanation"
+        case .technical: return "Technical explanation"
+        case .errorDiagnosis: return "Error diagnosis"
+        case .code: return "Code explanation"
+        case .background: return "Background"
+        }
+    }
+}
+
+public enum TodoExtractionMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
+    case actionItems
+    case byOwner
+    case byPriority
+    case byDeadline
+    case table
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .actionItems: return "Action items"
+        case .byOwner: return "By owner"
+        case .byPriority: return "By priority"
+        case .byDeadline: return "By deadline"
+        case .table: return "Task table"
+        }
+    }
+}
+
 public enum AppLanguage: String, Codable, Sendable, CaseIterable, Identifiable {
     case chinese = "zh-Hans"
     case english = "en"
@@ -367,6 +605,37 @@ public struct KeyboardShortcutPreference: Codable, Sendable, Hashable {
         modifiers: KeyboardShortcutPreference.optionModifier | KeyboardShortcutPreference.shiftModifier
     )
 
+    public static func commandNumber(_ number: Int) -> KeyboardShortcutPreference {
+        KeyboardShortcutPreference(
+            keyCode: ansiNumberKeyCode(number),
+            modifiers: commandModifier
+        )
+    }
+
+    public static func commandControlNumber(_ number: Int) -> KeyboardShortcutPreference {
+        KeyboardShortcutPreference(
+            keyCode: ansiNumberKeyCode(number),
+            modifiers: commandModifier | controlModifier
+        )
+    }
+
+    private static func ansiNumberKeyCode(_ number: Int) -> UInt32 {
+        switch number {
+        case 0: return 29
+        case 1: return 18
+        case 2: return 19
+        case 3: return 20
+        case 4: return 21
+        case 5: return 23
+        case 6: return 22
+        case 7: return 26
+        case 8: return 28
+        case 9: return 25
+        default:
+            preconditionFailure("Unsupported ANSI number shortcut: \(number)")
+        }
+    }
+
     public static let commandModifier: UInt32 = 1 << 8
     public static let shiftModifier: UInt32 = 1 << 9
     public static let optionModifier: UInt32 = 1 << 11
@@ -389,6 +658,144 @@ public struct SelectionLineLimitRule: Codable, Identifiable, Sendable, Hashable 
     }
 }
 
+public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
+    public var textMode: KeyboardShortcutPreference
+    public var imageMode: KeyboardShortcutPreference
+    public var translate: KeyboardShortcutPreference
+    public var polish: KeyboardShortcutPreference
+    public var summarize: KeyboardShortcutPreference
+    public var explain: KeyboardShortcutPreference
+    public var extractTodos: KeyboardShortcutPreference
+    public var ocrPlainText: KeyboardShortcutPreference
+    public var ocrStructured: KeyboardShortcutPreference
+    public var ocrExtractThenTranslate: KeyboardShortcutPreference
+    public var ocrExplainImage: KeyboardShortcutPreference
+
+    public init(
+        textMode: KeyboardShortcutPreference = .commandControlNumber(1),
+        imageMode: KeyboardShortcutPreference = .commandControlNumber(2),
+        translate: KeyboardShortcutPreference = .commandNumber(1),
+        polish: KeyboardShortcutPreference = .commandNumber(2),
+        summarize: KeyboardShortcutPreference = .commandNumber(3),
+        explain: KeyboardShortcutPreference = .commandNumber(4),
+        extractTodos: KeyboardShortcutPreference = .commandNumber(5),
+        ocrPlainText: KeyboardShortcutPreference = .commandNumber(1),
+        ocrStructured: KeyboardShortcutPreference = .commandNumber(2),
+        ocrExtractThenTranslate: KeyboardShortcutPreference = .commandNumber(3),
+        ocrExplainImage: KeyboardShortcutPreference = .commandNumber(4)
+    ) {
+        self.textMode = textMode
+        self.imageMode = imageMode
+        self.translate = translate
+        self.polish = polish
+        self.summarize = summarize
+        self.explain = explain
+        self.extractTodos = extractTodos
+        self.ocrPlainText = ocrPlainText
+        self.ocrStructured = ocrStructured
+        self.ocrExtractThenTranslate = ocrExtractThenTranslate
+        self.ocrExplainImage = ocrExplainImage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case textMode
+        case imageMode
+        case translate
+        case polish
+        case summarize
+        case explain
+        case extractTodos
+        case ocrPlainText
+        case ocrStructured
+        case ocrExtractThenTranslate
+        case ocrExplainImage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = QuickActionPopupShortcuts()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        textMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .textMode) ?? defaults.textMode
+        imageMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .imageMode) ?? defaults.imageMode
+        translate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .translate) ?? defaults.translate
+        polish = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .polish) ?? defaults.polish
+        summarize = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .summarize) ?? defaults.summarize
+        explain = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .explain) ?? defaults.explain
+        extractTodos = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .extractTodos) ?? defaults.extractTodos
+        ocrPlainText = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrPlainText) ?? defaults.ocrPlainText
+        ocrStructured = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrStructured) ?? defaults.ocrStructured
+        ocrExtractThenTranslate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrExtractThenTranslate) ?? defaults.ocrExtractThenTranslate
+        ocrExplainImage = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrExplainImage) ?? defaults.ocrExplainImage
+    }
+
+    public func textTaskShortcut(for task: TaskKind) -> KeyboardShortcutPreference? {
+        switch task {
+        case .translate:
+            return translate
+        case .polish:
+            return polish
+        case .summarize:
+            return summarize
+        case .explain:
+            return explain
+        case .extractTodos:
+            return extractTodos
+        case .webPageTranslate, .ocr:
+            return nil
+        }
+    }
+
+    public mutating func setTextTaskShortcut(_ shortcut: KeyboardShortcutPreference, for task: TaskKind) {
+        switch task {
+        case .translate:
+            translate = shortcut
+        case .polish:
+            polish = shortcut
+        case .summarize:
+            summarize = shortcut
+        case .explain:
+            explain = shortcut
+        case .extractTodos:
+            extractTodos = shortcut
+        case .webPageTranslate, .ocr:
+            break
+        }
+    }
+
+    public func textTask(matching shortcut: KeyboardShortcutPreference) -> TaskKind? {
+        TaskKind.interactiveCases.first { textTaskShortcut(for: $0) == shortcut }
+    }
+
+    public func ocrModeShortcut(for mode: OCRMode) -> KeyboardShortcutPreference {
+        switch mode {
+        case .plainText:
+            return ocrPlainText
+        case .structured:
+            return ocrStructured
+        case .extractThenTranslate:
+            return ocrExtractThenTranslate
+        case .explainImage:
+            return ocrExplainImage
+        }
+    }
+
+    public mutating func setOCRModeShortcut(_ shortcut: KeyboardShortcutPreference, for mode: OCRMode) {
+        switch mode {
+        case .plainText:
+            ocrPlainText = shortcut
+        case .structured:
+            ocrStructured = shortcut
+        case .extractThenTranslate:
+            ocrExtractThenTranslate = shortcut
+        case .explainImage:
+            ocrExplainImage = shortcut
+        }
+    }
+
+    public func ocrMode(matching shortcut: KeyboardShortcutPreference) -> OCRMode? {
+        OCRMode.allCases.first { ocrModeShortcut(for: $0) == shortcut }
+    }
+}
+
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
     public var autoCollapseWidget: Bool
@@ -403,11 +810,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var appLanguage: AppLanguage
     public var defaultTranslationTarget: String
     public var defaultPolishStyle: String
+    public var defaultSummaryMode: SummaryMode
+    public var defaultExplanationMode: ExplanationMode
+    public var defaultTodoExtractionMode: TodoExtractionMode
     public var recentHistoryLimit: Int
     public var webPageTranslation: WebPageTranslationPreferences
     public var ocr: OCRPreferences
+    public var promptTemplates: PromptTemplatePreferences
     public var quickActionShortcut: KeyboardShortcutPreference
     public var quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
+    public var quickActionPopupShortcuts: QuickActionPopupShortcuts
 
     public init(
         defaultModelID: UUID? = nil,
@@ -425,11 +837,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
         defaultPolishStyle: String = "natural",
+        defaultSummaryMode: SummaryMode = .keyPoints,
+        defaultExplanationMode: ExplanationMode = .plain,
+        defaultTodoExtractionMode: TodoExtractionMode = .actionItems,
         recentHistoryLimit: Int = 20,
         webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
         ocr: OCRPreferences = OCRPreferences(),
+        promptTemplates: PromptTemplatePreferences = PromptTemplatePreferences(),
         quickActionShortcut: KeyboardShortcutPreference = .optionSpace,
-        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace
+        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace,
+        quickActionPopupShortcuts: QuickActionPopupShortcuts = QuickActionPopupShortcuts()
     ) {
         self.defaultModelID = defaultModelID
         self.autoCollapseWidget = autoCollapseWidget
@@ -444,11 +861,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.appLanguage = appLanguage
         self.defaultTranslationTarget = defaultTranslationTarget
         self.defaultPolishStyle = defaultPolishStyle
+        self.defaultSummaryMode = defaultSummaryMode
+        self.defaultExplanationMode = defaultExplanationMode
+        self.defaultTodoExtractionMode = defaultTodoExtractionMode
         self.recentHistoryLimit = recentHistoryLimit
         self.webPageTranslation = webPageTranslation
         self.ocr = ocr
+        self.promptTemplates = promptTemplates
         self.quickActionShortcut = quickActionShortcut
         self.quickActionWithoutSelectionShortcut = quickActionWithoutSelectionShortcut
+        self.quickActionPopupShortcuts = quickActionPopupShortcuts
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -466,11 +888,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case appLanguage
         case defaultTranslationTarget
         case defaultPolishStyle
+        case defaultSummaryMode
+        case defaultExplanationMode
+        case defaultTodoExtractionMode
         case recentHistoryLimit
         case webPageTranslation
         case ocr
+        case promptTemplates
         case quickActionShortcut
         case quickActionWithoutSelectionShortcut
+        case quickActionPopupShortcuts
     }
 
     public init(from decoder: Decoder) throws {
@@ -501,11 +928,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
+        defaultSummaryMode = (try? container.decodeIfPresent(SummaryMode.self, forKey: .defaultSummaryMode)) ?? .keyPoints
+        defaultExplanationMode = (try? container.decodeIfPresent(ExplanationMode.self, forKey: .defaultExplanationMode)) ?? .plain
+        defaultTodoExtractionMode = (try? container.decodeIfPresent(TodoExtractionMode.self, forKey: .defaultTodoExtractionMode)) ?? .actionItems
         recentHistoryLimit = try container.decodeIfPresent(Int.self, forKey: .recentHistoryLimit) ?? 20
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
         ocr = try container.decodeIfPresent(OCRPreferences.self, forKey: .ocr) ?? OCRPreferences()
+        promptTemplates = try container.decodeIfPresent(PromptTemplatePreferences.self, forKey: .promptTemplates) ?? PromptTemplatePreferences()
         quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
         quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
+        quickActionPopupShortcuts = try container.decodeIfPresent(QuickActionPopupShortcuts.self, forKey: .quickActionPopupShortcuts) ?? QuickActionPopupShortcuts()
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -523,11 +955,16 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(appLanguage, forKey: .appLanguage)
         try container.encode(defaultTranslationTarget, forKey: .defaultTranslationTarget)
         try container.encode(defaultPolishStyle, forKey: .defaultPolishStyle)
+        try container.encode(defaultSummaryMode, forKey: .defaultSummaryMode)
+        try container.encode(defaultExplanationMode, forKey: .defaultExplanationMode)
+        try container.encode(defaultTodoExtractionMode, forKey: .defaultTodoExtractionMode)
         try container.encode(recentHistoryLimit, forKey: .recentHistoryLimit)
         try container.encode(webPageTranslation, forKey: .webPageTranslation)
         try container.encode(ocr, forKey: .ocr)
+        try container.encode(promptTemplates, forKey: .promptTemplates)
         try container.encode(quickActionShortcut, forKey: .quickActionShortcut)
         try container.encode(quickActionWithoutSelectionShortcut, forKey: .quickActionWithoutSelectionShortcut)
+        try container.encode(quickActionPopupShortcuts, forKey: .quickActionPopupShortcuts)
     }
 }
 
@@ -607,19 +1044,28 @@ public struct TaskRequest: Sendable, Hashable {
     public var sourceLanguage: String?
     public var targetLanguage: String?
     public var polishStyle: String?
+    public var summaryMode: SummaryMode?
+    public var explanationMode: ExplanationMode?
+    public var todoExtractionMode: TodoExtractionMode?
 
     public init(
         task: TaskKind,
         inputText: String,
         sourceLanguage: String? = nil,
         targetLanguage: String? = nil,
-        polishStyle: String? = nil
+        polishStyle: String? = nil,
+        summaryMode: SummaryMode? = nil,
+        explanationMode: ExplanationMode? = nil,
+        todoExtractionMode: TodoExtractionMode? = nil
     ) {
         self.task = task
         self.inputText = inputText
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
         self.polishStyle = polishStyle
+        self.summaryMode = summaryMode
+        self.explanationMode = explanationMode
+        self.todoExtractionMode = todoExtractionMode
     }
 }
 

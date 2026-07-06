@@ -496,7 +496,7 @@ async function runBackgroundBatchCheck() {
   });
   assert(restoredPendingStyleState.pendingIndicatorStyle === "flipText", "background should allow returning pending style to flip text");
   assert(finalState.diagnostics?.browserID === "chrome", "diagnostics should include the browser id");
-  assert(finalState.diagnostics?.extensionVersion === "0.2.0", `unexpected diagnostics extension version: ${finalState.diagnostics?.extensionVersion}`);
+  assert(finalState.diagnostics?.extensionVersion === "0.3.0", `unexpected diagnostics extension version: ${finalState.diagnostics?.extensionVersion}`);
   assert(finalState.diagnostics?.counts?.done === 3 && finalState.diagnostics?.counts?.total === 3, "diagnostics should include redacted progress counts");
   assert(finalState.diagnostics?.timings?.elapsedMs != null, "diagnostics should include elapsed timing");
   assert(finalState.diagnostics?.model?.name === "stub-model", `diagnostics should include model name, got ${finalState.diagnostics?.model?.name}`);
@@ -962,7 +962,7 @@ async function runPopupPermissionCheck() {
             pendingIndicatorStyle: message.pendingIndicatorStyle || "loading",
           diagnostics: {
             browserID: "chrome",
-            extensionVersion: "0.2.0",
+            extensionVersion: "0.3.0",
             status: "idle",
             domainHash: "h12345678",
             urlHash: "abcdef1234567890",

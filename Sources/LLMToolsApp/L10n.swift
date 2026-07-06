@@ -46,6 +46,51 @@ enum L10n {
         }
     }
 
+    static func summaryModeName(_ mode: SummaryMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            return mode.title
+        case .chinese:
+            switch mode {
+            case .keyPoints: return "关键要点"
+            case .oneSentence: return "一句话"
+            case .detailed: return "详细摘要"
+            case .meetingNotes: return "会议纪要"
+            case .structured: return "结构化摘要"
+            }
+        }
+    }
+
+    static func explanationModeName(_ mode: ExplanationMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            return mode.title
+        case .chinese:
+            switch mode {
+            case .plain: return "通俗解释"
+            case .technical: return "技术解释"
+            case .errorDiagnosis: return "错误诊断"
+            case .code: return "代码解释"
+            case .background: return "背景补充"
+            }
+        }
+    }
+
+    static func todoExtractionModeName(_ mode: TodoExtractionMode, language: AppLanguage) -> String {
+        switch language {
+        case .english:
+            return mode.title
+        case .chinese:
+            switch mode {
+            case .actionItems: return "行动项"
+            case .byOwner: return "按负责人"
+            case .byPriority: return "按优先级"
+            case .byDeadline: return "按截止时间"
+            case .table: return "任务表格"
+            }
+        }
+    }
+
     static func pendingIndicatorStyleName(_ style: WebPagePendingIndicatorStyle, language: AppLanguage) -> String {
         switch language {
         case .english:
@@ -125,6 +170,11 @@ enum L10n {
         "Language": "语言",
         "Selection": "划词",
         "Global shortcuts": "全局快捷键",
+        "Quick Action mode shortcuts": "快捷弹窗模式",
+        "Text action shortcuts": "文本动作快捷键",
+        "Image action shortcuts": "图片动作快捷键",
+        "Switch to text mode": "切换到文本",
+        "Switch to image mode": "切换到图片",
         "Open Quick Action without selected text": "打开快捷操作（不读取选中文本）",
         "Press shortcut": "按下快捷键",
         "Change shortcut": "修改快捷键",
@@ -146,6 +196,17 @@ enum L10n {
         "Settings": "设置",
         "Preferences": "偏好设置",
         "Defaults": "默认值",
+        "Prompts": "提示词",
+        "Text prompts": "文本提示词",
+        "Image prompts": "图片提示词",
+        "System prompt": "系统提示词",
+        "User prompt": "用户提示词",
+        "Mode prompt": "模式提示词",
+        "Image recognition system": "图片识别系统",
+        "Built-in default": "内置默认",
+        "Use built-in default": "使用内置默认",
+        "Empty uses the built-in default.": "留空则使用内置默认。",
+        "Custom": "自定义",
         "OCR": "图片识别",
         "Image": "图片",
         "Text mode": "文本",
@@ -173,6 +234,9 @@ enum L10n {
         "Loaded image": "已加载图片",
         "Failed to load image": "加载图片失败",
         "Clear Image": "清除图片",
+        "Open Image Preview": "打开大图预览",
+        "Image preview unavailable.": "图片预览不可用。",
+        "OCR/image recognition is disabled.": "图片识别已关闭。",
         "Follow up": "继续处理",
         "Vision": "视觉",
         "Text only": "仅文本",
@@ -301,9 +365,17 @@ enum L10n {
         "App language": "应用语言",
         "Default translation target": "默认翻译目标",
         "Default polish style": "默认润色风格",
+        "Summary mode": "总结模式",
+        "Explanation mode": "解释模式",
+        "TODO mode": "待办模式",
+        "Summary": "总结",
+        "Explanation": "解释",
+        "TODOs": "待办",
         "Recent history limit": "最近历史上限",
         "Hide source": "隐藏原文",
         "Show source": "显示原文",
+        "Show Markdown source": "显示 Markdown 源码",
+        "Show Markdown preview": "显示预览",
         "Show raw output": "显示原始输出",
         "Show result": "显示结果",
         "Detecting": "检测中...",

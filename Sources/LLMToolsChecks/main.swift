@@ -8,6 +8,7 @@ struct LLMToolsChecks {
     static func main() async throws {
         try checkGGUFDetectionChoosesPrimaryModel()
         try checkMLXDetection()
+        try await checkLocalMLXVisionMetadataDetection()
         try await checkModelDisplayName()
         try await checkProviderModelRegistration()
         try await checkProviderModelUpdate()
@@ -15,10 +16,14 @@ struct LLMToolsChecks {
         try await checkHistoryLimit()
         try await checkPhase1InteractiveNativeTasks()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
+        try checkTextTaskModePreferencesAndPrompts()
+        try checkCustomPromptTemplates()
         try checkOCRCapabilityDefaultsDecodeFromOlderRegistry()
         try checkOCRPrompts()
+        try checkLocalGenerationTokenLimits()
         try checkOCRImagePreprocessor()
         try await checkOCRModelPreferenceClearsTextOnlyModel()
+        try await checkManualVisionOverrideForLocalModel()
         try await checkTextOnlyModelRejectsOCRBeforeRunnerCall()
         try await checkStubVisionOCRAndHistoryRedaction()
         try checkBrowserIntegrationStateDecodesWithoutExtensionChannel()
@@ -33,6 +38,7 @@ struct LLMToolsChecks {
         try await checkWebPageTranslationBatchFallback()
         try await checkWebPageTranslationBatchRetriesOnlyMissingSegments()
         try checkVisibleOutputHidesThinkBlock()
+        try checkGeneratedOutputGuardTrimsDegenerateTail()
         try checkPromptsStayCompact()
         print("LLMToolsChecks passed")
     }
@@ -78,6 +84,49 @@ struct LLMToolsChecks {
         let nineBDetection = try ModelDetection.detect(from: nineBRoot)
         try require(nineBDetection.format == .mlx, "Expected 9B MLX detection.")
         try require(nineBDetection.sizeClass == "9b", "Expected 9b size class.")
+    }
+
+    private static func checkLocalMLXVisionMetadataDetection() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-0.8B-MLX-8bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("""
+        {
+          "model_type": "qwen3_5",
+          "image_token_id": 248056,
+          "vision_start_token_id": 248053,
+          "vision_end_token_id": 248054,
+          "vision_config": {
+            "model_type": "qwen3_5_vision"
+          }
+        }
+        """.utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("processor_config.json").path, contents: Data("""
+        {
+          "processor_class": "Qwen3VLProcessor",
+          "image_processor": {
+            "image_processor_type": "Qwen3VLImageProcessor"
+          }
+        }
+        """.utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        try require(ModelDetection.isLocalVisionModel(at: modelDirectory), "Expected Qwen3VL MLX metadata to detect image capability.")
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+        let descriptor = try await engine.addModel(from: modelDirectory)
+        try require(descriptor.capabilities.supportsImage, "Expected local MLX VLM to be image-capable after addModel.")
+        try require(descriptor.capabilities.source == .detected, "Expected detected local MLX VLM capability source.")
+
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = descriptor.id
+        }
+        let selectablePreference = await engine.registry().preferences.ocr.modelID
+        try require(selectablePreference == descriptor.id, "Expected detected local MLX VLM to remain selectable for OCR.")
     }
 
     private static func checkModelDisplayName() async throws {
@@ -345,10 +394,22 @@ struct LLMToolsChecks {
         try require(preferences.webPageTranslation.domainTranslationQualities.isEmpty, "Expected webpage domain quality defaults to default empty.")
         try require(!preferences.webPageTranslation.persistWebHistory, "Expected webpage translation history to default off.")
         try require(preferences.webPageTranslation.localConcurrentTranslationRequests == 1, "Expected local webpage concurrency to default to 1.")
+        try require(!preferences.promptTemplates.translate.hasCustomPrompt, "Expected custom translate prompts to default empty.")
+        try require(!preferences.promptTemplates.hasCustomOCRSystemPrompt, "Expected custom OCR system prompt to default empty.")
+        try require(!preferences.promptTemplates.hasCustomOCRPrompt(for: .plainText), "Expected custom OCR mode prompts to default empty.")
         try require(preferences.quickActionShortcut == .optionSpace, "Expected quick action shortcut to default to Option-Space.")
         try require(preferences.quickActionWithoutSelectionShortcut == .optionShiftSpace, "Expected no-selection quick action shortcut to default to Option-Shift-Space.")
+        try require(preferences.quickActionPopupShortcuts.textMode == .commandControlNumber(1), "Expected popup text-mode shortcut to default to Command-Control-1.")
+        try require(preferences.quickActionPopupShortcuts.imageMode == .commandControlNumber(2), "Expected popup image-mode shortcut to default to Command-Control-2.")
+        try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .translate) == .commandNumber(1), "Expected popup translate shortcut to default to Command-1.")
+        try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .extractTodos) == .commandNumber(5), "Expected popup TODO shortcut to default to Command-5.")
+        try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .plainText) == .commandNumber(1), "Expected popup plain OCR shortcut to default to Command-1.")
+        try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .explainImage) == .commandNumber(4), "Expected popup image explanation shortcut to default to Command-4.")
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
+        try require(preferences.defaultSummaryMode == .keyPoints, "Expected older registries to default summaries to key points.")
+        try require(preferences.defaultExplanationMode == .plain, "Expected older registries to default explanations to plain mode.")
+        try require(preferences.defaultTodoExtractionMode == .actionItems, "Expected older registries to default TODO extraction to action items.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
 
         let legacySelectionLimitJSON = """
@@ -394,6 +455,114 @@ struct LLMToolsChecks {
         }
         """.utf8))
         try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
+    }
+
+    private static func checkTextTaskModePreferencesAndPrompts() throws {
+        let json = """
+        {
+          "defaultSummaryMode": "meetingNotes",
+          "defaultExplanationMode": "errorDiagnosis",
+          "defaultTodoExtractionMode": "table"
+        }
+        """
+        let preferences = try JSONDecoder().decode(AppPreferences.self, from: Data(json.utf8))
+        try require(preferences.defaultSummaryMode == .meetingNotes, "Expected summary mode preference to decode.")
+        try require(preferences.defaultExplanationMode == .errorDiagnosis, "Expected explanation mode preference to decode.")
+        try require(preferences.defaultTodoExtractionMode == .table, "Expected TODO mode preference to decode.")
+
+        let summaryPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .summarize, inputText: "Discuss launch follow-up."),
+            preferences: preferences
+        )
+        try require(summaryPrompt.contains("会议纪要"), "Expected summary prompt to use configured meeting-notes mode.")
+        try require(summaryPrompt.contains("行动项"), "Expected meeting-notes summary prompt to preserve action items.")
+
+        let summaryOverridePrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(
+                task: .summarize,
+                inputText: "Discuss launch follow-up.",
+                summaryMode: .oneSentence
+            ),
+            preferences: preferences
+        )
+        try require(summaryOverridePrompt.contains("一句中文总结"), "Expected request summary mode to override preferences.")
+        try require(!summaryOverridePrompt.contains("会议纪要格式"), "Expected request summary override to avoid preference mode instructions.")
+
+        let explanationPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .explain, inputText: "ERROR timeout"),
+            preferences: preferences
+        )
+        try require(explanationPrompt.contains("排查步骤"), "Expected error-diagnosis explanation prompt.")
+
+        let codePrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .explain, inputText: "func run() {}", explanationMode: .code),
+            preferences: preferences
+        )
+        try require(codePrompt.contains("代码解释"), "Expected request explanation mode to override preferences.")
+
+        let todoPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .extractTodos, inputText: "Alice should send the report."),
+            preferences: preferences
+        )
+        try require(todoPrompt.contains("Markdown 表格"), "Expected table TODO prompt.")
+
+        let todoOverridePrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(
+                task: .extractTodos,
+                inputText: "Alice should send the report.",
+                todoExtractionMode: .byOwner
+            ),
+            preferences: preferences
+        )
+        try require(todoOverridePrompt.contains("按负责人分组"), "Expected request TODO mode to override preferences.")
+        try require(!todoOverridePrompt.contains("Markdown 表格"), "Expected request TODO override to avoid preference mode instructions.")
+    }
+
+    private static func checkCustomPromptTemplates() throws {
+        var preferences = AppPreferences(defaultTranslationTarget: "Chinese")
+        preferences.promptTemplates.translate.systemPrompt = "System target: {targetLanguage}"
+        preferences.promptTemplates.translate.userPrompt = "Custom translate to {targetLanguage}: {input}"
+        let systemPrompt = PromptTemplates.systemPrompt(for: .translate, preferences: preferences)
+        try require(systemPrompt == "System target: Simplified Chinese", "Expected custom translation system prompt to render target language.")
+
+        let userPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .translate, inputText: "hello", targetLanguage: "English"),
+            preferences: preferences
+        )
+        try require(userPrompt == "Custom translate to English: hello", "Expected custom translation prompt to replace variables.")
+
+        preferences.promptTemplates.polish.userPrompt = "Rewrite as {polishStyleValue}:"
+        let polishPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .polish, inputText: "keep this", polishStyle: "formal"),
+            preferences: preferences
+        )
+        try require(polishPrompt.contains("Rewrite as formal:"), "Expected custom polish prompt to render style value.")
+        try require(polishPrompt.hasSuffix("keep this"), "Expected custom text prompt without {input} to append the source text.")
+
+        preferences.promptTemplates.ocrSystemPrompt = "OCR system target: {targetLanguage}"
+        let ocrSystemPrompt = PromptTemplates.systemPrompt(for: .ocr, preferences: preferences)
+        try require(ocrSystemPrompt == "OCR system target: Simplified Chinese", "Expected custom OCR system prompt to render target language.")
+
+        preferences.promptTemplates.ocrExplainImagePrompt = "Explain image in {targetLanguage}. Mode: {modeName}"
+        let imagePrompt = PromptTemplates.ocrPrompt(
+            mode: .explainImage,
+            targetLanguage: "English",
+            preferences: preferences
+        )
+        try require(imagePrompt == "Explain image in English. Mode: Explain image", "Expected custom OCR mode prompt to render variables.")
+
+        let decoded = try JSONDecoder().decode(AppPreferences.self, from: Data("""
+        {
+          "promptTemplates": {
+            "translate": {
+              "userPrompt": "Translate: {input}"
+            },
+            "ocrPlainTextPrompt": "Read the visible text."
+          }
+        }
+        """.utf8))
+        try require(decoded.promptTemplates.translate.userPrompt == "Translate: {input}", "Expected custom text prompt to decode.")
+        try require(decoded.promptTemplates.ocrPrompt(for: .plainText) == "Read the visible text.", "Expected custom OCR prompt to decode.")
     }
 
     private static func checkOCRCapabilityDefaultsDecodeFromOlderRegistry() throws {
@@ -450,8 +619,28 @@ struct LLMToolsChecks {
 
         let explain = PromptTemplates.ocrPrompt(mode: .explainImage)
         try require(explain.contains("Explain the screenshot or image"), "Expected image explanation prompt.")
+        try require(explain.contains("Do not enumerate the same word"), "Expected image explanation prompt to discourage repeated labels.")
         let probe = PromptTemplates.visionProbePrompt()
         try require(probe.contains("VISION_OK"), "Expected deterministic vision probe output.")
+    }
+
+    private static func checkLocalGenerationTokenLimits() throws {
+        try require(
+            LocalGenerationPolicy.maxTokens(for: OCRMode.structured) > 0,
+            "Expected structured OCR to have a local generation token limit."
+        )
+        try require(
+            LocalGenerationPolicy.maxTokens(for: OCRMode.extractThenTranslate) <= LocalGenerationPolicy.maxTokens(for: .webPageTranslate),
+            "Expected local OCR generation to be bounded below webpage batch generation."
+        )
+        try require(
+            LocalGenerationPolicy.maxTokens(for: .webPageTranslate) >= LocalGenerationPolicy.maxTokens(for: .translate),
+            "Expected webpage batches to allow at least as many local output tokens as normal translation."
+        )
+        try require(
+            LocalGenerationPolicy.maxTokens(for: OCRMode.explainImage) <= LocalGenerationPolicy.maxTokens(for: OCRMode.structured),
+            "Expected local image explanation generation to stay no larger than structured OCR."
+        )
     }
 
     private static func checkOCRImagePreprocessor() throws {
@@ -494,6 +683,36 @@ struct LLMToolsChecks {
         _ = try await engine.markModelTextOnly(id: descriptor.id)
         let clearedPreference = await engine.registry().preferences.ocr.modelID
         try require(clearedPreference == nil, "Expected OCR preference to clear when selected model becomes text-only.")
+    }
+
+    private static func checkManualVisionOverrideForLocalModel() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("Qwen-VL-Local-MLX")
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+        let descriptor = try await engine.addModel(from: modelDirectory)
+        try require(!descriptor.capabilities.supportsImage, "Expected local models to remain text-only until manually overridden.")
+
+        let visionDescriptor = try await engine.markModelVisionCapable(id: descriptor.id)
+        try require(visionDescriptor.capabilities.supportsImage, "Expected manual override to mark a local model vision-capable.")
+        try require(visionDescriptor.capabilities.source == .manual, "Expected manual vision override source.")
+
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = descriptor.id
+        }
+        let selectablePreference = await engine.registry().preferences.ocr.modelID
+        try require(selectablePreference == descriptor.id, "Expected manually marked local vision model to remain selectable for OCR.")
+
+        _ = try await engine.markModelTextOnly(id: descriptor.id)
+        let clearedPreference = await engine.registry().preferences.ocr.modelID
+        try require(clearedPreference == nil, "Expected OCR preference to clear after manually marking the local model text-only.")
     }
 
     private static func checkTextOnlyModelRejectsOCRBeforeRunnerCall() async throws {
@@ -1094,6 +1313,19 @@ struct LLMToolsChecks {
         """
         try require(VisibleOutput.from(rawText: raw) == "你好", "Expected visible output after think block.")
         try require(VisibleOutput.from(rawText: "你好") == "你好", "Expected text without think block to stay unchanged.")
+    }
+
+    private static func checkGeneratedOutputGuardTrimsDegenerateTail() throws {
+        let looped = """
+        这张图片展示了一个训练进度图，图表包含“Training”、“Training”、“Training”、“Training”、“Training”、“Training”、“Training”、“Training”、“Training”、“Training”。
+        """
+        let trimmed = GeneratedOutputGuard.trimDegenerateTail(looped)
+        try require(trimmed == "这张图片展示了一个训练进度图，图表包含“Training”", "Expected repeated Training tail to be trimmed.")
+        try require(GeneratedOutputGuard.hasDegenerateTail(looped), "Expected repeated Training tail to be detected.")
+
+        let normal = "这张图片展示了一个训练进度图，并包含 Training、Validation 和 Accuracy 三类指标。"
+        try require(GeneratedOutputGuard.trimDegenerateTail(normal) == normal, "Expected normal explanation to stay unchanged.")
+        try require(!GeneratedOutputGuard.hasDegenerateTail(normal), "Expected normal explanation not to be flagged.")
     }
 
     private static func makeTemporaryDirectory(name: String = UUID().uuidString) throws -> URL {

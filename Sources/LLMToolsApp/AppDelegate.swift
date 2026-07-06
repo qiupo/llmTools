@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var floatingWindowController: WindowController?
     private var settingsWindowController: WindowController?
     private var selectionDismissMonitors: [Any] = []
+    private var quickActionKeyboardMonitor: Any?
     private var lastSelectionScreenPoint: NSPoint?
     private var selectionActionShownAt = Date.distantPast
     private var isSelectionActionEnabled = false
@@ -32,6 +33,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionService.delegate = self
         configureStatusItem()
         configureWindows()
+        installQuickActionKeyboardMonitor()
         observeAppState()
         Task {
             await appState.bootstrap()
@@ -50,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     func applicationWillTerminate(_ notification: Notification) {
         hotKeyService.unregister()
         appState.cancelCurrentTask(unloadModel: true)
+        removeQuickActionKeyboardMonitor()
         selectionActionService.stop()
         localAppBridgeServer.stop()
     }
@@ -96,8 +99,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             quickActionWindow.onEscape = { [weak self] in
                 self?.quickActionWindowController?.close()
             }
-            quickActionWindow.onCommandNumber = { [weak self] shortcutIndex in
-                self?.selectQuickActionTask(shortcutIndex: shortcutIndex)
+            quickActionWindow.onKeyboardShortcut = { [weak self] shortcut in
+                self?.handleQuickActionShortcut(shortcut) ?? false
+            }
+            quickActionWindow.onCommandPaste = { [weak self] in
+                guard let self,
+                      appState.quickActionMode == .image,
+                      appState.canLoadOCRImageFromPasteboard() else {
+                    return false
+                }
+                appState.loadOCRImageFromPasteboard()
+                return true
+            }
+            quickActionWindow.onCommandCopy = { [weak self, weak quickActionWindow] in
+                self?.copyQuickActionOutputIfAllowed(in: quickActionWindow) ?? false
             }
         }
         selectionActionWindowController = WindowController(
@@ -316,6 +331,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionWindowController?.window?.orderOut(nil)
     }
 
+    private func installQuickActionKeyboardMonitor() {
+        removeQuickActionKeyboardMonitor()
+        quickActionKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else {
+                return event
+            }
+            guard self.handleQuickActionCommandCopyEvent(event) else {
+                return event
+            }
+            return nil
+        }
+    }
+
+    private func removeQuickActionKeyboardMonitor() {
+        if let quickActionKeyboardMonitor {
+            NSEvent.removeMonitor(quickActionKeyboardMonitor)
+            self.quickActionKeyboardMonitor = nil
+        }
+    }
+
+    private func handleQuickActionCommandCopyEvent(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers == .command,
+              event.charactersIgnoringModifiers?.lowercased() == "c",
+              let window = quickActionWindowController?.window as? FloatingWindow,
+              window.isVisible,
+              event.window === window || window.isKeyWindow else {
+            return false
+        }
+        return copyQuickActionOutputIfAllowed(in: window)
+    }
+
+    private func copyQuickActionOutputIfAllowed(in window: FloatingWindow?) -> Bool {
+        guard window?.shouldUseWindowCopyFallback() == true else {
+            return false
+        }
+        let text = appState.displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            return false
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        return true
+    }
+
     private func installSelectionDismissMonitors() {
         removeSelectionDismissMonitors()
 
@@ -524,9 +584,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func openQuickActionWindow(nearSelection: Bool) {
-        quickActionWindowController?.window?.title = appState.quickActionMode == .image
-            ? L10n.text("Image OCR", language: appState.preferences.appLanguage)
-            : appState.selectedTask.title(language: appState.preferences.appLanguage)
+        refreshQuickActionWindowTitle()
         if nearSelection {
             positionQuickActionWindowNearSelectionIfPossible()
         }
@@ -534,17 +592,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    private func selectQuickActionTask(shortcutIndex: Int) {
-        guard !appState.isRunning else {
-            return
+    private func handleQuickActionShortcut(_ shortcut: KeyboardShortcutPreference) -> Bool {
+        guard !appState.isRunning, !appState.isPreparingOCRImage else {
+            return false
         }
-        let tasks = TaskKind.interactiveCases
-        guard tasks.indices.contains(shortcutIndex) else {
-            return
+        let shortcuts = appState.preferences.quickActionPopupShortcuts
+
+        if shortcut == shortcuts.textMode {
+            appState.quickActionMode = .text
+            refreshQuickActionWindowTitle()
+            return true
         }
-        appState.quickActionMode = .text
-        appState.selectedTask = tasks[shortcutIndex]
-        quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
+        if shortcut == shortcuts.imageMode {
+            appState.quickActionMode = .image
+            refreshQuickActionWindowTitle()
+            return true
+        }
+
+        switch appState.quickActionMode {
+        case .text:
+            guard let task = shortcuts.textTask(matching: shortcut) else {
+                return false
+            }
+            appState.selectedTask = task
+            refreshQuickActionWindowTitle()
+            return true
+        case .image:
+            guard let mode = shortcuts.ocrMode(matching: shortcut) else {
+                return false
+            }
+            appState.setOCRMode(mode)
+            refreshQuickActionWindowTitle()
+            return true
+        }
+    }
+
+    private func refreshQuickActionWindowTitle() {
+        quickActionWindowController?.window?.title = appState.quickActionMode == .image
+            ? L10n.text("Image OCR", language: appState.preferences.appLanguage)
+            : appState.selectedTask.title(language: appState.preferences.appLanguage)
     }
 
     private var selectionActionShouldShowInlineResult: Bool {
@@ -748,7 +834,9 @@ final class SelectionActionWindow: NSPanel {
 class FloatingWindow: NSWindow {
     var autoCollapseAtScreenEdge = false
     var onEscape: (() -> Void)?
-    var onCommandNumber: ((Int) -> Void)?
+    var onKeyboardShortcut: ((KeyboardShortcutPreference) -> Bool)?
+    var onCommandPaste: (() -> Bool)?
+    var onCommandCopy: (() -> Bool)?
     private var expandedWidth: CGFloat = 360
     private let collapsedWidth: CGFloat = 42
     private let edgeTolerance: CGFloat = 24
@@ -761,16 +849,38 @@ class FloatingWindow: NSWindow {
                 return
             }
             if modifiers == .command,
-               let characters = event.charactersIgnoringModifiers,
-               let shortcutNumber = Int(characters),
-               (1...9).contains(shortcutNumber),
-               let onCommandNumber {
-                onCommandNumber(shortcutNumber - 1)
+               event.charactersIgnoringModifiers?.lowercased() == "v",
+               let onCommandPaste,
+               onCommandPaste() {
+                return
+            }
+            if modifiers == .command,
+               event.charactersIgnoringModifiers?.lowercased() == "c",
+               let onCommandCopy,
+               onCommandCopy() {
+                return
+            }
+            if let shortcut = KeyboardShortcutPreference(event: event),
+               let onKeyboardShortcut,
+               onKeyboardShortcut(shortcut) {
                 return
             }
         }
 
         super.sendEvent(event)
+    }
+
+    func shouldUseWindowCopyFallback() -> Bool {
+        guard let responder = firstResponder else {
+            return true
+        }
+        guard let textView = responder as? NSTextView else {
+            return true
+        }
+        if textView.isEditable {
+            return false
+        }
+        return !textView.selectedRanges.contains { $0.rangeValue.length > 0 }
     }
 
     override func setFrameOrigin(_ point: NSPoint) {

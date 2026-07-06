@@ -2,6 +2,13 @@ import Foundation
 
 public enum PromptTemplates {
     public static func systemPrompt(for task: TaskKind, preferences: AppPreferences) -> String {
+        if let customPrompt = customSystemPrompt(for: task, preferences: preferences) {
+            return customPrompt
+        }
+        return defaultSystemPrompt(for: task)
+    }
+
+    public static func defaultSystemPrompt(for task: TaskKind) -> String {
         switch task {
         case .translate:
             return "You are a translation engine. Preserve meaning, formatting, numbers, code, and names. Output only the translated text."
@@ -26,59 +33,191 @@ public enum PromptTemplates {
     }
 
     public static func retryPrompt(for request: TaskRequest, preferences: AppPreferences) -> String {
+        if let customPrompt = customUserPrompt(for: request, preferences: preferences, isRetry: true) {
+            return customPrompt
+        }
+        return defaultUserPrompt(for: request, preferences: preferences, isRetry: true)
+    }
+
+    public static func userPrompt(for request: TaskRequest, preferences: AppPreferences) -> String {
+        if let customPrompt = customUserPrompt(for: request, preferences: preferences, isRetry: false) {
+            return customPrompt
+        }
+        return defaultUserPrompt(for: request, preferences: preferences, isRetry: false)
+    }
+
+    public static func defaultUserPrompt(for request: TaskRequest, preferences: AppPreferences, isRetry: Bool = false) -> String {
         switch request.task {
         case .translate:
             let target = request.targetLanguage ?? preferences.defaultTranslationTarget
             return translationPrompt(
                 inputText: request.inputText,
                 target: target,
-                isRetry: true
+                isRetry: isRetry
             )
         case .webPageTranslate:
-            return webPageTranslationPrompt(inputText: request.inputText, isRetry: true)
+            return webPageTranslationPrompt(inputText: request.inputText, isRetry: isRetry)
         case .polish:
             return polishPrompt(
                 inputText: request.inputText,
                 style: request.polishStyle ?? preferences.defaultPolishStyle,
-                isRetry: true
+                isRetry: isRetry
             )
         case .summarize:
-            return summarizePrompt(inputText: request.inputText, isRetry: true)
+            return summarizePrompt(
+                inputText: request.inputText,
+                mode: request.summaryMode ?? preferences.defaultSummaryMode,
+                isRetry: isRetry
+            )
         case .explain:
-            return explainPrompt(inputText: request.inputText, isRetry: true)
+            return explainPrompt(
+                inputText: request.inputText,
+                mode: request.explanationMode ?? preferences.defaultExplanationMode,
+                isRetry: isRetry
+            )
         case .extractTodos:
-            return todosPrompt(inputText: request.inputText, isRetry: true)
+            return todosPrompt(
+                inputText: request.inputText,
+                mode: request.todoExtractionMode ?? preferences.defaultTodoExtractionMode,
+                isRetry: isRetry
+            )
         case .ocr:
             return request.inputText
         }
     }
 
-    public static func userPrompt(for request: TaskRequest, preferences: AppPreferences) -> String {
-        switch request.task {
-        case .translate:
-            let target = request.targetLanguage ?? preferences.defaultTranslationTarget
-            return translationPrompt(
-                inputText: request.inputText,
-                target: target,
-                isRetry: false
-            )
-        case .webPageTranslate:
-            return webPageTranslationPrompt(inputText: request.inputText, isRetry: false)
-        case .polish:
-            return polishPrompt(
-                inputText: request.inputText,
-                style: request.polishStyle ?? preferences.defaultPolishStyle,
-                isRetry: false
-            )
-        case .summarize:
-            return summarizePrompt(inputText: request.inputText, isRetry: false)
-        case .explain:
-            return explainPrompt(inputText: request.inputText, isRetry: false)
-        case .extractTodos:
-            return todosPrompt(inputText: request.inputText, isRetry: false)
+    private static func customSystemPrompt(for task: TaskKind, preferences: AppPreferences) -> String? {
+        let rawPrompt: String
+        switch task {
+        case .translate, .polish, .summarize, .explain, .extractTodos:
+            rawPrompt = preferences.promptTemplates.textPrompt(for: task).systemPrompt
         case .ocr:
-            return request.inputText
+            rawPrompt = preferences.promptTemplates.ocrSystemPrompt
+        case .webPageTranslate:
+            return nil
         }
+        let trimmed = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        return renderPromptTemplate(
+            rawPrompt,
+            variables: systemVariables(for: task, preferences: preferences),
+            appendInputIfMissing: false
+        )
+    }
+
+    private static func customUserPrompt(for request: TaskRequest, preferences: AppPreferences, isRetry: Bool) -> String? {
+        guard TaskKind.interactiveCases.contains(request.task) else {
+            return nil
+        }
+        let rawPrompt = preferences.promptTemplates.textPrompt(for: request.task).userPrompt
+        let trimmed = rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        return renderPromptTemplate(
+            rawPrompt,
+            variables: textTaskVariables(for: request, preferences: preferences, isRetry: isRetry),
+            appendInputIfMissing: true
+        )
+    }
+
+    private static func textTaskVariables(
+        for request: TaskRequest,
+        preferences: AppPreferences,
+        isRetry: Bool
+    ) -> [String: String] {
+        let target = request.targetLanguage ?? preferences.defaultTranslationTarget
+        let polishStyle = request.polishStyle ?? preferences.defaultPolishStyle
+        let summaryMode = request.summaryMode ?? preferences.defaultSummaryMode
+        let explanationMode = request.explanationMode ?? preferences.defaultExplanationMode
+        let todoMode = request.todoExtractionMode ?? preferences.defaultTodoExtractionMode
+
+        var variables = systemVariables(for: request.task, preferences: preferences)
+        variables["input"] = request.inputText
+        variables["sourceLanguage"] = request.sourceLanguage ?? "auto"
+        variables["targetLanguage"] = targetLanguageName(for: target)
+        variables["target"] = targetLanguageName(for: target)
+        variables["targetLanguageValue"] = target
+        variables["polishStyle"] = polishStyleInstruction(polishStyle)
+        variables["polishStyleValue"] = polishStyle
+        variables["summaryMode"] = summaryModeInstruction(summaryMode)
+        variables["summaryModeValue"] = summaryMode.rawValue
+        variables["summaryModeTitle"] = summaryMode.title
+        variables["explanationMode"] = explanationModeInstruction(explanationMode)
+        variables["explanationModeValue"] = explanationMode.rawValue
+        variables["explanationModeTitle"] = explanationMode.title
+        variables["todoMode"] = todoModeInstruction(todoMode)
+        variables["todoModeValue"] = todoMode.rawValue
+        variables["todoModeTitle"] = todoMode.title
+        variables["retryInstruction"] = retryInstruction(for: request.task, isRetry: isRetry)
+        return variables
+    }
+
+    private static func systemVariables(for task: TaskKind, preferences: AppPreferences) -> [String: String] {
+        [
+            "task": task.rawValue,
+            "taskName": task.title,
+            "targetLanguage": targetLanguageName(for: preferences.defaultTranslationTarget),
+            "target": targetLanguageName(for: preferences.defaultTranslationTarget),
+            "targetLanguageValue": preferences.defaultTranslationTarget,
+            "polishStyle": polishStyleInstruction(preferences.defaultPolishStyle),
+            "polishStyleValue": preferences.defaultPolishStyle,
+            "summaryMode": summaryModeInstruction(preferences.defaultSummaryMode),
+            "summaryModeValue": preferences.defaultSummaryMode.rawValue,
+            "summaryModeTitle": preferences.defaultSummaryMode.title,
+            "explanationMode": explanationModeInstruction(preferences.defaultExplanationMode),
+            "explanationModeValue": preferences.defaultExplanationMode.rawValue,
+            "explanationModeTitle": preferences.defaultExplanationMode.title,
+            "todoMode": todoModeInstruction(preferences.defaultTodoExtractionMode),
+            "todoModeValue": preferences.defaultTodoExtractionMode.rawValue,
+            "todoModeTitle": preferences.defaultTodoExtractionMode.title
+        ]
+    }
+
+    private static func retryInstruction(for task: TaskKind, isRetry: Bool) -> String {
+        guard isRetry else {
+            return ""
+        }
+        switch task {
+        case .translate, .webPageTranslate:
+            return "This is a retry. Output only the requested result."
+        case .polish:
+            return "这是重试，请严格只输出润色后的正文。"
+        case .summarize:
+            return "这是重试，请严格只输出总结。"
+        case .explain:
+            return "这是重试，请严格只输出解释。"
+        case .extractTodos:
+            return "这是重试，请严格只输出待办列表。"
+        case .ocr:
+            return "This is a retry. Output only the requested image result."
+        }
+    }
+
+    private static func renderPromptTemplate(
+        _ template: String,
+        variables: [String: String],
+        appendInputIfMissing: Bool
+    ) -> String {
+        var rendered = template
+        for key in variables.keys.sorted(by: { $0.count > $1.count }) {
+            let value = variables[key] ?? ""
+            rendered = rendered.replacingOccurrences(of: "{{\(key)}}", with: value)
+            rendered = rendered.replacingOccurrences(of: "{\(key)}", with: value)
+        }
+        if appendInputIfMissing,
+           let input = variables["input"],
+           !input.isEmpty,
+           !containsTemplateVariable(template, "input") {
+            rendered += "\n\n\(input)"
+        }
+        return rendered
+    }
+
+    private static func containsTemplateVariable(_ template: String, _ variable: String) -> Bool {
+        template.contains("{\(variable)}") || template.contains("{{\(variable)}}")
     }
 
     private static func translationPrompt(inputText: String, target: String, isRetry: Bool) -> String {
@@ -169,14 +308,12 @@ public enum PromptTemplates {
         """
     }
 
-    private static func summarizePrompt(inputText: String, isRetry: Bool) -> String {
+    private static func summarizePrompt(inputText: String, mode: SummaryMode, isRetry: Bool) -> String {
         let retryLine = isRetry ? "这是重试，请严格只输出总结。" : "总结下面的文本。"
         return """
         你是一个总结函数。\(retryLine)
         规则：
-        - 只输出总结正文。
-        - 用简洁中文输出 3-6 条关键点。
-        - 如果原文包含行动项，单独用“行动项：”列出；不要把行动项混进普通摘要。
+        \(summaryModeInstruction(mode))
         - 不编造原文没有的结论、日期、负责人或优先级。
 
         原文：
@@ -186,14 +323,12 @@ public enum PromptTemplates {
         """
     }
 
-    private static func explainPrompt(inputText: String, isRetry: Bool) -> String {
+    private static func explainPrompt(inputText: String, mode: ExplanationMode, isRetry: Bool) -> String {
         let retryLine = isRetry ? "这是重试，请严格只输出解释。" : "解释下面的文本。"
         return """
         你是一个解释函数。\(retryLine)
         规则：
-        - 只输出解释正文。
-        - 用通俗中文解释含义、背景、关键影响和用户应该注意的点。
-        - 如果输入像术语、错误、日志、代码片段或密集段落，先说明它是什么，再解释为什么重要。
+        \(explanationModeInstruction(mode))
         - 不编造外部上下文；不确定的地方明确说不确定。
 
         原文：
@@ -203,14 +338,12 @@ public enum PromptTemplates {
         """
     }
 
-    private static func todosPrompt(inputText: String, isRetry: Bool) -> String {
+    private static func todosPrompt(inputText: String, mode: TodoExtractionMode, isRetry: Bool) -> String {
         let retryLine = isRetry ? "这是重试，请严格只输出待办列表。" : "从下面文本中提取待办。"
         return """
         你是一个待办提取函数。\(retryLine)
         规则：
-        - 只输出待办列表。
-        - 每条用 "- " 开头。
-        - 每条尽量包含任务、负责人、截止日期、优先级；没有的信息不要编造。
+        \(todoModeInstruction(mode))
         - 只提取可以执行的事项，不把背景信息或愿望改写成待办。
         - 如果没有待办，输出“无明确待办”。
 
@@ -219,6 +352,110 @@ public enum PromptTemplates {
 
         待办：
         """
+    }
+
+    private static func summaryModeInstruction(_ mode: SummaryMode) -> String {
+        switch mode {
+        case .keyPoints:
+            return """
+            - 只输出总结正文。
+            - 用简洁中文输出 3-6 条关键点。
+            - 如果原文包含行动项，单独用“行动项：”列出；不要把行动项混进普通摘要。
+            """
+        case .oneSentence:
+            return """
+            - 只输出一句中文总结。
+            - 这句话必须概括原文最核心的信息，避免项目符号、标题和额外说明。
+            """
+        case .detailed:
+            return """
+            - 输出较完整的中文摘要。
+            - 按“背景：”“重点：”“结论：”组织内容；缺失的信息写“未提及”。
+            - 重点部分可以使用项目符号，但不要超过 8 条。
+            """
+        case .meetingNotes:
+            return """
+            - 输出会议纪要格式。
+            - 按“议题：”“结论：”“行动项：”组织内容；没有行动项时写“无明确行动项”。
+            - 行动项要尽量包含任务、负责人和截止日期；缺失的信息写“未提及”。
+            """
+        case .structured:
+            return """
+            - 输出结构化摘要。
+            - 固定使用“背景：”“重点：”“风险：”“下一步：”四个小节。
+            - 每个小节只写原文明确支持的信息；缺失时写“未提及”。
+            """
+        }
+    }
+
+    private static func explanationModeInstruction(_ mode: ExplanationMode) -> String {
+        switch mode {
+        case .plain:
+            return """
+            - 只输出解释正文。
+            - 用通俗中文解释含义、背景、关键影响和用户应该注意的点。
+            - 如果输入像术语、错误、日志、代码片段或密集段落，先说明它是什么，再解释为什么重要。
+            """
+        case .technical:
+            return """
+            - 只输出技术解释正文。
+            - 保留专业术语、接口名、错误码、代码符号和关键数字。
+            - 解释机制、依赖关系、影响范围和需要注意的技术边界。
+            """
+        case .errorDiagnosis:
+            return """
+            - 输出错误诊断格式。
+            - 按“现象：”“可能原因：”“排查步骤：”“处理建议：”组织内容。
+            - 如果输入不是错误、日志或异常信息，也要说明可诊断信息不足。
+            """
+        case .code:
+            return """
+            - 输出代码解释格式。
+            - 说明代码在做什么、核心流程、输入输出、边界情况和潜在风险。
+            - 保留函数名、变量名、类型名和关键代码符号。
+            """
+        case .background:
+            return """
+            - 输出背景补充说明。
+            - 解释它是什么、常见上下文、为什么重要、可能影响和用户应关注的点。
+            - 不确定的背景必须标注为推测或不确定。
+            """
+        }
+    }
+
+    private static func todoModeInstruction(_ mode: TodoExtractionMode) -> String {
+        switch mode {
+        case .actionItems:
+            return """
+            - 只输出待办列表。
+            - 每条用 "- " 开头。
+            - 每条尽量包含任务、负责人、截止日期、优先级；没有的信息不要编造。
+            """
+        case .byOwner:
+            return """
+            - 按负责人分组输出待办。
+            - 负责人明确时使用“负责人：姓名”作为分组标题；没有负责人时归入“未指定负责人：”。
+            - 每条待办用 "- " 开头，并保留截止日期、优先级等原文明确的信息。
+            """
+        case .byPriority:
+            return """
+            - 按优先级分组输出待办。
+            - 固定使用“高优先级：”“中优先级：”“低优先级：”“未指定优先级：”四组；没有内容的组可以省略。
+            - 只能根据原文明确表述判断优先级，不要自行推断。
+            """
+        case .byDeadline:
+            return """
+            - 按截止时间从近到远输出待办。
+            - 每条用 "- " 开头，包含任务和原文明确的截止时间。
+            - 没有截止时间的任务放在“未指定截止时间：”分组。
+            """
+        case .table:
+            return """
+            - 输出 Markdown 表格。
+            - 表头固定为：任务 | 负责人 | 截止时间 | 优先级 | 依据。
+            - 没有明确负责人、截止时间或优先级时写“未提及”；依据列引用简短原文片段。
+            """
+        }
     }
 
     private static func polishStyleInstruction(_ style: String) -> String {
@@ -236,7 +473,23 @@ public enum PromptTemplates {
         }
     }
 
-    public static func ocrPrompt(mode: OCRMode, targetLanguage: String = "zh-Hans") -> String {
+    public static func ocrPrompt(
+        mode: OCRMode,
+        targetLanguage: String = "zh-Hans",
+        preferences: AppPreferences = AppPreferences()
+    ) -> String {
+        let rawPrompt = preferences.promptTemplates.ocrPrompt(for: mode)
+        if !rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return renderPromptTemplate(
+                rawPrompt,
+                variables: ocrVariables(mode: mode, targetLanguage: targetLanguage),
+                appendInputIfMissing: false
+            )
+        }
+        return defaultOCRPrompt(mode: mode, targetLanguage: targetLanguage)
+    }
+
+    public static func defaultOCRPrompt(mode: OCRMode, targetLanguage: String = "zh-Hans") -> String {
         switch mode {
         case .plainText:
             return """
@@ -274,11 +527,23 @@ public enum PromptTemplates {
             Rules:
             - Describe the visible content, UI, chart, error, workflow, or document state that matters.
             - Quote short visible text only when it helps the explanation.
+            - Do not enumerate the same word, legend label, or data-point label repeatedly; mention repeated items once.
+            - Keep the explanation concise and stop when the relevant visible content is covered.
             - Do not invent off-screen context.
             - If the image is unreadable, say what cannot be determined.
             - Output only the explanation.
             """
         }
+    }
+
+    private static func ocrVariables(mode: OCRMode, targetLanguage: String) -> [String: String] {
+        [
+            "mode": mode.rawValue,
+            "modeName": mode.title,
+            "targetLanguage": targetLanguageName(for: targetLanguage),
+            "target": targetLanguageName(for: targetLanguage),
+            "targetLanguageValue": targetLanguage
+        ]
     }
 
     public static func visionProbePrompt() -> String {
