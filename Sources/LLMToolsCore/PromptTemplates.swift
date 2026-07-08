@@ -272,6 +272,39 @@ public enum PromptTemplates {
         """
     }
 
+    public static func subtitleBatchPrompt(
+        segments: [SubtitleSegment],
+        targetLanguage: String,
+        isRetry: Bool
+    ) throws -> String {
+        let items = segments.map { SubtitlePromptItem(id: $0.id.uuidString, text: $0.originalText) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(items)
+        let json = String(decoding: data, as: UTF8.self)
+        let target = targetLanguageName(for: targetLanguage)
+        let retryLine = isRetry
+            ? "This is a retry. Return only the JSON array, with no Markdown fences and no prose."
+            : "Return only the JSON array, with no Markdown fences and no prose."
+
+        return """
+        Translate each subtitle item to \(target).
+        \(retryLine)
+        Return a JSON array with objects in the same order:
+        [{"id":"...","translation":"..."}]
+
+        Subtitle translation rules:
+        - Keep each line concise enough to read as a subtitle.
+        - Preserve names, numbers, units, UI labels, and technical terms.
+        - Do not merge, split, reorder, or add segments.
+        - Do not add explanations or speaker labels unless they are present in the source.
+        - Prefer natural, readable \(target) over long literal prose.
+
+        Items:
+        \(json)
+        """
+    }
+
     private static func webPageQualityInstruction(_ mode: WebPageTranslationQualityMode) -> String {
         switch mode {
         case .natural:
@@ -566,6 +599,11 @@ public enum PromptTemplates {
     }
 
     private struct WebPagePromptItem: Encodable {
+        var id: String
+        var text: String
+    }
+
+    private struct SubtitlePromptItem: Encodable {
         var id: String
         var text: String
     }

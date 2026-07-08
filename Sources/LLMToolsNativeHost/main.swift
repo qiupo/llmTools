@@ -54,6 +54,18 @@ final class NativeMessagingHost: @unchecked Sendable {
                 return try bridgeResponse(for: request, path: "/setDomainPageDefaults")
             case "setPendingIndicatorStyle":
                 return try bridgeResponse(for: request, path: "/setPendingIndicatorStyle")
+            case "createLiveSubtitleSession":
+                return try bridgeResponse(for: request, path: "/liveSubtitleSessions")
+            case "appendLiveAudioChunk":
+                return try bridgeResponse(for: request, path: "/liveSubtitleChunks")
+            case "stopLiveSubtitleSession":
+                return try bridgeResponse(for: request, path: "/stopLiveSubtitleSession")
+            case "getAppLiveSubtitleStatus":
+                return try bridgeResponse(for: request, path: "/appLiveSubtitleStatus", method: "GET")
+            case "startAppLiveSubtitles":
+                return try bridgeResponse(for: request, path: "/startAppLiveSubtitles")
+            case "stopAppLiveSubtitles":
+                return try bridgeResponse(for: request, path: "/stopAppLiveSubtitles")
             case "openSettings":
                 return try statusResponse(for: request)
             default:
@@ -94,7 +106,7 @@ final class NativeMessagingHost: @unchecked Sendable {
         )
     }
 
-    private func bridgeResponse(for request: GenericNativeEnvelope, path: String) throws -> Data {
+    private func bridgeResponse(for request: GenericNativeEnvelope, path: String, method: String = "POST") throws -> Data {
         guard let state = readBridgeState() else {
             return try encodeErrorResponse(
                 requestID: request.requestID,
@@ -103,9 +115,9 @@ final class NativeMessagingHost: @unchecked Sendable {
                 message: "llmTools 未运行，请先启动应用。"
             )
         }
-        let body = request.payload ?? Data("{}".utf8)
+        let body = method == "GET" ? nil : (request.payload ?? Data("{}".utf8))
         do {
-            let data = try httpRequest(state: state, method: "POST", path: path, body: body)
+            let data = try httpRequest(state: state, method: method, path: path, body: body)
             let payload = try decodeHTTPBody(data)
             return try encodeEnvelope(
                 requestID: request.requestID,

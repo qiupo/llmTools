@@ -8,10 +8,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private let selectionActionCompactSize = NSSize(width: 260, height: 58)
     private let selectionActionExpandedSize = NSSize(width: 260, height: 167)
     private let settingsWindowContentSize = NSSize(width: 700, height: 640)
+    private let liveSubtitleWindowInitialSize = NSSize(
+        width: CGFloat(MediaSubtitlePreferences.defaultLiveWindowWidth),
+        height: CGFloat(MediaSubtitlePreferences.defaultLiveWindowHeight)
+    )
+    private let liveSubtitleWindowMinSize = NSSize(
+        width: CGFloat(MediaSubtitlePreferences.minimumLiveWindowWidth),
+        height: CGFloat(MediaSubtitlePreferences.minimumLiveWindowHeight)
+    )
+    private let liveSubtitleImmersiveTwoLineHeight: CGFloat = 96
+    private let liveSubtitleImmersiveBilingualHeight: CGFloat = 128
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
     private let selectionActionService = SelectionActionService()
+    private let settingsNavigation = SettingsNavigationState()
     private lazy var localAppBridgeServer = LocalAppBridgeServer(appState: appState)
     private var cancellables: Set<AnyCancellable> = []
     private var statusItem: NSStatusItem?
@@ -19,7 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var quickActionWindowController: WindowController?
     private var selectionActionWindowController: WindowController?
     private var floatingWindowController: WindowController?
+    private var liveSubtitleWindowController: WindowController?
     private var settingsWindowController: WindowController?
+    private var liveSubtitleWindowResizeObserver: Any?
     private var selectionDismissMonitors: [Any] = []
     private var quickActionKeyboardMonitor: Any?
     private var lastSelectionScreenPoint: NSPoint?
@@ -52,6 +65,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     func applicationWillTerminate(_ notification: Notification) {
         hotKeyService.unregister()
         appState.cancelCurrentTask(unloadModel: true)
+        appState.stopAppLiveSubtitlesForShutdown()
+        if let liveSubtitleWindowResizeObserver {
+            NotificationCenter.default.removeObserver(liveSubtitleWindowResizeObserver)
+        }
         removeQuickActionKeyboardMonitor()
         selectionActionService.stop()
         localAppBridgeServer.stop()
@@ -73,10 +90,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "打开快捷操作", action: #selector(openQuickAction), keyEquivalent: "o"))
         menu.addItem(NSMenuItem(title: "图片 OCR", action: #selector(openImageOCR), keyEquivalent: "i"))
+        menu.addItem(NSMenuItem(title: "开始实时字幕", action: #selector(toggleAppLiveSubtitles), keyEquivalent: "l"))
         menu.addItem(NSMenuItem(title: "打开悬浮组件", action: #selector(openFloatingWidget), keyEquivalent: "w"))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "模型", action: #selector(openSettings), keyEquivalent: ","))
-        menu.addItem(NSMenuItem(title: "设置", action: #selector(openSettings), keyEquivalent: "s"))
+        menu.addItem(NSMenuItem(title: "模型", action: #selector(openModelSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "设置", action: #selector(openGeneralSettings), keyEquivalent: "s"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q"))
 
@@ -134,10 +152,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             windowLevel: .floating,
             autoCollapseAtScreenEdge: appState.preferences.autoCollapseWidget
         )
+        liveSubtitleWindowController = WindowController(
+            title: "实时字幕",
+            frame: NSRect(origin: .zero, size: liveSubtitleWindowInitialSize),
+            contentView: AnyView(LiveSubtitleFloatingView(appState: appState) { [weak self] in
+                self?.closeLiveSubtitlesFromWindow()
+            }),
+            windowLevel: .floating,
+            windowKind: .nonActivatingPanel,
+            allowsResizing: true
+        )
+        if let liveSubtitleWindow = liveSubtitleWindowController?.window {
+            liveSubtitleWindow.isOpaque = false
+            liveSubtitleWindow.backgroundColor = .clear
+            liveSubtitleWindow.hasShadow = false
+            liveSubtitleWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+            liveSubtitleWindow.contentMinSize = liveSubtitleWindowMinSize
+            liveSubtitleWindow.minSize = liveSubtitleWindowMinSize
+            liveSubtitleWindowResizeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didEndLiveResizeNotification,
+                object: liveSubtitleWindow,
+                queue: .main
+            ) { [weak self] notification in
+                guard let window = notification.object as? NSWindow else {
+                    return
+                }
+                Task { @MainActor in
+                    self?.persistLiveSubtitleWindowSize(window)
+                }
+            }
+        }
         settingsWindowController = WindowController(
             title: "设置",
             frame: NSRect(origin: .zero, size: settingsWindowContentSize),
-            contentView: AnyView(SettingsView(appState: appState))
+            contentView: AnyView(SettingsView(appState: appState, navigation: settingsNavigation))
         )
         if let settingsWindow = settingsWindowController?.window {
             settingsWindow.contentMinSize = NSSize(width: settingsWindowContentSize.width, height: 380)
@@ -164,7 +212,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    @objc private func openSettings() {
+    @objc private func toggleAppLiveSubtitles() {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            if appState.appLiveSubtitlesAreRunning {
+                _ = await appState.stopAppLiveSubtitles()
+            } else {
+                await openAppLiveSubtitles()
+            }
+        }
+    }
+
+    private func openAppLiveSubtitles() async {
+        if appState.appLiveSubtitlesAreRunning {
+            showLiveSubtitleWindow()
+            return
+        }
+        do {
+            _ = try await appState.startAppLiveSubtitles()
+        } catch {
+            // AppState stores the failure state; still show the floating window so the user can see it.
+        }
+        showLiveSubtitleWindow()
+    }
+
+    private func closeLiveSubtitlesFromWindow() {
+        if let window = liveSubtitleWindowController?.window {
+            persistLiveSubtitleWindowSize(window)
+            window.orderOut(nil)
+        }
+        Task { @MainActor [weak self] in
+            guard let self else {
+                return
+            }
+            if appState.appLiveSubtitlesAreRunning {
+                _ = await appState.stopAppLiveSubtitles(payload: StopAppLiveSubtitlePayload(reason: "window_closed"))
+            }
+            if let window = liveSubtitleWindowController?.window {
+                persistLiveSubtitleWindowSize(window)
+                window.orderOut(nil)
+            }
+        }
+    }
+
+    @objc private func openGeneralSettings() {
+        showSettings(tab: .general)
+    }
+
+    @objc private func openModelSettings() {
+        showSettings(tab: .models)
+    }
+
+    private func showSettings(tab: SettingsTab) {
+        settingsNavigation.selectedTab = tab
         settingsWindowController?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -186,6 +288,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
         }
         openQuickAction()
+    }
+
+    func hotKeyServiceDidTriggerLiveSubtitles(_ service: HotKeyService) {
+        Task { @MainActor [weak self] in
+            await self?.openAppLiveSubtitles()
+        }
     }
 
     func selectionActionService(
@@ -452,6 +560,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             }
             .store(in: &cancellables)
 
+        appState.$appLiveSubtitleRunState
+            .dropFirst()
+            .sink { [weak self] state in
+                self?.refreshLiveSubtitleWindow(for: state)
+                self?.refreshStatusMenuItem()
+                self?.refreshMenuTitles()
+            }
+            .store(in: &cancellables)
+
+        appState.$appLiveSubtitleIsImmersive
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.refreshLiveSubtitleWindowLayout(animated: true)
+            }
+            .store(in: &cancellables)
+
+        appState.$appLiveSubtitleDisplayMode
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard self?.appState.appLiveSubtitleIsImmersive == true else {
+                    return
+                }
+                self?.refreshLiveSubtitleWindowLayout(animated: true)
+            }
+            .store(in: &cancellables)
+
         appState.$isRunning
             .dropFirst()
             .sink { [weak self] _ in
@@ -494,6 +628,133 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
     }
 
+    private func refreshLiveSubtitleWindow(for state: AppState.AppLiveSubtitleRunState) {
+        switch state {
+        case .starting, .running, .failed:
+            showLiveSubtitleWindow()
+        case .stopping, .stopped:
+            if let window = liveSubtitleWindowController?.window {
+                persistLiveSubtitleWindowSize(window)
+                window.orderOut(nil)
+            }
+        }
+    }
+
+    private func showLiveSubtitleWindow() {
+        guard let window = liveSubtitleWindowController?.window else {
+            return
+        }
+        if !window.isVisible {
+            positionLiveSubtitleWindow(window)
+        }
+        refreshLiveSubtitleWindowLayout(animated: false)
+        window.orderFrontRegardless()
+    }
+
+    private func positionLiveSubtitleWindow(_ window: NSWindow) {
+        let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let availableWidth = max(liveSubtitleWindowMinSize.width, visibleFrame.width - 80)
+        let availableHeight = max(liveSubtitleWindowMinSize.height, visibleFrame.height - 120)
+        let savedWidth = CGFloat(appState.preferences.mediaSubtitles.liveWindowWidth)
+        let savedHeight = CGFloat(appState.preferences.mediaSubtitles.liveWindowHeight)
+        let width = min(max(liveSubtitleWindowMinSize.width, savedWidth), availableWidth)
+        let height = min(max(liveSubtitleWindowMinSize.height, savedHeight), availableHeight)
+        let x = visibleFrame.midX - width / 2
+        let y = visibleFrame.minY + 64
+        window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+    }
+
+    private func persistLiveSubtitleWindowSize(_ window: NSWindow) {
+        guard !appState.appLiveSubtitleIsImmersive else {
+            return
+        }
+        let width = Double(window.frame.width)
+        let height = Double(window.frame.height)
+        let current = appState.preferences.mediaSubtitles
+        guard abs(width - current.liveWindowWidth) >= 1 || abs(height - current.liveWindowHeight) >= 1 else {
+            return
+        }
+        appState.setLiveSubtitleWindowSize(width: width, height: height)
+    }
+
+    private func refreshLiveSubtitleWindowLayout(animated: Bool) {
+        guard let window = liveSubtitleWindowController?.window else {
+            return
+        }
+        if appState.appLiveSubtitleIsImmersive {
+            let targetHeight = liveSubtitleImmersiveHeight()
+            let minimumSize = NSSize(width: liveSubtitleWindowMinSize.width, height: targetHeight)
+            let maximumSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: targetHeight)
+            window.contentMinSize = minimumSize
+            window.minSize = minimumSize
+            window.contentMaxSize = maximumSize
+            window.maxSize = maximumSize
+            guard window.isVisible else {
+                return
+            }
+            resizeLiveSubtitleWindow(
+                window,
+                targetSize: NSSize(width: max(window.frame.width, liveSubtitleWindowMinSize.width), height: targetHeight),
+                animated: animated
+            )
+        } else {
+            window.contentMinSize = liveSubtitleWindowMinSize
+            window.minSize = liveSubtitleWindowMinSize
+            let maximumSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+            window.contentMaxSize = maximumSize
+            window.maxSize = maximumSize
+            guard window.isVisible else {
+                return
+            }
+            let targetSize = normalLiveSubtitleWindowSize()
+            resizeLiveSubtitleWindow(window, targetSize: targetSize, animated: animated)
+        }
+    }
+
+    private func liveSubtitleImmersiveHeight() -> CGFloat {
+        appState.appLiveSubtitleDisplayMode == .bilingual
+            ? liveSubtitleImmersiveBilingualHeight
+            : liveSubtitleImmersiveTwoLineHeight
+    }
+
+    private func normalLiveSubtitleWindowSize() -> NSSize {
+        let visibleFrame = liveSubtitleVisibleFrame()
+        let availableWidth = max(liveSubtitleWindowMinSize.width, visibleFrame.width - 80)
+        let availableHeight = max(liveSubtitleWindowMinSize.height, visibleFrame.height - 120)
+        let savedWidth = CGFloat(appState.preferences.mediaSubtitles.liveWindowWidth)
+        let savedHeight = CGFloat(appState.preferences.mediaSubtitles.liveWindowHeight)
+        return NSSize(
+            width: min(max(liveSubtitleWindowMinSize.width, savedWidth), availableWidth),
+            height: min(max(liveSubtitleWindowMinSize.height, savedHeight), availableHeight)
+        )
+    }
+
+    private func resizeLiveSubtitleWindow(
+        _ window: NSWindow,
+        targetSize: NSSize,
+        animated: Bool
+    ) {
+        let visibleFrame = liveSubtitleVisibleFrame(for: window)
+        let width = min(max(targetSize.width, window.minSize.width), max(window.minSize.width, visibleFrame.width - 40))
+        let height = min(max(targetSize.height, window.minSize.height), max(window.minSize.height, visibleFrame.height - 80))
+        let centeredX = window.frame.midX - width / 2
+        let minX = visibleFrame.minX + 20
+        let maxX = max(minX, visibleFrame.maxX - width - 20)
+        let minY = visibleFrame.minY + 20
+        let maxY = max(minY, visibleFrame.maxY - height - 20)
+        let x = min(max(centeredX, minX), maxX)
+        let y = min(max(window.frame.minY, minY), maxY)
+        window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true, animate: animated)
+    }
+
+    private func liveSubtitleVisibleFrame(for window: NSWindow? = nil) -> NSRect {
+        if let window,
+           let screen = NSScreen.screens.first(where: { NSIntersectsRect($0.frame, window.frame) }) {
+            return screen.visibleFrame
+        }
+        return NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
     private func applySelectionActionPreference(_ preferences: AppPreferences? = nil) {
         let isEnabled = (preferences ?? appState.preferences).selectionActionEnabled
         let preferences = preferences ?? appState.preferences
@@ -509,7 +770,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         let preferences = preferences ?? appState.preferences
         hotKeyService.registerHotKeys(
             quickActionShortcut: preferences.quickActionShortcut,
-            quickActionWithoutSelectionShortcut: preferences.quickActionWithoutSelectionShortcut
+            quickActionWithoutSelectionShortcut: preferences.quickActionWithoutSelectionShortcut,
+            liveSubtitleShortcut: preferences.liveSubtitleShortcut
         )
     }
 
@@ -537,6 +799,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         if appState.isRunning {
             return L10n.text("Running", language: appState.preferences.appLanguage)
         }
+        if appState.appLiveSubtitlesAreRunning {
+            return L10n.text("Live subtitles", language: appState.preferences.appLanguage)
+        }
         return appState.statusMessage
     }
 
@@ -551,14 +816,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 item.title = L10n.text("Open Quick Action", language: appState.preferences.appLanguage)
             case #selector(openImageOCR):
                 item.title = L10n.text("Image OCR", language: appState.preferences.appLanguage)
+            case #selector(toggleAppLiveSubtitles):
+                item.title = L10n.text(
+                    appState.appLiveSubtitlesAreRunning ? "Stop live subtitles" : "Start live subtitles",
+                    language: appState.preferences.appLanguage
+                )
             case #selector(openFloatingWidget):
                 item.title = L10n.text("Open Floating Widget", language: appState.preferences.appLanguage)
-            case #selector(openSettings):
-                if item.keyEquivalent == "," {
-                    item.title = L10n.text("Models", language: appState.preferences.appLanguage)
-                } else {
-                    item.title = L10n.text("Settings", language: appState.preferences.appLanguage)
-                }
+            case #selector(openModelSettings):
+                item.title = L10n.text("Models", language: appState.preferences.appLanguage)
+            case #selector(openGeneralSettings):
+                item.title = L10n.text("Settings", language: appState.preferences.appLanguage)
             case #selector(quitApp):
                 item.title = L10n.text("Quit", language: appState.preferences.appLanguage)
             default:
@@ -608,6 +876,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             refreshQuickActionWindowTitle()
             return true
         }
+        if shortcut == shortcuts.mediaMode {
+            appState.quickActionMode = .media
+            refreshQuickActionWindowTitle()
+            return true
+        }
 
         switch appState.quickActionMode {
         case .text:
@@ -624,13 +897,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             appState.setOCRMode(mode)
             refreshQuickActionWindowTitle()
             return true
+        case .media:
+            return false
         }
     }
 
     private func refreshQuickActionWindowTitle() {
-        quickActionWindowController?.window?.title = appState.quickActionMode == .image
-            ? L10n.text("Image OCR", language: appState.preferences.appLanguage)
-            : appState.selectedTask.title(language: appState.preferences.appLanguage)
+        switch appState.quickActionMode {
+        case .image:
+            quickActionWindowController?.window?.title = L10n.text("Image OCR", language: appState.preferences.appLanguage)
+        case .media:
+            quickActionWindowController?.window?.title = L10n.text("Media subtitles", language: appState.preferences.appLanguage)
+        case .text:
+            quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
+        }
     }
 
     private var selectionActionShouldShowInlineResult: Bool {
@@ -774,7 +1054,8 @@ final class WindowController: NSWindowController {
         contentView: AnyView,
         windowLevel: NSWindow.Level = .normal,
         autoCollapseAtScreenEdge: Bool = false,
-        windowKind: WindowKind = .regular
+        windowKind: WindowKind = .regular,
+        allowsResizing: Bool = false
     ) {
         let hosting = NSHostingView(rootView: contentView)
         hosting.wantsLayer = true
@@ -789,9 +1070,13 @@ final class WindowController: NSWindowController {
                 defer: false
             )
         case .nonActivatingPanel:
+            var styleMask: NSWindow.StyleMask = [.borderless, .nonactivatingPanel]
+            if allowsResizing {
+                styleMask.insert(.resizable)
+            }
             window = SelectionActionWindow(
                 contentRect: frame,
-                styleMask: [.borderless, .nonactivatingPanel],
+                styleMask: styleMask,
                 backing: .buffered,
                 defer: false
             )

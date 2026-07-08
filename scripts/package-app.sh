@@ -37,6 +37,24 @@ fi
 if [ -d "$ROOT_DIR/browser-extension" ]; then
     cp -R "$ROOT_DIR/browser-extension" "$RESOURCES_DIR/browser-extension"
 fi
+mkdir -p "$RESOURCES_DIR/asr"
+cp "$ROOT_DIR/scripts/llmtools-mlx-asr-runner.sh" "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh"
+cp "$ROOT_DIR/scripts/llmtools-streaming-asr-sidecar.py" "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py"
+cp "$ROOT_DIR/scripts/llmtools-whisper-coreml-runner.sh" "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh"
+cp "$ROOT_DIR/scripts/install-phase4-mlx-asr-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-funasr-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-funasr-nano-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-sensevoice-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-whisper-coreml-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
+chmod +x \
+    "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh" \
+    "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py" \
+    "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
 if [ ! -f "$ROOT_DIR/Resources/$APP_ICON_NAME.icns" ]; then
     echo "error: missing app icon at Resources/$APP_ICON_NAME.icns; run ./scripts/generate-app-icon.sh first." >&2
     exit 1
@@ -82,6 +100,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>llmTools uses microphone audio only when you start live subtitles.</string>
 </dict>
 </plist>
 PLIST

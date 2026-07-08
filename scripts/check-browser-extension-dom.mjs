@@ -37,6 +37,8 @@ async function runExtensionManifestPermissionCheck() {
     JSON.stringify([...permissions].sort()) === JSON.stringify(expectedPermissions),
     `manifest permissions should stay least-privilege; got ${JSON.stringify(permissions)}`
   );
+  assert(!permissions.includes("tabCapture"), "browser extension must not request tabCapture after live subtitles moved into the app");
+  assert(!permissions.includes("offscreen"), "browser extension must not request offscreen after live subtitles moved into the app");
   assert(!permissions.includes("<all_urls>"), "manual translation must not request <all_urls> as a normal permission");
   assert(
     !permissions.some((permission) => /^https?:\/\//.test(permission)),
@@ -80,6 +82,7 @@ async function runBackgroundBatchCheck() {
 
   let backgroundListener = null;
   let tabUpdatedListener = null;
+  let tabRemovedListener = null;
   let tabActivatedListener = null;
   let contextMenuClickListener = null;
   let contextMenuShownListener = null;
@@ -348,7 +351,9 @@ async function runBackgroundBatchCheck() {
     },
     tabs: {
       onRemoved: {
-        addListener() {}
+        addListener(listener) {
+          tabRemovedListener = listener;
+        }
       },
       onUpdated: {
         addListener(listener) {
@@ -437,12 +442,14 @@ async function runBackgroundBatchCheck() {
   vm.runInContext(source, context, { filename: "background.js" });
   assert(backgroundListener, "background listener was not registered");
   assert(tabUpdatedListener, "tab update listener was not registered");
+  assert(tabRemovedListener, "tab removal listener was not registered");
   assert(tabActivatedListener, "tab activation listener was not registered");
   assert(contextMenuClickListener, "context menu click listener was not registered");
   assert(contextMenuShownListener, "context menu shown listener was not registered");
   assert(nativePortDisconnectListener === null, "native port should not connect before a native request");
   assert(contextMenuItems.size === 1, `expected one top-level context menu item, got ${contextMenuItems.size}`);
   assert(contextMenuItems.has("llmtools-toggle-page"), "toggle context menu was not created");
+  assert(!contextMenuItems.has("llmtools-toggle-live-subtitles"), "live subtitles context menu should not be created");
   assert(contextMenuItems.get("llmtools-toggle-page").title === "翻译/原文", "toggle context menu should use the requested label");
   assert(contextMenuItems.get("llmtools-toggle-page").enabled !== false, "toggle context menu should start enabled");
 
@@ -509,6 +516,10 @@ async function runBackgroundBatchCheck() {
   assert(popupStates.some((message) => message.state?.appLanguage === "en"), "expected app language to be published to popup state");
   assert(contextMenuItems.get("llmtools-toggle-page").enabled === true, "toggle context menu should be enabled after translation");
   assert(contextMenuItems.get("llmtools-toggle-page").title === "Translate/Original", "toggle context menu should follow app language after status check");
+  assert(
+    !nativeMessages.some((message) => message.type === "startAppLiveSubtitles" || message.type === "stopAppLiveSubtitles"),
+    "browser extension should not start or stop app live subtitles"
+  );
 
   const nativeCallsBeforeRestrictedPage = nativeTranslatePayloads.length;
   const startSessionsBeforeRestrictedPage = startSessionMessages.length;

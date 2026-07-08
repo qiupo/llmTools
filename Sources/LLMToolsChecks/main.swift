@@ -16,6 +16,7 @@ struct LLMToolsChecks {
         try await checkHistoryLimit()
         try await checkPhase1InteractiveNativeTasks()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
+        try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
         try checkTextTaskModePreferencesAndPrompts()
         try checkCustomPromptTemplates()
         try checkOCRCapabilityDefaultsDecodeFromOlderRegistry()
@@ -37,6 +38,10 @@ struct LLMToolsChecks {
         try await checkWebPageTranslationQualityModePrompt()
         try await checkWebPageTranslationBatchFallback()
         try await checkWebPageTranslationBatchRetriesOnlyMissingSegments()
+        try await checkSpeechModelDetectionPreferencesAndHealth()
+        try await checkSubtitleTranslationCoordinatorUsesTextRunner()
+        try await checkMediaFileSubtitlePipelineWithConfiguredLocalCommand()
+        try checkSubtitlePromptExporterAndPrivacyDefaults()
         try checkVisibleOutputHidesThinkBlock()
         try checkGeneratedOutputGuardTrimsDegenerateTail()
         try checkPromptsStayCompact()
@@ -399,8 +404,10 @@ struct LLMToolsChecks {
         try require(!preferences.promptTemplates.hasCustomOCRPrompt(for: .plainText), "Expected custom OCR mode prompts to default empty.")
         try require(preferences.quickActionShortcut == .optionSpace, "Expected quick action shortcut to default to Option-Space.")
         try require(preferences.quickActionWithoutSelectionShortcut == .optionShiftSpace, "Expected no-selection quick action shortcut to default to Option-Shift-Space.")
+        try require(preferences.liveSubtitleShortcut == .commandOptionControlL, "Expected live subtitle shortcut to default to Command-Option-Control-L.")
         try require(preferences.quickActionPopupShortcuts.textMode == .commandControlNumber(1), "Expected popup text-mode shortcut to default to Command-Control-1.")
         try require(preferences.quickActionPopupShortcuts.imageMode == .commandControlNumber(2), "Expected popup image-mode shortcut to default to Command-Control-2.")
+        try require(preferences.quickActionPopupShortcuts.mediaMode == .commandControlNumber(3), "Expected popup media-mode shortcut to default to Command-Control-3.")
         try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .translate) == .commandNumber(1), "Expected popup translate shortcut to default to Command-1.")
         try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .extractTodos) == .commandNumber(5), "Expected popup TODO shortcut to default to Command-5.")
         try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .plainText) == .commandNumber(1), "Expected popup plain OCR shortcut to default to Command-1.")
@@ -455,6 +462,33 @@ struct LLMToolsChecks {
         }
         """.utf8))
         try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
+    }
+
+    private static func checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry() throws {
+        let preferences = try JSONDecoder().decode(AppPreferences.self, from: Data("{}".utf8))
+        try require(preferences.mediaSubtitles.isEnabled, "Expected media subtitles to default on.")
+        try require(preferences.mediaSubtitles.defaultTargetLanguage == "zh-Hans", "Expected media subtitles to default to Simplified Chinese.")
+        try require(preferences.mediaSubtitles.sourceLanguageHint == .auto, "Expected ASR source language hint to default to auto.")
+        try require(preferences.mediaSubtitles.defaultSubtitleMode == .bilingual, "Expected media subtitles to default to bilingual display.")
+        try require(!preferences.mediaSubtitles.saveTranscriptHistory, "Media transcript history must default off.")
+        try require(!preferences.mediaSubtitles.saveTranslatedSubtitleHistory, "Translated subtitle history must default off.")
+        try require(preferences.mediaSubtitles.funASRCommandTemplate.isEmpty, "Fun-ASR command should default empty.")
+        try require(preferences.mediaSubtitles.senseVoiceCommandTemplate.isEmpty, "SenseVoice command should default empty.")
+        try require(preferences.mediaSubtitles.qwen3ASRCommandTemplate.isEmpty, "Qwen3-ASR command should default empty.")
+        try require(preferences.mediaSubtitles.whisperCommandTemplate.isEmpty, "Whisper command should default empty.")
+        try require(preferences.mediaSubtitles.genericASRCommandTemplate.isEmpty, "Generic ASR command should default empty.")
+        try require(preferences.mediaSubtitles.liveWindowWidth == MediaSubtitlePreferences.defaultLiveWindowWidth, "Expected live subtitle window width to use the default.")
+        try require(preferences.mediaSubtitles.liveWindowHeight == MediaSubtitlePreferences.defaultLiveWindowHeight, "Expected live subtitle window height to use the default.")
+        let tinyWindowPreferences = MediaSubtitlePreferences(liveWindowWidth: 10, liveWindowHeight: 10)
+        try require(tinyWindowPreferences.liveWindowWidth == MediaSubtitlePreferences.minimumLiveWindowWidth, "Expected live subtitle window width to clamp to the minimum.")
+        try require(tinyWindowPreferences.liveWindowHeight == MediaSubtitlePreferences.minimumLiveWindowHeight, "Expected live subtitle window height to clamp to the minimum.")
+
+        let qwenCapabilities = ModelCapabilities.speech(.qwen3ASR06B())
+        let encoded = try JSONEncoder().encode(qwenCapabilities)
+        let decoded = try JSONDecoder().decode(ModelCapabilities.self, from: encoded)
+        try require(decoded.supportsSpeech, "Expected speech capabilities to round-trip as speech-capable.")
+        try require(decoded.supportsFileSpeech, "Expected Qwen3-ASR-0.6B to support file transcription.")
+        try require(decoded.supportsRealtimeSpeech, "Expected Qwen3-ASR-0.6B to support optional realtime subtitles.")
     }
 
     private static func checkTextTaskModePreferencesAndPrompts() throws {
@@ -1118,6 +1152,329 @@ struct LLMToolsChecks {
         try require(requestCount == 2, "Expected one initial batch and one retry for the missing segment.")
     }
 
+    private static func checkSpeechModelDetectionPreferencesAndHealth() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let senseDirectory = root.appendingPathComponent("SenseVoiceSmall", isDirectory: true)
+        try FileManager.default.createDirectory(at: senseDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("model.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("tokens.txt").path, contents: Data("stub".utf8))
+
+        let funMLTDirectory = root.appendingPathComponent("Fun-ASR-MLT-Nano-2512", isDirectory: true)
+        try FileManager.default.createDirectory(at: funMLTDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: funMLTDirectory.appendingPathComponent("model.pt").path, contents: Data())
+        FileManager.default.createFile(atPath: funMLTDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+
+        let qwenDirectory = root.appendingPathComponent("Qwen3-ASR-0.6B", isDirectory: true)
+        try FileManager.default.createDirectory(at: qwenDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: qwenDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+
+        let sherpaQwenDirectory = root.appendingPathComponent("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25", isDirectory: true)
+        try FileManager.default.createDirectory(at: sherpaQwenDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: sherpaQwenDirectory.appendingPathComponent("conv_frontend.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenDirectory.appendingPathComponent("encoder.int8.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenDirectory.appendingPathComponent("decoder.int8.onnx").path, contents: Data())
+        let sherpaTokenizer = sherpaQwenDirectory.appendingPathComponent("tokenizer", isDirectory: true)
+        try FileManager.default.createDirectory(at: sherpaTokenizer, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: sherpaTokenizer.appendingPathComponent("vocab.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: sherpaTokenizer.appendingPathComponent("merges.txt").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaTokenizer.appendingPathComponent("tokenizer_config.json").path, contents: Data("{}".utf8))
+
+        let sherpaQwenFP32Directory = root.appendingPathComponent("Qwen3-ASR-1.7B-onnx-fp32", isDirectory: true)
+        try FileManager.default.createDirectory(at: sherpaQwenFP32Directory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: sherpaQwenFP32Directory.appendingPathComponent("conv_frontend.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenFP32Directory.appendingPathComponent("encoder.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenFP32Directory.appendingPathComponent("encoder.onnx.data").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenFP32Directory.appendingPathComponent("decoder.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaQwenFP32Directory.appendingPathComponent("decoder.onnx.data").path, contents: Data())
+        let sherpaFP32Tokenizer = sherpaQwenFP32Directory.appendingPathComponent("tokenizer", isDirectory: true)
+        try FileManager.default.createDirectory(at: sherpaFP32Tokenizer, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: sherpaFP32Tokenizer.appendingPathComponent("vocab.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: sherpaFP32Tokenizer.appendingPathComponent("merges.txt").path, contents: Data())
+        FileManager.default.createFile(atPath: sherpaFP32Tokenizer.appendingPathComponent("tokenizer_config.json").path, contents: Data("{}".utf8))
+
+        let whisperDirectory = root.appendingPathComponent("whisper-base-en-coreml", isDirectory: true)
+        try FileManager.default.createDirectory(at: whisperDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: whisperDirectory.appendingPathComponent("ggml-base.en.bin").path, contents: Data())
+        try FileManager.default.createDirectory(
+            at: whisperDirectory.appendingPathComponent("ggml-base.en-encoder.mlmodelc", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let detectedSense = try requireNonNil(ModelDetection.detectSpeechModel(at: senseDirectory), "Expected SenseVoiceSmall speech detection.")
+        try require(detectedSense.family == .senseVoiceSmall, "Expected SenseVoiceSmall family detection.")
+        try require(detectedSense.supports(.realtime), "SenseVoiceSmall must be realtime-capable.")
+        try require(detectedSense.supports(.fileOnly), "SenseVoiceSmall must also support file transcription.")
+
+        let detectedFunMLT = try requireNonNil(ModelDetection.detectSpeechModel(at: funMLTDirectory), "Expected Fun-ASR-MLT-Nano speech detection.")
+        try require(detectedFunMLT.family == .funASRMLTNano, "Expected Fun-ASR-MLT-Nano family detection.")
+        try require(detectedFunMLT.supports(.realtime), "Fun-ASR-MLT-Nano must be realtime-capable through a local streaming runtime.")
+        try require(detectedFunMLT.supports(.fileOnly), "Fun-ASR-MLT-Nano must also support file transcription.")
+
+        let detectedQwen = try requireNonNil(ModelDetection.detectSpeechModel(at: qwenDirectory), "Expected Qwen3-ASR speech detection.")
+        try require(detectedQwen.family == .qwen3ASR06B, "Expected Qwen3-ASR-0.6B family detection.")
+        try require(detectedQwen.supports(.fileOnly), "Qwen3-ASR-0.6B must support file transcription.")
+        try require(detectedQwen.supports(.realtime), "Qwen3-ASR-0.6B should be selectable for experimental realtime subtitles.")
+
+        try require(ModelDetection.detectSpeechModel(at: sherpaQwenDirectory) == nil, "sherpa-onnx Qwen3-ASR int8 directories should no longer auto-register as speech models.")
+        try require(ModelDetection.detectSpeechModel(at: sherpaQwenFP32Directory) == nil, "sherpa-onnx Qwen3-ASR fp32 directories should no longer auto-register as speech models.")
+
+        let detectedWhisper = try requireNonNil(ModelDetection.detectSpeechModel(at: whisperDirectory), "Expected whisper.cpp CoreML speech detection.")
+        try require(detectedWhisper.family == .whisperCppCoreML, "Expected whisper.cpp CoreML family detection.")
+        try require(detectedWhisper.supports(.fileOnly), "whisper.cpp CoreML must support file transcription.")
+        try require(detectedWhisper.supports(.realtime), "whisper.cpp CoreML must be selectable for realtime subtitles through its persistent sidecar.")
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+
+        let sense = try await engine.addModel(from: senseDirectory)
+        let qwen = try await engine.addModel(from: qwenDirectory)
+        let funMLT = try await engine.addModel(from: funMLTDirectory)
+        let whisper = try await engine.addModel(from: whisperDirectory)
+        try require(sense.format == .speech, "Expected SenseVoiceSmall to register as speech format.")
+        try require(qwen.format == .speech, "Expected Qwen3-ASR-0.6B to register as speech format.")
+        try require(funMLT.format == .speech, "Expected Fun-ASR-MLT-Nano to register as speech format.")
+        try require(whisper.format == .speech, "Expected whisper.cpp CoreML to register as speech format.")
+        let speechModels = await engine.speechCapableModels()
+        let realtimeSpeechModels = await engine.realtimeSpeechModels()
+        let fileSpeechModels = await engine.fileSpeechModels()
+        try require(speechModels.count == 4, "Expected four speech-capable models after removing sherpa-onnx Qwen3-ASR.")
+        try require(realtimeSpeechModels.map(\.id).contains(sense.id), "SenseVoiceSmall should be realtime-capable.")
+        try require(realtimeSpeechModels.map(\.id).contains(funMLT.id), "Fun-ASR-MLT-Nano should be realtime-capable.")
+        try require(realtimeSpeechModels.map(\.id).contains(qwen.id), "Qwen3-ASR-0.6B should be selectable for realtime subtitles.")
+        try require(realtimeSpeechModels.map(\.id).contains(whisper.id), "whisper.cpp CoreML should be selectable for realtime subtitles.")
+        try require(fileSpeechModels.map(\.id).contains(funMLT.id), "Fun-ASR-MLT-Nano should be selectable for file subtitles.")
+        try require(fileSpeechModels.map(\.id).contains(qwen.id), "Qwen3-ASR-0.6B should be selectable for file subtitles.")
+        try require(fileSpeechModels.map(\.id).contains(whisper.id), "whisper.cpp CoreML should be selectable for file subtitles.")
+
+        var mediaPreferences = await engine.registry().preferences.mediaSubtitles
+        try require(mediaPreferences.realtimeASRModelID == funMLT.id, "Expected Fun-ASR-MLT-Nano to become preferred realtime ASR preference.")
+        try require(mediaPreferences.fileASRModelID == sense.id, "Expected first file-capable ASR to seed file preference.")
+
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.realtimeASRModelID = qwen.id
+            preferences.mediaSubtitles.fileASRModelID = qwen.id
+        }
+        mediaPreferences = await engine.registry().preferences.mediaSubtitles
+        try require(mediaPreferences.realtimeASRModelID == qwen.id, "Realtime preference should accept Qwen3-ASR when selected.")
+        try require(mediaPreferences.fileASRModelID == qwen.id, "File subtitle preference should accept Qwen3-ASR.")
+
+        let health = try await engine.checkASRHealth(modelID: sense.id, mode: .realtime)
+        try require(health.family == .senseVoiceSmall, "Expected SenseVoiceSmall ASR health family.")
+        try require(health.isRealtimeCapable, "Expected SenseVoiceSmall health to report realtime capability.")
+        try require(health.status == .runtimeMissing || health.status == .ready, "Expected health to be local-runtime missing or ready, got \(health.status).")
+        if health.status == .runtimeMissing {
+            try require(health.runtimeSource == .unavailable, "Missing ASR runtime should report unavailable runtime source.")
+        }
+        let healthMessage = health.message.lowercased()
+        try require(!healthMessage.contains("cloud") && !healthMessage.contains("remote"), "ASR health must not suggest a cloud fallback.")
+
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.sourceLanguageHint = .zh
+            preferences.mediaSubtitles.senseVoiceCommandTemplate = #"/usr/bin/printf '{"segments":[{"start":0,"end":1.25,"text":"hello from local command","language":"%s","confidence":0.9}]}' {language}"#
+            preferences.mediaSubtitles.realtimeASRModelID = sense.id
+            preferences.mediaSubtitles.fileASRModelID = sense.id
+        }
+        let configuredHealth = try await engine.checkASRHealth(modelID: sense.id, mode: .fileOnly)
+        try require(configuredHealth.status == .ready, "Expected settings ASR command to make SenseVoice file ASR health ready.")
+        try require(configuredHealth.runtimeSource == .settingsCommand, "Expected configured ASR runtime source to come from Settings.")
+        let audioURL = root.appendingPathComponent("fixture.wav")
+        FileManager.default.createFile(atPath: audioURL.path, contents: Data("stub".utf8))
+        let configuredPreferences = await engine.registry().preferences.mediaSubtitles
+        let fixtureSegments = try await LocalASRProcessRunner().transcribe(
+            audioURL: audioURL,
+            model: sense,
+            sessionID: UUID(),
+            duration: 1.25,
+            preferences: configuredPreferences
+        )
+        try require(fixtureSegments.count == 1, "Expected settings ASR command to return one fixture subtitle segment.")
+        try require(fixtureSegments.first?.originalText == "hello from local command", "Expected fixture transcript from settings ASR command.")
+        try require(fixtureSegments.first?.sourceLanguage == "zh", "Expected ASR command template to receive source language hint.")
+
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.funASRCommandTemplate = #"/usr/bin/printf '{"segments":[{"start":0,"end":1.0,"text":"fun asr local command","language":"%s"}]}' {language}"#
+            preferences.mediaSubtitles.realtimeASRModelID = funMLT.id
+            preferences.mediaSubtitles.fileASRModelID = funMLT.id
+        }
+        let funHealth = try await engine.checkASRHealth(modelID: funMLT.id, mode: .fileOnly)
+        try require(funHealth.status == .ready, "Expected settings ASR command to make Fun-ASR file ASR health ready.")
+        try require(funHealth.runtimeSource == .settingsCommand, "Expected Fun-ASR runtime source to come from Settings.")
+
+        let minimalLivePayload = try JSONDecoder().decode(
+            CreateLiveSubtitleSessionPayload.self,
+            from: Data(#"{"tabID":7}"#.utf8)
+        )
+        try require(minimalLivePayload.tabID == 7, "Expected live subtitle payload to preserve tabID.")
+        try require(minimalLivePayload.targetLanguage == "zh-Hans", "Expected live subtitle payload to default target language.")
+        try require(minimalLivePayload.displayMode == .bilingual, "Expected live subtitle payload to default display mode.")
+        try require(minimalLivePayload.sampleRate == 16_000, "Expected live subtitle payload to default sample rate.")
+        try require(minimalLivePayload.channelCount == 1, "Expected live subtitle payload to default channel count.")
+    }
+
+    private static func checkSubtitleTranslationCoordinatorUsesTextRunner() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let firstID = UUID(uuidString: "00000000-0000-0000-0000-000000000101")!
+        let secondID = UUID(uuidString: "00000000-0000-0000-0000-000000000102")!
+        let runner = StubRunner(output: """
+        [
+          {"id":"\(firstID.uuidString)","translation":"你好。"},
+          {"id":"\(secondID.uuidString)","translation":"世界。"}
+        ]
+        """)
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: runner]
+        )
+
+        let modelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+        _ = try await engine.addModel(from: modelDirectory)
+
+        let sessionID = UUID()
+        let translated = try await engine.translateSubtitleSegments([
+            SubtitleSegment(id: firstID, sessionID: sessionID, index: 0, startTime: 0, endTime: 1.5, originalText: "Hello.", asrModelID: "asr-fixture"),
+            SubtitleSegment(id: secondID, sessionID: sessionID, index: 1, startTime: 1.5, endTime: 3, originalText: "World.", asrModelID: "asr-fixture")
+        ])
+        try require(translated.map(\.translatedText) == ["你好。", "世界。"], "Expected subtitle coordinator to apply text-model JSON translations.")
+        try require(translated.allSatisfy { $0.translationModelID != nil }, "Expected translated subtitle segments to record translation model IDs.")
+
+        let requests = await runner.recordedRequests()
+        try require(requests.count == 1, "Expected one subtitle translation batch request.")
+        try require(requests[0].task == .webPageTranslate, "Expected subtitle translation to reuse JSON-capable text translation path.")
+        try require(requests[0].inputText.contains("Subtitle translation rules"), "Expected subtitle-specific prompt rules.")
+        try require(requests[0].targetLanguage == "zh-Hans", "Expected subtitle translation to default to Simplified Chinese.")
+        let history = await engine.recentHistory()
+        try require(history.isEmpty, "Subtitle translation history must default off.")
+    }
+
+    private static func checkMediaFileSubtitlePipelineWithConfiguredLocalCommand() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let textRunner = SubtitleJSONEchoRunner()
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.mlx: textRunner]
+        )
+
+        let textModelDirectory = root.appendingPathComponent("Qwen3.5-4B-MLX-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: textModelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: textModelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: textModelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: textModelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+        _ = try await engine.addModel(from: textModelDirectory)
+
+        let senseDirectory = root.appendingPathComponent("SenseVoiceSmall", isDirectory: true)
+        try FileManager.default.createDirectory(at: senseDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("model.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("tokens.txt").path, contents: Data("stub".utf8))
+        let speechModel = try await engine.addModel(from: senseDirectory)
+
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.fileASRModelID = speechModel.id
+            preferences.mediaSubtitles.realtimeASRModelID = speechModel.id
+            preferences.mediaSubtitles.senseVoiceCommandTemplate = #"/bin/echo '{"segments":[{"start":0,"end":1.5,"text":"file pipeline transcript","language":"en","confidence":0.98}]}'"#
+        }
+
+        let wavURL = root.appendingPathComponent("sample-audio.wav")
+        try writePCM16WAV(url: wavURL, duration: 0.4)
+        let fileResult = try await engine.transcribeMediaFile(at: wavURL, modelID: speechModel.id)
+        try require(fileResult.descriptor.mediaKind == "audio", "Expected WAV file intake to be treated as audio.")
+        try require(fileResult.normalizedAudioURL.lastPathComponent == "normalized-16k-mono.wav", "Expected file pipeline to normalize audio for ASR.")
+        try require(fileResult.segments.map(\.originalText) == ["file pipeline transcript"], "Expected file ASR command transcript segment.")
+        try require(fileResult.diagnostics.segmentCount == 1, "Expected diagnostics to count subtitle segments.")
+        try require(fileResult.diagnostics.targetLanguage == "zh-Hans", "Expected file diagnostics target language to default to Simplified Chinese.")
+
+        let translated = try await engine.translateSubtitleSegments(fileResult.segments)
+        try require(translated.first?.translatedText == "译文：file pipeline transcript", "Expected subtitle translation coordinator in file pipeline.")
+
+        let srt = try await engine.exportSubtitleSegments(translated, format: .srt, mode: .bilingual)
+        let vtt = try await engine.exportSubtitleSegments(translated, format: .vtt, mode: .translated)
+        let txt = try await engine.exportSubtitleSegments(translated, format: .txt, mode: .original)
+        let markdown = try await engine.exportSubtitleSegments(translated, format: .markdown, mode: .bilingual)
+        try require(srt.contains("file pipeline transcript\n译文：file pipeline transcript"), "Expected bilingual SRT export.")
+        try require(vtt.hasPrefix("WEBVTT"), "Expected VTT export.")
+        try require(vtt.contains("译文：file pipeline transcript"), "Expected translated VTT export.")
+        try require(txt == "file pipeline transcript\n", "Expected original TXT export.")
+        try require(markdown.contains("file pipeline transcript<br>译文：file pipeline transcript"), "Expected bilingual Markdown export.")
+
+        let diagnosticsJSON = String(data: try JSONEncoder().encode(fileResult.diagnostics), encoding: .utf8) ?? ""
+        try require(!diagnosticsJSON.contains("file pipeline transcript"), "File diagnostics must not include transcript text.")
+        try require(!diagnosticsJSON.contains(wavURL.path), "File diagnostics must not include full media path.")
+        let history = await engine.recentHistory()
+        try require(history.isEmpty, "File subtitle pipeline must not persist history by default.")
+    }
+
+    private static func checkSubtitlePromptExporterAndPrivacyDefaults() throws {
+        let sessionID = UUID()
+        let firstID = UUID(uuidString: "00000000-0000-0000-0000-000000000201")!
+        let secondID = UUID(uuidString: "00000000-0000-0000-0000-000000000202")!
+        let segments = [
+            SubtitleSegment(id: firstID, sessionID: sessionID, index: 0, startTime: 1.25, endTime: 3, originalText: "Hello | world.", translatedText: "你好，世界。", sourceLanguage: "en", asrModelID: "asr-fixture"),
+            SubtitleSegment(id: secondID, sessionID: sessionID, index: 1, startTime: 3.5, endTime: 5, originalText: "Second line.", translatedText: "第二行。", sourceLanguage: "en", asrModelID: "asr-fixture")
+        ]
+
+        let prompt = try PromptTemplates.subtitleBatchPrompt(segments: segments, targetLanguage: "zh-Hans", isRetry: false)
+        try require(prompt.contains("Subtitle translation rules"), "Expected subtitle prompt to include subtitle-specific rules.")
+        try require(prompt.contains(firstID.uuidString) && prompt.contains(secondID.uuidString), "Expected subtitle prompt to preserve segment IDs.")
+        try require(prompt.contains("Simplified Chinese"), "Expected zh-Hans target to render as Simplified Chinese.")
+
+        let srt = try SubtitleExporter.render(segments: segments, format: .srt, mode: .bilingual)
+        try require(srt.contains("00:00:01,250 --> 00:00:03,000"), "Expected SRT timestamp formatting.")
+        try require(srt.contains("Hello | world.\n你好，世界。"), "Expected bilingual SRT text.")
+
+        let vtt = try SubtitleExporter.render(segments: segments, format: .vtt, mode: .translated)
+        try require(vtt.hasPrefix("WEBVTT"), "Expected VTT header.")
+        try require(vtt.contains("00:00:01.250 --> 00:00:03.000"), "Expected VTT timestamp formatting.")
+        try require(!vtt.contains("Hello | world."), "Translated VTT mode should prefer translated subtitles.")
+
+        let markdown = try SubtitleExporter.render(segments: segments, format: .markdown, mode: .bilingual)
+        try require(markdown.contains("Hello \\| world.<br>你好，世界。"), "Expected Markdown export to escape pipes and keep bilingual line breaks.")
+
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let audioURL = root.appendingPathComponent("private-source-title.wav")
+        FileManager.default.createFile(atPath: audioURL.path, contents: Data())
+        let descriptor = try MediaIntakeService.descriptor(for: audioURL)
+        try require(MediaIntakeService.isSupportedMediaFile(audioURL), "Expected WAV media file to be supported.")
+        try require(!MediaIntakeService.isSupportedMediaFile(root.appendingPathComponent("notes.txt")), "Plain text must not be treated as Phase 4 media.")
+        try require(descriptor.mediaKind == "audio", "Expected WAV descriptor to be audio.")
+        try require(descriptor.redactedPathHash.hasPrefix("h"), "Expected descriptor to contain a redacted path hash.")
+        try require(!descriptor.redactedPathHash.contains(root.path), "Redacted media diagnostics must not contain the full file path.")
+
+        let diagnostics = MediaSubtitleDiagnostics(
+            mediaKind: "audio",
+            fileType: "wav",
+            durationBucket: "short",
+            sampleRate: 16_000,
+            asrModelID: "asr-fixture",
+            targetLanguage: "zh-Hans",
+            elapsedMilliseconds: 25,
+            segmentCount: 2,
+            errorCode: nil,
+            urlHash: nil,
+            domainHash: nil
+        )
+        let diagnosticsJSON = String(data: try JSONEncoder().encode(diagnostics), encoding: .utf8) ?? ""
+        try require(!diagnosticsJSON.contains("Hello | world."), "Diagnostics must not include transcript text.")
+        try require(!diagnosticsJSON.contains("你好，世界。"), "Diagnostics must not include translated subtitle text.")
+        try require(!diagnosticsJSON.contains(audioURL.path), "Diagnostics must not include full media paths.")
+    }
+
     private static func checkPromptsStayCompact() throws {
         let request = TaskRequest(task: .translate, inputText: "hello", targetLanguage: "Chinese")
         let prompt = PromptTemplates.userPrompt(for: request, preferences: AppPreferences())
@@ -1336,10 +1693,64 @@ struct LLMToolsChecks {
         return url
     }
 
+    private static func writePCM16WAV(
+        url: URL,
+        duration: TimeInterval,
+        sampleRate: UInt32 = 16_000,
+        amplitude: Int16 = 8_000
+    ) throws {
+        let sampleCount = max(Int(duration * Double(sampleRate)), 1)
+        let dataSize = UInt32(sampleCount * 2)
+        var data = Data()
+        appendASCII("RIFF", to: &data)
+        appendUInt32LE(36 + dataSize, to: &data)
+        appendASCII("WAVE", to: &data)
+        appendASCII("fmt ", to: &data)
+        appendUInt32LE(16, to: &data)
+        appendUInt16LE(1, to: &data)
+        appendUInt16LE(1, to: &data)
+        appendUInt32LE(sampleRate, to: &data)
+        appendUInt32LE(sampleRate * 2, to: &data)
+        appendUInt16LE(2, to: &data)
+        appendUInt16LE(16, to: &data)
+        appendASCII("data", to: &data)
+        appendUInt32LE(dataSize, to: &data)
+        for _ in 0..<sampleCount {
+            appendInt16LE(amplitude, to: &data)
+        }
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private static func appendASCII(_ value: String, to data: inout Data) {
+        data.append(contentsOf: value.utf8)
+    }
+
+    private static func appendUInt32LE(_ value: UInt32, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendUInt16LE(_ value: UInt16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
+    private static func appendInt16LE(_ value: Int16, to data: inout Data) {
+        var littleEndian = value.littleEndian
+        withUnsafeBytes(of: &littleEndian) { data.append(contentsOf: $0) }
+    }
+
     private static func require(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         if !condition() {
             throw CheckError(message)
         }
+    }
+
+    private static func requireNonNil<T>(_ value: T?, _ message: String) throws -> T {
+        guard let value else {
+            throw CheckError(message)
+        }
+        return value
     }
 }
 
@@ -1415,6 +1826,60 @@ private actor StubRunner: ModelRunner {
 
     func recordedRequests() -> [TaskRequest] {
         requests
+    }
+}
+
+private actor SubtitleJSONEchoRunner: ModelRunner {
+    private var loadedID: UUID?
+
+    func modelFormat() async -> ModelFormat {
+        .mlx
+    }
+
+    func loadedState() async -> Bool {
+        loadedID != nil
+    }
+
+    func loadedModelID() async -> UUID? {
+        loadedID
+    }
+
+    func loadedModelName() async -> String? {
+        "Subtitle JSON Echo"
+    }
+
+    func load(model: ModelDescriptor) async throws {
+        loadedID = model.id
+    }
+
+    func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
+        let marker = "Items:"
+        guard let markerRange = request.inputText.range(of: marker) else {
+            throw CheckError("Subtitle prompt did not contain Items marker.")
+        }
+        let jsonText = request.inputText[markerRange.upperBound...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = jsonText.data(using: .utf8),
+              let items = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw CheckError("Subtitle prompt items were not valid JSON.")
+        }
+        let translations = items.compactMap { item -> [String: String]? in
+            guard let id = item["id"] as? String,
+                  let text = item["text"] as? String else {
+                return nil
+            }
+            return [
+                "id": id,
+                "translation": "译文：\(text)"
+            ]
+        }
+        let outputData = try JSONSerialization.data(withJSONObject: translations, options: [.sortedKeys])
+        let output = String(data: outputData, encoding: .utf8) ?? "[]"
+        return TaskResult(text: output, modelName: "Subtitle JSON Echo", task: request.task)
+    }
+
+    func unload() async {
+        loadedID = nil
     }
 }
 

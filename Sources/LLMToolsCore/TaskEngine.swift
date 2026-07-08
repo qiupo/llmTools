@@ -30,7 +30,9 @@ public actor TaskEngine {
         } catch {
             snapshot = .init()
         }
-        if refreshDetectedLocalVisionCapabilities() {
+        let refreshedVision = refreshDetectedLocalVisionCapabilities()
+        let refreshedSpeech = refreshDetectedSpeechCapabilities()
+        if refreshedVision || refreshedSpeech {
             sanitizePreferences(&snapshot.preferences, models: snapshot.models)
             try? await registryStore.save(snapshot)
         }
@@ -51,6 +53,9 @@ public actor TaskEngine {
     }
 
     public func addModel(from url: URL, name: String? = nil, role: ModelRole? = nil) async throws -> ModelDescriptor {
+        if let speech = ModelDetection.detectSpeechModel(at: url) {
+            return try await addSpeechModel(from: url, name: name, speech: speech)
+        }
         let detection = try ModelDetection.detect(from: url)
         let displayName = name ?? inferDisplayName(from: url)
         let inferredRole: ModelRole = role ?? inferRole(format: detection.format, sizeClass: detection.sizeClass)
@@ -77,6 +82,45 @@ public actor TaskEngine {
             snapshot.preferences.defaultModelID = descriptor.id
         }
         sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        try await registryStore.save(snapshot)
+        return descriptor
+    }
+
+    public func addSpeechModel(
+        from url: URL,
+        name: String? = nil,
+        speech: SpeechModelCapabilities? = nil
+    ) async throws -> ModelDescriptor {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw ModelDetectionError.pathDoesNotExist(url)
+        }
+        guard let speech = speech ?? ModelDetection.detectSpeechModel(at: url) else {
+            throw ModelDetectionError.unsupported(url)
+        }
+        let displayName = name ?? inferDisplayName(from: url)
+        let descriptor = ModelDescriptor(
+            name: displayName,
+            sourcePath: url,
+            resolvedPath: url,
+            format: .speech,
+            sizeClass: speech.family.rawValue,
+            role: .default,
+            contextLength: 0,
+            enabled: true,
+            validationState: .valid,
+            lastErrorMessage: nil,
+            capabilities: ModelCapabilities.speech(speech)
+        )
+        snapshot.models.append(descriptor)
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        if descriptor.capabilities.supportsRealtimeSpeech,
+           shouldPromoteRealtimeSpeechModel(descriptor, over: snapshot.preferences.mediaSubtitles.realtimeASRModelID, models: snapshot.models) {
+            snapshot.preferences.mediaSubtitles.realtimeASRModelID = descriptor.id
+        }
+        if snapshot.preferences.mediaSubtitles.fileASRModelID == nil,
+           descriptor.capabilities.supportsFileSpeech {
+            snapshot.preferences.mediaSubtitles.fileASRModelID = descriptor.id
+        }
         try await registryStore.save(snapshot)
         return descriptor
     }
@@ -260,6 +304,12 @@ public actor TaskEngine {
         if snapshot.preferences.ocr.modelID == id {
             snapshot.preferences.ocr.modelID = nil
         }
+        if snapshot.preferences.mediaSubtitles.realtimeASRModelID == id {
+            snapshot.preferences.mediaSubtitles.realtimeASRModelID = nil
+        }
+        if snapshot.preferences.mediaSubtitles.fileASRModelID == id {
+            snapshot.preferences.mediaSubtitles.fileASRModelID = nil
+        }
         sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
     }
@@ -278,6 +328,36 @@ public actor TaskEngine {
 
     public func visionCapableModels() -> [ModelDescriptor] {
         snapshot.models.filter { $0.enabled && $0.capabilities.supportsImage }
+    }
+
+    public func speechCapableModels() -> [ModelDescriptor] {
+        snapshot.models.filter { $0.enabled && $0.capabilities.supportsSpeech }
+    }
+
+    public func realtimeSpeechModels() -> [ModelDescriptor] {
+        snapshot.models.filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
+    }
+
+    public func fileSpeechModels() -> [ModelDescriptor] {
+        snapshot.models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
+    }
+
+    public func checkASRHealth(modelID: UUID? = nil, mode: SpeechRuntimeMode = .fileOnly) async throws -> ASRHealthReport {
+        let model = try resolveSpeechModel(for: modelID, mode: mode)
+        let runner = LocalASRProcessRunner()
+        let report = runner.health(for: model, preferences: snapshot.preferences.mediaSubtitles, mode: mode)
+        if let index = snapshot.models.firstIndex(where: { $0.id == model.id }),
+           var speech = snapshot.models[index].capabilities.speech {
+            speech.lastCheckedAt = report.checkedAt
+            speech.lastFailureMessage = report.status == .ready ? nil : report.message
+            snapshot.models[index].capabilities.speech = speech
+            snapshot.models[index].capabilities.lastCheckedAt = report.checkedAt
+            snapshot.models[index].capabilities.lastFailureMessage = report.status == .ready ? nil : report.message
+            snapshot.models[index].validationState = report.status == .ready ? .ready : .failed
+            snapshot.models[index].lastErrorMessage = report.status == .ready ? nil : report.message
+            try? await registryStore.save(snapshot)
+        }
+        return report
     }
 
     public func markModelVisionCapable(id: UUID) async throws -> ModelDescriptor {
@@ -567,6 +647,113 @@ public actor TaskEngine {
         )
     }
 
+    public func transcribeMediaFile(
+        at url: URL,
+        modelID: UUID? = nil
+    ) async throws -> MediaSubtitleFileResult {
+        guard snapshot.preferences.mediaSubtitles.isEnabled else {
+            throw MediaSubtitleError.disabled
+        }
+        let startedAt = Date()
+        var descriptor = try MediaIntakeService.descriptor(for: url)
+        let model = try resolveSpeechModel(for: modelID, mode: .fileOnly)
+        let health = LocalASRProcessRunner().health(for: model, preferences: snapshot.preferences.mediaSubtitles, mode: .fileOnly)
+        guard health.status == .ready else {
+            switch health.status {
+            case .modelMissing:
+                throw MediaSubtitleError.asrModelMissing(health.message)
+            case .runtimeMissing:
+                throw MediaSubtitleError.asrRuntimeMissing(health.message)
+            case .incompatibleModel:
+                throw MediaSubtitleError.asrModelMissing(health.message)
+            case .loadFailed, .inferenceFailed:
+                throw MediaSubtitleError.asrRuntimeFailed(health.message)
+            case .ready:
+                throw MediaSubtitleError.asrRuntimeFailed(health.message)
+            }
+        }
+        let normalizedAudio = try await AudioExtractionService.normalizeMediaFile(at: url)
+        defer {
+            try? FileManager.default.removeItem(at: normalizedAudio.url.deletingLastPathComponent())
+        }
+        descriptor.duration = normalizedAudio.duration
+        let sessionID = UUID()
+        let segments = try await LocalASRProcessRunner().transcribe(
+            audioURL: normalizedAudio.url,
+            model: model,
+            sessionID: sessionID,
+            duration: normalizedAudio.duration,
+            preferences: snapshot.preferences.mediaSubtitles,
+            context: ASRTranscriptionContext(
+                mode: .fileOnly,
+                sourceLanguageHint: snapshot.preferences.mediaSubtitles.sourceLanguageHint,
+                isFinal: true
+            )
+        )
+        let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
+        let diagnostics = MediaSubtitleDiagnostics(
+            mediaKind: descriptor.mediaKind,
+            fileType: descriptor.fileExtension,
+            durationBucket: durationBucket(normalizedAudio.duration),
+            sampleRate: normalizedAudio.sampleRate,
+            asrModelID: model.id.uuidString,
+            targetLanguage: snapshot.preferences.mediaSubtitles.defaultTargetLanguage,
+            elapsedMilliseconds: elapsed,
+            segmentCount: segments.count,
+            errorCode: nil,
+            urlHash: nil,
+            domainHash: nil
+        )
+        return MediaSubtitleFileResult(
+            descriptor: descriptor,
+            normalizedAudioURL: normalizedAudio.url,
+            segments: segments,
+            diagnostics: diagnostics
+        )
+    }
+
+    public func translateSubtitleSegments(
+        _ segments: [SubtitleSegment],
+        targetLanguage: String? = nil,
+        modelID: UUID? = nil
+    ) async throws -> [SubtitleSegment] {
+        guard !segments.isEmpty else {
+            return []
+        }
+        let model = try resolveTextModel(for: modelID)
+        let target = targetLanguage ?? snapshot.preferences.mediaSubtitles.defaultTargetLanguage
+        var translatedByID = try await runSubtitleTranslationBatch(
+            segments: segments,
+            targetLanguage: target,
+            model: model,
+            isRetry: false
+        )
+        if translatedByID.count < segments.count {
+            let missing = segments.filter { translatedByID[$0.id.uuidString] == nil }
+            let retry = try await runSubtitleTranslationBatch(
+                segments: missing,
+                targetLanguage: target,
+                model: model,
+                isRetry: true
+            )
+            translatedByID.merge(retry) { current, _ in current }
+        }
+        return segments.map { segment in
+            var updated = segment
+            updated.translatedText = translatedByID[segment.id.uuidString]
+            updated.translationModelID = model.id.uuidString
+            return updated
+        }
+    }
+
+    public func exportSubtitleSegments(
+        _ segments: [SubtitleSegment],
+        format: SubtitleExportFormat,
+        mode: SubtitleDisplayMode
+    ) throws -> String {
+        try SubtitleExporter.render(segments: segments, format: format, mode: mode)
+    }
+
     public func clearHistory() async throws {
         history = []
         try await historyStore.save(history)
@@ -588,17 +775,54 @@ public actor TaskEngine {
     }
 
     private func resolveModel(for modelID: UUID?) throws -> ModelDescriptor {
-        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.enabled }) {
+        try resolveTextModel(for: modelID)
+    }
+
+    private func resolveTextModel(for modelID: UUID?) throws -> ModelDescriptor {
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
             return model
         }
         if let preferred = snapshot.preferences.defaultModelID,
-           let model = snapshot.models.first(where: { $0.id == preferred && $0.enabled }) {
+           let model = snapshot.models.first(where: { $0.id == preferred && $0.enabled && $0.capabilities.supportsText }) {
             return model
         }
-        if let firstEnabled = snapshot.models.first(where: { $0.enabled }) {
+        if let firstEnabled = snapshot.models.first(where: { $0.enabled && $0.capabilities.supportsText }) {
             return firstEnabled
         }
         throw RunnerError.unsupportedConfiguration("No enabled model is registered.")
+    }
+
+    private func resolveSpeechModel(for modelID: UUID?, mode: SpeechRuntimeMode) throws -> ModelDescriptor {
+        let supportsRequestedMode: (ModelDescriptor) -> Bool = { model in
+            guard model.enabled, model.capabilities.supportsSpeech else {
+                return false
+            }
+            switch mode {
+            case .realtime:
+                return model.capabilities.supportsRealtimeSpeech
+            case .fileOnly:
+                return model.capabilities.supportsFileSpeech
+            }
+        }
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && supportsRequestedMode($0) }) {
+            return model
+        }
+        let preferred = mode == .realtime
+            ? snapshot.preferences.mediaSubtitles.realtimeASRModelID
+            : snapshot.preferences.mediaSubtitles.fileASRModelID
+        if let preferred,
+           let model = snapshot.models.first(where: { $0.id == preferred && supportsRequestedMode($0) }) {
+            return model
+        }
+        if mode == .fileOnly,
+           let realtime = snapshot.preferences.mediaSubtitles.realtimeASRModelID,
+           let model = snapshot.models.first(where: { $0.id == realtime && supportsRequestedMode($0) }) {
+            return model
+        }
+        if let first = snapshot.models.first(where: supportsRequestedMode) {
+            return first
+        }
+        throw MediaSubtitleError.missingASRModel
     }
 
     private func resolveOCRModel(for modelID: UUID?) throws -> ModelDescriptor {
@@ -849,6 +1073,44 @@ public actor TaskEngine {
         }
     }
 
+    private func runSubtitleTranslationBatch(
+        segments: [SubtitleSegment],
+        targetLanguage: String,
+        model: ModelDescriptor,
+        isRetry: Bool
+    ) async throws -> [String: String] {
+        let request = TaskRequest(
+            task: .webPageTranslate,
+            inputText: try PromptTemplates.subtitleBatchPrompt(
+                segments: segments,
+                targetLanguage: targetLanguage,
+                isRetry: isRetry
+            ),
+            sourceLanguage: "auto",
+            targetLanguage: targetLanguage
+        )
+        try validateInputSize(request, for: model)
+        let result = try await run(
+            request: request,
+            modelID: model.id,
+            persistHistory: snapshot.preferences.mediaSubtitles.saveTranslatedSubtitleHistory
+        )
+        let expectedIDs = Set(segments.map { $0.id.uuidString })
+        let jsonText = extractJSONArray(from: result.text)
+        guard let data = jsonText.data(using: .utf8),
+              let decoded = try? JSONDecoder().decode([SubtitleTranslationJSONItem].self, from: data) else {
+            throw MediaSubtitleError.translationFailed("The translation model did not return subtitle JSON.")
+        }
+        var translatedByID: [String: String] = [:]
+        for item in decoded where expectedIDs.contains(item.id) {
+            let translation = item.translation.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !translation.isEmpty {
+                translatedByID[item.id] = translation
+            }
+        }
+        return translatedByID
+    }
+
     private func mergeSuccessfulTranslations(
         _ translations: [WebPageSegmentTranslation],
         into translationsByID: inout [String: WebPageSegmentTranslation]
@@ -943,6 +1205,8 @@ public actor TaskEngine {
                 let runner = AnthropicMessagesRunner()
                 runners[slot] = runner
                 return runner
+            case .speech:
+                throw RunnerError.unsupportedFormat(format)
             case .unknown:
                 throw RunnerError.unsupportedFormat(format)
             }
@@ -1000,6 +1264,29 @@ public actor TaskEngine {
         return changed
     }
 
+    private func refreshDetectedSpeechCapabilities() -> Bool {
+        var changed = false
+        for index in snapshot.models.indices {
+            let model = snapshot.models[index]
+            guard model.format == .speech,
+                  model.capabilities.source != .manual,
+                  let detected = ModelDetection.detectSpeechModel(at: model.resolvedPath ?? model.sourcePath) else {
+                continue
+            }
+            var speech = detected
+            speech.lastCheckedAt = model.capabilities.speech?.lastCheckedAt
+            speech.lastFailureMessage = model.capabilities.speech?.lastFailureMessage
+            var capabilities = ModelCapabilities.speech(speech)
+            capabilities.lastCheckedAt = model.capabilities.lastCheckedAt
+            capabilities.lastFailureMessage = model.capabilities.lastFailureMessage
+            if model.capabilities != capabilities {
+                snapshot.models[index].capabilities = capabilities
+                changed = true
+            }
+        }
+        return changed
+    }
+
     @discardableResult
     private func updateModelCapabilities(
         id: UUID,
@@ -1016,16 +1303,73 @@ public actor TaskEngine {
 
     private func sanitizePreferences(_ preferences: inout AppPreferences, models: [ModelDescriptor]) {
         if let modelID = preferences.defaultModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled }) {
-            preferences.defaultModelID = models.first(where: { $0.enabled })?.id
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+            preferences.defaultModelID = models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
         }
         if let modelID = preferences.webPageTranslation.modelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled }) {
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
             preferences.webPageTranslation.modelID = nil
         }
         if let modelID = preferences.ocr.modelID,
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
             preferences.ocr.modelID = nil
+        }
+        if let modelID = preferences.mediaSubtitles.realtimeASRModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) {
+            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+        }
+        if let modelID = preferences.mediaSubtitles.fileASRModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }) {
+            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+        }
+        if preferences.mediaSubtitles.fileASRModelID == nil {
+            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+        }
+        if preferences.mediaSubtitles.realtimeASRModelID == nil {
+            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+        }
+    }
+
+    private func shouldPromoteRealtimeSpeechModel(
+        _ candidate: ModelDescriptor,
+        over currentID: UUID?,
+        models: [ModelDescriptor]
+    ) -> Bool {
+        guard candidate.enabled, candidate.capabilities.supportsRealtimeSpeech else {
+            return false
+        }
+        guard let currentID,
+              let current = models.first(where: { $0.id == currentID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) else {
+            return true
+        }
+        return realtimeSpeechPriority(candidate) < realtimeSpeechPriority(current)
+    }
+
+    private func preferredRealtimeSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
+        models
+            .filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
+            .min { lhs, rhs in
+                let lhsPriority = realtimeSpeechPriority(lhs)
+                let rhsPriority = realtimeSpeechPriority(rhs)
+                if lhsPriority == rhsPriority {
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                return lhsPriority < rhsPriority
+            }
+    }
+
+    private func realtimeSpeechPriority(_ model: ModelDescriptor) -> Int {
+        switch model.capabilities.speech?.family {
+        case .funASRMLTNano:
+            return 0
+        case .funASRNano:
+            return 1
+        case .senseVoiceSmall:
+            return 2
+        case .qwen3ASR06B:
+            return 3
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal, .none:
+            return 4
         }
     }
 
@@ -1088,6 +1432,9 @@ public actor TaskEngine {
     }
 
     private func inferContextLength(format: ModelFormat, sizeClass: String) -> Int {
+        if format == .speech {
+            return 0
+        }
         if format == .gguf && (sizeClass == "0.8b" || sizeClass == "1.5b") {
             return 4096
         }
@@ -1118,5 +1465,28 @@ public actor TaskEngine {
     private struct WebPageTranslationJSONItem: Decodable {
         var id: String
         var translation: String
+    }
+
+    private struct SubtitleTranslationJSONItem: Decodable {
+        var id: String
+        var translation: String
+    }
+
+    private func durationBucket(_ duration: TimeInterval?) -> String {
+        guard let duration else {
+            return "unknown"
+        }
+        switch duration {
+        case ..<60:
+            return "<1m"
+        case ..<300:
+            return "1-5m"
+        case ..<1800:
+            return "5-30m"
+        case ..<3600:
+            return "30-60m"
+        default:
+            return "60m+"
+        }
     }
 }

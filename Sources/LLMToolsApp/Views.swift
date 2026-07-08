@@ -177,6 +177,7 @@ struct QuickActionView: View {
     var onClose: () -> Void = {}
     @State private var showFileImporter = false
     @State private var showImageImporter = false
+    @State private var showMediaImporter = false
     @State private var showInput = true
     @State private var imageURLDraft = ""
     @State private var isImagePreviewPresented = false
@@ -205,6 +206,8 @@ struct QuickActionView: View {
             case .plainText, .extractThenTranslate:
                 return false
             }
+        case .media:
+            return true
         }
     }
 
@@ -247,6 +250,11 @@ struct QuickActionView: View {
                 appState.loadOCRImageFile(from: url)
             }
         }
+        .fileImporter(isPresented: $showMediaImporter, allowedContentTypes: [.audio, .movie, .video, .item], allowsMultipleSelection: false) { result in
+            if case let .success(urls) = result, let url = urls.first {
+                appState.loadMediaSubtitleFile(from: url)
+            }
+        }
         .onDrop(of: [.fileURL, .plainText, .text, .image], isTargeted: nil) { providers in
             handleDrop(providers)
         }
@@ -265,67 +273,117 @@ struct QuickActionView: View {
     }
 
     private var controlsBar: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: controlsBarPrimaryOptionSpacing) {
-                Picker("", selection: $appState.quickActionMode) {
-                    Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
-                    Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
-                }
-                .labelsHidden()
-                .pickerStyle(.segmented)
-                .frame(width: 108, alignment: .leading)
-                .disabled(appState.isRunning || appState.isPreparingOCRImage)
+        ZStack(alignment: .leading) {
+            quickActionModePicker
+                .offset(x: quickActionModePickerX)
 
-                if appState.quickActionMode == .text {
-                    Picker("", selection: $appState.selectedTask) {
-                        ForEach(TaskKind.interactiveCases) { task in
-                            Text(task.title(language: language)).tag(task)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 108)
-                    .disabled(appState.isRunning)
-                } else {
-                    modeOptions
-                        .frame(width: 126, alignment: .leading)
-                }
-            }
+            primaryModeControl
+                .fixedSize(horizontal: true, vertical: false)
+                .offset(x: primaryModeControlX)
 
             if appState.quickActionMode == .text {
                 modeOptions
-                    .frame(width: 190, alignment: .leading)
+                    .frame(width: 175, alignment: .leading)
+                    .offset(x: textModeOptionsX)
             }
-
-            Spacer(minLength: 8)
 
             if appState.quickActionMode == .text {
-                Button {
-                    showInput.toggle()
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(L10n.text(showInput ? "Hide source" : "Show source", language: language))
-                            .lineLimit(1)
-                        Image(systemName: showInput ? "chevron.up" : "chevron.down")
-                            .font(.caption2)
-                            .frame(width: 10)
-                    }
-                    .frame(width: 76, alignment: .center)
+                HStack {
+                    Spacer(minLength: 0)
+                    hideSourceButton
                 }
-                .buttonStyle(.borderless)
-                .disabled(appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.leading, controlsBarLeadingPadding)
         .padding(.trailing, 14)
         .padding(.vertical, 10)
     }
 
     private var controlsBarLeadingPadding: CGFloat {
-        appState.quickActionMode == .text ? 10 : 11
+        12
     }
 
-    private var controlsBarPrimaryOptionSpacing: CGFloat {
-        appState.quickActionMode == .text ? 10 : 6
+    private var quickActionModePickerWidth: CGFloat {
+        168
+    }
+
+    private var quickActionModePickerVisualWidth: CGFloat {
+        140
+    }
+
+    private var controlsBarCompactGap: CGFloat {
+        8
+    }
+
+    private var textTaskPickerWidth: CGFloat {
+        108
+    }
+
+    private var targetLanguagePickerWidth: CGFloat {
+        86
+    }
+
+    private var quickActionModePickerX: CGFloat {
+        0
+    }
+
+    private var primaryModeControlX: CGFloat {
+        quickActionModePickerVisualWidth + controlsBarCompactGap
+    }
+
+    private var textModeOptionsX: CGFloat {
+        primaryModeControlX + textTaskPickerWidth + controlsBarCompactGap
+    }
+
+    private var quickActionModePicker: some View {
+        Picker("", selection: $appState.quickActionMode) {
+            Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
+            Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
+            Text(L10n.text("Media mode", language: language)).tag(AppState.QuickActionMode.media)
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: quickActionModePickerWidth, alignment: .leading)
+        .fixedSize(horizontal: true, vertical: false)
+        .disabled(appState.isRunning || appState.isPreparingOCRImage)
+    }
+
+    private var hideSourceButton: some View {
+        Button {
+            showInput.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Text(L10n.text(showInput ? "Hide source" : "Show source", language: language))
+                    .lineLimit(1)
+                Image(systemName: showInput ? "chevron.up" : "chevron.down")
+                    .font(.caption2)
+                    .frame(width: 10)
+            }
+            .frame(width: 76, alignment: .center)
+        }
+        .buttonStyle(.borderless)
+        .disabled(appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
+
+    @ViewBuilder
+    private var primaryModeControl: some View {
+        if appState.quickActionMode == .text {
+            Picker("", selection: $appState.selectedTask) {
+                ForEach(TaskKind.interactiveCases) { task in
+                    Text(task.title(language: language)).tag(task)
+                }
+            }
+            .labelsHidden()
+            .frame(width: textTaskPickerWidth, alignment: .leading)
+            .disabled(appState.isRunning)
+        } else if appState.quickActionMode == .image {
+            modeOptions
+                .frame(width: 126, alignment: .leading)
+        } else {
+            mediaModePicker
+                .frame(width: 126, alignment: .leading)
+        }
     }
 
     @ViewBuilder
@@ -345,7 +403,7 @@ struct QuickActionView: View {
         } else {
             switch appState.selectedTask {
             case .translate:
-                HStack(spacing: 6) {
+                HStack(spacing: 4) {
                     Text(L10n.text("Auto detect", language: language))
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
@@ -372,10 +430,9 @@ struct QuickActionView: View {
                         Text(L10n.targetLanguageName("auto", language: language)).tag("auto")
                     }
                     .labelsHidden()
-                    .frame(width: 108)
+                    .frame(width: targetLanguagePickerWidth)
                     .disabled(appState.isRunning)
                 }
-                .fixedSize(horizontal: true, vertical: false)
             case .polish:
                 Picker("", selection: Binding(
                     get: { appState.preferences.defaultPolishStyle },
@@ -402,6 +459,20 @@ struct QuickActionView: View {
                 EmptyView()
             }
         }
+    }
+
+    private var mediaModePicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.mediaSubtitleMode },
+            set: { appState.setMediaSubtitleMode($0) }
+        )) {
+            ForEach(SubtitleDisplayMode.allCases) { mode in
+                Text(subtitleModeName(mode)).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .disabled(appState.isRunning)
     }
 
     private var summaryModePicker: some View {
@@ -462,6 +533,8 @@ struct QuickActionView: View {
         Group {
             if appState.quickActionMode == .image {
                 imageMainContent
+            } else if appState.quickActionMode == .media {
+                mediaMainContent
             } else {
                 VStack(spacing: 10) {
                     if showInput || appState.outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -490,6 +563,176 @@ struct QuickActionView: View {
                 ocrFollowUpBar
             }
         }
+    }
+
+    private var mediaMainContent: some View {
+        HStack(spacing: 10) {
+            mediaInputPanel
+                .frame(width: 230)
+            VStack(spacing: 10) {
+                resultPanel
+                if markdownPreviewAvailable || appState.hasDifferentRawOutput {
+                    outputDisplayOptions
+                }
+                mediaExportBar
+            }
+        }
+    }
+
+    private var mediaInputPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color(NSColor.textBackgroundColor))
+                VStack(spacing: 9) {
+                    Button {
+                        showMediaImporter = true
+                    } label: {
+                        Image(systemName: "waveform.badge.mic")
+                            .font(.system(size: 27, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .frame(width: 42, height: 42)
+                    }
+                    .buttonStyle(.plain)
+                    .help(L10n.text("Choose Media", language: language))
+                    .disabled(appState.isRunning)
+                    Text(appState.mediaSubtitleDescriptor == nil
+                        ? L10n.text("Drop audio or video.", language: language)
+                        : L10n.text("Media loaded", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                if appState.mediaSubtitleDescriptor != nil {
+                    clearMediaButton
+                }
+            }
+            .frame(height: 132)
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
+
+            if let descriptor = appState.mediaSubtitleDescriptor {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(descriptor.fileName)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(mediaDescriptorLine(descriptor))
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text(L10n.text("File ASR", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                mediaFileASRPicker
+                Text(L10n.text("Realtime ASR", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                mediaRealtimeASRPicker
+            }
+
+            if let report = appState.mediaSubtitleHealthReport {
+                Text(report.message)
+                    .font(.caption)
+                    .foregroundStyle(report.status == .ready ? Color.secondary : Color.red)
+                    .lineLimit(3)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.65))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.14)))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var clearMediaButton: some View {
+        Button(role: .destructive) {
+            appState.clearMediaSubtitleFile()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 22, height: 22)
+                .background(Color(NSColor.windowBackgroundColor).opacity(0.94), in: Circle())
+                .overlay(Circle().stroke(Color.secondary.opacity(0.22)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text("Clear", language: language))
+        .disabled(appState.isRunning)
+        .padding(6)
+    }
+
+    private var mediaFileASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.mediaSubtitles.fileASRModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.mediaSubtitles.fileASRModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.fileSpeechModels) { model in
+                Text(speechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .disabled(appState.fileSpeechModels.isEmpty || appState.isRunning)
+    }
+
+    private var mediaRealtimeASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.mediaSubtitles.realtimeASRModelID },
+            set: { newValue in
+                appState.setRealtimeASRModel(id: newValue)
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.realtimeSpeechModels) { model in
+                Text(speechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .disabled(appState.realtimeSpeechModels.isEmpty || appState.isRunning)
+    }
+
+    private var mediaExportBar: some View {
+        HStack(spacing: 6) {
+            Text(L10n.text("Export", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(SubtitleExportFormat.allCases) { format in
+                Button {
+                    appState.exportCurrentMediaSubtitles(format: format)
+                } label: {
+                    Text(format.rawValue.uppercased())
+                        .font(.caption.bold())
+                        .frame(width: 38, height: 22)
+                }
+                .controlSize(.small)
+                .disabled(appState.mediaSubtitleSegments.isEmpty || appState.isRunning)
+                .help("\(L10n.text("Export", language: language)) \(format.rawValue.uppercased())")
+            }
+            Button {
+                appState.translateCurrentMediaSubtitles()
+            } label: {
+                Label(L10n.text("Retry translation", language: language), systemImage: "arrow.clockwise")
+                    .labelStyle(.iconOnly)
+                    .frame(width: 26, height: 22)
+            }
+            .controlSize(.small)
+            .help(L10n.text("Retry translation", language: language))
+            .disabled(appState.mediaSubtitleSegments.isEmpty || appState.isRunning)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var imageInputPanel: some View {
@@ -725,6 +968,8 @@ struct QuickActionView: View {
                     appState.cancelCurrentTask(unloadModel: true)
                 } else if appState.quickActionMode == .image {
                     appState.runCurrentOCR()
+                } else if appState.quickActionMode == .media {
+                    appState.runCurrentMediaSubtitles()
                 } else {
                     appState.runCurrentTask()
                 }
@@ -733,11 +978,14 @@ struct QuickActionView: View {
                     Label(L10n.text("Cancel", language: language), systemImage: "stop.fill")
                 } else if appState.quickActionMode == .image {
                     Label(ocrRunButtonTitle, systemImage: ocrRunButtonIcon)
+                } else if appState.quickActionMode == .media {
+                    Label(mediaRunButtonTitle, systemImage: "waveform")
                 } else {
                     Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
                 }
             }
-            .disabled(appState.quickActionMode == .image && !appState.isRunning && !canRunOCR)
+            .disabled((appState.quickActionMode == .image && !appState.isRunning && !canRunOCR)
+                || (appState.quickActionMode == .media && !appState.isRunning && !canRunMediaSubtitles))
 
             Button {
                 NSPasteboard.general.clearContents()
@@ -772,6 +1020,12 @@ struct QuickActionView: View {
             && !appState.isPreparingOCRImage
     }
 
+    private var canRunMediaSubtitles: Bool {
+        appState.mediaSubtitleFileURL != nil
+            && appState.preferences.mediaSubtitles.isEnabled
+            && appState.selectedFileASRModel != nil
+    }
+
     private var ocrRunButtonTitle: String {
         if appState.outputText.isEmpty {
             return appState.ocrMode == .explainImage
@@ -786,6 +1040,13 @@ struct QuickActionView: View {
             return "arrow.clockwise"
         }
         return appState.ocrMode == .explainImage ? "eye" : "text.viewfinder"
+    }
+
+    private var mediaRunButtonTitle: String {
+        if appState.mediaSubtitleSegments.isEmpty {
+            return L10n.text("Generate subtitles", language: language)
+        }
+        return L10n.text("Regenerate", language: language)
     }
 
     private var ocrFollowUpBar: some View {
@@ -878,6 +1139,9 @@ struct QuickActionView: View {
         if appState.quickActionMode == .image {
             return L10n.text("Image result will appear here.", language: language)
         }
+        if appState.quickActionMode == .media {
+            return L10n.text("Subtitle preview will appear here.", language: language)
+        }
         switch appState.selectedTask {
         case .translate:
             return L10n.text("Translation will appear here.", language: language)
@@ -903,7 +1167,54 @@ struct QuickActionView: View {
         return "\(model.name) · \(model.format.rawValue.uppercased()) · \(model.sizeClass)"
     }
 
+    private func speechModelPickerTitle(_ model: ModelDescriptor) -> String {
+        let modeLabel: String
+        if model.capabilities.supportsRealtimeSpeech {
+            modeLabel = L10n.text("Realtime", language: language)
+        } else {
+            modeLabel = L10n.text("File only", language: language)
+        }
+        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
+        return "\(model.name) · \(family) · \(modeLabel)"
+    }
+
+    private func subtitleModeName(_ mode: SubtitleDisplayMode) -> String {
+        switch (language, mode) {
+        case (.chinese, .original):
+            return "原文"
+        case (.chinese, .translated):
+            return "译文"
+        case (.chinese, .bilingual):
+            return "双语"
+        case (.english, .original):
+            return "Original"
+        case (.english, .translated):
+            return "Translated"
+        case (.english, .bilingual):
+            return "Bilingual"
+        }
+    }
+
+    private func mediaDescriptorLine(_ descriptor: MediaFileDescriptor) -> String {
+        let sizeText: String
+        if let size = descriptor.sizeBytes {
+            sizeText = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+        } else {
+            sizeText = "-"
+        }
+        let durationText: String
+        if let duration = descriptor.duration {
+            durationText = String(format: "%.1fs", duration)
+        } else {
+            durationText = "duration -"
+        }
+        return "\(descriptor.mediaKind) · \(descriptor.fileExtension) · \(sizeText) · \(durationText) · \(descriptor.redactedPathHash)"
+    }
+
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        if appState.quickActionMode == .media {
+            return handleFileDrop(providers) || handleTextDrop(providers) || handleImageDrop(providers)
+        }
         if appState.quickActionMode == .image {
             return handleImageDrop(providers) || handleTextDrop(providers) || handleFileDrop(providers)
         }
@@ -963,7 +1274,9 @@ struct QuickActionView: View {
                 return
             }
             DispatchQueue.main.async {
-                if isImageFile(url) {
+                if isMediaFile(url) {
+                    appState.loadMediaSubtitleFile(from: url)
+                } else if isImageFile(url) {
                     appState.loadOCRImageFile(from: url)
                 } else {
                     appState.loadInputFile(from: url)
@@ -978,6 +1291,10 @@ struct QuickActionView: View {
             return false
         }
         return type.conforms(to: .image)
+    }
+
+    private func isMediaFile(_ url: URL) -> Bool {
+        MediaIntakeService.isSupportedMediaFile(url)
     }
 }
 
@@ -1953,6 +2270,651 @@ struct FloatingWidgetView: View {
     }
 }
 
+struct LiveSubtitleFloatingView: View {
+    @ObservedObject var appState: AppState
+    var onClose: () -> Void
+
+    private var language: AppLanguage {
+        appState.preferences.appLanguage
+    }
+
+    private var backgroundOpacity: Double {
+        appState.preferences.mediaSubtitles.liveWindowOpacity
+    }
+
+    private var targetLanguageIsActive: Bool {
+        appState.appLiveSubtitleDisplayMode != .original
+    }
+
+    private var liveSubtitleMinimumHeight: CGFloat {
+        appState.appLiveSubtitleIsImmersive
+            ? immersiveWindowHeight
+            : CGFloat(MediaSubtitlePreferences.minimumLiveWindowHeight)
+    }
+
+    private var liveSubtitleIdealHeight: CGFloat {
+        appState.appLiveSubtitleIsImmersive
+            ? immersiveWindowHeight
+            : CGFloat(MediaSubtitlePreferences.defaultLiveWindowHeight)
+    }
+
+    private var immersiveWindowHeight: CGFloat {
+        appState.appLiveSubtitleDisplayMode == .bilingual ? 128 : 96
+    }
+
+    private var scrollBottomID: String {
+        "live-subtitle-scroll-bottom"
+    }
+
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
+            if appState.appLiveSubtitleIsImmersive {
+                immersiveSubtitleLines
+            } else {
+                standardSubtitleWindow
+            }
+            if appState.appLiveSubtitleIsImmersive {
+                exitImmersiveButton
+                    .padding(.top, 7)
+                    .padding(.trailing, 8)
+            }
+        }
+        .frame(
+            minWidth: CGFloat(MediaSubtitlePreferences.minimumLiveWindowWidth),
+            idealWidth: CGFloat(MediaSubtitlePreferences.defaultLiveWindowWidth),
+            maxWidth: .infinity,
+            minHeight: liveSubtitleMinimumHeight,
+            idealHeight: liveSubtitleIdealHeight,
+            maxHeight: appState.appLiveSubtitleIsImmersive ? liveSubtitleIdealHeight : .infinity
+        )
+        .background(Color.black.opacity(backgroundOpacity), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.16), lineWidth: 0.8)
+        )
+        .shadow(color: .black.opacity(0.26), radius: 10, y: 4)
+    }
+
+    private var standardSubtitleWindow: some View {
+        VStack(spacing: 0) {
+            chrome
+                .padding(.horizontal, 10)
+                .padding(.top, 6)
+                .padding(.bottom, 6)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.10))
+                .frame(height: 0.8)
+
+            subtitleLines
+        }
+    }
+
+    private var chrome: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Label(statusTitle, systemImage: sourceIcon)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(0.72))
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(0)
+            HStack(spacing: 6) {
+                realtimeASRPicker
+                targetLanguagePicker
+                sourceLanguagePicker
+                displayModePicker
+                audioSourcePicker
+            }
+            .foregroundStyle(.white)
+            .layoutPriority(2)
+            enterImmersiveButton
+            liveSubtitleToggleButton
+            closeButton
+        }
+    }
+
+    private var realtimeASRPicker: some View {
+        Menu {
+            Button {
+                appState.setRealtimeASRModel(id: nil)
+            } label: {
+                liveSubtitleMenuItem(
+                    L10n.text("No model", language: language),
+                    selected: appState.preferences.mediaSubtitles.realtimeASRModelID == nil
+                )
+            }
+            ForEach(appState.realtimeSpeechModels) { model in
+                Button {
+                    appState.setRealtimeASRModel(id: model.id)
+                } label: {
+                    liveSubtitleMenuItem(
+                        AppState.condensedModelName(model.name, limit: 36),
+                        selected: appState.preferences.mediaSubtitles.realtimeASRModelID == model.id
+                    )
+                }
+            }
+        } label: {
+            liveSubtitleControlLabel(currentASRModelName, width: 164)
+        }
+        .buttonStyle(.plain)
+        .disabled(appState.realtimeSpeechModels.isEmpty)
+        .help("\(L10n.text("Realtime ASR", language: language)): \(currentASRModelName)")
+    }
+
+    private var targetLanguagePicker: some View {
+        Menu {
+            ForEach(["zh-Hans", "en", "Japanese", "Korean"], id: \.self) { targetLanguage in
+                Button {
+                    appState.setMediaSubtitleTargetLanguage(targetLanguage)
+                } label: {
+                    liveSubtitleMenuItem(
+                        L10n.targetLanguageName(targetLanguage, language: language),
+                        selected: appState.preferences.mediaSubtitles.defaultTargetLanguage == targetLanguage
+                    )
+                }
+            }
+        } label: {
+            liveSubtitleControlLabel(
+                L10n.targetLanguageName(appState.preferences.mediaSubtitles.defaultTargetLanguage, language: language),
+                width: 58
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!targetLanguageIsActive)
+        .help(targetLanguageIsActive
+            ? L10n.text("Target", language: language)
+            : L10n.text("Target language applies when Display is Translated or Bilingual.", language: language)
+        )
+    }
+
+    private var sourceLanguagePicker: some View {
+        Menu {
+            ForEach(ASRSourceLanguageHint.allCases) { hint in
+                Button {
+                    appState.setMediaSubtitleSourceLanguageHint(hint)
+                } label: {
+                    liveSubtitleMenuItem(
+                        sourceLanguageHintName(hint),
+                        selected: appState.preferences.mediaSubtitles.sourceLanguageHint == hint
+                    )
+                }
+            }
+        } label: {
+            liveSubtitleControlLabel(
+                sourceLanguageHintName(appState.preferences.mediaSubtitles.sourceLanguageHint),
+                width: 68
+            )
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text("Source language", language: language))
+    }
+
+    private var displayModePicker: some View {
+        HStack(spacing: 2) {
+            ForEach(SubtitleDisplayMode.allCases) { mode in
+                Button {
+                    appState.setMediaSubtitleMode(mode)
+                } label: {
+                    Text(subtitleModeName(mode))
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.76)
+                        .frame(maxWidth: .infinity, minHeight: 18)
+                        .padding(.horizontal, 4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(mode == appState.appLiveSubtitleDisplayMode ? Color.white.opacity(0.22) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .frame(width: 126, height: 22)
+        .background(liveSubtitleControlBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .help(L10n.text("Display", language: language))
+    }
+
+    private var audioSourcePicker: some View {
+        Menu {
+            ForEach(LiveSubtitleAudioSource.allCases) { source in
+                Button {
+                    appState.setLiveSubtitleAudioSource(source)
+                } label: {
+                    liveSubtitleMenuItem(
+                        liveAudioSourceName(source),
+                        selected: appState.appLiveSubtitleAudioSource == source
+                    )
+                }
+            }
+        } label: {
+            liveSubtitleControlLabel(liveAudioSourceName(appState.appLiveSubtitleAudioSource), width: 112)
+        }
+        .buttonStyle(.plain)
+        .help(L10n.text("Audio source", language: language))
+    }
+
+    private var liveSubtitleControlBackground: some ShapeStyle {
+        Color.white.opacity(0.12)
+    }
+
+    private func liveSubtitleControlLabel(_ title: String, width: CGFloat) -> some View {
+        HStack(spacing: 4) {
+            Text(title)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.72)
+            Image(systemName: "chevron.down")
+                .font(.system(size: 7, weight: .bold))
+                .foregroundStyle(.white.opacity(0.78))
+        }
+        .frame(width: width, height: 22)
+        .padding(.horizontal, 7)
+        .background(liveSubtitleControlBackground)
+        .clipShape(RoundedRectangle(cornerRadius: 5))
+    }
+
+    private func liveSubtitleMenuItem(_ title: String, selected: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if selected {
+                Image(systemName: "checkmark")
+            }
+        }
+    }
+
+    private var liveSubtitleToggleButton: some View {
+        Button {
+            Task { @MainActor in
+                if appState.appLiveSubtitlesAreRunning {
+                    _ = await appState.stopAppLiveSubtitles()
+                } else {
+                    _ = try? await appState.startAppLiveSubtitles()
+                }
+            }
+        } label: {
+            Image(systemName: appState.appLiveSubtitlesAreRunning ? "stop.fill" : "play.fill")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.white.opacity(0.82))
+        .help(L10n.text(appState.appLiveSubtitlesAreRunning ? "Stop live subtitles" : "Start live subtitles", language: language))
+    }
+
+    private var enterImmersiveButton: some View {
+        Button {
+            appState.setLiveSubtitleImmersive(true)
+        } label: {
+            Image(systemName: "rectangle.compress.vertical")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.white.opacity(0.82))
+        .help(L10n.text("Enter immersive subtitles", language: language))
+    }
+
+    private var exitImmersiveButton: some View {
+        Button {
+            appState.setLiveSubtitleImmersive(false)
+        } label: {
+            Image(systemName: "arrow.down.right.and.arrow.up.left")
+                .font(.system(size: 11, weight: .bold))
+                .frame(width: 26, height: 26)
+                .background(Color.black.opacity(0.38), in: Circle())
+                .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.8))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.86))
+        .help(L10n.text("Exit immersive subtitles", language: language))
+    }
+
+    private var closeButton: some View {
+        Button {
+            onClose()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 11, weight: .bold))
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.white.opacity(0.72))
+        .help(L10n.text("Close", language: language))
+    }
+
+    @ViewBuilder
+    private var immersiveSubtitleLines: some View {
+        if appState.appLiveSubtitleDisplayMode == .bilingual {
+            VStack(alignment: .center, spacing: 5) {
+                immersiveTextLine(immersivePreviousTranslatedText, size: 16, weight: .medium, opacity: 0.62)
+                immersiveTextLine(immersiveCurrentOriginalText, size: 20, weight: .semibold, opacity: 0.95)
+                immersiveTextLine(immersiveCurrentTranslatedText, size: 18, weight: .semibold, opacity: 0.82)
+            }
+            .padding(.horizontal, 52)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            VStack(alignment: .center, spacing: 6) {
+                immersiveTextLine(immersivePreviousDisplayText, size: 17, weight: .medium, opacity: 0.62)
+                immersiveTextLine(immersiveCurrentDisplayText, size: 22, weight: .semibold, opacity: 0.96)
+            }
+            .padding(.horizontal, 52)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func immersiveTextLine(
+        _ text: String,
+        size: CGFloat,
+        weight: Font.Weight,
+        opacity: Double
+    ) -> some View {
+        Text(text.isEmpty ? " " : text)
+            .font(.system(size: size, weight: weight))
+            .foregroundStyle(.white.opacity(text.isEmpty ? 0 : opacity))
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
+            .truncationMode(.tail)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: .infinity, minHeight: size + 8)
+            .textSelection(.enabled)
+    }
+
+    private var immersivePreviousSegment: SubtitleSegment? {
+        if hasDraftSubtitle {
+            return appState.appLiveSubtitleHistory.last
+        }
+        return appState.appLiveSubtitleHistory.dropLast().last
+    }
+
+    private var immersivePreviousDisplayText: String {
+        guard let segment = immersivePreviousSegment else {
+            return ""
+        }
+        return subtitleTexts(original: segment.originalText, translated: segment.translatedText).primary
+    }
+
+    private var immersivePreviousTranslatedText: String {
+        guard let segment = immersivePreviousSegment else {
+            return ""
+        }
+        let translated = trimmed(segment.translatedText ?? "")
+        return translated.isEmpty ? trimmed(segment.originalText) : translated
+    }
+
+    private var immersiveCurrentDisplayText: String {
+        primarySubtitleText
+    }
+
+    private var immersiveCurrentOriginalText: String {
+        let original = trimmed(appState.appLiveSubtitleOriginalText)
+        return original.isEmpty ? listeningText : original
+    }
+
+    private var immersiveCurrentTranslatedText: String {
+        trimmed(appState.appLiveSubtitleTranslatedText)
+    }
+
+    @ViewBuilder
+    private var subtitleLines: some View {
+        ScrollViewReader { proxy in
+            ScrollView(.vertical) {
+                VStack(alignment: .center, spacing: 12) {
+                    if appState.appLiveSubtitleHistory.isEmpty && !hasDraftSubtitle {
+                        liveSubtitleTextBlock(
+                            primary: primarySubtitleText,
+                            secondary: secondarySubtitleText,
+                            isDraft: appState.appLiveSubtitleIsPartial
+                        )
+                    } else {
+                        ForEach(appState.appLiveSubtitleHistory) { segment in
+                            let texts = subtitleTexts(
+                                original: segment.originalText,
+                                translated: segment.translatedText
+                            )
+                            liveSubtitleTextBlock(
+                                primary: texts.primary,
+                                secondary: texts.secondary,
+                                isDraft: false
+                            )
+                            .id(segment.id)
+                        }
+                        if hasDraftSubtitle {
+                            liveSubtitleTextBlock(
+                                primary: draftSubtitleTexts.primary,
+                                secondary: draftSubtitleTexts.secondary,
+                                isDraft: true
+                            )
+                            .id("live-subtitle-draft")
+                        }
+                    }
+                    Color.clear
+                        .frame(height: 1)
+                        .id(scrollBottomID)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 46)
+                .padding(.top, 12)
+                .padding(.bottom, 16)
+            }
+            .onAppear {
+                scrollToLiveSubtitleBottom(proxy)
+            }
+            .onChange(of: appState.appLiveSubtitleHistory) { _, _ in
+                scrollToLiveSubtitleBottom(proxy)
+            }
+            .onChange(of: appState.appLiveSubtitleOriginalText) { _, _ in
+                scrollToLiveSubtitleBottom(proxy)
+            }
+            .onChange(of: appState.appLiveSubtitleTranslatedText) { _, _ in
+                scrollToLiveSubtitleBottom(proxy)
+            }
+        }
+    }
+
+    private func liveSubtitleTextBlock(primary: String, secondary: String?, isDraft: Bool) -> some View {
+        VStack(alignment: .center, spacing: 4) {
+            Text(primary)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white.opacity(isDraft ? 0.78 : 1))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
+                .textSelection(.enabled)
+            if let secondary {
+                Text(secondary)
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundStyle(.white.opacity(isDraft ? 0.58 : 0.74))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func scrollToLiveSubtitleBottom(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.16)) {
+                proxy.scrollTo(scrollBottomID, anchor: .bottom)
+            }
+        }
+    }
+
+    private var primarySubtitleText: String {
+        let texts = subtitleTexts(
+            original: appState.appLiveSubtitleOriginalText,
+            translated: appState.appLiveSubtitleTranslatedText
+        )
+        guard !texts.primary.isEmpty else {
+            return listeningText
+        }
+        return texts.primary
+    }
+
+    private var secondarySubtitleText: String? {
+        subtitleTexts(
+            original: appState.appLiveSubtitleOriginalText,
+            translated: appState.appLiveSubtitleTranslatedText
+        ).secondary
+    }
+
+    private var hasDraftSubtitle: Bool {
+        appState.appLiveSubtitleIsPartial
+            && (!trimmed(appState.appLiveSubtitleOriginalText).isEmpty
+                || !trimmed(appState.appLiveSubtitleTranslatedText).isEmpty)
+    }
+
+    private var draftSubtitleTexts: (primary: String, secondary: String?) {
+        let texts = subtitleTexts(
+            original: appState.appLiveSubtitleOriginalText,
+            translated: appState.appLiveSubtitleTranslatedText
+        )
+        return (texts.primary.isEmpty ? listeningText : texts.primary, texts.secondary)
+    }
+
+    private func subtitleTexts(original rawOriginal: String, translated rawTranslated: String?) -> (primary: String, secondary: String?) {
+        let original = trimmed(rawOriginal)
+        let translated = trimmed(rawTranslated ?? "")
+        switch appState.appLiveSubtitleDisplayMode {
+        case .original:
+            return (original, nil)
+        case .translated:
+            if !translated.isEmpty {
+                return (translated, nil)
+            }
+            return (original, nil)
+        case .bilingual:
+            if !translated.isEmpty {
+                let secondary = (!original.isEmpty && translated != original) ? original : nil
+                return (translated, secondary)
+            }
+            return (original, nil)
+        }
+    }
+
+    private var listeningText: String {
+        switch appState.appLiveSubtitleRunState {
+        case .starting:
+            return L10n.text("Starting live subtitles", language: language)
+        case .running:
+            if appState.appLiveSubtitleASRInFlight {
+                return L10n.text("Transcribing...", language: language)
+            }
+            if let message = appState.appLiveSubtitleMessage?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !message.isEmpty {
+                return message
+            }
+            if appState.appLiveSubtitleSpeechDetected {
+                return L10n.text("Speech detected. Waiting for ASR...", language: language)
+            }
+            if appState.appLiveSubtitleBufferedMilliseconds > 0 || appState.appLiveSubtitleAudioLevel > 0.02 {
+                return connectedAudioWaitingText
+            }
+            return L10n.text("Listening...", language: language)
+        case .stopping:
+            return L10n.text("Stopping live subtitles", language: language)
+        case .failed:
+            return appState.appLiveSubtitleMessage ?? L10n.text("Live subtitles failed", language: language)
+        case .stopped:
+            return L10n.text("Live subtitles stopped", language: language)
+        }
+    }
+
+    private var connectedAudioWaitingText: String {
+        switch appState.appLiveSubtitleAudioSource {
+        case .systemAudio:
+            return L10n.text("System audio connected. Waiting for speech...", language: language)
+        case .microphone:
+            return L10n.text("Microphone connected. Waiting for speech...", language: language)
+        case .systemAndMicrophone:
+            return L10n.text("System audio and microphone connected. Waiting for speech...", language: language)
+        }
+    }
+
+    private var statusTitle: String {
+        let source = liveAudioSourceName(appState.appLiveSubtitleAudioSource)
+        let model = currentASRModelName
+        if appState.appLiveSubtitleIsPartial {
+            return "\(model) · \(source) · \(L10n.text("Draft", language: language))"
+        }
+        return "\(model) · \(source)"
+    }
+
+    private var currentASRModelName: String {
+        AppState.condensedModelName(
+            appState.appLiveSubtitleModelName ?? appState.selectedRealtimeASRModel?.name ?? L10n.text("No model", language: language),
+            limit: 24
+        )
+    }
+
+    private var sourceIcon: String {
+        switch appState.appLiveSubtitleAudioSource {
+        case .systemAudio:
+            return "speaker.wave.2.fill"
+        case .microphone:
+            return "mic.fill"
+        case .systemAndMicrophone:
+            return "waveform.and.mic"
+        }
+    }
+
+    private func liveAudioSourceName(_ source: LiveSubtitleAudioSource) -> String {
+        switch source {
+        case .systemAudio:
+            return L10n.text("System audio", language: language)
+        case .microphone:
+            return L10n.text("Microphone", language: language)
+        case .systemAndMicrophone:
+            return L10n.text("System + Microphone", language: language)
+        }
+    }
+
+    private func subtitleModeName(_ mode: SubtitleDisplayMode) -> String {
+        switch (language, mode) {
+        case (.chinese, .original):
+            return "原文"
+        case (.chinese, .translated):
+            return "译文"
+        case (.chinese, .bilingual):
+            return "双语"
+        case (.english, .original):
+            return "Original"
+        case (.english, .translated):
+            return "Translated"
+        case (.english, .bilingual):
+            return "Bilingual"
+        }
+    }
+
+    private func sourceLanguageHintName(_ hint: ASRSourceLanguageHint) -> String {
+        switch (language, hint) {
+        case (.chinese, .auto):
+            return "自动"
+        case (.chinese, .zh):
+            return "中文"
+        case (.chinese, .yue):
+            return "粤语"
+        case (.chinese, .en):
+            return "英文"
+        case (.chinese, .ja):
+            return "日文"
+        case (.chinese, .ko):
+            return "韩文"
+        default:
+            return hint.rawValue
+        }
+    }
+
+    private func trimmed(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 struct ModelPickerView: View {
     @ObservedObject var appState: AppState
 
@@ -2072,11 +3034,12 @@ struct TaskOptionsView: View {
     }
 }
 
-private enum SettingsTab: CaseIterable, Identifiable {
+enum SettingsTab: CaseIterable, Identifiable {
     case general
     case shortcuts
     case models
     case ocr
+    case media
     case webPage
     case defaults
     case prompts
@@ -2094,6 +3057,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return "cpu"
         case .ocr:
             return "text.viewfinder"
+        case .media:
+            return "waveform.and.magnifyingglass"
         case .webPage:
             return "safari"
         case .defaults:
@@ -2115,6 +3080,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Models", language: language)
         case .ocr:
             return L10n.text("OCR", language: language)
+        case .media:
+            return L10n.text("Media", language: language)
         case .webPage:
             return L10n.text("Web Page Translation", language: language)
         case .defaults:
@@ -2132,6 +3099,8 @@ private enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Webpage", language: language)
         case .ocr:
             return L10n.text("OCR", language: language)
+        case .media:
+            return L10n.text("Media", language: language)
         case .prompts:
             return L10n.text("Prompts", language: language)
         default:
@@ -2140,11 +3109,18 @@ private enum SettingsTab: CaseIterable, Identifiable {
     }
 }
 
+@MainActor
+final class SettingsNavigationState: ObservableObject {
+    @Published var selectedTab: SettingsTab = .general
+}
+
 private enum ShortcutCaptureTarget: Identifiable, Hashable {
     case quickAction
     case quickActionWithoutSelection
+    case liveSubtitles
     case quickActionTextMode
     case quickActionImageMode
+    case quickActionMediaMode
     case textTask(TaskKind)
     case imageOCRMode(OCRMode)
 
@@ -2154,10 +3130,14 @@ private enum ShortcutCaptureTarget: Identifiable, Hashable {
             return "quickAction"
         case .quickActionWithoutSelection:
             return "quickActionWithoutSelection"
+        case .liveSubtitles:
+            return "liveSubtitles"
         case .quickActionTextMode:
             return "quickActionTextMode"
         case .quickActionImageMode:
             return "quickActionImageMode"
+        case .quickActionMediaMode:
+            return "quickActionMediaMode"
         case .textTask(let task):
             return "textTask:\(task.rawValue)"
         case .imageOCRMode(let mode):
@@ -2173,7 +3153,7 @@ private enum WebPageDomainRuleKind {
 
 struct SettingsView: View {
     @ObservedObject var appState: AppState
-    @State private var selectedTab: SettingsTab = .general
+    @ObservedObject var navigation: SettingsNavigationState
     @State private var providerDraftID: ModelProviderID = .siliconFlow
     @State private var providerDraftName = ""
     @State private var providerDraftModelID = ""
@@ -2190,6 +3170,10 @@ struct SettingsView: View {
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
+    }
+
+    private var selectedTab: SettingsTab {
+        navigation.selectedTab
     }
 
     var body: some View {
@@ -2278,6 +3262,8 @@ struct SettingsView: View {
             modelSettingsPage
         case .ocr:
             ocrSettingsPage
+        case .media:
+            mediaSubtitleSettingsPage
         case .webPage:
             webPageTranslationPage
         case .defaults:
@@ -2365,6 +3351,11 @@ struct SettingsView: View {
                         shortcut: appState.preferences.quickActionWithoutSelectionShortcut,
                         target: .quickActionWithoutSelection
                     )
+                    shortcutRecorderLine(
+                        title: L10n.text("Open live subtitles", language: language),
+                        shortcut: appState.preferences.liveSubtitleShortcut,
+                        target: .liveSubtitles
+                    )
                 }
             }
 
@@ -2379,6 +3370,11 @@ struct SettingsView: View {
                         title: L10n.text("Switch to image mode", language: language),
                         shortcut: appState.preferences.quickActionPopupShortcuts.imageMode,
                         target: .quickActionImageMode
+                    )
+                    shortcutRecorderLine(
+                        title: L10n.text("Switch to media mode", language: language),
+                        shortcut: appState.preferences.quickActionPopupShortcuts.mediaMode,
+                        target: .quickActionMediaMode
                     )
                 }
             }
@@ -2846,6 +3842,274 @@ struct SettingsView: View {
         .pickerStyle(.menu)
         .frame(width: 260, alignment: .leading)
         .disabled(appState.visionCapableModels.isEmpty)
+    }
+
+    private var settingsMediaFileASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.mediaSubtitles.fileASRModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.mediaSubtitles.fileASRModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.fileSpeechModels) { model in
+                Text(settingsSpeechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 320, alignment: .leading)
+        .disabled(appState.fileSpeechModels.isEmpty)
+    }
+
+    private var settingsMediaRealtimeASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.mediaSubtitles.realtimeASRModelID },
+            set: { newValue in
+                appState.setRealtimeASRModel(id: newValue)
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.realtimeSpeechModels) { model in
+                Text(settingsSpeechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 320, alignment: .leading)
+        .disabled(appState.realtimeSpeechModels.isEmpty)
+    }
+
+    private var mediaSubtitleSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Media subtitles", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Enable media subtitles", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.mediaSubtitles.isEnabled },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.isEnabled = newValue }
+                            }
+                        )
+                    )
+                    Text(L10n.text("ASR is local-only in Phase 4. No remote ASR fallback is used.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: L10n.text("Realtime ASR", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsMediaRealtimeASRPicker
+                    HStack(spacing: 8) {
+                        Button {
+                            appState.checkMediaSubtitleASRHealth(mode: .realtime)
+                        } label: {
+                            Label(L10n.text("Health Check", language: language), systemImage: appState.mediaSubtitleHealthCheckMode == .realtime ? "clock" : "stethoscope")
+                        }
+                        .controlSize(.small)
+                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedRealtimeASRModel == nil)
+                        Text(L10n.text("Fun-ASR-MLT-Nano remains the broad-language default; MLX Qwen3-ASR and whisper.cpp Core ML also run realtime through persistent local sidecars.", language: language))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let report = appState.mediaSubtitleHealthReport,
+                       report.modelID == appState.selectedRealtimeASRModel?.id {
+                        mediaASRHealthReportView(report, mode: .realtime)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("File ASR", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsMediaFileASRPicker
+                    HStack(spacing: 8) {
+                        Button {
+                            appState.checkMediaSubtitleASRHealth(mode: .fileOnly)
+                        } label: {
+                            Label(L10n.text("Health Check", language: language), systemImage: appState.mediaSubtitleHealthCheckMode == .fileOnly ? "clock" : "stethoscope")
+                        }
+                        .controlSize(.small)
+                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedFileASRModel == nil)
+                        Text(L10n.text("Qwen3-ASR-0.6B is quality-oriented for file transcription. Fun-ASR uses local streaming or GGUF sidecars for lower-latency live captions.", language: language))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let report = appState.mediaSubtitleHealthReport,
+                       report.modelID == appState.selectedFileASRModel?.id {
+                        mediaASRHealthReportView(report, mode: .fileOnly)
+                    }
+                }
+            }
+
+            settingRow(title: L10n.text("Local ASR runtime", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    mediaASRCommandField(
+                        title: L10n.text("Fun-ASR command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.funASRCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.funASRCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "fun-asr-stream --model {model} --audio {audio} --language {language}"
+                    )
+                    mediaASRCommandField(
+                        title: L10n.text("SenseVoice command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.senseVoiceCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.senseVoiceCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "sensevoice --model {model} --audio {audio} --language {language}"
+                    )
+                    mediaASRCommandField(
+                        title: L10n.text("Qwen3-ASR command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.qwen3ASRCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.qwen3ASRCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "qwen3-asr --model {model} --audio {audio} --language {language}"
+                    )
+                    mediaASRCommandField(
+                        title: L10n.text("Whisper command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.whisperCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.whisperCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "whisper-cli -m {model} -f {audio} -l {language}"
+                    )
+                    mediaASRCommandField(
+                        title: L10n.text("Generic ASR command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.genericASRCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.genericASRCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "local-asr --model {model} --audio {audio} --language {language}"
+                    )
+                    Text(L10n.text("Use {model}, {audio}, {language}, {mode}, and {isFinal}. Empty fields fall back to environment variables or detected local runtimes.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: L10n.text("Subtitle defaults", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker(L10n.text("Target", language: language), selection: Binding(
+                        get: { appState.preferences.mediaSubtitles.defaultTargetLanguage },
+                        set: { newValue in
+                            appState.setMediaSubtitleTargetLanguage(newValue)
+                        }
+                    )) {
+                        Text(L10n.targetLanguageName("Chinese", language: language)).tag("zh-Hans")
+                        Text(L10n.targetLanguageName("English", language: language)).tag("en")
+                        Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
+                        Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220, alignment: .leading)
+                    .disabled(appState.preferences.mediaSubtitles.defaultSubtitleMode == .original)
+                    .help(appState.preferences.mediaSubtitles.defaultSubtitleMode == .original
+                        ? L10n.text("Target language applies when Display is Translated or Bilingual.", language: language)
+                        : L10n.text("Target", language: language)
+                    )
+
+                    Picker(L10n.text("Source language", language: language), selection: Binding(
+                        get: { appState.preferences.mediaSubtitles.sourceLanguageHint },
+                        set: { newValue in
+                            appState.setMediaSubtitleSourceLanguageHint(newValue)
+                        }
+                    )) {
+                        ForEach(ASRSourceLanguageHint.allCases) { hint in
+                            Text(sourceLanguageHintName(hint)).tag(hint)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220, alignment: .leading)
+
+                    Picker(L10n.text("Display", language: language), selection: Binding(
+                        get: { appState.preferences.mediaSubtitles.defaultSubtitleMode },
+                        set: { newValue in
+                            appState.setMediaSubtitleMode(newValue)
+                        }
+                    )) {
+                        ForEach(SubtitleDisplayMode.allCases) { mode in
+                            Text(subtitleModeName(mode)).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(width: 220, alignment: .leading)
+
+                    Picker(L10n.text("Audio source", language: language), selection: Binding(
+                        get: { appState.preferences.mediaSubtitles.liveAudioSource },
+                        set: { newValue in
+                            appState.setLiveSubtitleAudioSource(newValue)
+                        }
+                    )) {
+                        ForEach(LiveSubtitleAudioSource.allCases) { source in
+                            Text(liveAudioSourceName(source)).tag(source)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220, alignment: .leading)
+
+                    HStack(spacing: 10) {
+                        Label(L10n.text("Window opacity", language: language), systemImage: "circle.lefthalf.filled")
+                            .frame(width: 150, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { appState.preferences.mediaSubtitles.liveWindowOpacity },
+                                set: { appState.setLiveSubtitleWindowOpacity($0) }
+                            ),
+                            in: 0.25...1.0
+                        )
+                        Text("\(Int(appState.preferences.mediaSubtitles.liveWindowOpacity * 100))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 44, alignment: .trailing)
+                    }
+                    .frame(width: 320, alignment: .leading)
+                }
+            }
+
+            settingRow(title: L10n.text("History", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Save transcript history", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.mediaSubtitles.saveTranscriptHistory },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.saveTranscriptHistory = newValue }
+                            }
+                        )
+                    )
+                    checkboxLine(
+                        title: L10n.text("Save translated subtitle history", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.mediaSubtitles.saveTranslatedSubtitleHistory },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.saveTranslatedSubtitleHistory = newValue }
+                            }
+                        )
+                    )
+                    Text(L10n.text("Raw audio, full page URLs, page titles, transcripts, and translated subtitles are not saved by default.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+        }
     }
 
     private var browserIntegrationList: some View {
@@ -3413,14 +4677,14 @@ struct SettingsView: View {
             }
         )) {
             Text(L10n.text("No model", language: language)).tag(UUID?.none)
-            ForEach(appState.models) { model in
+            ForEach(appState.textCapableModels) { model in
                 Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(width: 230, alignment: .leading)
-        .disabled(appState.models.isEmpty)
+        .disabled(appState.textCapableModels.isEmpty)
     }
 
     private var webPageTranslationModelPicker: some View {
@@ -3431,14 +4695,14 @@ struct SettingsView: View {
             }
         )) {
             Text(L10n.text("Use default model", language: language)).tag(UUID?.none)
-            ForEach(appState.models.filter { $0.enabled }) { model in
+            ForEach(appState.textCapableModels) { model in
                 Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(width: 230, alignment: .leading)
-        .disabled(appState.models.isEmpty)
+        .disabled(appState.textCapableModels.isEmpty)
     }
 
     private var translationTargetPicker: some View {
@@ -3642,7 +4906,7 @@ struct SettingsView: View {
     private func settingsTabButton(_ tab: SettingsTab) -> some View {
         let isSelected = selectedTab == tab
         return Button {
-            selectedTab = tab
+            navigation.selectedTab = tab
             if tab == .webPage {
                 refreshBrowserIntegrationStates()
             }
@@ -3809,6 +5073,19 @@ struct SettingsView: View {
             content()
         }
         .frame(width: width, alignment: .topLeading)
+    }
+
+    private func mediaASRCommandField(
+        title: String,
+        text: Binding<String>,
+        placeholder: String
+    ) -> some View {
+        fieldStack(title: title, width: 500) {
+            CommandFriendlyTextField(
+                text: text,
+                placeholder: placeholder
+            )
+        }
     }
 
     private func webPageDomainList(
@@ -3996,10 +5273,14 @@ struct SettingsView: View {
                 preferences.quickActionShortcut = shortcut
             case .quickActionWithoutSelection:
                 preferences.quickActionWithoutSelectionShortcut = shortcut
+            case .liveSubtitles:
+                preferences.liveSubtitleShortcut = shortcut
             case .quickActionTextMode:
                 preferences.quickActionPopupShortcuts.textMode = shortcut
             case .quickActionImageMode:
                 preferences.quickActionPopupShortcuts.imageMode = shortcut
+            case .quickActionMediaMode:
+                preferences.quickActionPopupShortcuts.mediaMode = shortcut
             case .textTask(let task):
                 preferences.quickActionPopupShortcuts.setTextTaskShortcut(shortcut, for: task)
             case .imageOCRMode(let mode):
@@ -4170,8 +5451,10 @@ struct SettingsView: View {
         var assignments: [(target: ShortcutCaptureTarget, shortcut: KeyboardShortcutPreference)] = [
             (.quickAction, appState.preferences.quickActionShortcut),
             (.quickActionWithoutSelection, appState.preferences.quickActionWithoutSelectionShortcut),
+            (.liveSubtitles, appState.preferences.liveSubtitleShortcut),
             (.quickActionTextMode, popupShortcuts.textMode),
-            (.quickActionImageMode, popupShortcuts.imageMode)
+            (.quickActionImageMode, popupShortcuts.imageMode),
+            (.quickActionMediaMode, popupShortcuts.mediaMode)
         ]
         for task in TaskKind.interactiveCases {
             if let shortcut = popupShortcuts.textTaskShortcut(for: task) {
@@ -4200,10 +5483,14 @@ struct SettingsView: View {
             return .optionSpace
         case .quickActionWithoutSelection:
             return .optionShiftSpace
+        case .liveSubtitles:
+            return .commandOptionControlL
         case .quickActionTextMode:
             return popupDefaults.textMode
         case .quickActionImageMode:
             return popupDefaults.imageMode
+        case .quickActionMediaMode:
+            return popupDefaults.mediaMode
         case .textTask(let task):
             return popupDefaults.textTaskShortcut(for: task) ?? .commandNumber(1)
         case .imageOCRMode(let mode):
@@ -4354,7 +5641,15 @@ struct SettingsView: View {
                     }
                 }
 
-                if model.capabilities.supportsImage {
+                if model.capabilities.supportsSpeech {
+                    iconToolButton(
+                        systemImage: "stethoscope",
+                        help: L10n.text("Health Check", language: language),
+                        isDisabled: appState.mediaSubtitleHealthCheckMode != nil
+                    ) {
+                        appState.checkMediaSubtitleASRHealth(mode: model.capabilities.supportsRealtimeSpeech ? .realtime : .fileOnly)
+                    }
+                } else if model.capabilities.supportsImage {
                     iconToolButton(
                         systemImage: "textformat",
                         help: L10n.text("Mark text-only", language: language),
@@ -4447,6 +5742,12 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
             }
+            if let speech = capabilities.speech {
+                Text("\(speech.family.rawValue) · \(speech.modes.map { $0.rawValue }.joined(separator: ", "))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             if let failure = capabilities.lastFailureMessage, !failure.isEmpty {
                 Text(failure)
                     .font(.caption)
@@ -4477,6 +5778,8 @@ struct SettingsView: View {
             return "network"
         case .anthropicMessages:
             return "cloud"
+        case .speech:
+            return "waveform"
         case .unknown:
             return "questionmark.square.dashed"
         }
@@ -4492,6 +5795,8 @@ struct SettingsView: View {
             return .indigo
         case .anthropicMessages:
             return .orange
+        case .speech:
+            return .green
         case .unknown:
             return .gray
         }
@@ -4550,6 +5855,12 @@ struct SettingsView: View {
     }
 
     private func capabilityName(_ capabilities: ModelCapabilities) -> String {
+        if capabilities.supportsSpeech {
+            if capabilities.supportsRealtimeSpeech {
+                return L10n.text("Speech realtime", language: language)
+            }
+            return L10n.text("Speech file-only", language: language)
+        }
         if capabilities.supportsImage {
             return L10n.text("Vision", language: language)
         }
@@ -4557,6 +5868,9 @@ struct SettingsView: View {
     }
 
     private func capabilityIcon(_ capabilities: ModelCapabilities) -> String {
+        if capabilities.supportsSpeech {
+            return "waveform"
+        }
         if capabilities.supportsImage {
             return "eye"
         }
@@ -4564,6 +5878,9 @@ struct SettingsView: View {
     }
 
     private func capabilityTint(_ capabilities: ModelCapabilities) -> Color {
+        if capabilities.supportsSpeech {
+            return .green
+        }
         if capabilities.supportsImage {
             return .teal
         }
@@ -4717,6 +6034,240 @@ struct SettingsView: View {
             return "xmark.octagon.fill"
         default:
             return "circle.dashed"
+        }
+    }
+
+    private func mediaASRStatusName(_ status: ASRHealthReport.Status) -> String {
+        switch (language, status) {
+        case (.chinese, .ready):
+            return "就绪"
+        case (.chinese, .modelMissing):
+            return "模型缺失"
+        case (.chinese, .runtimeMissing):
+            return "运行时缺失"
+        case (.chinese, .incompatibleModel):
+            return "模型不兼容"
+        case (.chinese, .loadFailed):
+            return "加载失败"
+        case (.chinese, .inferenceFailed):
+            return "推理失败"
+        case (.english, .ready):
+            return "Ready"
+        case (.english, .modelMissing):
+            return "Model missing"
+        case (.english, .runtimeMissing):
+            return "Runtime missing"
+        case (.english, .incompatibleModel):
+            return "Incompatible"
+        case (.english, .loadFailed):
+            return "Load failed"
+        case (.english, .inferenceFailed):
+            return "Inference failed"
+        }
+    }
+
+    private func mediaASRStatusIcon(_ status: ASRHealthReport.Status) -> String {
+        switch status {
+        case .ready:
+            return "checkmark.circle.fill"
+        case .runtimeMissing, .modelMissing, .incompatibleModel:
+            return "exclamationmark.triangle.fill"
+        case .loadFailed, .inferenceFailed:
+            return "xmark.octagon.fill"
+        }
+    }
+
+    @ViewBuilder
+    private func mediaASRHealthReportView(_ report: ASRHealthReport, mode: SpeechRuntimeMode) -> some View {
+        statusBadge(mediaASRStatusName(report.status), systemImage: mediaASRStatusIcon(report.status))
+        Text(report.message)
+            .font(.caption)
+            .foregroundStyle(report.status == .ready ? Color.secondary : Color.red)
+            .fixedSize(horizontal: false, vertical: true)
+        Text("\(L10n.text("Runtime source", language: language)): \(mediaASRRuntimeSourceName(report.runtimeSource))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        if appState.canRepairMediaSubtitleASRRuntime(report: report) {
+            HStack(spacing: 8) {
+                Button {
+                    appState.repairMediaSubtitleASRRuntime(mode: mode)
+                } label: {
+                    Label(
+                        L10n.text("Repair Runtime", language: language),
+                        systemImage: appState.mediaSubtitleASRRepairMode == mode ? "clock" : "wrench.and.screwdriver"
+                    )
+                }
+                .controlSize(.small)
+                .disabled(appState.mediaSubtitleASRRepairMode != nil || appState.mediaSubtitleHealthCheckMode != nil)
+                Text(L10n.text("Installs or reuses the matching isolated MLX ASR runtime, then writes the command template.", language: language))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func mediaASRRuntimeSourceName(_ source: ASRRuntimeSource) -> String {
+        switch (language, source) {
+        case (.chinese, .settingsCommand):
+            return "设置命令"
+        case (.chinese, .environmentCommand):
+            return "环境变量"
+        case (.chinese, .fixtureTranscript):
+            return "测试夹具"
+        case (.chinese, .mlxAudioRunner):
+            return "本地 mlx-audio"
+        case (.chinese, .sherpaOnnxAuto):
+            return "自动 sherpa-onnx"
+        case (.chinese, .sherpaOnnxQwen3Runner):
+            return "已移除 sherpa-onnx Qwen3"
+        case (.chinese, .whisperCppCoreMLRunner):
+            return "whisper.cpp CoreML"
+        case (.chinese, .funASRGGUFAuto):
+            return "自动 FunASR GGUF"
+        case (.chinese, .unavailable):
+            return "未配置"
+        case (.english, .settingsCommand):
+            return "Settings command"
+        case (.english, .environmentCommand):
+            return "Environment variable"
+        case (.english, .fixtureTranscript):
+            return "Fixture transcript"
+        case (.english, .mlxAudioRunner):
+            return "Local mlx-audio"
+        case (.english, .sherpaOnnxAuto):
+            return "Auto sherpa-onnx"
+        case (.english, .sherpaOnnxQwen3Runner):
+            return "Removed sherpa-onnx Qwen3"
+        case (.english, .whisperCppCoreMLRunner):
+            return "whisper.cpp Core ML"
+        case (.english, .funASRGGUFAuto):
+            return "Auto FunASR GGUF"
+        case (.english, .unavailable):
+            return "Unavailable"
+        }
+    }
+
+    private func settingsSpeechModelPickerTitle(_ model: ModelDescriptor) -> String {
+        let modeLabel = model.capabilities.supportsRealtimeSpeech
+            ? L10n.text("Realtime", language: language)
+            : L10n.text("File only", language: language)
+        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
+        return "\(model.name) · \(family) · \(modeLabel)"
+    }
+
+    private func subtitleModeName(_ mode: SubtitleDisplayMode) -> String {
+        switch (language, mode) {
+        case (.chinese, .original):
+            return "原文"
+        case (.chinese, .translated):
+            return "译文"
+        case (.chinese, .bilingual):
+            return "双语"
+        case (.english, .original):
+            return "Original"
+        case (.english, .translated):
+            return "Translated"
+        case (.english, .bilingual):
+            return "Bilingual"
+        }
+    }
+
+    private func sourceLanguageHintName(_ hint: ASRSourceLanguageHint) -> String {
+        switch (language, hint) {
+        case (.chinese, .auto):
+            return "自动"
+        case (.chinese, .zh):
+            return "中文"
+        case (.chinese, .yue):
+            return "粤语"
+        case (.chinese, .en):
+            return "英文"
+        case (.chinese, .ja):
+            return "日语"
+        case (.chinese, .ko):
+            return "韩语"
+        case (.chinese, .vi):
+            return "越南语"
+        case (.chinese, .id):
+            return "印尼语"
+        case (.chinese, .th):
+            return "泰语"
+        case (.chinese, .ms):
+            return "马来语"
+        case (.chinese, .fil):
+            return "菲律宾语"
+        case (.chinese, .ar):
+            return "阿拉伯语"
+        case (.chinese, .hi):
+            return "印地语"
+        case (.chinese, .de):
+            return "德语"
+        case (.chinese, .fr):
+            return "法语"
+        case (.chinese, .es):
+            return "西班牙语"
+        case (.chinese, .pt):
+            return "葡萄牙语"
+        case (.chinese, .it):
+            return "意大利语"
+        case (.chinese, .ru):
+            return "俄语"
+        case (.english, .auto):
+            return "Auto"
+        case (.english, .zh):
+            return "Chinese"
+        case (.english, .yue):
+            return "Cantonese"
+        case (.english, .en):
+            return "English"
+        case (.english, .ja):
+            return "Japanese"
+        case (.english, .ko):
+            return "Korean"
+        case (.english, .vi):
+            return "Vietnamese"
+        case (.english, .id):
+            return "Indonesian"
+        case (.english, .th):
+            return "Thai"
+        case (.english, .ms):
+            return "Malay"
+        case (.english, .fil):
+            return "Filipino"
+        case (.english, .ar):
+            return "Arabic"
+        case (.english, .hi):
+            return "Hindi"
+        case (.english, .de):
+            return "German"
+        case (.english, .fr):
+            return "French"
+        case (.english, .es):
+            return "Spanish"
+        case (.english, .pt):
+            return "Portuguese"
+        case (.english, .it):
+            return "Italian"
+        case (.english, .ru):
+            return "Russian"
+        }
+    }
+
+    private func liveAudioSourceName(_ source: LiveSubtitleAudioSource) -> String {
+        switch (language, source) {
+        case (.chinese, .systemAudio):
+            return "系统音频"
+        case (.chinese, .microphone):
+            return "麦克风"
+        case (.chinese, .systemAndMicrophone):
+            return "系统音频 + 麦克风"
+        case (.english, .systemAudio):
+            return "System audio"
+        case (.english, .microphone):
+            return "Microphone"
+        case (.english, .systemAndMicrophone):
+            return "System + Microphone"
         }
     }
 

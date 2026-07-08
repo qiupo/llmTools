@@ -5,6 +5,7 @@ import LLMToolsCore
 @MainActor
 protocol HotKeyServiceDelegate: AnyObject {
     func hotKeyService(_ service: HotKeyService, didTriggerQuickActionCapturingSelection shouldCaptureSelection: Bool)
+    func hotKeyServiceDidTriggerLiveSubtitles(_ service: HotKeyService)
 }
 
 @MainActor
@@ -29,7 +30,8 @@ final class HotKeyService {
 
     func registerHotKeys(
         quickActionShortcut: KeyboardShortcutPreference,
-        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
+        quickActionWithoutSelectionShortcut: KeyboardShortcutPreference,
+        liveSubtitleShortcut: KeyboardShortcutPreference
     ) {
         unregister()
 
@@ -56,12 +58,20 @@ final class HotKeyService {
                     nil,
                     &hotKeyID
                 )
-                let shouldCaptureSelection = status == noErr ? hotKeyID.id == 1 : true
+                guard status == noErr else {
+                    return noErr
+                }
                 Task { @MainActor in
-                    service.delegate?.hotKeyService(
-                        service,
-                        didTriggerQuickActionCapturingSelection: shouldCaptureSelection
-                    )
+                    switch hotKeyID.id {
+                    case 1:
+                        service.delegate?.hotKeyService(service, didTriggerQuickActionCapturingSelection: true)
+                    case 2:
+                        service.delegate?.hotKeyService(service, didTriggerQuickActionCapturingSelection: false)
+                    case 3:
+                        service.delegate?.hotKeyServiceDidTriggerLiveSubtitles(service)
+                    default:
+                        break
+                    }
                 }
                 return noErr
             },
@@ -80,6 +90,11 @@ final class HotKeyService {
             keyCode: quickActionWithoutSelectionShortcut.keyCode,
             modifiers: quickActionWithoutSelectionShortcut.modifiers,
             id: 2
+        )
+        registerHotKey(
+            keyCode: liveSubtitleShortcut.keyCode,
+            modifiers: liveSubtitleShortcut.modifiers,
+            id: 3
         )
     }
 

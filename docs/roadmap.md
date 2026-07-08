@@ -1,6 +1,6 @@
 # llmTools Roadmap
 
-Last updated: 2026-07-04
+Last updated: 2026-07-06
 
 ## Product Direction
 
@@ -9,6 +9,7 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 - selected-text translation, polishing, summarization, explanation, and TODO extraction
 - direct web-page translation, where English text in a page can be translated into Chinese in place
 - native image OCR using explicitly configured vision-capable models
+- local-first media subtitles for audio, video, and desktop live playback, with direct Chinese translation
 - a floating desktop widget that accepts pasted text and dragged files
 - local model reuse through user-selected model files or model folders
 - task-first interaction, with model selection hidden behind sensible defaults
@@ -29,6 +30,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 2.6 privacy, diagnostics, and release-QA baseline is implemented: redacted webpage diagnostics, explicit cache/history policy, default-off webpage Recent History, fixture matrix coverage, least-privilege manifest checks, browser runtime/console checks, and Phase 1 regression checks.
 - Remaining Phase 2 work is now limited to external/manual closure tasks: real Edge acceptance when Edge is available, real Chrome packaged-app smoke after the unpacked extension is loaded from this repo, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, browser image/canvas OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
 - Phase 3 implementation baseline is complete as of 2026-07-04: native text-task prompts and follow-up actions are hardened, model capability metadata is persisted and visible, and native model-vision OCR plus screenshot/image explanation are available through a user-selected vision-capable model.
+- Phase 4 product direction is now media intake and live subtitles: local audio/video transcription, translated subtitles, and desktop live subtitles from system audio and/or microphone audio. The previous file/document intake plan is retained as supporting file-ingestion scope and later document-assistant work.
 
 ## Confirmed Decisions
 
@@ -58,6 +60,10 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 3 does not use Apple Vision, VisionKit, or Apple-provided OCR/visual recognition APIs. Image recognition is performed by the configured vision-capable model.
 - OCR models must be chosen from models marked as vision-capable. When provider APIs cannot prove vision support, the app should expose confidence and allow a clear manual override instead of silently assuming support.
 - Local text-only GGUF and MLX models should remain unavailable for OCR until a real multimodal local runner exists.
+- Phase 4 changes the main line from generic file/document intake to media intake and subtitles. TXT/Markdown/image drag-and-drop can remain as supporting workflow, but PDF/DOCX and reusable document understanding stay later-phase work.
+- Phase 4 does not consider remote ASR. Speech recognition must run locally by default and should not include a cloud fallback path in MVP requirements.
+- Phase 4 realtime subtitles prefer Fun-ASR-MLT-Nano when a local Fun-ASR streaming runtime is configured, with Fun-ASR-Nano as the lower-latency Chinese/English/Japanese option. SenseVoiceSmall remains supported as a short-window low-latency runtime. Qwen3-ASR-0.6B is selectable as an experimental realtime ASR through a local vLLM/streaming runtime and remains available for audio/video file transcription.
+- Phase 4 translated subtitles reuse llmTools' existing text translation engine after ASR; ASR models should produce transcripts, not final Chinese translations.
 
 ## Phase 1: Native MVP - Completed
 
@@ -314,40 +320,75 @@ Primary acceptance:
 - A user can ask llmTools to explain a screenshot/image when a vision-capable model is configured.
 - OCR failures explain whether the blocker is missing vision support, provider configuration, input format, network/API failure, or no readable text.
 
-## Phase 4: File Drop And Document Intake
+## Phase 4: Media Intake And Live Subtitles
 
-Goal: make the floating widget a natural file-processing entry point after native text tasks and OCR are stable.
+Goal: make llmTools process audio, video, and desktop live audio into original and translated subtitles, with Simplified Chinese as the default target language and local ASR as a hard product boundary.
+
+Detailed PRD: `docs/phase-4-media-live-subtitles-prd.md`.
+
+Implementation status as of 2026-07-06:
+
+- Implemented in the native app: speech-capable model metadata, media subtitle preferences, realtime/file ASR pickers, local ASR health checks, file media intake, macOS audio extraction/normalization, subtitle segment model, subtitle translation coordinator, SRT/VTT/TXT/Markdown export, media quick-action mode, and redacted diagnostics.
+- Implemented for local ASR runtime integration: Fun-ASR-Nano and Fun-ASR-MLT-Nano realtime/file capability detection, SenseVoiceSmall realtime/file capability detection, Qwen3-ASR-0.6B file/realtime capability detection, Settings-configurable command templates for local sidecars, runtime-source health labels, ASR source-language hints, launch-time environment variable fallback through `LLMTOOLS_FUN_ASR_COMMAND`, `LLMTOOLS_SENSEVOICE_COMMAND`, `LLMTOOLS_QWEN3_ASR_COMMAND`, or `LLMTOOLS_ASR_COMMAND`, automatic `llama-funasr-cli` GGUF detection for compatible Fun-ASR folders, automatic bundled MLX runner use for supported safetensors/MLX ASR folders when the matching isolated venv is installed, plus automatic `sherpa-onnx-offline` use for SenseVoiceSmall ONNX folders where available.
+- Implemented in the native app for desktop live subtitles: ScreenCaptureKit system-audio capture, microphone capture, mixed audio source selection, floating subtitle window, configurable global shortcut, VAD gating, partial/final/translated event plumbing, and local ASR command execution over temporary live-audio WAV windows.
+- Implemented checks: `swift run LLMToolsChecks`, `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke`, `node scripts/check-phase4-media-subtitles.mjs`, `node scripts/check-phase4-local-asr-runtime.mjs`, extension JavaScript syntax checks, and the existing browser DOM regression suite with browser live-subtitle permissions removed.
+- Runtime dependency: real file transcription and real desktop live subtitles require a local Fun-ASR, SenseVoiceSmall, or Qwen3-ASR runtime/model on the user's Mac. Fun-ASR can use a configured local streaming command or compatible GGUF files with `llama-funasr-cli`; supported safetensors/MLX ASR folders can use the bundled `llmtools-mlx-asr-runner.sh` after the matching isolated runtime is installed. Qwen3 uses `scripts/install-phase4-mlx-asr-runtime.sh`; Fun-ASR-MLT-Nano uses `scripts/install-phase4-funasr-mlx-runtime.sh`; Fun-ASR-Nano uses `scripts/install-phase4-funasr-nano-mlx-runtime.sh`; SenseVoiceSmall uses `scripts/install-phase4-sensevoice-mlx-runtime.sh`. The app reports missing local runtime/model state explicitly and does not fall back to remote ASR.
 
 Core capabilities:
 
+- audio and video file intake
+- local audio extraction and normalization to the ASR runtime format
+- non-realtime transcription for recordings and videos
+- timestamped subtitle generation
+- subtitle translation through the existing llmTools translation engine
+- SRT, VTT, TXT, and Markdown export
+- Desktop live subtitles after explicit user action
+- original, translated, and bilingual subtitle modes
+- Fun-ASR-MLT-Nano realtime ASR runner for broad-language live subtitles
+- Fun-ASR-Nano optional low-latency runner for Chinese/English/Japanese live subtitles
+- SenseVoiceSmall fallback short-window ASR runner
+- Qwen3-ASR-0.6B optional ASR runner for file transcription quality and experimental realtime subtitles
+- VAD-based speech segmentation and silence handling
+- source-language detection with confidence and low-confidence states
+- model capability metadata for speech-capable models
+- redacted diagnostics that do not store raw audio, transcripts, translated subtitles, page titles, or full URLs by default
+- cancellation, stop, retry, and clear running/error states
+- local-only ASR; no remote ASR fallback or provider mode in Phase 4
+
+Supporting file-intake capabilities:
+
 - always-available floating widget
-- drag-to-process interaction
+- drag-to-process interaction for supported media and text/image files
 - screen-edge docking and auto-collapse
-- TXT and Markdown file ingestion
+- TXT and Markdown file ingestion as lightweight supporting workflows
 - image file OCR handoff to the Phase 3 OCR engine
-- PDF ingestion after text extraction is stable
 - automatic task suggestion based on file content
 - file summary
 - key point extraction
 - action item extraction
 - recent result history
-- clear running/error states
-
-Candidate Phase 4.x requirement under research:
-
-- browser live audio translation and subtitles for current-tab audio, with Chrome first, native-app model execution first, local processing by default, multilingual source detection with confidence, and Simplified Chinese translated subtitles. See `docs/phase-4-live-audio-subtitles-research.md`.
 
 Suggested scope:
 
-- Start with TXT/Markdown and images because text extraction and OCR paths are explicit.
-- Add PDF only after text chunking, page extraction, and progress reporting are reliable.
-- Treat DOCX as a later extension unless it becomes an explicit priority.
+- Start with file transcription before live browser subtitles: file input has clearer progress, retry, and export semantics.
+- Use Fun-ASR-MLT-Nano through a local streaming runtime for broad-language realtime subtitles; use Fun-ASR-Nano where lower-latency Chinese/English/Japanese realtime matters most.
+- Keep SenseVoiceSmall as a supported short-window ASR runtime where users already have a working sidecar.
+- Provide Qwen3-ASR-0.6B for file transcription and optional realtime subtitles where slower but potentially higher-quality or broader Chinese-dialect support is acceptable.
+- Keep live subtitles desktop-native through user-triggered system-audio and/or microphone capture. Browser-extension-hosted live subtitles, always-on microphone dictation, and meeting bots are out of scope.
+- Keep ASR local-only. Remote ASR, automatic cloud fallback, and cloud live translation are not part of Phase 4.
+- Translate ASR output with the existing text translation engine so target-language behavior stays consistent with selected-text and webpage translation.
+- Keep PDF, DOCX, reusable document indexing, and multi-document QA in Phase 5 unless explicitly reprioritized.
 
 Primary acceptance:
 
-- A user can drag a supported text or image file onto the floating widget and receive a structured result.
-- The widget remains unobtrusive when docked to the side of the screen.
-- Large-file failures produce understandable messages instead of silent hangs.
+- A user can drop a supported audio or video file, generate original subtitles, translate them into Simplified Chinese, and export SRT/VTT/TXT/Markdown.
+- A user can choose Fun-ASR-MLT-Nano for broad-language realtime subtitles, Fun-ASR-Nano for lower-latency Chinese/English/Japanese realtime subtitles, SenseVoiceSmall for existing short-window ASR setups, and Qwen3-ASR-0.6B for file transcription or experimental realtime subtitles.
+- A user can open desktop live subtitles from the menu or global shortcut, listen to system audio and/or microphone audio, and stop capture from the floating subtitle window.
+- Live subtitles can show original-only, translated-only, or bilingual modes without mutating source app or page content.
+- Chinese and English are required acceptance languages. Cantonese, Japanese, Korean, Spanish, French, and German form the first multilingual smoke set.
+- Low-confidence language detection shows an unknown or low-confidence state instead of fabricating certainty.
+- Raw audio, transcript text, translated subtitle text, page title, and full URL are not written to diagnostics or history by default.
+- Existing Phase 1 selected-text tasks, Phase 2 webpage translation, and Phase 3 OCR workflows remain unaffected.
 
 ## Phase 5: Local Document Assistant
 

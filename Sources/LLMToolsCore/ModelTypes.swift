@@ -5,6 +5,7 @@ public enum ModelFormat: String, Codable, Sendable, CaseIterable {
     case mlx
     case openAICompatible = "openai-compatible"
     case anthropicMessages = "anthropic-messages"
+    case speech
     case unknown
 }
 
@@ -26,6 +27,7 @@ public enum ModelValidationState: String, Codable, Sendable, CaseIterable {
 public enum ModelInputCapability: String, Codable, Sendable, CaseIterable, Hashable {
     case text
     case image
+    case speech
 }
 
 public enum ModelCapabilitySource: String, Codable, Sendable, CaseIterable, Hashable {
@@ -44,6 +46,7 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
     public var note: String?
     public var lastCheckedAt: Date?
     public var lastFailureMessage: String?
+    public var speech: SpeechModelCapabilities?
 
     public init(
         inputs: [ModelInputCapability] = [.text],
@@ -51,14 +54,20 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         confidence: Double = 0.5,
         note: String? = nil,
         lastCheckedAt: Date? = nil,
-        lastFailureMessage: String? = nil
+        lastFailureMessage: String? = nil,
+        speech: SpeechModelCapabilities? = nil
     ) {
-        self.inputs = ModelCapabilities.normalizedInputs(inputs)
+        var normalizedInputs = inputs
+        if speech != nil, !normalizedInputs.contains(.speech) {
+            normalizedInputs.append(.speech)
+        }
+        self.inputs = ModelCapabilities.normalizedInputs(normalizedInputs)
         self.source = source
         self.confidence = min(max(confidence, 0), 1)
         self.note = note
         self.lastCheckedAt = lastCheckedAt
         self.lastFailureMessage = lastFailureMessage
+        self.speech = speech
     }
 
     public func supports(_ capability: ModelInputCapability) -> Bool {
@@ -71,6 +80,19 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
 
     public var supportsImage: Bool {
         supports(.image)
+    }
+
+    public var supportsSpeech: Bool {
+        supports(.speech) && speech?.isSelectableASRBackend == true
+    }
+
+    public var supportsRealtimeSpeech: Bool {
+        speech?.isSelectableASRBackend == true && speech?.supports(.realtime) == true
+    }
+
+    public var supportsFileSpeech: Bool {
+        speech?.isSelectableASRBackend == true
+            && (speech?.supports(.fileOnly) == true || speech?.supports(.realtime) == true)
     }
 
     public static func textOnly(source: ModelCapabilitySource = .inferred, note: String? = nil) -> ModelCapabilities {
@@ -91,6 +113,21 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         )
     }
 
+    public static func speech(
+        _ speech: SpeechModelCapabilities,
+        note: String? = nil
+    ) -> ModelCapabilities {
+        ModelCapabilities(
+            inputs: [.speech],
+            source: speech.source,
+            confidence: speech.confidence,
+            note: note ?? speech.note,
+            lastCheckedAt: speech.lastCheckedAt,
+            lastFailureMessage: speech.lastFailureMessage,
+            speech: speech
+        )
+    }
+
     public static func inferred(
         format: ModelFormat,
         providerConfiguration: ProviderConfiguration?
@@ -105,9 +142,37 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
             return inferOpenAICompatibleCapabilities(providerConfiguration)
         case .anthropicMessages:
             return textOnly(source: .unknown, note: "Anthropic vision payload is not implemented in Phase 3.")
+        case .speech:
+            return textOnly(source: .unknown, note: "Speech model metadata is required.")
         case .unknown:
             return textOnly(source: .unknown, note: "Unknown model format.")
         }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case inputs
+        case source
+        case confidence
+        case note
+        case lastCheckedAt
+        case lastFailureMessage
+        case speech
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedSpeech = try container.decodeIfPresent(SpeechModelCapabilities.self, forKey: .speech)
+        var decodedInputs = try container.decodeIfPresent([ModelInputCapability].self, forKey: .inputs) ?? [.text]
+        if decodedSpeech != nil, !decodedInputs.contains(.speech) {
+            decodedInputs.append(.speech)
+        }
+        inputs = ModelCapabilities.normalizedInputs(decodedInputs)
+        source = try container.decodeIfPresent(ModelCapabilitySource.self, forKey: .source) ?? .unknown
+        confidence = min(max(try container.decodeIfPresent(Double.self, forKey: .confidence) ?? 0.5, 0), 1)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        lastCheckedAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckedAt)
+        lastFailureMessage = try container.decodeIfPresent(String.self, forKey: .lastFailureMessage)
+        speech = decodedSpeech
     }
 
     private static func inferOpenAICompatibleCapabilities(_ configuration: ProviderConfiguration) -> ModelCapabilities {
@@ -605,6 +670,11 @@ public struct KeyboardShortcutPreference: Codable, Sendable, Hashable {
         modifiers: KeyboardShortcutPreference.optionModifier | KeyboardShortcutPreference.shiftModifier
     )
 
+    public static let commandOptionControlL = KeyboardShortcutPreference(
+        keyCode: 37,
+        modifiers: KeyboardShortcutPreference.commandModifier | KeyboardShortcutPreference.optionModifier | KeyboardShortcutPreference.controlModifier
+    )
+
     public static func commandNumber(_ number: Int) -> KeyboardShortcutPreference {
         KeyboardShortcutPreference(
             keyCode: ansiNumberKeyCode(number),
@@ -661,6 +731,7 @@ public struct SelectionLineLimitRule: Codable, Identifiable, Sendable, Hashable 
 public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     public var textMode: KeyboardShortcutPreference
     public var imageMode: KeyboardShortcutPreference
+    public var mediaMode: KeyboardShortcutPreference
     public var translate: KeyboardShortcutPreference
     public var polish: KeyboardShortcutPreference
     public var summarize: KeyboardShortcutPreference
@@ -674,6 +745,7 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     public init(
         textMode: KeyboardShortcutPreference = .commandControlNumber(1),
         imageMode: KeyboardShortcutPreference = .commandControlNumber(2),
+        mediaMode: KeyboardShortcutPreference = .commandControlNumber(3),
         translate: KeyboardShortcutPreference = .commandNumber(1),
         polish: KeyboardShortcutPreference = .commandNumber(2),
         summarize: KeyboardShortcutPreference = .commandNumber(3),
@@ -686,6 +758,7 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     ) {
         self.textMode = textMode
         self.imageMode = imageMode
+        self.mediaMode = mediaMode
         self.translate = translate
         self.polish = polish
         self.summarize = summarize
@@ -700,6 +773,7 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case textMode
         case imageMode
+        case mediaMode
         case translate
         case polish
         case summarize
@@ -716,6 +790,7 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         textMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .textMode) ?? defaults.textMode
         imageMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .imageMode) ?? defaults.imageMode
+        mediaMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .mediaMode) ?? defaults.mediaMode
         translate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .translate) ?? defaults.translate
         polish = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .polish) ?? defaults.polish
         summarize = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .summarize) ?? defaults.summarize
@@ -816,9 +891,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var recentHistoryLimit: Int
     public var webPageTranslation: WebPageTranslationPreferences
     public var ocr: OCRPreferences
+    public var mediaSubtitles: MediaSubtitlePreferences
     public var promptTemplates: PromptTemplatePreferences
     public var quickActionShortcut: KeyboardShortcutPreference
     public var quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
+    public var liveSubtitleShortcut: KeyboardShortcutPreference
     public var quickActionPopupShortcuts: QuickActionPopupShortcuts
 
     public init(
@@ -843,9 +920,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         recentHistoryLimit: Int = 20,
         webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
         ocr: OCRPreferences = OCRPreferences(),
+        mediaSubtitles: MediaSubtitlePreferences = MediaSubtitlePreferences(),
         promptTemplates: PromptTemplatePreferences = PromptTemplatePreferences(),
         quickActionShortcut: KeyboardShortcutPreference = .optionSpace,
         quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace,
+        liveSubtitleShortcut: KeyboardShortcutPreference = .commandOptionControlL,
         quickActionPopupShortcuts: QuickActionPopupShortcuts = QuickActionPopupShortcuts()
     ) {
         self.defaultModelID = defaultModelID
@@ -867,9 +946,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.recentHistoryLimit = recentHistoryLimit
         self.webPageTranslation = webPageTranslation
         self.ocr = ocr
+        self.mediaSubtitles = mediaSubtitles
         self.promptTemplates = promptTemplates
         self.quickActionShortcut = quickActionShortcut
         self.quickActionWithoutSelectionShortcut = quickActionWithoutSelectionShortcut
+        self.liveSubtitleShortcut = liveSubtitleShortcut
         self.quickActionPopupShortcuts = quickActionPopupShortcuts
     }
 
@@ -894,9 +975,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case recentHistoryLimit
         case webPageTranslation
         case ocr
+        case mediaSubtitles
         case promptTemplates
         case quickActionShortcut
         case quickActionWithoutSelectionShortcut
+        case liveSubtitleShortcut
         case quickActionPopupShortcuts
     }
 
@@ -934,9 +1017,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         recentHistoryLimit = try container.decodeIfPresent(Int.self, forKey: .recentHistoryLimit) ?? 20
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
         ocr = try container.decodeIfPresent(OCRPreferences.self, forKey: .ocr) ?? OCRPreferences()
+        mediaSubtitles = try container.decodeIfPresent(MediaSubtitlePreferences.self, forKey: .mediaSubtitles) ?? MediaSubtitlePreferences()
         promptTemplates = try container.decodeIfPresent(PromptTemplatePreferences.self, forKey: .promptTemplates) ?? PromptTemplatePreferences()
         quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
         quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
+        liveSubtitleShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .liveSubtitleShortcut) ?? .commandOptionControlL
         quickActionPopupShortcuts = try container.decodeIfPresent(QuickActionPopupShortcuts.self, forKey: .quickActionPopupShortcuts) ?? QuickActionPopupShortcuts()
     }
 
@@ -961,9 +1046,11 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(recentHistoryLimit, forKey: .recentHistoryLimit)
         try container.encode(webPageTranslation, forKey: .webPageTranslation)
         try container.encode(ocr, forKey: .ocr)
+        try container.encode(mediaSubtitles, forKey: .mediaSubtitles)
         try container.encode(promptTemplates, forKey: .promptTemplates)
         try container.encode(quickActionShortcut, forKey: .quickActionShortcut)
         try container.encode(quickActionWithoutSelectionShortcut, forKey: .quickActionWithoutSelectionShortcut)
+        try container.encode(liveSubtitleShortcut, forKey: .liveSubtitleShortcut)
         try container.encode(quickActionPopupShortcuts, forKey: .quickActionPopupShortcuts)
     }
 }

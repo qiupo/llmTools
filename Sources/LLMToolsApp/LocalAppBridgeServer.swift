@@ -150,7 +150,16 @@ final class LocalAppBridgeServer {
                         autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
                         disabledDomains: appState.preferences.webPageTranslation.disabledDomains,
                         domainReadingModes: domainReadingModePayload,
-                        domainTranslationQualities: domainTranslationQualityPayload
+                        domainTranslationQualities: domainTranslationQualityPayload,
+                        mediaSubtitlesEnabled: appState.preferences.mediaSubtitles.isEnabled,
+                        liveSubtitleModelName: appState.selectedRealtimeASRModel?.name,
+                        liveSubtitleTargetLanguage: appState.appLiveSubtitleTargetLanguage,
+                        liveSubtitleDisplayMode: appState.appLiveSubtitleDisplayMode.rawValue,
+                        appLiveSubtitleStatus: appState.appLiveSubtitleRunState.rawValue,
+                        appLiveSubtitleIsRunning: appState.appLiveSubtitlesAreRunning,
+                        appLiveSubtitleSessionID: appState.appLiveSubtitleSessionID,
+                        appLiveSubtitleAudioSource: appState.appLiveSubtitleAudioSource.rawValue,
+                        appLiveSubtitleWindowOpacity: appState.preferences.mediaSubtitles.liveWindowOpacity
                     )
                 )
             case ("POST", "/translateSegments"):
@@ -198,6 +207,40 @@ final class LocalAppBridgeServer {
             case ("POST", "/setPendingIndicatorStyle"):
                 let payload = try decoder.decode(SetPendingIndicatorStylePayload.self, from: request.body)
                 let response = setPendingIndicatorStyle(payload.pendingIndicatorStyle)
+                sendResponse(connection: connection, statusCode: 200, payload: response)
+            case ("POST", "/liveSubtitleSessions"):
+                let payload = try decoder.decode(CreateLiveSubtitleSessionPayload.self, from: request.body)
+                do {
+                    let response = try await appState.createLiveSubtitleSession(payload: payload)
+                    sendResponse(connection: connection, statusCode: 200, payload: response)
+                } catch {
+                    sendResponse(connection: connection, statusCode: 400, payload: errorPayload(code: .modelNotReady, message: error.localizedDescription))
+                }
+            case ("POST", "/liveSubtitleChunks"):
+                let payload = try decoder.decode(LiveAudioChunkPayload.self, from: request.body)
+                do {
+                    let response = try await appState.appendLiveAudioChunk(payload: payload)
+                    sendResponse(connection: connection, statusCode: 200, payload: response)
+                } catch {
+                    sendResponse(connection: connection, statusCode: 400, payload: errorPayload(code: .translationFailed, message: error.localizedDescription))
+                }
+            case ("POST", "/stopLiveSubtitleSession"):
+                let payload = try decoder.decode(StopLiveSubtitleSessionPayload.self, from: request.body)
+                let response = appState.stopLiveSubtitleSession(payload: payload)
+                sendResponse(connection: connection, statusCode: 200, payload: response)
+            case ("GET", "/appLiveSubtitleStatus"):
+                sendResponse(connection: connection, statusCode: 200, payload: appState.appLiveSubtitleStatusPayload())
+            case ("POST", "/startAppLiveSubtitles"):
+                let payload = try decoder.decode(StartAppLiveSubtitlePayload.self, from: request.body)
+                do {
+                    let response = try await appState.startAppLiveSubtitles(payload: payload)
+                    sendResponse(connection: connection, statusCode: 200, payload: response)
+                } catch {
+                    sendResponse(connection: connection, statusCode: 400, payload: errorPayload(code: .modelNotReady, message: error.localizedDescription))
+                }
+            case ("POST", "/stopAppLiveSubtitles"):
+                let payload = try decoder.decode(StopAppLiveSubtitlePayload.self, from: request.body)
+                let response = await appState.stopAppLiveSubtitles(payload: payload)
                 sendResponse(connection: connection, statusCode: 200, payload: response)
             default:
                 sendResponse(connection: connection, statusCode: 404, payload: ["error": "Not found"])
@@ -489,6 +532,15 @@ private struct BridgeStatusPayload: Codable {
     var disabledDomains: [String]
     var domainReadingModes: [String: String]
     var domainTranslationQualities: [String: String]
+    var mediaSubtitlesEnabled: Bool
+    var liveSubtitleModelName: String?
+    var liveSubtitleTargetLanguage: String
+    var liveSubtitleDisplayMode: String
+    var appLiveSubtitleStatus: String
+    var appLiveSubtitleIsRunning: Bool
+    var appLiveSubtitleSessionID: String?
+    var appLiveSubtitleAudioSource: String
+    var appLiveSubtitleWindowOpacity: Double
 }
 
 private struct CancelJobPayload: Codable {

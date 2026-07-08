@@ -157,6 +157,44 @@ Native OCR requires a configured model that is marked vision-capable. OCR can us
 
 When a real OpenAI-compatible provider API key is configured, `swift run LLMToolsLiveOCRCheck` can be used as the live Phase 3 OCR gate. It reuses the existing provider configuration, adds or selects a vision-capable model, sets it as the OCR model, runs a vision probe, OCRs a generated text image, and runs screenshot/image explanation without storing raw source images in history.
 
+## Media Subtitles And Live Captions
+
+Phase 4 adds media-first subtitle workflows. The native app can register speech-capable local models, pick separate realtime and file ASR models, check local ASR runtime health, import local audio/video files, normalize audio through macOS media tools, transcribe into timestamped subtitle segments, translate those segments through the existing text translation engine, and export SRT, VTT, TXT, or Markdown.
+
+ASR is local-only. There is no remote ASR setting and no cloud fallback. Fun-ASR-MLT-Nano is the preferred broad-language realtime family when a local Fun-ASR streaming runtime is configured. Fun-ASR-Nano can also be used for lower-latency Chinese/English/Japanese realtime subtitles. SenseVoiceSmall remains supported for short-window low-latency ASR, and Qwen3-ASR-0.6B is supported for file transcription plus experimental realtime ASR when a local vLLM/streaming runtime is ready; realtime Qwen3 uses a conservative final-transcript strategy by default.
+
+Official Fun-ASR acceleration paths split by hardware. The vLLM path targets CUDA/NVIDIA servers and provides the highest throughput/streaming service. The llama.cpp/GGUF path targets CPU/edge/on-device use with a single `llama-funasr-cli` binary and built-in FSMN-VAD when compatible GGUF files are present. The checked Fun-ASR GitHub docs do not document Apple MPS/Metal as a supported acceleration path, so llmTools does not assume `device="mps"` for Fun-ASR runtimes.
+
+Local ASR runtime integration is command-based so the app can work with installed local sidecars without sending audio off-device. Configure command templates in Settings -> Media -> Local ASR runtime. Command templates can use `{model}`, `{audio}`, `{language}`, `{mode}`, and `{isFinal}`. Environment variables are still supported as a launch-time fallback:
+
+```sh
+LLMTOOLS_FUN_ASR_COMMAND='your-fun-asr-command --model {model} --audio {audio} --language {language}'
+LLMTOOLS_SENSEVOICE_COMMAND='your-sensevoice-command --model {model} --audio {audio}'
+LLMTOOLS_QWEN3_ASR_COMMAND='your-qwen3-asr-command --model {model} --audio {audio}'
+LLMTOOLS_ASR_COMMAND='your-generic-local-asr-command --model {model} --audio {audio}'
+```
+
+The command must print either plain transcript text or JSON subtitle segments such as `{"segments":[{"start":0,"end":2.5,"text":"Hello"}]}`. `{audio}` is the normalized 16 kHz mono WAV path and `{model}` is the selected local model folder. Settings commands take priority over environment variables. Fun-ASR GGUF folders can be detected automatically when `llama-funasr-cli` is in `PATH` and the selected model folder contains compatible Fun-ASR encoder and Qwen3 decoder GGUF files. SenseVoiceSmall can also use `sherpa-onnx-offline` from `PATH` when the selected model folder contains `model.onnx` and `tokens.txt`. safetensors/MLX ASR folders use the bundled `llmtools-mlx-asr-runner.sh` with family-specific isolated runtimes: pinned `mlx-audio` for Qwen3, patched `mlx-audio` for SenseVoiceSmall and Fun-ASR-Nano, and `mlx-audio-plus` for Fun-ASR-MLT-Nano.
+
+```sh
+./scripts/install-phase4-mlx-asr-runtime.sh
+./scripts/install-phase4-funasr-mlx-runtime.sh
+./scripts/install-phase4-funasr-nano-mlx-runtime.sh
+./scripts/install-phase4-sensevoice-mlx-runtime.sh
+```
+
+Health checks show the runtime source: Settings command, environment variable, fixture transcript, local MLX runner, automatic sherpa-onnx, or unavailable. The Settings health check can offer a repair button for supported safetensors/MLX model folders when the matching local runtime is missing.
+
+To inspect the current Mac's ASR setup without changing app state:
+
+```sh
+node scripts/check-phase4-local-asr-runtime.mjs
+```
+
+Desktop live subtitles run in the native app and can listen to system audio, microphone audio, or both. Use the menu item or the configurable global shortcut to open the floating subtitle window; the Chromium extension no longer contains live-subtitle controls or audio-capture permissions. After changing extension files, reload the unpacked extension in `chrome://extensions`.
+
+Privacy defaults stay restrictive: raw audio, full transcripts, translated subtitles, page titles, full URLs, and full media paths are not written to diagnostics or history by default. Temporary normalized audio is deleted after ASR processing.
+
 ## Development Commands
 
 | Task | Command |
@@ -165,6 +203,13 @@ When a real OpenAI-compatible provider API key is configured, `swift run LLMTool
 | Build release | `swift build -c release` |
 | Core checks | `swift run LLMToolsChecks` |
 | Browser extension checks | `node scripts/check-browser-extension-dom.mjs` |
+| Phase 4 media subtitle checks | `node scripts/check-phase4-media-subtitles.mjs` |
+| Phase 4 local ASR runtime check | `node scripts/check-phase4-local-asr-runtime.mjs` |
+| Install Phase 4 local MLX ASR runtime | `./scripts/install-phase4-mlx-asr-runtime.sh` |
+| Install Phase 4 Fun-ASR-MLT MLX runtime | `./scripts/install-phase4-funasr-mlx-runtime.sh` |
+| Install Phase 4 Fun-ASR-Nano MLX runtime | `./scripts/install-phase4-funasr-nano-mlx-runtime.sh` |
+| Install Phase 4 SenseVoice MLX runtime | `./scripts/install-phase4-sensevoice-mlx-runtime.sh` |
+| Phase 4 real media pipeline smoke | `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke` |
 | Package app | `./scripts/package-app.sh` |
 | Verify packaged code signature | `codesign --verify --deep --strict --verbose=2 dist/llmTools.app` |
 | Live OCR provider check | `swift run LLMToolsLiveOCRCheck` |
@@ -249,6 +294,7 @@ Resources/              app icon assets
 - [Phase 1 spec](docs/phase-1-spec.md)
 - [Phase 2 webpage translation PRD](docs/phase-2-web-page-translation-prd.md)
 - [Phase 3 native task and OCR PRD](docs/phase-3-native-task-and-ocr-prd.md)
+- [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)
 
 ## Contributing
@@ -264,6 +310,7 @@ Before opening a pull request:
 
 - API keys and provider credentials are stored locally.
 - Webpage translation diagnostics are designed to avoid raw page content by default.
+- Media subtitle diagnostics are designed to avoid raw audio, transcript text, translated subtitle text, full media paths, page titles, and full URLs by default.
 - Browser extension host access uses optional host permissions rather than global `<all_urls>` normal permissions.
 - Do not publish logs or closure reports containing private local paths, model names, or provider configuration unless they have been reviewed.
 

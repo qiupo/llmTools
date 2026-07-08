@@ -16,15 +16,19 @@ enum L10n {
         case .english:
             switch value {
             case "auto": return "Auto"
+            case "zh-Hans", "zh", "Chinese": return "Chinese"
+            case "en", "English": return "English"
+            case "ja", "Japanese": return "Japanese"
+            case "ko", "Korean": return "Korean"
             default: return value
             }
         case .chinese:
             switch value {
             case "auto": return "自动"
-            case "Chinese": return "中文"
-            case "English": return "英文"
-            case "Japanese": return "日文"
-            case "Korean": return "韩文"
+            case "zh-Hans", "zh", "Chinese": return "中文"
+            case "en", "English": return "英文"
+            case "ja", "Japanese": return "日文"
+            case "ko", "Korean": return "韩文"
             default: return value
             }
         }
@@ -175,7 +179,9 @@ enum L10n {
         "Image action shortcuts": "图片动作快捷键",
         "Switch to text mode": "切换到文本",
         "Switch to image mode": "切换到图片",
+        "Switch to media mode": "切换到媒体",
         "Open Quick Action without selected text": "打开快捷操作（不读取选中文本）",
+        "Open live subtitles": "打开实时字幕",
         "Press shortcut": "按下快捷键",
         "Change shortcut": "修改快捷键",
         "Reset shortcut": "恢复默认快捷键",
@@ -211,6 +217,87 @@ enum L10n {
         "Image": "图片",
         "Text mode": "文本",
         "Image mode": "图片",
+        "Media mode": "媒体",
+        "Media": "媒体",
+        "Media subtitles": "媒体字幕",
+        "Enable media subtitles": "启用媒体字幕",
+        "ASR is local-only in Phase 4. No remote ASR fallback is used.": "Phase 4 的 ASR 仅本地运行，不使用远程 ASR fallback。",
+        "Realtime ASR": "实时 ASR",
+        "File ASR": "文件 ASR",
+        "Health Check": "健康检查",
+        "SenseVoiceSmall is low-latency; Qwen3-ASR realtime is experimental and uses a conservative final-transcript strategy.": "SenseVoiceSmall 偏低延迟；Qwen3-ASR 实时模式仍是实验性能力，并使用更保守的最终字幕策略。",
+        "Qwen3-ASR-0.6B can be used for file transcription and optional realtime subtitles when the local runtime is ready.": "本地运行时就绪后，Qwen3-ASR-0.6B 可用于文件转写，也可选作实时字幕 ASR。",
+        "Fun-ASR-MLT-Nano is preferred for broad-language realtime subtitles when a local streaming runtime is configured. Qwen3-ASR realtime remains experimental.": "配置本地流式运行时后，Fun-ASR-MLT-Nano 优先用于多语言实时字幕；Qwen3-ASR 实时模式仍是实验性能力。",
+        "Fun-ASR-MLT-Nano remains the broad-language default; MLX Qwen3-ASR and whisper.cpp Core ML also run realtime through persistent local sidecars.": "Fun-ASR-MLT-Nano 仍作为多语言默认选择；MLX Qwen3-ASR 与 whisper.cpp Core ML 也会通过长驻本地 sidecar 运行实时字幕。",
+        "Qwen3-ASR-0.6B is quality-oriented for file transcription. Fun-ASR uses local streaming or GGUF sidecars for lower-latency live captions.": "Qwen3-ASR-0.6B 更偏文件转写质量；Fun-ASR 通过本地流式或 GGUF sidecar 提供更低延迟的实时字幕。",
+        "Local ASR runtime": "本地 ASR 运行时",
+        "Runtime source": "运行时来源",
+        "Switching ASR model": "正在切换 ASR 模型",
+        "Switching audio source": "正在切换音频来源",
+        "Fun-ASR command": "Fun-ASR 命令",
+        "SenseVoice command": "SenseVoice 命令",
+        "Qwen3-ASR command": "Qwen3-ASR 命令",
+        "Whisper command": "Whisper 命令",
+        "Generic ASR command": "通用 ASR 命令",
+        "Use {model}, {audio}, {language}, {mode}, and {isFinal}. Empty fields fall back to environment variables or detected local runtimes.": "可使用 {model}、{audio}、{language}、{mode} 和 {isFinal}。留空则回退到环境变量或自动发现的本地运行时。",
+        "Subtitle defaults": "字幕默认值",
+        "Source language": "源语言",
+        "Target language applies when Display is Translated or Bilingual.": "目标语言仅在显示为“译文”或“双语”时生效。",
+        "Display": "显示",
+        "Audio source": "音频来源",
+        "System audio": "系统音频",
+        "Microphone": "麦克风",
+        "System + Microphone": "系统音频 + 麦克风",
+        "Window opacity": "窗口透明度",
+        "Live subtitles": "实时字幕",
+        "Start live subtitles": "开始实时字幕",
+        "Stop live subtitles": "停止实时字幕",
+        "Starting live subtitles": "正在启动实时字幕",
+        "Live subtitles running": "实时字幕运行中",
+        "Stopping live subtitles": "正在停止实时字幕",
+        "Live subtitles stopped": "实时字幕已停止",
+        "Live subtitles failed": "实时字幕失败",
+        "Enter immersive subtitles": "进入沉浸字幕",
+        "Exit immersive subtitles": "退出沉浸字幕",
+        "Listening...": "正在听...",
+        "System audio connected. Waiting for speech...": "系统音频已连接，等待语音...",
+        "Microphone connected. Waiting for speech...": "麦克风已连接，等待语音...",
+        "System audio and microphone connected. Waiting for speech...": "系统音频和麦克风已连接，等待语音...",
+        "Speech detected. Waiting for ASR...": "已检测到语音，等待转写...",
+        "Transcribing...": "正在转写...",
+        "ASR returned no text.": "ASR 未返回文本。",
+        "Draft": "草稿",
+        "Save transcript history": "保存转写历史",
+        "Save translated subtitle history": "保存翻译字幕历史",
+        "Raw audio, full page URLs, page titles, transcripts, and translated subtitles are not saved by default.": "默认不保存原始音频、完整页面 URL、页面标题、完整转写或翻译字幕。",
+        "Desktop floating subtitles": "桌面悬浮字幕",
+        "Choose Media": "选择媒体",
+        "Drop audio or video.": "拖入音频或视频。",
+        "Media loaded": "媒体已载入",
+        "Subtitle preview will appear here.": "字幕预览会显示在这里。",
+        "Generate subtitles": "生成字幕",
+        "Retry translation": "重试翻译",
+        "Realtime": "实时",
+        "File only": "仅文件",
+        "Speech realtime": "语音实时",
+        "Speech file-only": "语音文件",
+        "Checking ASR": "正在检查 ASR",
+        "ASR ready": "ASR 就绪",
+        "ASR check failed": "ASR 检查失败",
+        "Repair Runtime": "修复运行时",
+        "Repairing ASR runtime": "正在修复 ASR 运行时",
+        "ASR runtime repaired": "ASR 运行时已修复",
+        "ASR runtime repair failed": "ASR 运行时修复失败",
+        "Installs or reuses the matching isolated MLX ASR runtime, then writes the command template.": "安装或复用匹配的隔离 MLX ASR 运行时，并写入命令模板。",
+        "Preparing media": "正在处理媒体",
+        "Translating subtitles": "正在翻译字幕",
+        "Choose an audio or video file first.": "请先选择音频或视频文件。",
+        "Media subtitles are disabled.": "媒体字幕已关闭。",
+        "Choose a local speech ASR model in Settings.": "请先在设置中选择本地语音 ASR 模型。",
+        "Generate transcript segments first.": "请先生成原文字幕片段。",
+        "No subtitle segments to export.": "没有可导出的字幕片段。",
+        "Exported": "已导出",
+        "Export": "导出",
         "Image OCR": "图片 OCR",
         "Privacy": "隐私",
         "Enable image OCR": "启用图片识别",
