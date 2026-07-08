@@ -161,7 +161,9 @@ When a real OpenAI-compatible provider API key is configured, `swift run LLMTool
 
 Phase 4 adds media-first subtitle workflows. The native app can register speech-capable local models, pick separate realtime and file ASR models, check local ASR runtime health, import local audio/video files, normalize audio through macOS media tools, transcribe into timestamped subtitle segments, translate those segments through the existing text translation engine, and export SRT, VTT, TXT, or Markdown.
 
-ASR is local-only. There is no remote ASR setting and no cloud fallback. Fun-ASR-MLT-Nano is the preferred broad-language realtime family when a local Fun-ASR streaming runtime is configured. Fun-ASR-Nano can also be used for lower-latency Chinese/English/Japanese realtime subtitles. SenseVoiceSmall remains supported for short-window low-latency ASR, and Qwen3-ASR-0.6B is supported for file transcription plus experimental realtime ASR when a local vLLM/streaming runtime is ready; realtime Qwen3 uses a conservative final-transcript strategy by default.
+ASR is local-only. There is no remote ASR setting and no cloud fallback. On the current Apple Silicon test machine, Qwen3-ASR-0.6B bf16 through the MLX sidecar is the preferred mixed Chinese/English realtime candidate; in the packaged-app bridge benchmark with 100 ms realtime PCM transport chunks, the first partial appeared at about 1.59 s wall time and ASR-event responses measured about 157 ms median / 203 ms p90. Qwen3-ASR-0.6B 4bit remains the faster Qwen3 alternative when its quantized quality is acceptable. Fun-ASR-MLT-Nano, Fun-ASR-Nano, and SenseVoiceSmall remain supported realtime candidates with lower-latency or broader-language tradeoffs. Realtime partial subtitles use tested family-specific partial-window defaults: Qwen3 1350 ms, SenseVoice 1200 ms, Fun-ASR 1500 ms, and whisper.cpp Core ML 2000 ms. Settings -> Media -> Realtime ASR exposes a `Partial window` control for per-model manual tuning, while final subtitles still decode the complete buffered utterance. This control is not the model decoder's low-level audio-slice size; the bundled Qwen3, SenseVoice, Fun-ASR, and whisper realtime sidecars currently re-decode rolling windows instead of maintaining an incremental decoder state for every PCM slice.
+
+The current Mac realtime ASR benchmark notes are kept in [Phase 4 ASR realtime latency report](docs/phase-4-asr-realtime-latency-report.md). That report separates live first-subtitle latency from offline file throughput and records the tested MLX, whisper.cpp Core ML, Apple SpeechAnalyzer, FluidAudio/Parakeet, and removed sherpa-onnx Qwen3-ASR paths.
 
 Official Fun-ASR acceleration paths split by hardware. The vLLM path targets CUDA/NVIDIA servers and provides the highest throughput/streaming service. The llama.cpp/GGUF path targets CPU/edge/on-device use with a single `llama-funasr-cli` binary and built-in FSMN-VAD when compatible GGUF files are present. The checked Fun-ASR GitHub docs do not document Apple MPS/Metal as a supported acceleration path, so llmTools does not assume `device="mps"` for Fun-ASR runtimes.
 
@@ -296,6 +298,7 @@ Resources/              app icon assets
 - [Phase 3 native task and OCR PRD](docs/phase-3-native-task-and-ocr-prd.md)
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)
+- [Phase 4 ASR realtime latency report](docs/phase-4-asr-realtime-latency-report.md)
 
 ## Contributing
 

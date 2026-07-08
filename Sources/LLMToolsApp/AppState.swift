@@ -60,6 +60,7 @@ final class AppState: ObservableObject {
     private struct LiveSubtitleASRStrategy {
         var minimumPartialMilliseconds: Int
         var partialIntervalMilliseconds: Int
+        var maximumPartialMilliseconds: Int?
         var minimumFinalMilliseconds: Int
         var continuousFinalIntervalMilliseconds: Int
         var silenceFrameThreshold: Int
@@ -69,8 +70,19 @@ final class AppState: ObservableObject {
             switch model.capabilities.speech?.family {
             case .funASRNano, .funASRMLTNano:
                 return LiveSubtitleASRStrategy(
-                    minimumPartialMilliseconds: 600,
-                    partialIntervalMilliseconds: 800,
+                    minimumPartialMilliseconds: 1_500,
+                    partialIntervalMilliseconds: 1_500,
+                    maximumPartialMilliseconds: 4_000,
+                    minimumFinalMilliseconds: 600,
+                    continuousFinalIntervalMilliseconds: 3_000,
+                    silenceFrameThreshold: 3,
+                    emitsPartialTranscripts: true
+                )
+            case .senseVoiceSmall:
+                return LiveSubtitleASRStrategy(
+                    minimumPartialMilliseconds: 1_200,
+                    partialIntervalMilliseconds: 1_200,
+                    maximumPartialMilliseconds: 3_000,
                     minimumFinalMilliseconds: 600,
                     continuousFinalIntervalMilliseconds: 3_000,
                     silenceFrameThreshold: 3,
@@ -78,8 +90,9 @@ final class AppState: ObservableObject {
                 )
             case .qwen3ASR06B:
                 return LiveSubtitleASRStrategy(
-                    minimumPartialMilliseconds: 1_200,
-                    partialIntervalMilliseconds: 1_500,
+                    minimumPartialMilliseconds: 1_350,
+                    partialIntervalMilliseconds: 1_350,
+                    maximumPartialMilliseconds: 4_500,
                     minimumFinalMilliseconds: 700,
                     continuousFinalIntervalMilliseconds: 3_000,
                     silenceFrameThreshold: 4,
@@ -88,7 +101,8 @@ final class AppState: ObservableObject {
             case .whisperCppCoreML:
                 return LiveSubtitleASRStrategy(
                     minimumPartialMilliseconds: 2_000,
-                    partialIntervalMilliseconds: 2_500,
+                    partialIntervalMilliseconds: 2_000,
+                    maximumPartialMilliseconds: 6_000,
                     minimumFinalMilliseconds: 1_000,
                     continuousFinalIntervalMilliseconds: 4_000,
                     silenceFrameThreshold: 4,
@@ -98,12 +112,27 @@ final class AppState: ObservableObject {
                 return LiveSubtitleASRStrategy(
                     minimumPartialMilliseconds: 700,
                     partialIntervalMilliseconds: 1_000,
+                    maximumPartialMilliseconds: 4_000,
                     minimumFinalMilliseconds: 700,
                     continuousFinalIntervalMilliseconds: 5_000,
                     silenceFrameThreshold: 3,
                     emitsPartialTranscripts: true
                 )
             }
+        }
+
+        func applying(partialMilliseconds: Int?) -> LiveSubtitleASRStrategy {
+            guard let partialMilliseconds else {
+                return self
+            }
+            var strategy = self
+            strategy.minimumPartialMilliseconds = partialMilliseconds
+            strategy.partialIntervalMilliseconds = partialMilliseconds
+            if let maximumPartialMilliseconds = strategy.maximumPartialMilliseconds,
+               maximumPartialMilliseconds < partialMilliseconds {
+                strategy.maximumPartialMilliseconds = partialMilliseconds
+            }
+            return strategy
         }
     }
 
@@ -707,6 +736,37 @@ final class AppState: ObservableObject {
         }
     }
 
+    func defaultLiveASRPartialMilliseconds(for model: ModelDescriptor?) -> Int {
+        guard let model else {
+            return 0
+        }
+        return LiveSubtitleASRStrategy.strategy(for: model).minimumPartialMilliseconds
+    }
+
+    func effectiveLiveASRPartialMilliseconds(for model: ModelDescriptor?) -> Int {
+        guard let model else {
+            return 0
+        }
+        return liveSubtitleASRStrategy(for: model).minimumPartialMilliseconds
+    }
+
+    func liveASRPartialMillisecondsOverride(for model: ModelDescriptor?) -> Int? {
+        guard let model else {
+            return nil
+        }
+        return preferences.mediaSubtitles.liveASRPartialMillisecondsOverride(for: model.id)
+    }
+
+    func setLiveASRPartialMillisecondsOverride(_ milliseconds: Int?, for model: ModelDescriptor?) {
+        guard let model else {
+            return
+        }
+        let normalized = milliseconds.map(MediaSubtitlePreferences.normalizedLiveASRPartialMilliseconds)
+        updatePreferences {
+            $0.mediaSubtitles.setLiveASRPartialMillisecondsOverride(normalized, for: model.id)
+        }
+    }
+
     func setRealtimeASRModel(id modelID: UUID?) {
         let previousRunningModelID = liveSubtitleSessions[appLiveSubtitleSessionID ?? ""]?.asrModel.id
         updatePreferences { $0.mediaSubtitles.realtimeASRModelID = modelID }
@@ -937,6 +997,7 @@ final class AppState: ObservableObject {
             task: selectedTask,
             inputText: text,
             targetLanguage: preferences.defaultTranslationTarget,
+            translationQuality: preferences.defaultTranslationQuality,
             polishStyle: preferences.defaultPolishStyle,
             summaryMode: preferences.defaultSummaryMode,
             explanationMode: preferences.defaultExplanationMode,
@@ -1940,6 +2001,11 @@ final class AppState: ObservableObject {
         )
     }
 
+    private func liveSubtitleASRStrategy(for model: ModelDescriptor) -> LiveSubtitleASRStrategy {
+        let override = preferences.mediaSubtitles.liveASRPartialMillisecondsOverride(for: model.id)
+        return LiveSubtitleASRStrategy.strategy(for: model).applying(partialMilliseconds: override)
+    }
+
     private func switchActiveLiveSubtitleASRModel(
         to modelID: UUID?,
         previousModelID: UUID?
@@ -2067,7 +2133,7 @@ final class AppState: ObservableObject {
                 code: nil
             ))
         }
-        let strategy = LiveSubtitleASRStrategy.strategy(for: session.asrModel)
+        let strategy = liveSubtitleASRStrategy(for: session.asrModel)
         var ranASRThisChunk = false
         if speechDetected,
            strategy.emitsPartialTranscripts,
@@ -2084,7 +2150,7 @@ final class AppState: ObservableObject {
             var partial: SubtitleSegment?
             var asrError: Error?
             do {
-                partial = try await transcribeLiveAudioBuffer(for: session, isFinal: false).first
+                partial = try await transcribeLiveAudioBuffer(for: session, isFinal: false, strategy: strategy).first
             } catch {
                 asrError = error
             }
@@ -2182,7 +2248,7 @@ final class AppState: ObservableObject {
                 var finalSegments: [SubtitleSegment] = []
                 var asrError: Error?
                 do {
-                    finalSegments = try await transcribeLiveAudioBuffer(for: session, isFinal: true)
+                    finalSegments = try await transcribeLiveAudioBuffer(for: session, isFinal: true, strategy: strategy)
                 } catch {
                     asrError = error
                 }
@@ -2368,15 +2434,22 @@ final class AppState: ObservableObject {
 
     private func transcribeLiveAudioBuffer(
         for session: LiveSubtitleRuntimeSession,
-        isFinal: Bool
+        isFinal: Bool,
+        strategy: LiveSubtitleASRStrategy
     ) async throws -> [SubtitleSegment] {
         guard !session.audioBuffer.isEmpty else {
             return []
         }
-        let duration = TimeInterval(chunkMilliseconds(data: session.audioBuffer, sampleRate: session.sampleRate)) / 1_000
+        let transcriptionBuffer = liveAudioBufferForASR(
+            session.audioBuffer,
+            sampleRate: session.sampleRate,
+            isFinal: isFinal,
+            strategy: strategy
+        )
+        let duration = TimeInterval(chunkMilliseconds(data: transcriptionBuffer, sampleRate: session.sampleRate)) / 1_000
         if let streamingASR = session.streamingASR {
             var segments = try await streamingASR.transcribe(
-                pcm16Data: session.audioBuffer,
+                pcm16Data: transcriptionBuffer,
                 sampleRate: session.sampleRate,
                 sessionID: UUID(uuidString: session.id) ?? UUID(),
                 duration: duration,
@@ -2396,7 +2469,7 @@ final class AppState: ObservableObject {
             try? FileManager.default.removeItem(at: temporaryDirectory)
         }
         let audioURL = temporaryDirectory.appendingPathComponent("live-16k-mono.wav")
-        try writePCM16WAV(data: session.audioBuffer, sampleRate: session.sampleRate, url: audioURL)
+        try writePCM16WAV(data: transcriptionBuffer, sampleRate: session.sampleRate, url: audioURL)
         var segments = try await LocalASRProcessRunner().transcribe(
             audioURL: audioURL,
             model: session.asrModel,
@@ -2414,6 +2487,28 @@ final class AppState: ObservableObject {
             segments[index].isFinal = isFinal
         }
         return segments
+    }
+
+    private func liveAudioBufferForASR(
+        _ data: Data,
+        sampleRate: Int,
+        isFinal: Bool,
+        strategy: LiveSubtitleASRStrategy
+    ) -> Data {
+        guard !isFinal,
+              let maximumPartialMilliseconds = strategy.maximumPartialMilliseconds,
+              maximumPartialMilliseconds > 0,
+              sampleRate > 0 else {
+            return data
+        }
+        let bytesPerSample = 2
+        let maximumSamples = max(1, Int((Double(maximumPartialMilliseconds) / 1_000) * Double(sampleRate)))
+        let maximumBytes = maximumSamples * bytesPerSample
+        guard data.count > maximumBytes else {
+            return data
+        }
+        let start = data.count - maximumBytes
+        return Data(data[start..<data.count])
     }
 
     private func writePCM16WAV(data: Data, sampleRate: Int, url: URL) throws {

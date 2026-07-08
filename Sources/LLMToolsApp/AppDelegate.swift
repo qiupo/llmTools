@@ -5,6 +5,20 @@ import LLMToolsCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate, SelectionActionServiceDelegate, NSMenuDelegate {
+    private enum LiveSubtitleResizeCursorKind {
+        case horizontal
+        case vertical
+
+        var cursor: NSCursor {
+            switch self {
+            case .horizontal:
+                return .resizeLeftRight
+            case .vertical:
+                return .resizeUpDown
+            }
+        }
+    }
+
     private let selectionActionCompactSize = NSSize(width: 260, height: 58)
     private let selectionActionExpandedSize = NSSize(width: 260, height: 167)
     private let settingsWindowContentSize = NSSize(width: 700, height: 640)
@@ -35,6 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var liveSubtitleWindowResizeObserver: Any?
     private var selectionDismissMonitors: [Any] = []
     private var quickActionKeyboardMonitor: Any?
+    private var liveSubtitleEscapeMonitors: [Any] = []
+    private var liveSubtitlePointerMonitors: [Any] = []
+    private var liveSubtitleResizeCursorKind: LiveSubtitleResizeCursorKind?
     private var lastSelectionScreenPoint: NSPoint?
     private var selectionActionShownAt = Date.distantPast
     private var isSelectionActionEnabled = false
@@ -47,6 +64,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         configureStatusItem()
         configureWindows()
         installQuickActionKeyboardMonitor()
+        installLiveSubtitleEscapeMonitors()
+        installLiveSubtitlePointerMonitors()
         observeAppState()
         Task {
             await appState.bootstrap()
@@ -70,6 +89,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             NotificationCenter.default.removeObserver(liveSubtitleWindowResizeObserver)
         }
         removeQuickActionKeyboardMonitor()
+        removeLiveSubtitleEscapeMonitors()
+        removeLiveSubtitlePointerMonitors()
         selectionActionService.stop()
         localAppBridgeServer.stop()
     }
@@ -169,6 +190,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             liveSubtitleWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
             liveSubtitleWindow.contentMinSize = liveSubtitleWindowMinSize
             liveSubtitleWindow.minSize = liveSubtitleWindowMinSize
+            if let liveSubtitlePanel = liveSubtitleWindow as? SelectionActionWindow {
+                liveSubtitlePanel.onEscape = { [weak self] in
+                    self?.closeLiveSubtitlesFromWindow()
+                }
+            }
             liveSubtitleWindowResizeObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didEndLiveResizeNotification,
                 object: liveSubtitleWindow,
@@ -243,6 +269,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             persistLiveSubtitleWindowSize(window)
             window.orderOut(nil)
         }
+        clearLiveSubtitleResizeCursor()
         Task { @MainActor [weak self] in
             guard let self else {
                 return
@@ -254,6 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 persistLiveSubtitleWindowSize(window)
                 window.orderOut(nil)
             }
+            clearLiveSubtitleResizeCursor()
         }
     }
 
@@ -459,6 +487,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
     }
 
+    private func installLiveSubtitleEscapeMonitors() {
+        removeLiveSubtitleEscapeMonitors()
+
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            guard let self else {
+                return event
+            }
+            guard self.handleLiveSubtitleEscapeEvent(event, requirePointerInsideWindow: false) else {
+                return event
+            }
+            return nil
+        }) {
+            liveSubtitleEscapeMonitors.append(localMonitor)
+        }
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { [weak self] event in
+            Task { @MainActor in
+                _ = self?.handleLiveSubtitleEscapeEvent(event, requirePointerInsideWindow: true)
+            }
+        }) {
+            liveSubtitleEscapeMonitors.append(globalMonitor)
+        }
+    }
+
+    private func removeLiveSubtitleEscapeMonitors() {
+        liveSubtitleEscapeMonitors.forEach(NSEvent.removeMonitor)
+        liveSubtitleEscapeMonitors.removeAll()
+    }
+
+    private func installLiveSubtitlePointerMonitors() {
+        removeLiveSubtitlePointerMonitors()
+
+        let mask: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            self?.updateLiveSubtitleResizeCursor(at: NSEvent.mouseLocation)
+            return event
+        }) {
+            liveSubtitlePointerMonitors.append(localMonitor)
+        }
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            Task { @MainActor in
+                self?.updateLiveSubtitleResizeCursor(at: NSEvent.mouseLocation)
+            }
+        }) {
+            liveSubtitlePointerMonitors.append(globalMonitor)
+        }
+    }
+
+    private func removeLiveSubtitlePointerMonitors() {
+        liveSubtitlePointerMonitors.forEach(NSEvent.removeMonitor)
+        liveSubtitlePointerMonitors.removeAll()
+        clearLiveSubtitleResizeCursor()
+    }
+
+    private func updateLiveSubtitleResizeCursor(at screenPoint: NSPoint) {
+        guard let cursorKind = liveSubtitleResizeCursorKind(at: screenPoint) else {
+            clearLiveSubtitleResizeCursor()
+            return
+        }
+        guard liveSubtitleResizeCursorKind != cursorKind else {
+            return
+        }
+        clearLiveSubtitleResizeCursor()
+        cursorKind.cursor.push()
+        liveSubtitleResizeCursorKind = cursorKind
+    }
+
+    private func clearLiveSubtitleResizeCursor() {
+        guard liveSubtitleResizeCursorKind != nil else {
+            return
+        }
+        NSCursor.pop()
+        liveSubtitleResizeCursorKind = nil
+    }
+
+    private func liveSubtitleResizeCursorKind(at screenPoint: NSPoint) -> LiveSubtitleResizeCursorKind? {
+        guard let window = liveSubtitleWindowController?.window,
+              window.isVisible,
+              window.styleMask.contains(.resizable) else {
+            return nil
+        }
+
+        let edgeSlop: CGFloat = 10
+        let frame = window.frame
+        let hitFrame = frame.insetBy(dx: -edgeSlop, dy: -edgeSlop)
+        guard hitFrame.contains(screenPoint) else {
+            return nil
+        }
+
+        let canResizeHorizontally = Self.canResizeLiveSubtitleWindow(
+            minimum: window.contentMinSize.width,
+            maximum: window.contentMaxSize.width
+        )
+        let canResizeVertically = Self.canResizeLiveSubtitleWindow(
+            minimum: window.contentMinSize.height,
+            maximum: window.contentMaxSize.height
+        )
+        let isNearHorizontalEdge = abs(screenPoint.x - frame.minX) <= edgeSlop
+            || abs(screenPoint.x - frame.maxX) <= edgeSlop
+        let isNearVerticalEdge = abs(screenPoint.y - frame.minY) <= edgeSlop
+            || abs(screenPoint.y - frame.maxY) <= edgeSlop
+
+        if canResizeHorizontally && isNearHorizontalEdge {
+            return .horizontal
+        }
+        if canResizeVertically && isNearVerticalEdge {
+            return .vertical
+        }
+        return nil
+    }
+
+    private static func canResizeLiveSubtitleWindow(minimum: CGFloat, maximum: CGFloat) -> Bool {
+        if maximum.isFinite {
+            return maximum - minimum > 1
+        }
+        return true
+    }
+
+    @discardableResult
+    private func handleLiveSubtitleEscapeEvent(_ event: NSEvent, requirePointerInsideWindow: Bool) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard event.keyCode == 53,
+              modifiers.isEmpty,
+              let window = liveSubtitleWindowController?.window,
+              window.isVisible else {
+            return false
+        }
+
+        if requirePointerInsideWindow || event.window == nil {
+            guard window.frame.contains(NSEvent.mouseLocation) else {
+                return false
+            }
+        } else if let eventWindow = event.window,
+                  eventWindow !== window {
+            return false
+        }
+
+        closeLiveSubtitlesFromWindow()
+        return true
+    }
+
     private func handleQuickActionCommandCopyEvent(_ event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard modifiers == .command,
@@ -636,6 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             if let window = liveSubtitleWindowController?.window {
                 persistLiveSubtitleWindowSize(window)
                 window.orderOut(nil)
+                clearLiveSubtitleResizeCursor()
             }
         }
     }
@@ -649,6 +820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
         refreshLiveSubtitleWindowLayout(animated: false)
         window.orderFrontRegardless()
+        updateLiveSubtitleResizeCursor(at: NSEvent.mouseLocation)
     }
 
     private func positionLiveSubtitleWindow(_ window: NSWindow) {
@@ -689,6 +861,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             window.minSize = minimumSize
             window.contentMaxSize = maximumSize
             window.maxSize = maximumSize
+            invalidateResizeCursorRects(for: window)
             guard window.isVisible else {
                 return
             }
@@ -703,6 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             let maximumSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
             window.contentMaxSize = maximumSize
             window.maxSize = maximumSize
+            invalidateResizeCursorRects(for: window)
             guard window.isVisible else {
                 return
             }
@@ -745,6 +919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         let x = min(max(centeredX, minX), maxX)
         let y = min(max(window.frame.minY, minY), maxY)
         window.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true, animate: animated)
+        invalidateResizeCursorRects(for: window)
     }
 
     private func liveSubtitleVisibleFrame(for window: NSWindow? = nil) -> NSRect {
@@ -753,6 +928,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             return screen.visibleFrame
         }
         return NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    private func invalidateResizeCursorRects(for window: NSWindow) {
+        guard let hostingView = window.contentView as? WindowHostingView else {
+            return
+        }
+        window.invalidateCursorRects(for: hostingView)
     }
 
     private func applySelectionActionPreference(_ preferences: AppPreferences? = nil) {
@@ -1057,7 +1239,8 @@ final class WindowController: NSWindowController {
         windowKind: WindowKind = .regular,
         allowsResizing: Bool = false
     ) {
-        let hosting = NSHostingView(rootView: contentView)
+        let hosting = WindowHostingView(rootView: contentView)
+        hosting.usesResizeCursorRects = allowsResizing
         hosting.wantsLayer = true
         hosting.layer?.backgroundColor = NSColor.clear.cgColor
         let window: NSWindow
@@ -1091,6 +1274,9 @@ final class WindowController: NSWindowController {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .managed]
         window.isMovableByWindowBackground = true
         window.level = windowLevel
+        if allowsResizing {
+            window.acceptsMouseMovedEvents = true
+        }
         super.init(window: window)
     }
 
@@ -1099,7 +1285,76 @@ final class WindowController: NSWindowController {
     }
 }
 
+final class WindowHostingView: NSHostingView<AnyView> {
+    var usesResizeCursorRects = false {
+        didSet {
+            guard usesResizeCursorRects != oldValue else {
+                return
+            }
+            window?.invalidateCursorRects(for: self)
+        }
+    }
+
+    private let resizeCursorThickness: CGFloat = 8
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard usesResizeCursorRects,
+              let window,
+              window.styleMask.contains(.resizable),
+              bounds.width > 0,
+              bounds.height > 0 else {
+            return
+        }
+
+        let canResizeHorizontally = Self.canResize(
+            minimum: window.contentMinSize.width,
+            maximum: window.contentMaxSize.width
+        )
+        let canResizeVertically = Self.canResize(
+            minimum: window.contentMinSize.height,
+            maximum: window.contentMaxSize.height
+        )
+        guard canResizeHorizontally || canResizeVertically else {
+            return
+        }
+
+        let thickness = min(resizeCursorThickness, bounds.width / 2, bounds.height / 2)
+        if canResizeHorizontally {
+            let verticalInset = canResizeVertically ? thickness : 0
+            let sideHeight = max(0, bounds.height - verticalInset * 2)
+            addCursorRect(
+                NSRect(x: bounds.minX, y: bounds.minY + verticalInset, width: thickness, height: sideHeight),
+                cursor: .resizeLeftRight
+            )
+            addCursorRect(
+                NSRect(x: bounds.maxX - thickness, y: bounds.minY + verticalInset, width: thickness, height: sideHeight),
+                cursor: .resizeLeftRight
+            )
+        }
+        if canResizeVertically {
+            addCursorRect(
+                NSRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: thickness),
+                cursor: .resizeUpDown
+            )
+            addCursorRect(
+                NSRect(x: bounds.minX, y: bounds.maxY - thickness, width: bounds.width, height: thickness),
+                cursor: .resizeUpDown
+            )
+        }
+    }
+
+    private static func canResize(minimum: CGFloat, maximum: CGFloat) -> Bool {
+        if maximum.isFinite {
+            return maximum - minimum > 1
+        }
+        return true
+    }
+}
+
 final class SelectionActionWindow: NSPanel {
+    var onEscape: (() -> Void)?
+
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
@@ -1113,6 +1368,18 @@ final class SelectionActionWindow: NSPanel {
         hidesOnDeactivate = false
         becomesKeyOnlyIfNeeded = false
         isFloatingPanel = true
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown {
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if event.keyCode == 53, modifiers.isEmpty, let onEscape {
+                onEscape()
+                return
+            }
+        }
+
+        super.sendEvent(event)
     }
 }
 

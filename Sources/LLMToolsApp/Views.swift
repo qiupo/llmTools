@@ -2314,7 +2314,7 @@ struct LiveSubtitleFloatingView: View {
                 standardSubtitleWindow
             }
             if appState.appLiveSubtitleIsImmersive {
-                exitImmersiveButton
+                immersiveWindowButtons
                     .padding(.top, 7)
                     .padding(.trailing, 8)
             }
@@ -2330,9 +2330,9 @@ struct LiveSubtitleFloatingView: View {
         .background(Color.black.opacity(backgroundOpacity), in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(Color.white.opacity(0.16), lineWidth: 0.8)
+                .stroke(Color.white.opacity(0.16 * backgroundOpacity), lineWidth: 0.8)
         )
-        .shadow(color: .black.opacity(0.26), radius: 10, y: 4)
+        .shadow(color: .black.opacity(0.26 * backgroundOpacity), radius: 10, y: 4)
     }
 
     private var standardSubtitleWindow: some View {
@@ -2562,15 +2562,37 @@ struct LiveSubtitleFloatingView: View {
         Button {
             appState.setLiveSubtitleImmersive(false)
         } label: {
-            Image(systemName: "arrow.down.right.and.arrow.up.left")
-                .font(.system(size: 11, weight: .bold))
-                .frame(width: 26, height: 26)
-                .background(Color.black.opacity(0.38), in: Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.8))
+            immersiveButtonIcon("arrow.down.right.and.arrow.up.left")
         }
         .buttonStyle(.plain)
         .foregroundStyle(.white.opacity(0.86))
         .help(L10n.text("Exit immersive subtitles", language: language))
+    }
+
+    private var immersiveCloseButton: some View {
+        Button {
+            onClose()
+        } label: {
+            immersiveButtonIcon("xmark")
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.86))
+        .help(L10n.text("Close", language: language))
+    }
+
+    private var immersiveWindowButtons: some View {
+        HStack(spacing: 6) {
+            exitImmersiveButton
+            immersiveCloseButton
+        }
+    }
+
+    private func immersiveButtonIcon(_ systemName: String) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 11, weight: .bold))
+            .frame(width: 26, height: 26)
+            .background(Color.black.opacity(0.38), in: Circle())
+            .overlay(Circle().stroke(Color.white.opacity(0.16), lineWidth: 0.8))
     }
 
     private var closeButton: some View {
@@ -2593,7 +2615,7 @@ struct LiveSubtitleFloatingView: View {
                 immersiveTextLine(immersiveCurrentOriginalText, size: 20, weight: .semibold, opacity: 0.95)
                 immersiveTextLine(immersiveCurrentTranslatedText, size: 18, weight: .semibold, opacity: 0.82)
             }
-            .padding(.horizontal, 52)
+            .padding(.horizontal, 82)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
@@ -2601,7 +2623,7 @@ struct LiveSubtitleFloatingView: View {
                 immersiveTextLine(immersivePreviousDisplayText, size: 17, weight: .medium, opacity: 0.62)
                 immersiveTextLine(immersiveCurrentDisplayText, size: 22, weight: .semibold, opacity: 0.96)
             }
-            .padding(.horizontal, 52)
+            .padding(.horizontal, 82)
             .padding(.vertical, 12)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -3038,10 +3060,10 @@ enum SettingsTab: CaseIterable, Identifiable {
     case general
     case shortcuts
     case models
+    case defaults
     case ocr
     case media
     case webPage
-    case defaults
     case prompts
     case about
 
@@ -3085,7 +3107,7 @@ enum SettingsTab: CaseIterable, Identifiable {
         case .webPage:
             return L10n.text("Web Page Translation", language: language)
         case .defaults:
-            return L10n.text("Defaults", language: language)
+            return L10n.text("Text", language: language)
         case .prompts:
             return L10n.text("Prompts", language: language)
         case .about:
@@ -3098,9 +3120,11 @@ enum SettingsTab: CaseIterable, Identifiable {
         case .webPage:
             return L10n.text("Webpage", language: language)
         case .ocr:
-            return L10n.text("OCR", language: language)
+            return L10n.text("Image", language: language)
         case .media:
             return L10n.text("Media", language: language)
+        case .defaults:
+            return L10n.text("Text", language: language)
         case .prompts:
             return L10n.text("Prompts", language: language)
         default:
@@ -3222,7 +3246,7 @@ struct SettingsView: View {
                 .font(.headline)
                 .frame(maxWidth: .infinity)
 
-            HStack(spacing: 4) {
+            HStack(spacing: 2) {
                 ForEach(SettingsTab.allCases) { tab in
                     settingsTabButton(tab)
                 }
@@ -3231,7 +3255,7 @@ struct SettingsView: View {
         }
         .padding(.top, 6)
         .padding(.bottom, 6)
-        .padding(.horizontal, 18)
+        .padding(.horizontal, 16)
     }
 
     @ViewBuilder
@@ -3739,7 +3763,7 @@ struct SettingsView: View {
 
     private var ocrSettingsPage: some View {
         settingsForm(maxWidth: 620) {
-            settingRow(title: L10n.text("Image OCR", language: language)) {
+            settingRow(title: L10n.text("Feature", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     checkboxLine(
                         title: L10n.text("Enable image OCR", language: language),
@@ -3751,7 +3775,7 @@ struct SettingsView: View {
                         )
                     )
                     checkboxLine(
-                        title: L10n.text("Use model recognition by default", language: language),
+                        title: L10n.text("Run recognition after image loads", language: language),
                         isOn: Binding(
                             get: { appState.preferences.ocr.useModelRecognitionByDefault },
                             set: { newValue in
@@ -3762,7 +3786,7 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("OCR model", language: language)) {
+            settingRow(title: L10n.text("Default recognition model", language: language)) {
                 VStack(alignment: .leading, spacing: 7) {
                     ocrSettingsModelPicker
                     if let model = appState.selectedOCRModel {
@@ -3782,7 +3806,7 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("OCR mode", language: language)) {
+            settingRow(title: L10n.text("Default recognition mode", language: language)) {
                 Picker("", selection: Binding(
                     get: { appState.preferences.ocr.defaultMode },
                     set: { newValue in
@@ -3798,7 +3822,7 @@ struct SettingsView: View {
                 .frame(width: 190, alignment: .leading)
             }
 
-            settingRow(title: L10n.text("OCR history", language: language)) {
+            settingRow(title: L10n.text("History", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     checkboxLine(
                         title: L10n.text("Save OCR results to recent history", language: language),
@@ -3880,9 +3904,49 @@ struct SettingsView: View {
         .disabled(appState.realtimeSpeechModels.isEmpty)
     }
 
+    private func settingsLiveASRPartialControl(for model: ModelDescriptor) -> some View {
+        let effective = appState.effectiveLiveASRPartialMilliseconds(for: model)
+        let defaultValue = appState.defaultLiveASRPartialMilliseconds(for: model)
+        let hasOverride = appState.liveASRPartialMillisecondsOverride(for: model) != nil
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Label(L10n.text("Partial window", language: language), systemImage: "waveform")
+                    .frame(width: 120, alignment: .leading)
+                Slider(
+                    value: Binding<Double>(
+                        get: { Double(appState.effectiveLiveASRPartialMilliseconds(for: model)) },
+                        set: { newValue in
+                            appState.setLiveASRPartialMillisecondsOverride(Int(newValue), for: model)
+                        }
+                    ),
+                    in: Double(MediaSubtitlePreferences.minimumLiveASRPartialMilliseconds)...Double(MediaSubtitlePreferences.maximumLiveASRPartialMilliseconds),
+                    step: Double(MediaSubtitlePreferences.liveASRPartialStepMilliseconds)
+                )
+                Text("\(effective) ms")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 70, alignment: .trailing)
+                Button {
+                    appState.setLiveASRPartialMillisecondsOverride(nil, for: model)
+                } label: {
+                    Label(L10n.text("Reset", language: language), systemImage: "arrow.counterclockwise")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.borderless)
+                .disabled(!hasOverride)
+                .help(L10n.text("Reset partial window to the tested default for this model.", language: language))
+            }
+            .frame(width: 420, alignment: .leading)
+            Text(L10n.text("This controls the partial ASR window/cadence, not the low-level PCM slice size. Lower values reduce first-subtitle latency; higher values give the ASR model more context for partial text. Default for the selected model: \(defaultValue) ms.", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var mediaSubtitleSettingsPage: some View {
         settingsForm(maxWidth: 620) {
-            settingRow(title: L10n.text("Media subtitles", language: language)) {
+            settingRow(title: L10n.text("Feature", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     checkboxLine(
                         title: L10n.text("Enable media subtitles", language: language),
@@ -3900,9 +3964,12 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("Realtime ASR", language: language)) {
+            settingRow(title: L10n.text("Default realtime model", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     settingsMediaRealtimeASRPicker
+                    if let model = appState.selectedRealtimeASRModel {
+                        settingsLiveASRPartialControl(for: model)
+                    }
                     HStack(spacing: 8) {
                         Button {
                             appState.checkMediaSubtitleASRHealth(mode: .realtime)
@@ -3922,7 +3989,7 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("File ASR", language: language)) {
+            settingRow(title: L10n.text("Default file model", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     settingsMediaFileASRPicker
                     HStack(spacing: 8) {
@@ -4003,7 +4070,7 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("Subtitle defaults", language: language)) {
+            settingRow(title: L10n.text("Default subtitle settings", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     Picker(L10n.text("Target", language: language), selection: Binding(
                         get: { appState.preferences.mediaSubtitles.defaultTargetLanguage },
@@ -4071,7 +4138,7 @@ struct SettingsView: View {
                                 get: { appState.preferences.mediaSubtitles.liveWindowOpacity },
                                 set: { appState.setLiveSubtitleWindowOpacity($0) }
                             ),
-                            in: 0.25...1.0
+                            in: 0.0...1.0
                         )
                         Text("\(Int(appState.preferences.mediaSubtitles.liveWindowOpacity * 100))%")
                             .font(.caption.monospacedDigit())
@@ -4347,6 +4414,10 @@ struct SettingsView: View {
                 translationTargetPicker
             }
 
+            settingRow(title: L10n.text("Translation quality", language: language)) {
+                defaultTranslationQualityPicker
+            }
+
             settingRow(title: L10n.text("Style", language: language)) {
                 polishStylePicker
             }
@@ -4548,9 +4619,9 @@ struct SettingsView: View {
     private var textPromptVariableText: String {
         switch language {
         case .chinese:
-            return "占位符：{input}、{targetLanguage}、{polishStyle}、{summaryMode}、{explanationMode}、{todoMode}、{retryInstruction}"
+            return "占位符：{input}、{targetLanguage}、{translationQuality}、{polishStyle}、{summaryMode}、{explanationMode}、{todoMode}、{retryInstruction}"
         case .english:
-            return "Variables: {input}, {targetLanguage}, {polishStyle}, {summaryMode}, {explanationMode}, {todoMode}, {retryInstruction}"
+            return "Variables: {input}, {targetLanguage}, {translationQuality}, {polishStyle}, {summaryMode}, {explanationMode}, {todoMode}, {retryInstruction}"
         }
     }
 
@@ -4717,6 +4788,22 @@ struct SettingsView: View {
             Text(L10n.targetLanguageName("English", language: language)).tag("English")
             Text(L10n.targetLanguageName("Japanese", language: language)).tag("Japanese")
             Text(L10n.targetLanguageName("Korean", language: language)).tag("Korean")
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 150, alignment: .leading)
+    }
+
+    private var defaultTranslationQualityPicker: some View {
+        Picker("", selection: Binding(
+            get: { appState.preferences.defaultTranslationQuality },
+            set: { newValue in
+                appState.updatePreferences { $0.defaultTranslationQuality = newValue }
+            }
+        )) {
+            ForEach(WebPageTranslationQualityMode.allCases) { mode in
+                Text(L10n.webPageTranslationQualityName(mode, language: language)).tag(mode)
+            }
         }
         .labelsHidden()
         .pickerStyle(.menu)
@@ -4913,14 +5000,14 @@ struct SettingsView: View {
         } label: {
             VStack(spacing: 3) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
                         .fill(isSelected ? Color.accentColor.opacity(0.12) : Color.clear)
                     Image(systemName: tab.systemImage)
-                        .font(.system(size: 22, weight: .medium))
+                        .font(.system(size: 20, weight: .medium))
                         .symbolRenderingMode(.hierarchical)
                         .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
                 }
-                .frame(width: 54, height: 36)
+                .frame(width: 48, height: 32)
 
                 Text(tab.tabTitle(language: language))
                     .font(.caption2)
@@ -4928,7 +5015,7 @@ struct SettingsView: View {
                     .truncationMode(.tail)
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
             }
-            .frame(width: 76, height: 56)
+            .frame(width: 64, height: 52)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

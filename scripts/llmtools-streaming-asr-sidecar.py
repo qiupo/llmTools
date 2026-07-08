@@ -134,6 +134,10 @@ def pcm16_bytes(pcm16_base64: str) -> bytes:
 
 def pcm16_to_float32(pcm16_base64: str) -> np.ndarray:
     raw = pcm16_bytes(pcm16_base64)
+    return pcm16_data_to_float32(raw)
+
+
+def pcm16_data_to_float32(raw: bytes) -> np.ndarray:
     if not raw:
         return np.zeros((0,), dtype=np.float32)
     samples = np.frombuffer(raw, dtype="<i2")
@@ -336,7 +340,7 @@ class StreamingASRSidecar:
         start = time.perf_counter()
         encoded_pcm16 = str(request.get("pcm16Base64") or "")
         raw_pcm16 = pcm16_bytes(encoded_pcm16)
-        audio = pcm16_to_float32(encoded_pcm16)
+        audio = pcm16_data_to_float32(raw_pcm16)
         sample_rate = int(request.get("sampleRate") or 16000)
         duration = float(len(audio)) / float(sample_rate or 16000)
         is_final = bool(request.get("isFinal", True))

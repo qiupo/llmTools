@@ -50,9 +50,11 @@ public enum PromptTemplates {
         switch request.task {
         case .translate:
             let target = request.targetLanguage ?? preferences.defaultTranslationTarget
+            let qualityMode = request.translationQuality ?? preferences.defaultTranslationQuality
             return translationPrompt(
                 inputText: request.inputText,
                 target: target,
+                qualityMode: qualityMode,
                 isRetry: isRetry
             )
         case .webPageTranslate:
@@ -129,6 +131,7 @@ public enum PromptTemplates {
         isRetry: Bool
     ) -> [String: String] {
         let target = request.targetLanguage ?? preferences.defaultTranslationTarget
+        let translationQuality = request.translationQuality ?? preferences.defaultTranslationQuality
         let polishStyle = request.polishStyle ?? preferences.defaultPolishStyle
         let summaryMode = request.summaryMode ?? preferences.defaultSummaryMode
         let explanationMode = request.explanationMode ?? preferences.defaultExplanationMode
@@ -140,6 +143,9 @@ public enum PromptTemplates {
         variables["targetLanguage"] = targetLanguageName(for: target)
         variables["target"] = targetLanguageName(for: target)
         variables["targetLanguageValue"] = target
+        variables["translationQuality"] = translationQualityInstruction(translationQuality)
+        variables["translationQualityInstruction"] = translationQualityInstruction(translationQuality)
+        variables["translationQualityValue"] = translationQuality.rawValue
         variables["polishStyle"] = polishStyleInstruction(polishStyle)
         variables["polishStyleValue"] = polishStyle
         variables["summaryMode"] = summaryModeInstruction(summaryMode)
@@ -162,6 +168,9 @@ public enum PromptTemplates {
             "targetLanguage": targetLanguageName(for: preferences.defaultTranslationTarget),
             "target": targetLanguageName(for: preferences.defaultTranslationTarget),
             "targetLanguageValue": preferences.defaultTranslationTarget,
+            "translationQuality": translationQualityInstruction(preferences.defaultTranslationQuality),
+            "translationQualityInstruction": translationQualityInstruction(preferences.defaultTranslationQuality),
+            "translationQualityValue": preferences.defaultTranslationQuality.rawValue,
             "polishStyle": polishStyleInstruction(preferences.defaultPolishStyle),
             "polishStyleValue": preferences.defaultPolishStyle,
             "summaryMode": summaryModeInstruction(preferences.defaultSummaryMode),
@@ -220,20 +229,26 @@ public enum PromptTemplates {
         template.contains("{\(variable)}") || template.contains("{{\(variable)}}")
     }
 
-    private static func translationPrompt(inputText: String, target: String, isRetry: Bool) -> String {
+    private static func translationPrompt(
+        inputText: String,
+        target: String,
+        qualityMode: WebPageTranslationQualityMode,
+        isRetry: Bool
+    ) -> String {
         let targetLanguage = target == "auto"
             ? "English if the source text is mainly Chinese, otherwise Simplified Chinese"
             : targetLanguageName(for: target)
+        let qualityInstruction = translationQualityInstruction(qualityMode)
 
         if isRetry {
             return """
-            Translate to \(targetLanguage). Output only the translation.
+            Translate to \(targetLanguage). \(qualityInstruction) Output only the translation.
             \(inputText)
             """
         }
 
         return """
-        Translate to \(targetLanguage). Output only the translation.
+        Translate to \(targetLanguage). \(qualityInstruction) Output only the translation.
         \(inputText)
         """
     }
@@ -313,6 +328,17 @@ public enum PromptTemplates {
             return "- Prefer a more literal translation; preserve source sentence structure and terminology when it remains readable."
         case .technical:
             return "- Preserve technical terminology, API names, product names, code-like tokens, and UI labels; use standard technical Chinese where appropriate."
+        }
+    }
+
+    private static func translationQualityInstruction(_ mode: WebPageTranslationQualityMode) -> String {
+        switch mode {
+        case .natural:
+            return "Prefer fluent, natural phrasing in the target language while preserving the source meaning."
+        case .literal:
+            return "Prefer a more literal translation; preserve source sentence structure and terminology when readable."
+        case .technical:
+            return "Preserve technical terminology, API names, product names, code-like tokens, and UI labels; use standard technical wording in the target language where appropriate."
         }
     }
 

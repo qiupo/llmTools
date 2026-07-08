@@ -884,6 +884,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var selectionLineLimitRules: [SelectionLineLimitRule]
     public var appLanguage: AppLanguage
     public var defaultTranslationTarget: String
+    public var defaultTranslationQuality: WebPageTranslationQualityMode
     public var defaultPolishStyle: String
     public var defaultSummaryMode: SummaryMode
     public var defaultExplanationMode: ExplanationMode
@@ -913,6 +914,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         ],
         appLanguage: AppLanguage = .chinese,
         defaultTranslationTarget: String = "auto",
+        defaultTranslationQuality: WebPageTranslationQualityMode = .natural,
         defaultPolishStyle: String = "natural",
         defaultSummaryMode: SummaryMode = .keyPoints,
         defaultExplanationMode: ExplanationMode = .plain,
@@ -939,6 +941,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.selectionLineLimitRules = selectionLineLimitRules
         self.appLanguage = appLanguage
         self.defaultTranslationTarget = defaultTranslationTarget
+        self.defaultTranslationQuality = defaultTranslationQuality
         self.defaultPolishStyle = defaultPolishStyle
         self.defaultSummaryMode = defaultSummaryMode
         self.defaultExplanationMode = defaultExplanationMode
@@ -968,6 +971,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case wechatSelectionMaximumLineCount
         case appLanguage
         case defaultTranslationTarget
+        case defaultTranslationQuality
         case defaultPolishStyle
         case defaultSummaryMode
         case defaultExplanationMode
@@ -1010,6 +1014,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         }
         appLanguage = try container.decodeIfPresent(AppLanguage.self, forKey: .appLanguage) ?? .chinese
         defaultTranslationTarget = try container.decodeIfPresent(String.self, forKey: .defaultTranslationTarget) ?? "auto"
+        defaultTranslationQuality = try container.decodeIfPresent(WebPageTranslationQualityMode.self, forKey: .defaultTranslationQuality) ?? .natural
         defaultPolishStyle = try container.decodeIfPresent(String.self, forKey: .defaultPolishStyle) ?? "natural"
         defaultSummaryMode = (try? container.decodeIfPresent(SummaryMode.self, forKey: .defaultSummaryMode)) ?? .keyPoints
         defaultExplanationMode = (try? container.decodeIfPresent(ExplanationMode.self, forKey: .defaultExplanationMode)) ?? .plain
@@ -1039,6 +1044,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(selectionLineLimitRules, forKey: .selectionLineLimitRules)
         try container.encode(appLanguage, forKey: .appLanguage)
         try container.encode(defaultTranslationTarget, forKey: .defaultTranslationTarget)
+        try container.encode(defaultTranslationQuality, forKey: .defaultTranslationQuality)
         try container.encode(defaultPolishStyle, forKey: .defaultPolishStyle)
         try container.encode(defaultSummaryMode, forKey: .defaultSummaryMode)
         try container.encode(defaultExplanationMode, forKey: .defaultExplanationMode)
@@ -1130,6 +1136,7 @@ public struct TaskRequest: Sendable, Hashable {
     public var inputText: String
     public var sourceLanguage: String?
     public var targetLanguage: String?
+    public var translationQuality: WebPageTranslationQualityMode?
     public var polishStyle: String?
     public var summaryMode: SummaryMode?
     public var explanationMode: ExplanationMode?
@@ -1140,6 +1147,7 @@ public struct TaskRequest: Sendable, Hashable {
         inputText: String,
         sourceLanguage: String? = nil,
         targetLanguage: String? = nil,
+        translationQuality: WebPageTranslationQualityMode? = nil,
         polishStyle: String? = nil,
         summaryMode: SummaryMode? = nil,
         explanationMode: ExplanationMode? = nil,
@@ -1149,6 +1157,7 @@ public struct TaskRequest: Sendable, Hashable {
         self.inputText = inputText
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
+        self.translationQuality = translationQuality
         self.polishStyle = polishStyle
         self.summaryMode = summaryMode
         self.explanationMode = explanationMode

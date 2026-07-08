@@ -413,6 +413,7 @@ struct LLMToolsChecks {
         try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .plainText) == .commandNumber(1), "Expected popup plain OCR shortcut to default to Command-1.")
         try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .explainImage) == .commandNumber(4), "Expected popup image explanation shortcut to default to Command-4.")
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
+        try require(preferences.defaultTranslationQuality == .natural, "Expected older registries to default translation quality to natural.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
         try require(preferences.defaultSummaryMode == .keyPoints, "Expected older registries to default summaries to key points.")
         try require(preferences.defaultExplanationMode == .plain, "Expected older registries to default explanations to plain mode.")
@@ -479,9 +480,23 @@ struct LLMToolsChecks {
         try require(preferences.mediaSubtitles.genericASRCommandTemplate.isEmpty, "Generic ASR command should default empty.")
         try require(preferences.mediaSubtitles.liveWindowWidth == MediaSubtitlePreferences.defaultLiveWindowWidth, "Expected live subtitle window width to use the default.")
         try require(preferences.mediaSubtitles.liveWindowHeight == MediaSubtitlePreferences.defaultLiveWindowHeight, "Expected live subtitle window height to use the default.")
+        try require(preferences.mediaSubtitles.liveASRPartialMillisecondsByModelID.isEmpty, "Expected live ASR partial-window overrides to default empty.")
         let tinyWindowPreferences = MediaSubtitlePreferences(liveWindowWidth: 10, liveWindowHeight: 10)
         try require(tinyWindowPreferences.liveWindowWidth == MediaSubtitlePreferences.minimumLiveWindowWidth, "Expected live subtitle window width to clamp to the minimum.")
         try require(tinyWindowPreferences.liveWindowHeight == MediaSubtitlePreferences.minimumLiveWindowHeight, "Expected live subtitle window height to clamp to the minimum.")
+        let asrModelID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        var partialWindowPreferences = MediaSubtitlePreferences(
+            liveASRPartialMillisecondsByModelID: [
+                asrModelID.uuidString: 1_333,
+                "not-a-uuid": 999
+            ]
+        )
+        try require(partialWindowPreferences.liveASRPartialMillisecondsOverride(for: asrModelID) == 1_350, "Expected live ASR partial-window override to normalize to the nearest step.")
+        try require(partialWindowPreferences.liveASRPartialMillisecondsByModelID.count == 1, "Expected invalid ASR partial-window override keys to be dropped.")
+        partialWindowPreferences.setLiveASRPartialMillisecondsOverride(12_000, for: asrModelID)
+        try require(partialWindowPreferences.liveASRPartialMillisecondsOverride(for: asrModelID) == MediaSubtitlePreferences.maximumLiveASRPartialMilliseconds, "Expected live ASR partial-window override to clamp to max.")
+        partialWindowPreferences.setLiveASRPartialMillisecondsOverride(nil, for: asrModelID)
+        try require(partialWindowPreferences.liveASRPartialMillisecondsOverride(for: asrModelID) == nil, "Expected live ASR partial-window override reset to remove the model key.")
 
         let qwenCapabilities = ModelCapabilities.speech(.qwen3ASR06B())
         let encoded = try JSONEncoder().encode(qwenCapabilities)
@@ -503,6 +518,20 @@ struct LLMToolsChecks {
         try require(preferences.defaultSummaryMode == .meetingNotes, "Expected summary mode preference to decode.")
         try require(preferences.defaultExplanationMode == .errorDiagnosis, "Expected explanation mode preference to decode.")
         try require(preferences.defaultTodoExtractionMode == .table, "Expected TODO mode preference to decode.")
+        try require(preferences.defaultTranslationQuality == .natural, "Expected missing translation quality to default to natural.")
+
+        let qualityPreferences = try JSONDecoder().decode(AppPreferences.self, from: Data("""
+        {
+          "defaultTranslationQuality": "technical"
+        }
+        """.utf8))
+        try require(qualityPreferences.defaultTranslationQuality == .technical, "Expected translation quality preference to decode.")
+
+        let technicalTranslationPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .translate, inputText: "Open the API reference."),
+            preferences: qualityPreferences
+        )
+        try require(technicalTranslationPrompt.contains("Preserve technical terminology"), "Expected technical translation quality to affect normal translation prompt.")
 
         let summaryPrompt = PromptTemplates.userPrompt(
             for: TaskRequest(task: .summarize, inputText: "Discuss launch follow-up."),
@@ -555,7 +584,8 @@ struct LLMToolsChecks {
     private static func checkCustomPromptTemplates() throws {
         var preferences = AppPreferences(defaultTranslationTarget: "Chinese")
         preferences.promptTemplates.translate.systemPrompt = "System target: {targetLanguage}"
-        preferences.promptTemplates.translate.userPrompt = "Custom translate to {targetLanguage}: {input}"
+        preferences.defaultTranslationQuality = .literal
+        preferences.promptTemplates.translate.userPrompt = "Custom translate to {targetLanguage} as {translationQualityValue}: {input}"
         let systemPrompt = PromptTemplates.systemPrompt(for: .translate, preferences: preferences)
         try require(systemPrompt == "System target: Simplified Chinese", "Expected custom translation system prompt to render target language.")
 
@@ -563,7 +593,7 @@ struct LLMToolsChecks {
             for: TaskRequest(task: .translate, inputText: "hello", targetLanguage: "English"),
             preferences: preferences
         )
-        try require(userPrompt == "Custom translate to English: hello", "Expected custom translation prompt to replace variables.")
+        try require(userPrompt == "Custom translate to English as literal: hello", "Expected custom translation prompt to replace quality variables.")
 
         preferences.promptTemplates.polish.userPrompt = "Rewrite as {polishStyleValue}:"
         let polishPrompt = PromptTemplates.userPrompt(

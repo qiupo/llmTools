@@ -326,6 +326,8 @@ Goal: make llmTools process audio, video, and desktop live audio into original a
 
 Detailed PRD: `docs/phase-4-media-live-subtitles-prd.md`.
 
+Phase 4.x enhancement PRD: `docs/phase-4x-language-speaker-fast-mt-prd.md`.
+
 Implementation status as of 2026-07-06:
 
 - Implemented in the native app: speech-capable model metadata, media subtitle preferences, realtime/file ASR pickers, local ASR health checks, file media intake, macOS audio extraction/normalization, subtitle segment model, subtitle translation coordinator, SRT/VTT/TXT/Markdown export, media quick-action mode, and redacted diagnostics.
@@ -389,6 +391,43 @@ Primary acceptance:
 - Low-confidence language detection shows an unknown or low-confidence state instead of fabricating certainty.
 - Raw audio, transcript text, translated subtitle text, page title, and full URL are not written to diagnostics or history by default.
 - Existing Phase 1 selected-text tasks, Phase 2 webpage translation, and Phase 3 OCR workflows remain unaffected.
+
+## Phase 4.x: Language Routing, Speaker Intelligence, And Fast Local MT
+
+Goal: strengthen Phase 2 webpage translation and Phase 4 media/live subtitles with small local infrastructure models: ultra-small text language identification, speaker diarization/embedding support, and dedicated high-speed local machine translation for webpage and subtitle workloads.
+
+Detailed PRD: `docs/phase-4x-language-speaker-fast-mt-prd.md`.
+
+Core capabilities:
+
+- local text language identification for selected text, webpage segments, OCR output, and ASR transcript segments
+- low-confidence and short-text language behavior for routing instead of over-confident automatic decisions
+- source-language metadata on finalized subtitle segments
+- speaker diarization for file subtitles, with optional speaker labels in SRT/VTT/TXT/Markdown exports
+- session-local speaker labels and speaker embedding policy, with persistent speaker embeddings off by default
+- optional realtime speaker-label spike that must not delay first readable subtitle text
+- fast local MT runtime layer for webpage translation and subtitle translation
+- task-specific engine selection: default LLM, fast local MT, or automatic routing
+- structured fallback from unsupported fast-MT language pairs to the configured LLM translation engine
+- redacted diagnostics for language detector, speaker diarization, and translation engine choice
+
+Suggested scope:
+
+- Start with language ID because it improves routing across text, OCR, webpage translation, and subtitles with very small model cost.
+- Add speaker diarization to file subtitles before attempting realtime speaker labels.
+- Add fast local MT to subtitles first, then webpage translation, because subtitle segment order/timing gives a smaller validation surface.
+- Keep ASR local-only and keep remote/cloud ASR out of this phase.
+- Keep fast MT optional. The existing LLM translation path remains the default quality path unless the user selects speed mode or automatic routing.
+- Keep browser permissions unchanged; webpage fast MT should reuse the existing native bridge and DOM translation pipeline.
+
+Primary acceptance:
+
+- A user can enable automatic language detection and see high-confidence source-language routing across text, OCR, webpage, and finalized subtitle segments.
+- A user can generate file subtitles with stable local speaker labels and export those labels.
+- A user can translate subtitle segments through a local fast-MT engine without rerunning ASR and can retry with the LLM quality path.
+- A user can translate a webpage through local fast MT while preserving restore, cache controls, reading modes, site rules, and privacy diagnostics.
+- Unsupported or low-confidence language pairs fall back according to the user's visible preference instead of silently producing wrong output.
+- Existing Phase 4 live subtitle first-text latency is not regressed by speaker diarization or fast-MT work.
 
 ## Phase 5: Local Document Assistant
 

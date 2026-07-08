@@ -238,6 +238,9 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     public static let defaultLiveWindowHeight: Double = 220
     public static let minimumLiveWindowWidth: Double = 860
     public static let minimumLiveWindowHeight: Double = 180
+    public static let minimumLiveASRPartialMilliseconds = 500
+    public static let maximumLiveASRPartialMilliseconds = 6_000
+    public static let liveASRPartialStepMilliseconds = 50
 
     public var isEnabled: Bool
     public var realtimeASRModelID: UUID?
@@ -256,6 +259,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     public var liveWindowOpacity: Double
     public var liveWindowWidth: Double
     public var liveWindowHeight: Double
+    public var liveASRPartialMillisecondsByModelID: [String: Int]
     public var exportDirectoryBookmark: Data?
 
     public init(
@@ -276,6 +280,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         liveWindowOpacity: Double = 0.82,
         liveWindowWidth: Double = Self.defaultLiveWindowWidth,
         liveWindowHeight: Double = Self.defaultLiveWindowHeight,
+        liveASRPartialMillisecondsByModelID: [String: Int] = [:],
         exportDirectoryBookmark: Data? = nil
     ) {
         self.isEnabled = isEnabled
@@ -295,6 +300,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         self.liveWindowOpacity = Self.normalizedOpacity(liveWindowOpacity)
         self.liveWindowWidth = Self.normalizedLiveWindowWidth(liveWindowWidth)
         self.liveWindowHeight = Self.normalizedLiveWindowHeight(liveWindowHeight)
+        self.liveASRPartialMillisecondsByModelID = Self.normalizedLiveASRPartialMillisecondsByModelID(liveASRPartialMillisecondsByModelID)
         self.exportDirectoryBookmark = exportDirectoryBookmark
     }
 
@@ -316,6 +322,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         case liveWindowOpacity
         case liveWindowWidth
         case liveWindowHeight
+        case liveASRPartialMillisecondsByModelID
         case exportDirectoryBookmark
     }
 
@@ -355,6 +362,9 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         liveWindowHeight = Self.normalizedLiveWindowHeight(
             try container.decodeIfPresent(Double.self, forKey: .liveWindowHeight) ?? defaults.liveWindowHeight
         )
+        liveASRPartialMillisecondsByModelID = Self.normalizedLiveASRPartialMillisecondsByModelID(
+            try container.decodeIfPresent([String: Int].self, forKey: .liveASRPartialMillisecondsByModelID) ?? defaults.liveASRPartialMillisecondsByModelID
+        )
         exportDirectoryBookmark = try container.decodeIfPresent(Data.self, forKey: .exportDirectoryBookmark)
     }
 
@@ -370,6 +380,34 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
             return defaultLiveWindowHeight
         }
         return max(minimumLiveWindowHeight, height)
+    }
+
+    public static func normalizedLiveASRPartialMilliseconds(_ milliseconds: Int) -> Int {
+        let clamped = min(max(milliseconds, minimumLiveASRPartialMilliseconds), maximumLiveASRPartialMilliseconds)
+        let step = max(liveASRPartialStepMilliseconds, 1)
+        return max(minimumLiveASRPartialMilliseconds, ((clamped + step / 2) / step) * step)
+    }
+
+    public static func normalizedLiveASRPartialMillisecondsByModelID(_ values: [String: Int]) -> [String: Int] {
+        values.reduce(into: [:]) { result, element in
+            guard UUID(uuidString: element.key) != nil else {
+                return
+            }
+            result[element.key.uppercased()] = normalizedLiveASRPartialMilliseconds(element.value)
+        }
+    }
+
+    public func liveASRPartialMillisecondsOverride(for modelID: UUID) -> Int? {
+        liveASRPartialMillisecondsByModelID[modelID.uuidString.uppercased()]
+    }
+
+    public mutating func setLiveASRPartialMillisecondsOverride(_ milliseconds: Int?, for modelID: UUID) {
+        let key = modelID.uuidString.uppercased()
+        if let milliseconds {
+            liveASRPartialMillisecondsByModelID[key] = Self.normalizedLiveASRPartialMilliseconds(milliseconds)
+        } else {
+            liveASRPartialMillisecondsByModelID.removeValue(forKey: key)
+        }
     }
 
     public func commandTemplate(for family: SpeechModelFamily) -> String? {
@@ -407,7 +445,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     }
 
     public static func normalizedOpacity(_ value: Double) -> Double {
-        min(max(value, 0.25), 1.0)
+        min(max(value, 0.0), 1.0)
     }
 
     private static func nonEmpty(_ value: String) -> String? {
