@@ -354,11 +354,15 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         process.standardError = stderr
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             throw SpeakerDiarizationError.runtimeFailed(userVisibleRuntimeFailure(error.localizedDescription))
         }
-        let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        async let stdoutData = readPipeToEnd(stdout)
+        async let stderrData = readPipeToEnd(stderr)
+        process.waitUntilExit()
+        let capturedStdout = await stdoutData
+        let capturedStderr = await stderrData
+        let stderrText = String(data: capturedStderr, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard process.terminationStatus == 0 else {
             throw SpeakerDiarizationError.runtimeFailed(
@@ -369,11 +373,17 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         if FileManager.default.fileExists(atPath: outputURL.path) {
             data = try Data(contentsOf: outputURL)
         } else {
-            data = stdout.fileHandleForReading.readDataToEndOfFile()
+            data = capturedStdout
         }
         var result = try parseResult(data: data, source: resolution.source)
         result.latencyMilliseconds = Int(Date().timeIntervalSince(started) * 1000)
         return result
+    }
+
+    private static func readPipeToEnd(_ pipe: Pipe) async -> Data {
+        await Task.detached(priority: .utility) {
+            pipe.fileHandleForReading.readDataToEndOfFile()
+        }.value
     }
 
     private static func parseResult(data: Data, source: SpeakerDiarizationRuntimeSource) throws -> SpeakerDiarizationResult {

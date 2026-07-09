@@ -22,6 +22,7 @@ struct LLMToolsChecks {
         try await checkLanguageRoutingCallerWiring()
         try await checkSpeakerDiarizationFixtureAndMapping()
         try await checkSpeakerDiarizationFailureMessageSanitization()
+        try await checkSpeakerDiarizationCommandDrainsLargeStderr()
         try checkSubtitleExportWithSpeakers()
         try await checkSpeakerDiarizationFilePipeline()
         try await checkFastMTFixtureRoundTrip()
@@ -1110,6 +1111,24 @@ struct LLMToolsChecks {
             try require(!message.contains("Traceback"), "Expected Python traceback to be hidden.")
             try require(!message.contains("requests.exceptions"), "Expected low-level requests error to be hidden.")
         }
+    }
+
+    private static func checkSpeakerDiarizationCommandDrainsLargeStderr() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let wavURL = root.appendingPathComponent("speaker-pipe-drain.wav")
+        try writePCM16WAV(url: wavURL, duration: 0.2)
+        let preferences = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: #"/usr/bin/python3 -c 'import pathlib, sys; sys.stderr.write("x" * 200000); pathlib.Path(sys.argv[1]).write_text("{\"model\":\"pipe-fixture\",\"turns\":[{\"start\":0.0,\"end\":0.2,\"speakerID\":\"SPEAKER_A\"}]}", encoding="utf-8")' {output_json}"#
+        )
+
+        let result = try await SpeakerDiarizationService().diarize(
+            audioURL: wavURL,
+            preferences: preferences
+        )
+        try require(result.modelID == "pipe-fixture", "Expected diarization command result after large stderr output.")
+        try require(result.turns.first?.speakerID == "SPEAKER_A", "Expected pipe-drain command output to be parsed.")
     }
 
     private static func checkSpeakerDiarizationFilePipeline() async throws {
