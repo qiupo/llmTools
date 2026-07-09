@@ -100,7 +100,8 @@ async function runBackgroundBatchCheck() {
     autoTranslateDomains: [],
     disabledDomains: [],
     domainReadingModes: {},
-    domainTranslationQualities: {}
+    domainTranslationQualities: {},
+    domainTranslationEngines: {}
   };
   let nativePendingIndicatorStyle = "flipText";
   let currentUnsupportedEmbeddedContent = { frames: 0, canvas: 0, images: 0, pdf: 0, total: 0 };
@@ -119,12 +120,16 @@ async function runBackgroundBatchCheck() {
         status: "ok",
         payload: {
           modelName: "stub-model",
+          webPageTranslationEngine: "llm",
+          webPageTranslationEngineID: "llm",
+          webPageTranslationEngineModelID: "stub-model-id",
           pendingIndicatorStyle: nativePendingIndicatorStyle,
           appLanguage: "en",
           autoTranslateDomains: nativeDomainRules.autoTranslateDomains,
           disabledDomains: nativeDomainRules.disabledDomains,
           domainReadingModes: nativeDomainRules.domainReadingModes,
-          domainTranslationQualities: nativeDomainRules.domainTranslationQualities
+          domainTranslationQualities: nativeDomainRules.domainTranslationQualities,
+          domainTranslationEngines: nativeDomainRules.domainTranslationEngines
         }
       };
     }
@@ -156,13 +161,17 @@ async function runBackgroundBatchCheck() {
       if (message.payload.translationQuality) {
         nativeDomainRules.domainTranslationQualities[domain] = message.payload.translationQuality;
       }
+      if (message.payload.translationEngine) {
+        nativeDomainRules.domainTranslationEngines[domain] = message.payload.translationEngine;
+      }
       return {
         requestID: message.requestID,
         status: "ok",
         payload: {
           domain,
           domainReadingModes: nativeDomainRules.domainReadingModes,
-          domainTranslationQualities: nativeDomainRules.domainTranslationQualities
+          domainTranslationQualities: nativeDomainRules.domainTranslationQualities,
+          domainTranslationEngines: nativeDomainRules.domainTranslationEngines
         }
       };
     }
@@ -190,6 +199,11 @@ async function runBackgroundBatchCheck() {
         status: "ok",
         payload: {
           modelName: "stub-model",
+          translationEngineID: message.payload.translationEngine === "fastMT" ? "ctranslate2" : "llm",
+          translationModelID: message.payload.translationEngine === "fastMT" ? "fixture-fastmt" : "stub-model-id",
+          detectedSourceLanguage: message.payload.sourceLanguage === "auto" ? "en" : (message.payload.sourceLanguage || "en"),
+          elapsedMilliseconds: 11,
+          fallbackReason: "",
           translations: message.payload.segments.map((segment) => ({
             segmentID: segment.segmentID,
             translation: segment.textHash === repeatHash ? "重复标签" : "敏捷的棕色狐狸跳过懒狗。",
@@ -254,12 +268,16 @@ async function runBackgroundBatchCheck() {
         if (message.type === "getStatus") {
           return Promise.resolve({ status: "ok", payload: {
             modelName: "stub-model",
+            webPageTranslationEngine: "llm",
+            webPageTranslationEngineID: "llm",
+            webPageTranslationEngineModelID: "stub-model-id",
             pendingIndicatorStyle: "flipText",
             appLanguage: "en",
             autoTranslateDomains: nativeDomainRules.autoTranslateDomains,
             disabledDomains: nativeDomainRules.disabledDomains,
             domainReadingModes: nativeDomainRules.domainReadingModes,
-            domainTranslationQualities: nativeDomainRules.domainTranslationQualities
+            domainTranslationQualities: nativeDomainRules.domainTranslationQualities,
+            domainTranslationEngines: nativeDomainRules.domainTranslationEngines
           } });
         }
         if (message.type === "translateSegments") {
@@ -274,6 +292,11 @@ async function runBackgroundBatchCheck() {
             status: "ok",
             payload: {
               modelName: "stub-model",
+              translationEngineID: message.payload.translationEngine === "fastMT" ? "ctranslate2" : "llm",
+              translationModelID: message.payload.translationEngine === "fastMT" ? "fixture-fastmt" : "stub-model-id",
+              detectedSourceLanguage: message.payload.sourceLanguage === "auto" ? "en" : (message.payload.sourceLanguage || "en"),
+              elapsedMilliseconds: 11,
+              fallbackReason: "",
               translations: message.payload.segments.map((segment) => ({
                 segmentID: segment.segmentID,
                 translation: segment.textHash === repeatHash ? "重复标签" : "敏捷的棕色狐狸跳过懒狗。",
@@ -458,6 +481,7 @@ async function runBackgroundBatchCheck() {
   const finalState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
 
   assert(nativeTranslatePayloads.length === 1, `expected one translateSegments call, got ${nativeTranslatePayloads.length}`);
+  assert(nativeTranslatePayloads[0].sourceLanguage === "auto", `expected webpage translation to request automatic source language, got ${nativeTranslatePayloads[0].sourceLanguage}`);
   assert(nativeTranslatePayloads[0].translationQuality === "natural", `expected default natural translation quality, got ${nativeTranslatePayloads[0].translationQuality}`);
   assert(nativeTranslatePayloads[0].segments.length === 2, "expected repeated text to be sent once per batch");
   assert(nativeTranslatePayloads[0].segments.some((segment) => segment.segmentID === "s1"), "expected first repeated segment to be translated");
@@ -507,6 +531,7 @@ async function runBackgroundBatchCheck() {
   assert(finalState.diagnostics?.counts?.done === 3 && finalState.diagnostics?.counts?.total === 3, "diagnostics should include redacted progress counts");
   assert(finalState.diagnostics?.timings?.elapsedMs != null, "diagnostics should include elapsed timing");
   assert(finalState.diagnostics?.model?.name === "stub-model", `diagnostics should include model name, got ${finalState.diagnostics?.model?.name}`);
+  assert(finalState.diagnostics?.translation?.detectedSource === "en", `diagnostics should include detected source language, got ${finalState.diagnostics?.translation?.detectedSource}`);
   assert(finalState.diagnostics?.domainHash && finalState.diagnostics.domainHash !== "example.test", "diagnostics should use a redacted domain hash");
   assert(finalState.diagnostics?.urlHash?.length === 64, "diagnostics should include the page URL hash");
   const finalDiagnosticsJSON = JSON.stringify(finalState.diagnostics);
@@ -613,20 +638,34 @@ async function runBackgroundBatchCheck() {
     tabID: 7,
     tabURL: "https://example.test/article",
     readingMode: "original",
-    translationQuality: "literal"
+    translationQuality: "literal",
+    translationEngine: "fastMT"
   });
   assert(siteDefaultsState.domainReadingModeDefault === "original", `expected site reading default to be original, got ${siteDefaultsState.domainReadingModeDefault}`);
   assert(siteDefaultsState.domainTranslationQualityDefault === "literal", `expected site quality default to be literal, got ${siteDefaultsState.domainTranslationQualityDefault}`);
+  assert(siteDefaultsState.domainTranslationEngineDefault === "fastMT", `expected site engine default to be fastMT, got ${siteDefaultsState.domainTranslationEngineDefault}`);
   assert(siteDefaultsState.readingMode === "original", `expected current page reading mode to follow site default, got ${siteDefaultsState.readingMode}`);
   assert(siteDefaultsState.translationQuality === "literal", `expected current page quality to follow site default, got ${siteDefaultsState.translationQuality}`);
+  assert(siteDefaultsState.translationEngine === "fastMT", `expected current page engine to follow site default, got ${siteDefaultsState.translationEngine}`);
   assert(siteDefaultsState.notice === true, "saving site defaults should publish a notice state");
   assert(nativeDomainRules.domainReadingModes["example.test"] === "original", "native preferences should store the site reading default");
   assert(nativeDomainRules.domainTranslationQualities["example.test"] === "literal", "native preferences should store the site quality default");
+  assert(nativeDomainRules.domainTranslationEngines["example.test"] === "fastMT", "native preferences should store the site engine default");
   assert(readingModeMessages.some((message) => message.mode === "original"), "saving a reading default should forward the mode to content script");
 
   const siteDefaultSyncedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(siteDefaultSyncedState.readingMode === "original", "getPopupState should preserve the site reading default when there is no current-page override");
   assert(siteDefaultSyncedState.translationQuality === "literal", "getPopupState should preserve the site quality default when there is no current-page override");
+  assert(siteDefaultSyncedState.translationEngine === "fastMT", "getPopupState should preserve the site engine default");
+
+  const nativeCallsBeforeEngineSwitchTranslate = nativeTranslatePayloads.length;
+  await sendBackgroundMessage(backgroundListener, { type: "restorePage", tabID: 7 });
+  appliedTranslations.length = 0;
+  await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
+  await waitUntil(() => appliedTranslations.length === 3, 2_000, "engine-isolated translation did not apply translations");
+  assert(nativeTranslatePayloads.length === nativeCallsBeforeEngineSwitchTranslate + 1, "switching to fastMT should not reuse the existing LLM cache entries");
+  assert(nativeTranslatePayloads.at(-1).translationEngine === "fastMT", "fastMT site default should be sent to native translateSegments");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).some((entry) => entry.translationEngineID === "ctranslate2"), "translation cache v2 should isolate fastMT engine entries");
 
   const tabOverrideState = await sendBackgroundMessage(backgroundListener, {
     type: "setReadingMode",
@@ -637,13 +676,14 @@ async function runBackgroundBatchCheck() {
   const tabOverrideSyncedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(tabOverrideSyncedState.readingMode === "bilingual", "getPopupState should not overwrite a current-page reading-mode override");
 
+  const nativeCallsBeforeRetranslate = nativeTranslatePayloads.length;
   await sendBackgroundMessage(backgroundListener, {
     type: "retranslatePage",
     tabID: 7,
     tabURL: "https://example.test/article"
   });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "retranslate did not apply translations");
-  assert(nativeTranslatePayloads.length === nativeCallsAfterFirstTranslate + 1, "retranslate should clear page cache and call native translateSegments again");
+  assert(nativeTranslatePayloads.length === nativeCallsBeforeRetranslate + 1, "retranslate should clear page cache and call native translateSegments again");
   assert(nativeTranslatePayloads.at(-1).translationQuality === "literal", `expected retranslate payload to use site default literal quality, got ${nativeTranslatePayloads.at(-1).translationQuality}`);
   const retranslatedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(retranslatedState.hasTranslations === true, "retranslate should leave translated state");
@@ -661,7 +701,7 @@ async function runBackgroundBatchCheck() {
   assert(clearedState.notice === true, "clear page cache should publish a notice state");
   assert(clearedState.message.includes("Cleared 2 cached translations"), `unexpected clear cache message: ${clearedState.message}`);
   assert(appliedTranslations.length === 0, "clear cache should restore page translations");
-  assert(Object.keys(localStorageData.webPageTranslationCacheV1 || {}).length === 0, "clear cache should remove current page storage entries");
+  assert(Object.keys(localStorageData.webPageTranslationCacheV2 || {}).length === 0, "clear cache should remove current page storage entries");
   await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not translate after clearing cache");
   assert(nativeTranslatePayloads.length === nativeCallsAfterRetranslate + 1, "translation after clearing cache should call native translateSegments again");
@@ -833,7 +873,12 @@ async function runBackgroundBatchCheck() {
     tabURL: "https://example.test/article"
   });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "popup manual translation should override never-translate rule");
-  assert(Object.values(localStorageData.webPageTranslationCacheV1 || {}).every((entry) => entry.domain === "example.test"), "translation cache entries should include the normalized domain");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).every((entry) => entry.domain === "example.test"), "translation cache entries should include the normalized domain");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).every((entry) => entry.translationEngineID), "translation cache v2 entries should include the engine id");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).every((entry) => entry.translationEngineModelID), "translation cache v2 entries should include the engine model id");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).some((entry) => entry.translationEngineID === "ctranslate2"), "translation cache v2 should include fastMT engine entries after engine override");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).every((entry) => entry.sourceLanguage === "auto"), "translation cache v2 entries should key entries by the requested auto source language");
+  assert(Object.values(localStorageData.webPageTranslationCacheV2 || {}).every((entry) => entry.detectedSourceLanguage === "en"), "translation cache v2 entries should retain the detected source language for diagnostics");
   const domainClearedState = await sendBackgroundMessage(backgroundListener, {
     type: "clearCurrentDomainCache",
     tabID: 7,
@@ -842,7 +887,7 @@ async function runBackgroundBatchCheck() {
   assert(domainClearedState.status === "idle", `expected idle state after clearing domain cache, got ${domainClearedState.status}`);
   assert(domainClearedState.notice === true, "clear domain cache should publish a notice state");
   assert(domainClearedState.message.includes("Cleared 3 cached translations"), `unexpected domain clear cache message: ${domainClearedState.message}`);
-  assert(Object.keys(localStorageData.webPageTranslationCacheV1 || {}).length === 0, "clear domain cache should remove current domain storage entries");
+  assert(Object.keys(localStorageData.webPageTranslationCacheV2 || {}).length === 0, "clear domain cache should remove current domain storage entries");
 
   await sendBackgroundMessage(backgroundListener, {
     type: "translatePage",
@@ -850,12 +895,12 @@ async function runBackgroundBatchCheck() {
     tabURL: "https://example.test/article"
   });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not translate after clearing domain cache");
-  assert(Object.keys(localStorageData.webPageTranslationCacheV1 || {}).length > 0, "translation after clearing domain cache should repopulate storage cache");
+  assert(Object.keys(localStorageData.webPageTranslationCacheV2 || {}).length > 0, "translation after clearing domain cache should repopulate storage cache");
   const allClearedState = await sendBackgroundMessage(backgroundListener, { type: "clearAllPageCache", tabID: 7 });
   assert(allClearedState.status === "idle", `expected idle state after clearing all cache, got ${allClearedState.status}`);
   assert(allClearedState.notice === true, "clear all cache should publish a notice state");
   assert(allClearedState.message.includes("Cleared all 2 cached webpage translations"), `unexpected all clear cache message: ${allClearedState.message}`);
-  assert(Object.keys(localStorageData.webPageTranslationCacheV1 || {}).length === 0, "clear all cache should remove all storage entries");
+  assert(Object.keys(localStorageData.webPageTranslationCacheV2 || {}).length === 0, "clear all cache should remove all storage entries");
 
   currentUnsupportedEmbeddedContent = { frames: 1, shadowRoots: 1, canvas: 1, images: 1, pdf: 1, total: 5 };
   appliedTranslations.length = 0;
@@ -980,6 +1025,7 @@ async function runPopupPermissionCheck() {
             counts: { done: 0, total: 0, failed: 0 },
             timings: { elapsedMs: 12 },
             model: { name: "stub-model" },
+            translation: { engineID: "ctranslate2", detectedSource: "en" },
             errorCode: ""
           }
         });
@@ -999,6 +1045,7 @@ async function runPopupPermissionCheck() {
   vm.runInContext(source, context, { filename: "popup.js" });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert(elements.diagnostics.textContent.includes("Diagnostics"), "popup should render a redacted diagnostics summary");
+  assert(elements.diagnostics.textContent.includes("source en"), "popup diagnostics should render the detected source language");
   assert(elements.diagnostics.textContent.includes("h12345678"), "popup diagnostics should show the domain hash");
   assert(!elements.diagnostics.textContent.includes("example.test"), "popup diagnostics should not include the raw domain");
 
@@ -1139,6 +1186,8 @@ async function runContentScriptDomCheck(browserTarget) {
     const duplicateSegments = startResult.segments.filter((segment) => segment.text === "Repeated label for duplicate translation.");
     assert(duplicateSegments.length === 2, `expected two duplicate text segments, got ${duplicateSegments.length}`);
     assert(new Set(duplicateSegments.map((segment) => segment.textHash)).size === 1, "expected duplicate text to share the same textHash");
+    assert(startResult.segments.some((segment) => segment.text.includes("設定を変更すると")), "Japanese page text should be discovered for translation");
+    assert(!startResult.segments.some((segment) => segment.text.includes("这段中文不应该进入翻译队列")), "Chinese target-language text should not be rediscovered for translation");
     assert(!startResult.segments.some((segment) => segment.text.includes("Code blocks should not be translated")), "code block text should be skipped");
     assert(!startResult.segments.some((segment) => segment.text.includes("Do not translate input values")), "input value text should be skipped");
     const initialSpinnerState = await evaluate(client, `

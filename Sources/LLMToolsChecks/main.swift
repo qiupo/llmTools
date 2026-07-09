@@ -17,6 +17,19 @@ struct LLMToolsChecks {
         try await checkPhase1InteractiveNativeTasks()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
         try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
+        try checkPhase4XFoundationTypesAndPreferences()
+        try await checkLanguageDetectionFixture()
+        try await checkLanguageRoutingCallerWiring()
+        try await checkSpeakerDiarizationFixtureAndMapping()
+        try checkSubtitleExportWithSpeakers()
+        try await checkSpeakerDiarizationFilePipeline()
+        try await checkFastMTFixtureRoundTrip()
+        try await checkFastMTDegenerateOutputGuard()
+        try checkFastMTPreferencesMigration()
+        try checkTranslationRoutingDecisionTable()
+        try await checkTextTranslateFastMTPipeline()
+        try await checkSubtitleFastMTPipeline()
+        try await checkWebPageFastMTRouting()
         try checkTextTaskModePreferencesAndPrompts()
         try checkCustomPromptTemplates()
         try checkOCRCapabilityDefaultsDecodeFromOlderRegistry()
@@ -506,6 +519,991 @@ struct LLMToolsChecks {
         try require(decoded.supportsRealtimeSpeech, "Expected Qwen3-ASR-0.6B to support optional realtime subtitles.")
     }
 
+    private static func checkPhase4XFoundationTypesAndPreferences() throws {
+        let preferences = try JSONDecoder().decode(AppPreferences.self, from: Data("{}".utf8))
+        try require(!preferences.languageRouting.enabled, "Expected language routing to default off until the service is wired.")
+        try require(preferences.languageRouting.modelVariant == .ftz, "Expected fastText ftz to be the default LID variant.")
+        try require(preferences.languageRouting.shortTextMinimumCharactersLatin == 20, "Expected Latin short-text threshold to default to 20.")
+        try require(preferences.languageRouting.shortTextMinimumCharactersCJK == 3, "Expected CJK short-text threshold to default to 3.")
+        try require(preferences.languageRouting.lowConfidenceThreshold == 0.65, "Expected LID low-confidence threshold to default to 0.65.")
+        try require(preferences.languageRouting.ocrConfidenceBoost == 0.1, "Expected OCR confidence boost to default to 0.1.")
+        try require(preferences.languageRouting.commandTemplate.isEmpty, "Expected LID command template to default empty.")
+        try require(!preferences.speakerDiarization.enabledForFileSubtitles, "Expected speaker diarization file path to default off.")
+        try require(!preferences.speakerDiarization.enabledForLiveSubtitles, "Expected live speaker diarization to default off.")
+        try require(!preferences.speakerDiarization.persistSpeakerEmbeddings, "Expected speaker embeddings persistence to default off.")
+        try require(SpeakerDiarizationTokenStore.tokenFileURL.lastPathComponent == "pyannote-hf-token", "Expected speaker diarization token to use the local token store.")
+        try require(preferences.fastTranslation.subtitleEngine == .llm, "Expected subtitle fast translation to default to LLM.")
+        try require(preferences.fastTranslation.webpageEngine == .llm, "Expected webpage fast translation to default to LLM.")
+        try require(preferences.fastTranslation.textEngine == .llm, "Expected text translation to default to LLM.")
+        try require(preferences.fastTranslation.modelVariant == .nllb200Distilled600M, "Expected NLLB 600M to be the default fast MT model.")
+        try require(preferences.fastTranslation.fallbackPolicy == .fallbackToLLM, "Expected fast translation fallback to default to LLM.")
+        try require(preferences.fastTranslation.maxConcurrentBatches == 1, "Expected fast translation concurrency to default to 1.")
+        try require(!preferences.fastTranslation.forceLLM, "Expected fast translation killswitch to default off.")
+
+        let languageRouting = LanguageRoutingPreferences(
+            enabled: true,
+            shortTextMinimumCharactersLatin: 0,
+            shortTextMinimumCharactersCJK: 0,
+            lowConfidenceThreshold: 2,
+            ocrConfidenceBoost: -1,
+            commandTemplate: "  python lid.py  "
+        )
+        try require(languageRouting.shortTextMinimumCharactersLatin == 1, "Expected Latin threshold to clamp to at least 1.")
+        try require(languageRouting.shortTextMinimumCharactersCJK == 1, "Expected CJK threshold to clamp to at least 1.")
+        try require(languageRouting.lowConfidenceThreshold == 1, "Expected confidence threshold to clamp to 1.")
+        try require(languageRouting.ocrConfidenceBoost == 0, "Expected OCR boost to clamp to 0.")
+        try require(languageRouting.commandTemplate == "python lid.py", "Expected LID command template to trim whitespace.")
+        try require(
+            LanguageRoutingPreferences(shortTextMinimumCharactersLatin: 3).shouldSkipDetection(for: "hi"),
+            "Expected short Latin text to skip LID."
+        )
+        try require(!LanguageRoutingPreferences().shouldSkipDetection(for: "你好世界"), "Expected non-short CJK text to allow LID.")
+
+        let speakerDiarization = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            enabledForLiveSubtitles: true,
+            commandTemplate: "  pyannote run  ",
+            persistSpeakerEmbeddings: true
+        )
+        try require(speakerDiarization.commandTemplate == "pyannote run", "Expected diarization command template to trim whitespace.")
+        try require(!speakerDiarization.enabledForLiveSubtitles, "Live speaker diarization must remain hard-disabled before the realtime spike passes.")
+
+        let decodedDiarization = try JSONDecoder().decode(SpeakerDiarizationPreferences.self, from: Data("""
+        {
+          "enabledForFileSubtitles": true,
+          "enabledForLiveSubtitles": true
+        }
+        """.utf8))
+        try require(decodedDiarization.enabledForFileSubtitles, "Expected file diarization preference to decode.")
+        try require(!decodedDiarization.enabledForLiveSubtitles, "Expected live diarization decode to stay hard-disabled.")
+
+        let fastTranslation = FastTranslationPreferences(
+            subtitleEngine: .fastMT,
+            webpageEngine: .auto,
+            textEngine: .fastMT,
+            modelVariant: .nllb200Distilled600M,
+            maxConcurrentBatches: 99,
+            forceLLM: true
+        )
+        try require(fastTranslation.textEngine == .fastMT, "Expected text translation engine to allow fast MT.")
+        try require(fastTranslation.modelVariant == .nllb200Distilled600M, "Expected fast translation model variant to allow NLLB selection.")
+        try require(fastTranslation.maxConcurrentBatches == 8, "Expected fast translation concurrency to clamp to 8.")
+        try require(fastTranslation.engineForSubtitles() == .llm, "Expected forceLLM to override subtitle engine.")
+        try require(fastTranslation.engine(for: .webPageTranslate) == .llm, "Expected forceLLM to override webpage engine.")
+        try require(fastTranslation.engine(for: .polish) == .llm, "Expected polish to stay on LLM even when text translation uses fast MT.")
+
+        try require(LanguageCodeNormalizer.normalizedBCP47("__label__eng") == "en", "Expected fastText English label to normalize.")
+        try require(LanguageCodeNormalizer.normalizedBCP47("zho_Hans") == "zh-Hans", "Expected NLLB Simplified Chinese to normalize.")
+        try require(LanguageCodeNormalizer.normalizedBCP47("cmn_Hant") == "zh-Hant", "Expected Traditional Chinese alias to normalize.")
+        try require(LanguageCodeNormalizer.nllbCode(for: "zh-Hans") == "zho_Hans", "Expected zh-Hans NLLB mapping.")
+        try require(LanguageCodeNormalizer.argosCode(for: "zh-Hans") == "zh", "Expected zh-Hans Argos mapping.")
+        try require(LanguageCodeNormalizer.asrHintCode(for: "zh-Hant") == "zh", "Expected zh-Hant ASR hint mapping.")
+        let normalizedPair = LanguagePair(source: "__label__eng", target: "zho_Hans")
+        try require(normalizedPair == LanguagePair(source: "en", target: "zh-Hans"), "Expected LanguagePair to normalize source and target.")
+
+        let capabilities = ModelCapabilities(
+            inputs: [.text],
+            languageID: LanguageIDModelCapabilities(
+                supportedLanguages: ["eng_Latn", "zho_Hans", "zh-Hant"],
+                latencyMillisecondsPerKB: -10,
+                source: .detected,
+                confidence: 2
+            ),
+            speakerDiarization: SpeakerDiarizationModelCapabilities(
+                supportsFile: true,
+                supportsRealtime: false,
+                requiresUserToken: true,
+                source: .manual,
+                confidence: -1
+            ),
+            fastTranslation: FastTranslationModelCapabilities(
+                engineID: .ctranslate2,
+                modelID: "  opus-mt-en-zh  ",
+                supportedPairs: [
+                    LanguagePair(source: "eng_Latn", target: "zho_Hans"),
+                    LanguagePair(source: "en", target: "zh-Hans")
+                ],
+                source: .probePassed,
+                confidence: 0.9
+            )
+        )
+        try require(capabilities.supportsLanguageID, "Expected LID details to add languageID input capability.")
+        try require(capabilities.supportsSpeakerDiarization, "Expected speaker details to add speakerDiarization input capability.")
+        try require(capabilities.supportsFastTranslation, "Expected fast MT details to add fastTranslation input capability.")
+        try require(capabilities.languageID?.supportedLanguages == ["en", "zh-Hans", "zh-Hant"], "Expected LID languages to normalize and sort.")
+        try require(capabilities.languageID?.latencyMillisecondsPerKB == 0, "Expected LID latency to clamp to non-negative.")
+        try require(capabilities.languageID?.confidence == 1, "Expected LID confidence to clamp to 1.")
+        try require(capabilities.speakerDiarization?.confidence == 0, "Expected diarization confidence to clamp to 0.")
+        try require(capabilities.fastTranslation?.modelID == "opus-mt-en-zh", "Expected fast MT model ID to trim whitespace.")
+        try require(capabilities.fastTranslation?.supportedPairs.count == 1, "Expected duplicate fast MT pairs to deduplicate.")
+        let decodedCapabilities = try JSONDecoder().decode(ModelCapabilities.self, from: JSONEncoder().encode(capabilities))
+        try require(decodedCapabilities.supportsFastTranslation, "Expected fast MT capability to round-trip.")
+        try require(decodedCapabilities.fastTranslation?.supports(LanguagePair(source: "en", target: "zh-Hans")) == true, "Expected fast MT pair support to round-trip.")
+
+        let oldSegmentJSON = """
+        {
+          "id": "00000000-0000-0000-0000-000000000301",
+          "sessionID": "00000000-0000-0000-0000-000000000302",
+          "index": 0,
+          "startTime": 0.25,
+          "originalText": "Hello",
+          "sourceLanguage": "en",
+          "languageConfidence": 0.92,
+          "isFinal": true,
+          "asrModelID": "asr-fixture",
+          "translationModelID": "text-fixture"
+        }
+        """
+        let oldSegment = try JSONDecoder().decode(SubtitleSegment.self, from: Data(oldSegmentJSON.utf8))
+        try require(oldSegment.sourceLanguageDetectorModel == nil, "Expected old subtitle segments to decode without detector model.")
+        try require(oldSegment.speakerID == nil, "Expected old subtitle segments to decode without speaker ID.")
+        try require(oldSegment.translationEngineID == nil, "Expected old subtitle segments to decode without translation engine.")
+
+        let enrichedSegment = SubtitleSegment(
+            id: UUID(uuidString: "00000000-0000-0000-0000-000000000303")!,
+            sessionID: oldSegment.sessionID,
+            index: 1,
+            startTime: 1,
+            originalText: "World",
+            sourceLanguage: "en",
+            languageConfidence: 0.95,
+            sourceLanguageDetectorModel: "fasttext/lid.176.ftz",
+            speakerID: "spk-1",
+            speakerLabel: "Speaker 1",
+            speakerConfidence: 2,
+            asrModelID: "asr-fixture",
+            translationModelID: "text-fixture",
+            translationEngineID: TranslationEngineID.llm.rawValue
+        )
+        try require(enrichedSegment.speakerConfidence == 1, "Expected speaker confidence to clamp to 1.")
+        let decodedSegment = try JSONDecoder().decode(SubtitleSegment.self, from: JSONEncoder().encode(enrichedSegment))
+        try require(decodedSegment.sourceLanguageDetectorModel == "fasttext/lid.176.ftz", "Expected detector model to round-trip.")
+        try require(decodedSegment.speakerLabel == "Speaker 1", "Expected speaker label to round-trip.")
+        try require(decodedSegment.translationEngineID == TranslationEngineID.llm.rawValue, "Expected translation engine ID to round-trip.")
+
+        try require(Phase4XFixtureEnvironment.languageIDJSON == "LLMTOOLS_LID_FIXTURE_JSON", "Expected LID fixture env var name.")
+        try require(Phase4XFixtureEnvironment.fastTranslationJSON == "LLMTOOLS_FAST_MT_FIXTURE_JSON", "Expected fast MT fixture env var name.")
+        try require(Phase4XFixtureEnvironment.diarizationJSON == "LLMTOOLS_DIARIZATION_FIXTURE_JSON", "Expected diarization fixture env var name.")
+    }
+
+    private static func checkLanguageDetectionFixture() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fixtureURL = root.appendingPathComponent("lid-fixture.json")
+        try Data("""
+        {
+          "type": "result",
+          "language": "__label__eng",
+          "confidence": 0.91,
+          "model": "fixture/lid.176.ftz",
+          "latencyMilliseconds": 4
+        }
+        """.utf8).write(to: fixtureURL)
+        setenv(Phase4XFixtureEnvironment.languageIDJSON, fixtureURL.path, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.languageIDJSON)
+        }
+
+        let preferences = LanguageRoutingPreferences(
+            enabled: true,
+            lowConfidenceThreshold: 0.65
+        )
+        let service = LanguageDetectionService()
+        let detected = try await service.detect(
+            text: "This is long enough for language detection.",
+            preferences: preferences
+        )
+        try require(detected.language == "en", "Expected LID fixture language to normalize to en.")
+        try require(detected.rawLanguage == "__label__eng", "Expected LID fixture raw language to be preserved.")
+        try require(detected.confidence == 0.91, "Expected LID fixture confidence to decode.")
+        try require(detected.detectorModel == "fixture/lid.176.ftz", "Expected LID fixture model to decode.")
+        try require(detected.source == .fixtureJSON, "Expected LID fixture source.")
+        try require(detected.isReliable, "Expected LID fixture to be reliable above threshold.")
+
+        let shortText = try await service.detect(
+            text: "hi",
+            preferences: LanguageRoutingPreferences(enabled: true, shortTextMinimumCharactersLatin: 3)
+        )
+        try require(shortText.language == nil, "Expected short LID text to skip detection.")
+        try require(!shortText.isReliable, "Expected skipped short text to be unreliable.")
+
+        let health = await service.health(
+            preferences: preferences,
+            sampleText: "Bonjour, this sentence is intentionally long enough."
+        )
+        try require(health.status == .ready, "Expected LID fixture health to be ready.")
+        try require(health.source == .fixtureJSON, "Expected LID fixture health source.")
+        try require(health.sampleResult?.language == "en", "Expected LID fixture health sample result.")
+
+        setenv(Phase4XFixtureEnvironment.languageIDJSON, """
+        {"type":"result","language":"zho_Hans","confidence":0.88,"model":"inline-fixture"}
+        """, 1)
+        let inlineFixture = try await LanguageDetectionService().detect(
+            text: "这是一段足够长的中文。",
+            preferences: preferences
+        )
+        try require(inlineFixture.language == "zh-Hans", "Expected inline LID fixture JSON to decode and normalize.")
+    }
+
+    private static func checkLanguageRoutingCallerWiring() async throws {
+        setenv(Phase4XFixtureEnvironment.languageIDJSON, """
+        {"type":"result","language":"__label__eng","confidence":0.93,"model":"fixture/lid.176.ftz"}
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.languageIDJSON)
+        }
+
+        try await checkLanguageRoutingTextCaller()
+        try await checkLanguageRoutingWebpageCaller()
+        try await checkLanguageRoutingOCRCaller()
+        try await checkLanguageRoutingSubtitleCaller()
+    }
+
+    private static func checkLanguageRoutingTextCaller() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = StubRunner(format: .mlx)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let modelDirectory = try makeMLXModelDirectory(root: root)
+        let model = try await engine.addModel(from: modelDirectory)
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.defaultTranslationTarget = "auto"
+            preferences.languageRouting = LanguageRoutingPreferences(
+                enabled: true,
+                useForTextTasks: true
+            )
+        }
+
+        let routedResult = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "This sentence is long enough for language detection.",
+                targetLanguage: "auto"
+            ),
+            modelID: model.id,
+            persistHistory: false
+        )
+        try require(routedResult.sourceLanguage == "en", "Expected text result to expose detected source language.")
+        var requests = await runner.recordedRequests()
+        try require(requests.last?.sourceLanguage == "en", "Expected text caller to receive detected source language.")
+
+        _ = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "This sentence is long enough for language detection.",
+                sourceLanguage: "ja",
+                targetLanguage: "auto"
+            ),
+            modelID: model.id,
+            persistHistory: false
+        )
+        requests = await runner.recordedRequests()
+        try require(requests.last?.sourceLanguage == "ja", "Expected explicit text source language to win over LID.")
+    }
+
+    private static func checkLanguageRoutingWebpageCaller() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = StubRunner(output: """
+        [
+          {"id":"s1","translation":"网页译文。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.languageRouting = LanguageRoutingPreferences(
+                enabled: true,
+                useForWebpage: true
+            )
+        }
+        _ = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "lid-webpage",
+                sourceLanguage: "auto",
+                targetLanguage: "zh-Hans",
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "This webpage sentence is long enough for language detection.")
+                ]
+            ),
+            modelID: model.id
+        )
+        let requests = await runner.recordedRequests()
+        try require(requests.first?.task == .webPageTranslate, "Expected webpage caller to keep webpage translation task.")
+        try require(requests.first?.sourceLanguage == "en", "Expected webpage caller to receive detected source language.")
+
+        _ = try await engine.translateWebPageSegments(
+            payload: WebPageTranslateSegmentsPayload(
+                jobID: "script-lid-webpage",
+                sourceLanguage: "auto",
+                targetLanguage: "zh-Hans",
+                segments: [
+                    WebPageTranslationSegment(segmentID: "s1", text: "設定を変更すると、次回の翻訳から新しいモデルが使われます。")
+                ]
+            ),
+            modelID: model.id
+        )
+        let scriptRequests = await runner.recordedRequests()
+        try require(scriptRequests.last?.sourceLanguage == "ja", "Expected webpage script heuristic to detect Japanese source language.")
+    }
+
+    private static func checkLanguageRoutingOCRCaller() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = StubVisionRunner(output: "This OCR sentence is long enough for language detection.")
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.openAICompatible: runner]
+        )
+        let model = try await engine.addProviderModel(
+            providerID: .siliconFlow,
+            name: "Vision provider",
+            modelID: "gpt-4o",
+            apiKey: "test-key",
+            baseURL: "https://api.siliconflow.cn/v1",
+            contextLength: 8192
+        )
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.defaultTranslationTarget = "auto"
+            preferences.ocr.modelID = model.id
+            preferences.languageRouting = LanguageRoutingPreferences(
+                enabled: true,
+                useForOCR: true
+            )
+        }
+        let result = try await engine.runOCR(
+            image: OCRImageInput(
+                data: Data("fake-image".utf8),
+                mimeType: "image/png",
+                contentHash: "h-lid-ocr"
+            ),
+            mode: .extractThenTranslate,
+            modelID: model.id,
+            persistHistory: false
+        )
+        try require(result.sourceLanguage == "en", "Expected OCR result to expose detected source language.")
+        let requests = await runner.recordedRequests()
+        try require(requests.last?.task == .translate, "Expected OCR extract-then-translate to call text translation.")
+        try require(requests.last?.sourceLanguage == "en", "Expected OCR translation caller to receive detected source language.")
+    }
+
+    private static func checkLanguageRoutingSubtitleCaller() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let segmentID = UUID(uuidString: "00000000-0000-0000-0000-000000000401")!
+        let runner = StubRunner(output: """
+        [
+          {"id":"\(segmentID.uuidString)","translation":"字幕译文。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.mediaSubtitles.defaultTargetLanguage = "auto"
+            preferences.languageRouting = LanguageRoutingPreferences(
+                enabled: true,
+                useForSubtitles: true
+            )
+        }
+        let translated = try await engine.translateSubtitleSegments(
+            [
+                SubtitleSegment(
+                    id: segmentID,
+                    sessionID: UUID(),
+                    index: 0,
+                    startTime: 0,
+                    endTime: 1,
+                    originalText: "This subtitle sentence is long enough for language detection.",
+                    asrModelID: "asr-fixture"
+                )
+            ],
+            targetLanguage: "auto",
+            modelID: model.id
+        )
+        try require(translated.first?.sourceLanguage == "en", "Expected subtitle segment to receive detected source language.")
+        try require(translated.first?.sourceLanguageDetectorModel == "fixture/lid.176.ftz", "Expected subtitle segment to record detector model.")
+        try require(translated.first?.languageConfidence == 0.93, "Expected subtitle segment to record detector confidence.")
+    }
+
+    private static func checkSpeakerDiarizationFixtureAndMapping() async throws {
+        setenv(Phase4XFixtureEnvironment.diarizationJSON, """
+        {
+          "model": "fixture-pyannote",
+          "turns": [
+            {"start": 0.0, "end": 1.4, "speakerID": "SPEAKER_A", "confidence": 0.91},
+            {"start": 1.4, "end": 3.0, "speakerID": "SPEAKER_B", "confidence": 0.87}
+          ],
+          "latencyMilliseconds": 12
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.diarizationJSON)
+        }
+
+        let preferences = SpeakerDiarizationPreferences(enabledForFileSubtitles: true)
+        let health = await SpeakerDiarizationService().health(preferences: preferences)
+        try require(health.status == .ready, "Expected diarization fixture health to be ready.")
+        try require(health.source == .fixtureJSON, "Expected diarization fixture health source.")
+        try require(health.tokenPresent, "Expected diarization fixture to bypass token requirements.")
+
+        let result = try await SpeakerDiarizationService().diarize(
+            audioURL: URL(fileURLWithPath: "/tmp/nonexistent-fixture.wav"),
+            preferences: preferences
+        )
+        try require(result.modelID == "fixture-pyannote", "Expected diarization fixture model ID.")
+        try require(result.turns.count == 2, "Expected two diarization fixture turns.")
+
+        let sessionID = UUID()
+        let mapped = SpeakerTurnMapper.apply(
+            turns: result.turns,
+            to: [
+                SubtitleSegment(id: UUID(), sessionID: sessionID, index: 0, startTime: 0.1, endTime: 1.0, originalText: "first", asrModelID: "asr"),
+                SubtitleSegment(id: UUID(), sessionID: sessionID, index: 1, startTime: 1.6, endTime: 2.5, originalText: "second", asrModelID: "asr")
+            ]
+        )
+        try require(mapped.map(\.speakerID) == ["SPEAKER_A", "SPEAKER_B"], "Expected speaker IDs to map by midpoint.")
+        try require(mapped.map(\.speakerLabel) == ["Speaker 1", "Speaker 2"], "Expected stable speaker labels.")
+        try require(mapped.map(\.speakerConfidence) == [0.91, 0.87], "Expected speaker confidences to map.")
+        try require(SpeakerTurnMapper.speakerCount(in: mapped) == 2, "Expected speaker count from mapped segments.")
+    }
+
+    private static func checkSubtitleExportWithSpeakers() throws {
+        let sessionID = UUID()
+        let segments = [
+            SubtitleSegment(
+                id: UUID(),
+                sessionID: sessionID,
+                index: 0,
+                startTime: 0,
+                endTime: 1,
+                originalText: "Hello.",
+                translatedText: "你好。",
+                speakerID: "speaker-a",
+                speakerLabel: "Speaker 1",
+                asrModelID: "asr"
+            ),
+            SubtitleSegment(
+                id: UUID(),
+                sessionID: sessionID,
+                index: 1,
+                startTime: 1,
+                endTime: 2,
+                originalText: "World.",
+                translatedText: "世界。",
+                speakerID: "speaker-b",
+                speakerLabel: "Speaker 2",
+                asrModelID: "asr"
+            )
+        ]
+        let srt = try SubtitleExporter.render(segments: segments, format: .srt, mode: .bilingual)
+        try require(srt.contains("Speaker 1: Hello.\n你好。"), "Expected speaker label in bilingual SRT.")
+        let vtt = try SubtitleExporter.render(segments: segments, format: .vtt, mode: .translated)
+        try require(vtt.contains("Speaker 2: 世界。"), "Expected speaker label in translated VTT.")
+        let txt = try SubtitleExporter.render(
+            segments: segments,
+            format: .txt,
+            mode: .original,
+            options: SubtitleExportOptions(includeSpeakerLabels: true, speakerFormat: .bracketed)
+        )
+        try require(txt.contains("[Speaker 1] Hello."), "Expected bracketed speaker label in TXT.")
+        let markdown = try SubtitleExporter.render(
+            segments: segments,
+            format: .markdown,
+            mode: .bilingual,
+            options: SubtitleExportOptions(includeSpeakerLabels: false)
+        )
+        try require(!markdown.contains("Speaker 1:"), "Expected export option to hide speaker labels.")
+    }
+
+    private static func checkSpeakerDiarizationFilePipeline() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        setenv(Phase4XFixtureEnvironment.diarizationJSON, """
+        {
+          "model": "fixture-pyannote",
+          "turns": [
+            {"start": 0.0, "end": 0.8, "speakerID": "SPEAKER_A"},
+            {"start": 0.8, "end": 1.8, "speakerID": "SPEAKER_B"}
+          ]
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.diarizationJSON)
+        }
+
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        )
+        let senseDirectory = root.appendingPathComponent("SenseVoiceSmall", isDirectory: true)
+        try FileManager.default.createDirectory(at: senseDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("model.onnx").path, contents: Data())
+        FileManager.default.createFile(atPath: senseDirectory.appendingPathComponent("tokens.txt").path, contents: Data("stub".utf8))
+        let speechModel = try await engine.addModel(from: senseDirectory)
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.fileASRModelID = speechModel.id
+            preferences.mediaSubtitles.realtimeASRModelID = speechModel.id
+            preferences.mediaSubtitles.senseVoiceCommandTemplate = #"/bin/echo '{"segments":[{"start":0,"end":0.7,"text":"first speaker","language":"en"},{"start":1.0,"end":1.5,"text":"second speaker","language":"en"}]}'"#
+            preferences.speakerDiarization.enabledForFileSubtitles = true
+        }
+        let wavURL = root.appendingPathComponent("speaker-fixture.wav")
+        try writePCM16WAV(url: wavURL, duration: 1.6)
+        let fileResult = try await engine.transcribeMediaFile(at: wavURL, modelID: speechModel.id)
+        try require(fileResult.segments.map(\.speakerLabel) == ["Speaker 1", "Speaker 2"], "Expected file subtitle pipeline to map speaker labels.")
+        try require(fileResult.diagnostics.speakerCount == 2, "Expected diagnostics to record speaker count.")
+        try require(fileResult.diagnostics.diarizationModelID == "fixture-pyannote", "Expected diagnostics to record diarization model ID.")
+        let srt = try await engine.exportSubtitleSegments(fileResult.segments, format: .srt, mode: .original)
+        try require(srt.contains("Speaker 1: first speaker"), "Expected exported file subtitles to include speaker labels.")
+
+        unsetenv(Phase4XFixtureEnvironment.diarizationJSON)
+        try await engine.updatePreferences { preferences in
+            preferences.speakerDiarization.commandTemplate = "/bin/false"
+        }
+        let failedDiarization = try await engine.transcribeMediaFile(at: wavURL, modelID: speechModel.id)
+        try require(failedDiarization.segments.map(\.originalText) == ["first speaker", "second speaker"], "Diarization failure must not drop transcript segments.")
+        try require(failedDiarization.diagnostics.diarizationErrorCode != nil, "Expected diarization failure to be recorded in diagnostics.")
+        try require(failedDiarization.diagnostics.diarizationErrorMessage?.isEmpty == false, "Expected diarization failure message to be recorded in diagnostics.")
+
+        let generatedFiles = (FileManager.default.enumerator(atPath: root.path)?.allObjects as? [String]) ?? []
+        try require(
+            !generatedFiles.contains { $0.localizedCaseInsensitiveContains("embedding") },
+            "Speaker embeddings must not be persisted by the fixture pipeline."
+        )
+    }
+
+    private static func checkFastMTFixtureRoundTrip() async throws {
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, """
+        {
+          "protocol": "llmtools.fastmt/v1",
+          "type": "translation",
+          "engine": "ctranslate2",
+          "model": "fixture-opus-mt-en-zh",
+          "supportedPairs": [{"source":"en","target":"zh-Hans"}],
+          "segments": [
+            {"id":"seg-2","translation":"第二段"},
+            {"id":"seg-1","translation":"第一段"}
+          ],
+          "latencyMilliseconds": 9
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+
+        let service = FastTranslationCommandRunner()
+        let preferences = FastTranslationPreferences(subtitleEngine: .fastMT)
+        let health = await service.probe(preferences: preferences)
+        try require(health.status == .ready, "Expected fast MT fixture health to be ready.")
+        try require(health.source == .fixtureJSON, "Expected fast MT fixture health source.")
+        try require(health.engineID == .ctranslate2, "Expected fast MT fixture engine.")
+        try require(health.modelID == "fixture-opus-mt-en-zh", "Expected fast MT fixture model.")
+        try require(health.supportedPairs == [LanguagePair(source: "en", target: "zh-Hans")], "Expected fast MT fixture supported pair.")
+        let pairs = await service.supportedPairs(preferences: preferences)
+        try require(pairs == [LanguagePair(source: "en", target: "zh-Hans")], "Expected fast MT fixture supported pairs.")
+        let translated = try await service.translate(
+            batch: [
+                FastTranslationSegment(id: "seg-1", text: "Hello."),
+                FastTranslationSegment(id: "seg-2", text: "World.")
+            ],
+            pair: LanguagePair(source: "en", target: "zh-Hans"),
+            preferences: preferences
+        )
+        try require(translated.map(\.id) == ["seg-1", "seg-2"], "Expected fast MT fixture to preserve request order.")
+        try require(translated.map(\.translation) == ["第一段", "第二段"], "Expected fast MT fixture translations.")
+        do {
+            _ = try await service.translate(
+                batch: [FastTranslationSegment(id: "seg-1", text: "Hello.")],
+                pair: LanguagePair(source: "ja", target: "zh-Hans"),
+                preferences: preferences
+            )
+            throw CheckError("Expected unsupported fast MT fixture pair to throw.")
+        } catch FastTranslationError.unsupportedLanguagePair {
+        }
+    }
+
+    private static func checkFastMTDegenerateOutputGuard() async throws {
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, """
+        {
+          "type": "translation",
+          "engine": "ctranslate2",
+          "model": "fixture-degenerate-fastmt",
+          "supportedPairs": [{"source":"en","target":"zh-Hans"}],
+          "segments": [{"id":"text","translation":"注注注注注注注注注注注注注注注注注注注注注注注注注注注注注注"}],
+          "latencyMilliseconds": 5
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+
+        let service = FastTranslationCommandRunner()
+        do {
+            _ = try await service.translate(
+                batch: [FastTranslationSegment(id: "text", text: "Note")],
+                pair: LanguagePair(source: "en", target: "zh-Hans"),
+                preferences: FastTranslationPreferences(textEngine: .fastMT)
+            )
+            throw CheckError("Expected degenerate fast MT fixture output to throw.")
+        } catch FastTranslationError.runtimeFailed(let message) {
+            try require(message.contains("degenerate repeated output"), "Expected degenerate fast MT error message.")
+        }
+
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runner = StubRunner(output: "LLM fallback translation")
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.fastTranslation.textEngine = .fastMT
+            preferences.fastTranslation.fallbackPolicy = .fallbackToLLM
+        }
+        let fallback = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "Note",
+                sourceLanguage: "en",
+                targetLanguage: "zh-Hans"
+            ),
+            modelID: model.id
+        )
+        try require(fallback.text == "LLM fallback translation", "Expected degenerate fast MT output to fall back to LLM.")
+        let fallbackRequestCount = await runner.generatedRequestCount()
+        try require(fallbackRequestCount == 1, "Expected degenerate fast MT fallback to use LLM runner.")
+    }
+
+    private static func checkFastMTPreferencesMigration() throws {
+        let empty = try JSONDecoder().decode(AppPreferences.self, from: Data("{}".utf8))
+        try require(empty.fastTranslation.modelVariant == .nllb200Distilled600M, "Expected older preferences to default fast MT model to NLLB 600M.")
+        try require(empty.fastTranslation.commandTemplates.ctranslate2.contains("llmtools-fastmt-sidecar.py") || empty.fastTranslation.commandTemplates.ctranslate2.contains("{sidecar}"), "Expected default CTranslate2 fast MT command template.")
+        try require(empty.fastTranslation.commandTemplates.argos.contains("--engine argos"), "Expected default Argos fast MT command template.")
+
+        let decoded = try JSONDecoder().decode(AppPreferences.self, from: Data("""
+        {
+          "fastTranslation": {
+            "subtitleEngine": "auto",
+            "webpageEngine": "fastMT",
+            "textEngine": "fastMT",
+            "modelVariant": "nllb200Distilled600M",
+            "fallbackPolicy": "showError",
+            "commandTemplates": {
+              "ctranslate2": "  ct2-sidecar  ",
+              "argos": "  argos-sidecar  ",
+              "generic": "  generic-sidecar  "
+            },
+            "maxConcurrentBatches": 99,
+            "forceLLM": true
+          }
+        }
+        """.utf8))
+        try require(decoded.fastTranslation.subtitleEngine == .auto, "Expected subtitle fast MT engine to decode.")
+        try require(decoded.fastTranslation.webpageEngine == .fastMT, "Expected webpage fast MT engine to decode.")
+        try require(decoded.fastTranslation.textEngine == .fastMT, "Expected text translation engine to decode.")
+        try require(decoded.fastTranslation.modelVariant == .nllb200Distilled600M, "Expected NLLB fast MT model variant to decode.")
+        try require(decoded.fastTranslation.fallbackPolicy == .showError, "Expected fast MT fallback policy to decode.")
+        try require(decoded.fastTranslation.commandTemplates.ctranslate2 == "ct2-sidecar", "Expected CTranslate2 command to trim.")
+        try require(decoded.fastTranslation.commandTemplates.argos == "argos-sidecar", "Expected Argos command to trim.")
+        try require(decoded.fastTranslation.commandTemplates.generic == "generic-sidecar", "Expected generic command to trim.")
+        try require(decoded.fastTranslation.maxConcurrentBatches == 8, "Expected fast MT concurrency to clamp to 8.")
+        try require(decoded.fastTranslation.engineForSubtitles() == .llm, "Expected forceLLM to override subtitle auto routing.")
+        try require(decoded.fastTranslation.engine(for: .webPageTranslate) == .llm, "Expected forceLLM to override webpage fast MT routing.")
+        try require(decoded.fastTranslation.engine(for: .translate) == .llm, "Expected forceLLM to override text translation fast MT routing.")
+        try require(decoded.fastTranslation.engine(for: .summarize) == .llm, "Expected summary to stay on LLM.")
+
+        let nllbRoot = try makeTemporaryDirectory(name: "nllb-200-distilled-600m-ct2-int8")
+        defer { try? FileManager.default.removeItem(at: nllbRoot) }
+        setenv("LLMTOOLS_FASTMT_NLLB_600M_MODEL", nllbRoot.path, 1)
+        defer { unsetenv("LLMTOOLS_FASTMT_NLLB_600M_MODEL") }
+        let nllbResolution = try FastTranslationCommandRunner.commandResolution(
+            preferences: FastTranslationPreferences(modelVariant: .nllb200Distilled600M)
+        )
+        try require(nllbResolution.command.contains(nllbRoot.path), "Expected NLLB fast MT selection to resolve the NLLB model path.")
+    }
+
+    private static func checkTranslationRoutingDecisionTable() throws {
+        let pair = LanguagePair(source: "en", target: "zh-Hans")
+        let supported = [pair]
+        let auto = FastTranslationPreferences(subtitleEngine: .auto, webpageEngine: .auto)
+        let explicitLLM = TranslationRoutingService.decide(
+            surface: .subtitle,
+            preferences: auto,
+            pair: pair,
+            supportedPairs: supported,
+            detectedConfidence: 0.99,
+            lowConfidenceThreshold: 0.65,
+            explicitEngineID: .llm
+        )
+        try require(explicitLLM.engineID == .llm && explicitLLM.reason == "explicitEngine", "Expected explicit LLM route to win.")
+
+        let autoFast = TranslationRoutingService.decide(
+            surface: .subtitle,
+            preferences: auto,
+            pair: pair,
+            supportedPairs: supported,
+            detectedConfidence: 0.99,
+            lowConfidenceThreshold: 0.65
+        )
+        try require(autoFast.usesFastMT && autoFast.reason == "autoFastMT", "Expected high-confidence supported auto route to use fast MT.")
+
+        let lowConfidence = TranslationRoutingService.decide(
+            surface: .subtitle,
+            preferences: auto,
+            pair: pair,
+            supportedPairs: supported,
+            detectedConfidence: 0.4,
+            lowConfidenceThreshold: 0.65
+        )
+        try require(lowConfidence.engineID == .llm && lowConfidence.reason == "lowConfidence", "Expected low-confidence auto route to use LLM.")
+
+        let unsupported = TranslationRoutingService.decide(
+            surface: .webpage,
+            preferences: auto,
+            pair: LanguagePair(source: "ja", target: "zh-Hans"),
+            supportedPairs: supported,
+            detectedConfidence: 0.99,
+            lowConfidenceThreshold: 0.65
+        )
+        try require(unsupported.engineID == .llm && unsupported.reason == "unsupportedLanguagePair", "Expected unsupported auto pair to use LLM.")
+
+        let forced = TranslationRoutingService.decide(
+            surface: .subtitle,
+            preferences: FastTranslationPreferences(subtitleEngine: .fastMT),
+            pair: pair,
+            supportedPairs: [],
+            detectedConfidence: nil,
+            lowConfidenceThreshold: 0.65
+        )
+        try require(forced.usesFastMT && forced.reason == "preferenceFastMT", "Expected explicit fast MT preference to route fast.")
+
+        let textFast = TranslationRoutingService.decide(
+            surface: .text,
+            preferences: FastTranslationPreferences(textEngine: .fastMT),
+            pair: pair,
+            supportedPairs: supported,
+            detectedConfidence: 0.99,
+            lowConfidenceThreshold: 0.65
+        )
+        try require(textFast.usesFastMT, "Expected text translation fast MT route to be allowed.")
+        let nonTranslateLocked = FastTranslationPreferences(textEngine: .fastMT)
+        try require(nonTranslateLocked.engine(for: .polish) == .llm, "Expected non-translation text tasks to stay locked to LLM.")
+    }
+
+    private static func checkTextTranslateFastMTPipeline() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, """
+        {
+          "type": "translation",
+          "engine": "ctranslate2",
+          "model": "fixture-text-fastmt",
+          "supportedPairs": [{"source":"en","target":"zh-Hans"}],
+          "segments": [{"id":"text","translation":"文本快速译文"}],
+          "latencyMilliseconds": 5
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+        let runner = StubRunner(output: "LLM polished")
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.fastTranslation.textEngine = .fastMT
+            preferences.fastTranslation.fallbackPolicy = .showError
+        }
+        let translated = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "Hello text translation.",
+                sourceLanguage: "en",
+                targetLanguage: "zh-Hans"
+            ),
+            modelID: model.id
+        )
+        try require(translated.text == "文本快速译文", "Expected text translate to use fast MT.")
+        try require(translated.modelName == "Fast MT (CTranslate2)", "Expected text fast MT model display name.")
+        let fastTextRequestCount = await runner.generatedRequestCount()
+        try require(fastTextRequestCount == 0, "Expected text fast MT path to avoid LLM runner.")
+
+        let polished = try await engine.run(
+            request: TaskRequest(task: .polish, inputText: "Hello text polishing."),
+            modelID: model.id
+        )
+        try require(polished.text == "LLM polished", "Expected polish to keep using LLM runner.")
+        let polishedRequestCount = await runner.generatedRequestCount()
+        try require(polishedRequestCount == 1, "Expected only non-translation text task to use LLM runner.")
+    }
+
+    private static func checkSubtitleFastMTPipeline() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let segmentID = UUID(uuidString: "00000000-0000-0000-0000-000000000501")!
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, """
+        {
+          "type": "translation",
+          "engine": "ctranslate2",
+          "model": "fixture-opus-mt-en-zh",
+          "supportedPairs": [{"source":"en","target":"zh-Hans"}],
+          "segments": [{"id":"\(segmentID.uuidString)","translation":"你好，快速翻译。"}],
+          "latencyMilliseconds": 7
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+        let runner = StubRunner(output: """
+        [
+          {"id":"\(segmentID.uuidString)","translation":"你好，LLM 回退。"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.fastTranslation.subtitleEngine = .fastMT
+            preferences.fastTranslation.fallbackPolicy = .showError
+        }
+        let sourceSegment = SubtitleSegment(
+            id: segmentID,
+            sessionID: UUID(),
+            index: 0,
+            startTime: 0,
+            endTime: 1,
+            originalText: "Hello fast translation.",
+            sourceLanguage: "en",
+            languageConfidence: 0.99,
+            asrModelID: "asr-fixture"
+        )
+        let fastTranslated = try await engine.translateSubtitleSegments([sourceSegment], targetLanguage: "zh-Hans", modelID: model.id)
+        try require(fastTranslated.first?.translatedText == "你好，快速翻译。", "Expected subtitle fast MT fixture translation.")
+        try require(fastTranslated.first?.translationEngineID == TranslationEngineID.ctranslate2.rawValue, "Expected subtitle fast MT engine metadata.")
+        try require(fastTranslated.first?.translationModelID == "fixture-opus-mt-en-zh", "Expected subtitle fast MT model metadata.")
+        let fastMTRequestCount = await runner.generatedRequestCount()
+        try require(fastMTRequestCount == 0, "Expected fast MT subtitle path to avoid LLM runner.")
+
+        let vtt = try await engine.exportSubtitleSegments(fastTranslated, format: .vtt, mode: .translated)
+        try require(vtt.contains("NOTE Translation engine: ctranslate2; model: fixture-opus-mt-en-zh"), "Expected VTT export metadata for fast MT.")
+        let markdown = try await engine.exportSubtitleSegments(fastTranslated, format: .markdown, mode: .translated)
+        try require(markdown.contains("translationEngine: ctranslate2"), "Expected Markdown front-matter translation engine.")
+        try require(markdown.contains("translationModel: fixture-opus-mt-en-zh"), "Expected Markdown front-matter translation model.")
+        let srt = try await engine.exportSubtitleSegments(fastTranslated, format: .srt, mode: .translated)
+        try require(srt.hasPrefix("# Translation engine: ctranslate2; model: fixture-opus-mt-en-zh"), "Expected SRT metadata header.")
+
+        unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        try await engine.updatePreferences { preferences in
+            preferences.fastTranslation.subtitleEngine = .fastMT
+            preferences.fastTranslation.modelVariant = .opusMTEnZh
+            preferences.fastTranslation.fallbackPolicy = .fallbackToLLM
+        }
+        let llmFallback = try await engine.translateSubtitleSegments([sourceSegment], targetLanguage: "ja", modelID: model.id)
+        try require(llmFallback.first?.translatedText == "你好，LLM 回退。", "Expected unsupported fast MT runtime to fall back to LLM.")
+        try require(llmFallback.first?.translationEngineID == TranslationEngineID.llm.rawValue, "Expected fallback translation engine metadata to be LLM.")
+        let fallbackRequestCount = await runner.generatedRequestCount()
+        try require(fallbackRequestCount == 1, "Expected fallback path to use LLM runner once.")
+    }
+
+    private static func checkWebPageFastMTRouting() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, """
+        {
+          "type": "translation",
+          "engine": "ctranslate2",
+          "model": "fixture-web-fastmt",
+          "supportedPairs": [{"source":"en","target":"zh-Hans"}],
+          "segments": [{"id":"web-1","translation":"网页快速译文"}],
+          "latencyMilliseconds": 6
+        }
+        """, 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+        let runner = StubRunner(output: """
+        [
+          {"id":"web-1","translation":"网页 LLM 回退"}
+        ]
+        """)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        let model = try await engine.addModel(from: try makeMLXModelDirectory(root: root))
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = model.id
+            preferences.fastTranslation.webpageEngine = .fastMT
+            preferences.fastTranslation.fallbackPolicy = .showError
+        }
+        let payload = WebPageTranslateSegmentsPayload(
+            jobID: "web-fastmt",
+            sourceLanguage: "en",
+            targetLanguage: "zh-Hans",
+            translationEngine: .fastMT,
+            segments: [
+                WebPageTranslationSegment(segmentID: "web-1", text: "Hello webpage.", textHash: "h-web-1")
+            ]
+        )
+        let fastResult = try await engine.translateWebPageSegments(payload: payload, modelID: model.id)
+        try require(fastResult.translations.first?.translation == "网页快速译文", "Expected webpage fast MT fixture translation.")
+        try require(fastResult.translationEngineID == TranslationEngineID.ctranslate2.rawValue, "Expected webpage fast MT engine metadata.")
+        try require(fastResult.translationModelID == "fixture-web-fastmt", "Expected webpage fast MT model metadata.")
+        try require(fastResult.detectedSourceLanguage == "en", "Expected webpage source language metadata.")
+        try require(fastResult.elapsedMilliseconds != nil, "Expected webpage elapsed metadata.")
+        let fastRequestCount = await runner.generatedRequestCount()
+        try require(fastRequestCount == 0, "Expected webpage fast MT path to avoid LLM runner.")
+
+        unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        try await engine.updatePreferences { preferences in
+            preferences.fastTranslation.webpageEngine = .fastMT
+            preferences.fastTranslation.modelVariant = .opusMTEnZh
+            preferences.fastTranslation.fallbackPolicy = .fallbackToLLM
+        }
+        let fallbackPayload = WebPageTranslateSegmentsPayload(
+            jobID: "web-fastmt-fallback",
+            sourceLanguage: "en",
+            targetLanguage: "ja",
+            translationEngine: .fastMT,
+            segments: [
+                WebPageTranslationSegment(segmentID: "web-1", text: "Hello webpage.", textHash: "h-web-1")
+            ]
+        )
+        let fallback = try await engine.translateWebPageSegments(payload: fallbackPayload, modelID: model.id)
+        try require(fallback.translations.first?.translation == "网页 LLM 回退", "Expected webpage fast MT failure to fall back to LLM.")
+        try require(fallback.translationEngineID == TranslationEngineID.llm.rawValue, "Expected webpage fallback engine metadata.")
+        let fallbackCount = await runner.generatedRequestCount()
+        try require(fallbackCount == 1, "Expected webpage fallback to use LLM runner once.")
+    }
+
     private static func checkTextTaskModePreferencesAndPrompts() throws {
         let json = """
         {
@@ -532,6 +1530,16 @@ struct LLMToolsChecks {
             preferences: qualityPreferences
         )
         try require(technicalTranslationPrompt.contains("Preserve technical terminology"), "Expected technical translation quality to affect normal translation prompt.")
+        let routedTranslationPrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(
+                task: .translate,
+                inputText: "Open the API reference.",
+                sourceLanguage: "en",
+                targetLanguage: "zh-Hans"
+            ),
+            preferences: qualityPreferences
+        )
+        try require(routedTranslationPrompt.contains("Translate from English to Simplified Chinese."), "Expected detected source language to affect normal translation prompt.")
 
         let summaryPrompt = PromptTemplates.userPrompt(
             for: TaskRequest(task: .summarize, inputText: "Discuss launch follow-up."),
@@ -1439,7 +2447,8 @@ struct LLMToolsChecks {
         try require(srt.contains("file pipeline transcript\n译文：file pipeline transcript"), "Expected bilingual SRT export.")
         try require(vtt.hasPrefix("WEBVTT"), "Expected VTT export.")
         try require(vtt.contains("译文：file pipeline transcript"), "Expected translated VTT export.")
-        try require(txt == "file pipeline transcript\n", "Expected original TXT export.")
+        try require(txt.contains("# Translation engine: llm"), "Expected original TXT export to include translation metadata.")
+        try require(txt.hasSuffix("file pipeline transcript\n"), "Expected original TXT export body.")
         try require(markdown.contains("file pipeline transcript<br>译文：file pipeline transcript"), "Expected bilingual Markdown export.")
 
         let diagnosticsJSON = String(data: try JSONEncoder().encode(fileResult.diagnostics), encoding: .utf8) ?? ""
@@ -1723,6 +2732,15 @@ struct LLMToolsChecks {
         return url
     }
 
+    private static func makeMLXModelDirectory(root: URL, name: String = "Qwen3.5-4B-MLX-4bit") throws -> URL {
+        let modelDirectory = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("tokenizer.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: modelDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
+        return modelDirectory
+    }
+
     private static func writePCM16WAV(
         url: URL,
         duration: TimeInterval,
@@ -1917,6 +2935,7 @@ private actor StubVisionRunner: VisionModelRunner {
     private var loadedID: UUID?
     private var output: String
     private var ocrCount = 0
+    private var requests: [TaskRequest] = []
 
     init(output: String = "OCR stub result") {
         self.output = output
@@ -1943,7 +2962,8 @@ private actor StubVisionRunner: VisionModelRunner {
     }
 
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
-        TaskResult(text: "text stub result", modelName: "Vision Stub", task: request.task)
+        requests.append(request)
+        return TaskResult(text: "text stub result", modelName: "Vision Stub", task: request.task)
     }
 
     func generateOCR(request: OCRTaskRequest, preferences: AppPreferences) async throws -> OCRTaskResult {
@@ -1962,6 +2982,10 @@ private actor StubVisionRunner: VisionModelRunner {
 
     func ocrRequestCount() -> Int {
         ocrCount
+    }
+
+    func recordedRequests() -> [TaskRequest] {
+        requests
     }
 }
 

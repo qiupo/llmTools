@@ -14,7 +14,7 @@ public enum PromptTemplates {
             return "You are a translation engine. Preserve meaning, formatting, numbers, code, and names. Output only the translated text."
         case .webPageTranslate:
             return """
-            You are a webpage translation engine. Translate English webpage text to Simplified Chinese.
+            You are a webpage translation engine. Translate webpage text to Simplified Chinese.
             Preserve meaning, numbers, names, URLs, product names, code-like tokens, and UI intent.
             Return only valid JSON that follows the requested schema.
             Do not explain.
@@ -53,6 +53,7 @@ public enum PromptTemplates {
             let qualityMode = request.translationQuality ?? preferences.defaultTranslationQuality
             return translationPrompt(
                 inputText: request.inputText,
+                source: request.sourceLanguage,
                 target: target,
                 qualityMode: qualityMode,
                 isRetry: isRetry
@@ -231,6 +232,7 @@ public enum PromptTemplates {
 
     private static func translationPrompt(
         inputText: String,
+        source: String?,
         target: String,
         qualityMode: WebPageTranslationQualityMode,
         isRetry: Bool
@@ -238,19 +240,29 @@ public enum PromptTemplates {
         let targetLanguage = target == "auto"
             ? "English if the source text is mainly Chinese, otherwise Simplified Chinese"
             : targetLanguageName(for: target)
+        let sourceInstruction = sourceLanguageInstruction(for: source)
         let qualityInstruction = translationQualityInstruction(qualityMode)
 
         if isRetry {
             return """
-            Translate to \(targetLanguage). \(qualityInstruction) Output only the translation.
+            Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction) Output only the translation.
             \(inputText)
             """
         }
 
         return """
-        Translate to \(targetLanguage). \(qualityInstruction) Output only the translation.
+        Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction) Output only the translation.
         \(inputText)
         """
+    }
+
+    private static func sourceLanguageInstruction(for source: String?) -> String {
+        guard let source = source?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !source.isEmpty,
+              source.lowercased() != "auto" else {
+            return ""
+        }
+        return " from \(targetLanguageName(for: source))"
     }
 
     public static func webPageBatchPrompt(
@@ -614,8 +626,10 @@ public enum PromptTemplates {
 
     public static func targetLanguageName(for target: String) -> String {
         switch target {
-        case "zh-Hans": return "Simplified Chinese"
+        case "zh-Hans", "zh": return "Simplified Chinese"
         case "en": return "English"
+        case "ja": return "Japanese"
+        case "ko": return "Korean"
         case "Chinese": return "Simplified Chinese"
         case "English": return "English"
         case "Japanese": return "Japanese"

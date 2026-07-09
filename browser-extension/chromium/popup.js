@@ -25,6 +25,10 @@ const POPUP_TEXT = {
     ready: "就绪",
     localModel: "本地模型",
     model: ({ modelName }) => `模型：${modelName}`,
+    engine: ({ engineName }) => `引擎：${engineName}`,
+    engineWithDetail: ({ engineName, engineID }) => `引擎：${engineName}（${engineID}）`,
+    engineFastMT: "快速 MT",
+    engineAuto: "自动",
     localAppNotConnected: "本地应用未连接",
     openWebpageBeforeClearingCache: "请先打开网页标签页再清除缓存。",
     openWebpageBeforeTranslating: "请先打开网页标签页再翻译。",
@@ -51,7 +55,7 @@ const POPUP_TEXT = {
     pendingStyleLoading: "Loading",
     pendingStyleFlipText: "翻牌",
     pendingStyleNone: "无样式",
-    saveSiteDefault: "站点默认",
+    saveSiteDefault: "默认",
     saveReadingDefaultTitle: "保存为当前网站默认阅读模式",
     saveQualityDefaultTitle: "保存为当前网站默认翻译质量",
     translatePage: "翻译页面",
@@ -67,6 +71,8 @@ const POPUP_TEXT = {
     clearDomainCacheTitle: "清除当前网站的缓存译文",
     clearAllCacheTitle: "清除全部网页缓存译文",
     diagnosticsPrefix: "诊断",
+    diagnosticsEngine: "引擎",
+    diagnosticsSource: "来源",
     diagnosticsDomain: "域名",
     diagnosticsUrl: "页面",
     diagnosticsError: "错误"
@@ -75,6 +81,10 @@ const POPUP_TEXT = {
     ready: "Ready",
     localModel: "Local model",
     model: ({ modelName }) => `Model: ${modelName}`,
+    engine: ({ engineName }) => `Engine: ${engineName}`,
+    engineWithDetail: ({ engineName, engineID }) => `Engine: ${engineName} (${engineID})`,
+    engineFastMT: "Fast MT",
+    engineAuto: "Auto",
     localAppNotConnected: "Local app not connected",
     openWebpageBeforeClearingCache: "Open a webpage tab before clearing cache.",
     openWebpageBeforeTranslating: "Open a webpage tab before translating.",
@@ -101,7 +111,7 @@ const POPUP_TEXT = {
     pendingStyleLoading: "Loading",
     pendingStyleFlipText: "Flip text",
     pendingStyleNone: "No style",
-    saveSiteDefault: "Site default",
+    saveSiteDefault: "Default",
     saveReadingDefaultTitle: "Save as this site's default reading mode",
     saveQualityDefaultTitle: "Save as this site's default translation quality",
     translatePage: "Translate Page",
@@ -117,6 +127,8 @@ const POPUP_TEXT = {
     clearDomainCacheTitle: "Clear cached translations for the current site",
     clearAllCacheTitle: "Clear all cached webpage translations",
     diagnosticsPrefix: "Diagnostics",
+    diagnosticsEngine: "engine",
+    diagnosticsSource: "source",
     diagnosticsDomain: "domain",
     diagnosticsUrl: "page",
     diagnosticsError: "error"
@@ -243,6 +255,21 @@ function shortHash(value = "") {
   return text.length > 12 ? text.slice(0, 12) : text;
 }
 
+function modelStatusText(state) {
+  const engine = state?.translationEngine || "";
+  const engineID = state?.translationEngineID || "";
+  if (engine === "fastMT") {
+    const engineName = t("engineFastMT");
+    return engineID && engineID !== "fastmt" && engineID !== "auto"
+      ? t("engineWithDetail", { engineName, engineID })
+      : t("engine", { engineName });
+  }
+  if (engine === "auto") {
+    return t("engine", { engineName: t("engineAuto") });
+  }
+  return state?.modelName ? t("model", { modelName: state.modelName }) : t("localModel");
+}
+
 function formatDiagnostics(state) {
   const diagnostics = state?.diagnostics;
   if (!diagnostics) {
@@ -251,12 +278,16 @@ function formatDiagnostics(state) {
   const counts = diagnostics.counts || {};
   const timings = diagnostics.timings || {};
   const model = diagnostics.model || {};
+  const translation = diagnostics.translation || {};
+  const engine = translation.engineID || translation.engine || "";
   const parts = [
     t("diagnosticsPrefix"),
     [diagnostics.browserID, diagnostics.extensionVersion].filter(Boolean).join(" "),
     diagnostics.status || state.status || "",
     `${Math.max(counts.done || 0, 0)}/${Math.max(counts.total || 0, 0)}`,
     timings.elapsedMs == null ? "" : `${timings.elapsedMs}ms`,
+    engine ? `${t("diagnosticsEngine")} ${engine}` : "",
+    translation.detectedSource ? `${t("diagnosticsSource")} ${translation.detectedSource}` : "",
     model.name || "",
     diagnostics.domainHash ? `${t("diagnosticsDomain")} ${shortHash(diagnostics.domainHash)}` : "",
     diagnostics.urlHash ? `${t("diagnosticsUrl")} ${shortHash(diagnostics.urlHash)}` : "",
@@ -269,7 +300,7 @@ function render(state) {
   if (!state) return;
   applyLanguage(state.appLanguage || appLanguage);
   statusEl.textContent = state.message || state.status || t("ready");
-  modelEl.textContent = state.modelName ? t("model", { modelName: state.modelName }) : t("localModel");
+  modelEl.textContent = modelStatusText(state);
   const diagnosticsText = formatDiagnostics(state);
   diagnosticsEl.textContent = diagnosticsText;
   diagnosticsEl.hidden = !diagnosticsText;

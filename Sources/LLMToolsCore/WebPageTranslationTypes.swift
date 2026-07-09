@@ -37,6 +37,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
     public var disabledDomains: [String]
     public var domainReadingModes: [String: WebPageReadingMode]
     public var domainTranslationQualities: [String: WebPageTranslationQualityMode]
+    public var domainTranslationEngines: [String: FastTranslationSurfaceEngine]
     public var persistWebHistory: Bool
     public var maxSegmentsPerBatch: Int
     public var maxCharactersPerBatch: Int
@@ -52,6 +53,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         disabledDomains: [String] = [],
         domainReadingModes: [String: WebPageReadingMode] = [:],
         domainTranslationQualities: [String: WebPageTranslationQualityMode] = [:],
+        domainTranslationEngines: [String: FastTranslationSurfaceEngine] = [:],
         persistWebHistory: Bool = false,
         maxSegmentsPerBatch: Int = 20,
         maxCharactersPerBatch: Int = 2_000,
@@ -66,6 +68,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         self.disabledDomains = disabledDomains
         self.domainReadingModes = domainReadingModes
         self.domainTranslationQualities = domainTranslationQualities
+        self.domainTranslationEngines = domainTranslationEngines.filter { $0.value != .auto }
         self.persistWebHistory = persistWebHistory
         self.maxSegmentsPerBatch = maxSegmentsPerBatch
         self.maxCharactersPerBatch = maxCharactersPerBatch
@@ -89,6 +92,7 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         case disabledDomains
         case domainReadingModes
         case domainTranslationQualities
+        case domainTranslationEngines
         case persistWebHistory
         case maxSegmentsPerBatch
         case maxCharactersPerBatch
@@ -106,6 +110,8 @@ public struct WebPageTranslationPreferences: Codable, Sendable, Hashable {
         disabledDomains = try container.decodeIfPresent([String].self, forKey: .disabledDomains) ?? []
         domainReadingModes = try container.decodeIfPresent([String: WebPageReadingMode].self, forKey: .domainReadingModes) ?? [:]
         domainTranslationQualities = try container.decodeIfPresent([String: WebPageTranslationQualityMode].self, forKey: .domainTranslationQualities) ?? [:]
+        domainTranslationEngines = (try container.decodeIfPresent([String: FastTranslationSurfaceEngine].self, forKey: .domainTranslationEngines) ?? [:])
+            .filter { $0.value != .auto }
         persistWebHistory = try container.decodeIfPresent(Bool.self, forKey: .persistWebHistory) ?? false
         maxSegmentsPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxSegmentsPerBatch) ?? 20
         maxCharactersPerBatch = try container.decodeIfPresent(Int.self, forKey: .maxCharactersPerBatch) ?? 2_000
@@ -252,15 +258,17 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
     public var sourceLanguage: String
     public var targetLanguage: String
     public var translationQuality: WebPageTranslationQualityMode
+    public var translationEngine: FastTranslationSurfaceEngine?
     public var urlHash: String?
     public var title: String?
     public var segments: [WebPageTranslationSegment]
 
     public init(
         jobID: String,
-        sourceLanguage: String = "en",
+        sourceLanguage: String = "auto",
         targetLanguage: String = "zh-Hans",
         translationQuality: WebPageTranslationQualityMode = .natural,
+        translationEngine: FastTranslationSurfaceEngine? = nil,
         urlHash: String? = nil,
         title: String? = nil,
         segments: [WebPageTranslationSegment]
@@ -269,6 +277,7 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
         self.translationQuality = translationQuality
+        self.translationEngine = translationEngine
         self.urlHash = urlHash
         self.title = title
         self.segments = segments
@@ -279,6 +288,7 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
         case sourceLanguage
         case targetLanguage
         case translationQuality
+        case translationEngine
         case urlHash
         case title
         case segments
@@ -287,9 +297,10 @@ public struct WebPageTranslateSegmentsPayload: Codable, Sendable, Hashable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         jobID = try container.decode(String.self, forKey: .jobID)
-        sourceLanguage = try container.decodeIfPresent(String.self, forKey: .sourceLanguage) ?? "en"
+        sourceLanguage = try container.decodeIfPresent(String.self, forKey: .sourceLanguage) ?? "auto"
         targetLanguage = try container.decodeIfPresent(String.self, forKey: .targetLanguage) ?? "zh-Hans"
         translationQuality = try container.decodeIfPresent(WebPageTranslationQualityMode.self, forKey: .translationQuality) ?? .natural
+        translationEngine = try container.decodeIfPresent(FastTranslationSurfaceEngine.self, forKey: .translationEngine)
         urlHash = try container.decodeIfPresent(String.self, forKey: .urlHash)
         title = try container.decodeIfPresent(String.self, forKey: .title)
         segments = try container.decode([WebPageTranslationSegment].self, forKey: .segments)
@@ -330,19 +341,41 @@ public struct WebPageTranslationUsage: Codable, Sendable, Hashable {
 public struct WebPageTranslateSegmentsResult: Codable, Sendable, Hashable {
     public var jobID: String
     public var modelName: String
+    public var translationEngineID: String
+    public var translationModelID: String?
+    public var detectedSourceLanguage: String?
+    public var elapsedMilliseconds: Int?
+    public var fallbackReason: String?
     public var translations: [WebPageSegmentTranslation]
     public var usage: WebPageTranslationUsage
 
     public init(
         jobID: String,
         modelName: String,
+        translationEngineID: String = TranslationEngineID.llm.rawValue,
+        translationModelID: String? = nil,
+        detectedSourceLanguage: String? = nil,
+        elapsedMilliseconds: Int? = nil,
+        fallbackReason: String? = nil,
         translations: [WebPageSegmentTranslation],
         usage: WebPageTranslationUsage
     ) {
         self.jobID = jobID
         self.modelName = modelName
+        self.translationEngineID = translationEngineID
+        self.translationModelID = translationModelID?.trimmingCharacters(in: .whitespacesAndNewlines).emptyAsNil
+        self.detectedSourceLanguage = LanguageCodeNormalizer.normalizedBCP47(detectedSourceLanguage)
+        self.elapsedMilliseconds = elapsedMilliseconds.map { max(0, $0) }
+        self.fallbackReason = fallbackReason?.trimmingCharacters(in: .whitespacesAndNewlines).emptyAsNil
         self.translations = translations
         self.usage = usage
+    }
+}
+
+private extension String {
+    var emptyAsNil: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

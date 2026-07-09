@@ -6,8 +6,18 @@ public actor TaskEngine {
         case mlxVision
     }
 
+    private enum LanguageRoutingSurface {
+        case text
+        case webpage
+        case ocr
+        case subtitles
+    }
+
     private let registryStore: RegistryStore
     private let historyStore: HistoryStore
+    private let languageDetectionService: LanguageDetectionService
+    private let speakerDiarizationService: SpeakerDiarizationService
+    private let fastTranslationService: FastTranslationCommandRunner
     private var snapshot: RegistrySnapshot
     private var history: [HistoryItem]
     private var runners: [RunnerSlot: any ModelRunner]
@@ -15,10 +25,16 @@ public actor TaskEngine {
     public init(
         registryStore: RegistryStore = RegistryStore(),
         historyStore: HistoryStore = HistoryStore(),
+        languageDetectionService: LanguageDetectionService = LanguageDetectionService(),
+        speakerDiarizationService: SpeakerDiarizationService = SpeakerDiarizationService(),
+        fastTranslationService: FastTranslationCommandRunner = FastTranslationCommandRunner(),
         runners: [ModelFormat: any ModelRunner] = [:]
     ) {
         self.registryStore = registryStore
         self.historyStore = historyStore
+        self.languageDetectionService = languageDetectionService
+        self.speakerDiarizationService = speakerDiarizationService
+        self.fastTranslationService = fastTranslationService
         self.snapshot = .init()
         self.history = []
         self.runners = Dictionary(uniqueKeysWithValues: runners.map { (.format($0.key), $0.value) })
@@ -485,17 +501,72 @@ public actor TaskEngine {
 
     public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
         let model = try resolveModel(for: modelID)
-        try validateInputSize(request, for: model)
+        let routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
+        if let fastResult = try await translateTextWithFastMTIfSelected(routedRequest) {
+            if persistHistory {
+                appendHistory(model: model, result: fastResult, request: routedRequest)
+            }
+            return fastResult
+        }
+        try validateInputSize(routedRequest, for: model)
         let runner = try runner(for: model)
         if await runner.loadedModelID() != model.id {
             await runner.unload()
             try await runner.load(model: model)
         }
-        let result = try await runner.generate(request: request, preferences: snapshot.preferences)
+        var result = try await runner.generate(request: routedRequest, preferences: snapshot.preferences)
+        result.sourceLanguage = routedRequest.sourceLanguage
         if persistHistory {
-            appendHistory(model: model, result: result, request: request)
+            appendHistory(model: model, result: result, request: routedRequest)
         }
         return result
+    }
+
+    private func translateTextWithFastMTIfSelected(_ request: TaskRequest) async throws -> TaskResult? {
+        guard request.task == .translate else {
+            return nil
+        }
+        let preferences = snapshot.preferences.fastTranslation
+        guard preferences.engine(for: .translate) != .llm else {
+            return nil
+        }
+        guard let pair = await fastTranslationPair(forTextRequest: request) else {
+            return nil
+        }
+        let supportedPairs = await fastTranslationService.supportedPairs(preferences: preferences)
+        let decision = TranslationRoutingService.decide(
+            surface: .text,
+            preferences: preferences,
+            pair: pair.pair,
+            supportedPairs: supportedPairs,
+            detectedConfidence: pair.confidence,
+            lowConfidenceThreshold: snapshot.preferences.languageRouting.lowConfidenceThreshold
+        )
+        guard decision.usesFastMT else {
+            return nil
+        }
+        do {
+            let translated = try await fastTranslationService.translate(
+                batch: [FastTranslationSegment(id: "text", text: request.inputText)],
+                pair: pair.pair,
+                preferences: preferences
+            )
+            guard let first = translated.first else {
+                throw FastTranslationError.incompleteResponse("Fast translation did not return the text translation.")
+            }
+            return TaskResult(
+                text: first.translation,
+                rawText: first.translation,
+                modelName: fastTranslationDisplayName(for: first.engineID),
+                task: .translate,
+                sourceLanguage: pair.pair.source
+            )
+        } catch {
+            if preferences.fallbackPolicy == .fallbackToLLM {
+                return nil
+            }
+            throw error
+        }
     }
 
     public func runOCR(
@@ -534,12 +605,22 @@ public actor TaskEngine {
         let finalText: String
         let finalRawText: String
         let finalModelName: String
+        var detectedOCRSourceLanguage: String?
 
         if mode == .extractThenTranslate && !isNoReadableText(visibleOCRText) {
+            let sourceLanguage = await detectedSourceLanguageIfNeeded(
+                for: visibleOCRText,
+                currentSourceLanguage: nil,
+                targetLanguage: snapshot.preferences.defaultTranslationTarget,
+                surface: .ocr,
+                confidenceBoost: snapshot.preferences.languageRouting.ocrConfidenceBoost
+            )?.language
+            detectedOCRSourceLanguage = sourceLanguage
             let translation = try await run(
                 request: TaskRequest(
                     task: .translate,
                     inputText: visibleOCRText,
+                    sourceLanguage: sourceLanguage,
                     targetLanguage: snapshot.preferences.defaultTranslationTarget
                 ),
                 modelID: nil,
@@ -564,7 +645,8 @@ public actor TaskEngine {
             text: finalText,
             rawText: finalRawText,
             modelName: finalModelName,
-            task: .ocr
+            task: .ocr,
+            sourceLanguage: detectedOCRSourceLanguage
         )
         if persistHistory ?? snapshot.preferences.ocr.persistHistory {
             appendOCRHistory(model: model, result: result, image: image)
@@ -576,7 +658,19 @@ public actor TaskEngine {
         payload: WebPageTranslateSegmentsPayload,
         modelID: UUID? = nil
     ) async throws -> WebPageTranslateSegmentsResult {
+        let startedAt = Date()
         try validateWebPagePayload(payload)
+        let detectedSourceLanguage = await webPageSourceLanguageIfNeeded(
+            segments: payload.segments,
+            payload: payload
+        )
+        if let fastResult = try await translateWebPageSegmentsWithFastMTIfSelected(
+            payload: payload,
+            detectedSourceLanguage: detectedSourceLanguage,
+            startedAt: startedAt
+        ) {
+            return fastResult
+        }
         let model = try resolveModel(for: modelID)
         let persistHistory = snapshot.preferences.webPageTranslation.persistWebHistory
         var translationsByID: [String: WebPageSegmentTranslation] = [:]
@@ -599,7 +693,11 @@ public actor TaskEngine {
                 jobID: payload.jobID,
                 modelName: latestModelName,
                 segments: payload.segments,
-                translations: orderedTranslations(for: payload.segments, from: translationsByID)
+                translations: orderedTranslations(for: payload.segments, from: translationsByID),
+                translationEngineID: TranslationEngineID.llm.rawValue,
+                translationModelID: model.id.uuidString,
+                detectedSourceLanguage: detectedSourceLanguage,
+                elapsedMilliseconds: elapsedMilliseconds(since: startedAt)
             )
         }
 
@@ -621,7 +719,11 @@ public actor TaskEngine {
                 jobID: payload.jobID,
                 modelName: latestModelName,
                 segments: payload.segments,
-                translations: orderedTranslations(for: payload.segments, from: translationsByID)
+                translations: orderedTranslations(for: payload.segments, from: translationsByID),
+                translationEngineID: TranslationEngineID.llm.rawValue,
+                translationModelID: model.id.uuidString,
+                detectedSourceLanguage: detectedSourceLanguage,
+                elapsedMilliseconds: elapsedMilliseconds(since: startedAt)
             )
         }
 
@@ -643,7 +745,11 @@ public actor TaskEngine {
             jobID: payload.jobID,
             modelName: latestModelName,
             segments: payload.segments,
-            translations: orderedTranslations(for: payload.segments, from: translationsByID)
+            translations: orderedTranslations(for: payload.segments, from: translationsByID),
+            translationEngineID: TranslationEngineID.llm.rawValue,
+            translationModelID: model.id.uuidString,
+            detectedSourceLanguage: detectedSourceLanguage,
+            elapsedMilliseconds: elapsedMilliseconds(since: startedAt)
         )
     }
 
@@ -678,7 +784,7 @@ public actor TaskEngine {
         }
         descriptor.duration = normalizedAudio.duration
         let sessionID = UUID()
-        let segments = try await LocalASRProcessRunner().transcribe(
+        var segments = try await LocalASRProcessRunner().transcribe(
             audioURL: normalizedAudio.url,
             model: model,
             sessionID: sessionID,
@@ -690,6 +796,30 @@ public actor TaskEngine {
                 isFinal: true
             )
         )
+        var diarizationModelID: String?
+        var diarizationErrorCode: String?
+        var diarizationErrorMessage: String?
+        if snapshot.preferences.speakerDiarization.enabledForFileSubtitles {
+            if SpeakerTurnMapper.speakerCount(in: segments) > 0 {
+                diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
+            } else if model.capabilities.speech?.canEmitSpeakerLabels == true {
+                diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
+                diarizationErrorCode = "native_speaker_labels_missing"
+                diarizationErrorMessage = "\(model.name) supports native speaker-attributed transcription, but the configured ASR runtime returned no speaker labels. Use the model's rich transcription output instead of plain transcript text."
+            } else {
+                do {
+                    let diarization = try await speakerDiarizationService.diarize(
+                        audioURL: normalizedAudio.url,
+                        preferences: snapshot.preferences.speakerDiarization
+                    )
+                    diarizationModelID = diarization.modelID
+                    segments = SpeakerTurnMapper.apply(turns: diarization.turns, to: segments)
+                } catch {
+                    diarizationErrorCode = String(describing: type(of: error))
+                    diarizationErrorMessage = Self.userVisibleErrorMessage(error)
+                }
+            }
+        }
         let elapsed = Int(Date().timeIntervalSince(startedAt) * 1000)
         let diagnostics = MediaSubtitleDiagnostics(
             mediaKind: descriptor.mediaKind,
@@ -700,6 +830,10 @@ public actor TaskEngine {
             targetLanguage: snapshot.preferences.mediaSubtitles.defaultTargetLanguage,
             elapsedMilliseconds: elapsed,
             segmentCount: segments.count,
+            speakerCount: SpeakerTurnMapper.speakerCount(in: segments),
+            diarizationModelID: diarizationModelID,
+            diarizationErrorCode: diarizationErrorCode,
+            diarizationErrorMessage: diarizationErrorMessage,
             errorCode: nil,
             urlHash: nil,
             domainHash: nil
@@ -712,6 +846,12 @@ public actor TaskEngine {
         )
     }
 
+    private static func userVisibleErrorMessage(_ error: Error) -> String {
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? String(describing: type(of: error)) : normalized
+    }
+
     public func translateSubtitleSegments(
         _ segments: [SubtitleSegment],
         targetLanguage: String? = nil,
@@ -720,16 +860,38 @@ public actor TaskEngine {
         guard !segments.isEmpty else {
             return []
         }
-        let model = try resolveTextModel(for: modelID)
         let target = targetLanguage ?? snapshot.preferences.mediaSubtitles.defaultTargetLanguage
+        let routedSegments = await subtitleSegmentsWithDetectedSourceLanguageIfNeeded(
+            segments,
+            targetLanguage: target
+        )
+        if let fastResult = try await translateSubtitleSegmentsWithFastMTIfSelected(
+            routedSegments,
+            targetLanguage: target
+        ) {
+            return fastResult
+        }
+        let model = try resolveTextModel(for: modelID)
+        return try await translateSubtitleSegmentsWithLLM(
+            routedSegments,
+            targetLanguage: target,
+            model: model
+        )
+    }
+
+    private func translateSubtitleSegmentsWithLLM(
+        _ routedSegments: [SubtitleSegment],
+        targetLanguage target: String,
+        model: ModelDescriptor
+    ) async throws -> [SubtitleSegment] {
         var translatedByID = try await runSubtitleTranslationBatch(
-            segments: segments,
+            segments: routedSegments,
             targetLanguage: target,
             model: model,
             isRetry: false
         )
-        if translatedByID.count < segments.count {
-            let missing = segments.filter { translatedByID[$0.id.uuidString] == nil }
+        if translatedByID.count < routedSegments.count {
+            let missing = routedSegments.filter { translatedByID[$0.id.uuidString] == nil }
             let retry = try await runSubtitleTranslationBatch(
                 segments: missing,
                 targetLanguage: target,
@@ -738,20 +900,131 @@ public actor TaskEngine {
             )
             translatedByID.merge(retry) { current, _ in current }
         }
-        return segments.map { segment in
+        return routedSegments.map { segment in
             var updated = segment
             updated.translatedText = translatedByID[segment.id.uuidString]
             updated.translationModelID = model.id.uuidString
+            updated.translationEngineID = TranslationEngineID.llm.rawValue
             return updated
+        }
+    }
+
+    private func translateSubtitleSegmentsWithFastMTIfSelected(
+        _ segments: [SubtitleSegment],
+        targetLanguage: String
+    ) async throws -> [SubtitleSegment]? {
+        guard let pair = fastTranslationPair(from: segments, targetLanguage: targetLanguage) else {
+            return nil
+        }
+        let preferences = snapshot.preferences.fastTranslation
+        let supportedPairs = await fastTranslationService.supportedPairs(preferences: preferences)
+        let confidence = segments.compactMap(\.languageConfidence).max()
+        let decision = TranslationRoutingService.decide(
+            surface: .subtitle,
+            preferences: preferences,
+            pair: pair,
+            supportedPairs: supportedPairs,
+            detectedConfidence: confidence,
+            lowConfidenceThreshold: snapshot.preferences.languageRouting.lowConfidenceThreshold
+        )
+        guard decision.usesFastMT else {
+            return nil
+        }
+        do {
+            let translated = try await fastTranslationService.translate(
+                batch: segments.map { FastTranslationSegment(id: $0.id.uuidString, text: $0.originalText) },
+                pair: pair,
+                preferences: preferences
+            )
+            let translatedByID = Dictionary(uniqueKeysWithValues: translated.map { ($0.id, $0) })
+            guard translatedByID.count == segments.count else {
+                throw FastTranslationError.incompleteResponse("Fast translation did not return all subtitle segments.")
+            }
+            return segments.map { segment in
+                var updated = segment
+                if let translated = translatedByID[segment.id.uuidString] {
+                    updated.translatedText = translated.translation
+                    updated.translationEngineID = translated.engineID.rawValue
+                    updated.translationModelID = translated.modelID
+                }
+                return updated
+            }
+        } catch {
+            if preferences.fallbackPolicy == .fallbackToLLM {
+                return nil
+            }
+            throw error
+        }
+    }
+
+    private func fastTranslationPair(
+        from segments: [SubtitleSegment],
+        targetLanguage: String
+    ) -> LanguagePair? {
+        guard let target = LanguageCodeNormalizer.normalizedBCP47(targetLanguage) else {
+            return nil
+        }
+        let source = segments.lazy.compactMap { segment -> String? in
+            LanguageCodeNormalizer.normalizedBCP47(segment.sourceLanguage)
+        }.first
+        guard let source, source != target else {
+            return nil
+        }
+        return LanguagePair(source: source, target: target)
+    }
+
+    private func fastTranslationPair(
+        sourceLanguage: String,
+        targetLanguage: String
+    ) -> LanguagePair? {
+        guard let source = LanguageCodeNormalizer.normalizedBCP47(sourceLanguage),
+              let target = LanguageCodeNormalizer.normalizedBCP47(targetLanguage),
+              source != target else {
+            return nil
+        }
+        return LanguagePair(source: source, target: target)
+    }
+
+    private func fastTranslationPair(forTextRequest request: TaskRequest) async -> (pair: LanguagePair, confidence: Double)? {
+        let targetLanguage = request.targetLanguage ?? snapshot.preferences.defaultTranslationTarget
+        guard let target = LanguageCodeNormalizer.normalizedBCP47(targetLanguage) else {
+            return nil
+        }
+        if let source = LanguageCodeNormalizer.normalizedBCP47(request.sourceLanguage), source != target {
+            return (LanguagePair(source: source, target: target), 1)
+        }
+        var routingPreferences = snapshot.preferences.languageRouting
+        routingPreferences.enabled = true
+        routingPreferences.useForTextTasks = true
+        do {
+            let detected = try await languageDetectionService.detect(
+                text: languageDetectionSample([request.inputText]),
+                preferences: routingPreferences
+            )
+            guard let source = detected.language, source != target, detected.isReliable else {
+                return nil
+            }
+            return (LanguagePair(source: source, target: target), detected.confidence)
+        } catch {
+            return nil
         }
     }
 
     public func exportSubtitleSegments(
         _ segments: [SubtitleSegment],
         format: SubtitleExportFormat,
-        mode: SubtitleDisplayMode
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions = SubtitleExportOptions()
     ) throws -> String {
-        try SubtitleExporter.render(segments: segments, format: format, mode: mode)
+        try SubtitleExporter.render(segments: segments, format: format, mode: mode, options: options)
+    }
+
+    public func checkSpeakerDiarizationHealth() async -> SpeakerDiarizationHealth {
+        await speakerDiarizationService.health(preferences: snapshot.preferences.speakerDiarization)
+    }
+
+    public func checkFastTranslationHealth() async -> FastTranslationHealth {
+        await fastTranslationService.probe(preferences: snapshot.preferences.fastTranslation)
     }
 
     public func clearHistory() async throws {
@@ -895,7 +1168,10 @@ public actor TaskEngine {
                 qualityMode: payload.translationQuality,
                 isRetry: isRetry
             ),
-            sourceLanguage: payload.sourceLanguage,
+            sourceLanguage: await webPageSourceLanguageIfNeeded(
+                segments: segments,
+                payload: payload
+            ),
             targetLanguage: payload.targetLanguage
         )
         try validateInputSize(request, for: model)
@@ -908,6 +1184,290 @@ public actor TaskEngine {
             modelName: result.modelName,
             translations: parseWebPageTranslations(from: result.text, segments: segments)
         )
+    }
+
+    private func translateWebPageSegmentsWithFastMTIfSelected(
+        payload: WebPageTranslateSegmentsPayload,
+        detectedSourceLanguage: String,
+        startedAt: Date
+    ) async throws -> WebPageTranslateSegmentsResult? {
+        guard let pair = fastTranslationPair(
+            sourceLanguage: detectedSourceLanguage,
+            targetLanguage: payload.targetLanguage
+        ) else {
+            return nil
+        }
+        let preferences = snapshot.preferences.fastTranslation
+        let supportedPairs = await fastTranslationService.supportedPairs(preferences: preferences)
+        let decision = TranslationRoutingService.decide(
+            surface: .webpage,
+            preferences: preferences,
+            pair: pair,
+            supportedPairs: supportedPairs,
+            detectedConfidence: sourceLanguageIsExplicit(detectedSourceLanguage) ? 1 : nil,
+            lowConfidenceThreshold: snapshot.preferences.languageRouting.lowConfidenceThreshold,
+            domainOverride: payload.translationEngine
+        )
+        guard decision.usesFastMT else {
+            return nil
+        }
+        do {
+            let translated = try await fastTranslationService.translate(
+                batch: payload.segments.map { FastTranslationSegment(id: $0.segmentID, text: $0.text) },
+                pair: pair,
+                preferences: preferences
+            )
+            let translatedByID = Dictionary(uniqueKeysWithValues: translated.map { ($0.id, $0) })
+            let ordered = payload.segments.map { segment -> WebPageSegmentTranslation in
+                guard let translated = translatedByID[segment.segmentID] else {
+                    return WebPageSegmentTranslation(
+                        segmentID: segment.segmentID,
+                        translation: "",
+                        status: .failed,
+                        errorMessage: "Fast translation did not return this segment."
+                    )
+                }
+                return WebPageSegmentTranslation(
+                    segmentID: segment.segmentID,
+                    translation: translated.translation,
+                    status: .translated
+                )
+            }
+            let firstTranslation = translated.first
+            return webPageResult(
+                jobID: payload.jobID,
+                modelName: fastTranslationDisplayName(for: firstTranslation?.engineID ?? decision.engineID),
+                segments: payload.segments,
+                translations: ordered,
+                translationEngineID: firstTranslation?.engineID.rawValue ?? decision.engineID.rawValue,
+                translationModelID: firstTranslation?.modelID ?? decision.modelID,
+                detectedSourceLanguage: pair.source,
+                elapsedMilliseconds: elapsedMilliseconds(since: startedAt)
+            )
+        } catch {
+            if preferences.fallbackPolicy == .fallbackToLLM {
+                return nil
+            }
+            throw WebPageTranslationError(
+                code: .translationFailed,
+                message: error.localizedDescription,
+                diagnostic: "fastMT"
+            )
+        }
+    }
+
+    private func fastTranslationDisplayName(for engineID: TranslationEngineID) -> String {
+        switch engineID {
+        case .ctranslate2:
+            return "Fast MT (CTranslate2)"
+        case .argos:
+            return "Fast MT (Argos)"
+        case .customCommand:
+            return "Fast MT (Custom)"
+        case .llm:
+            return "LLM"
+        }
+    }
+
+    private func requestWithDetectedSourceLanguageIfNeeded(
+        _ request: TaskRequest,
+        surface: LanguageRoutingSurface
+    ) async -> TaskRequest {
+        guard request.task != .webPageTranslate else {
+            return request
+        }
+        guard let detected = await detectedSourceLanguageIfNeeded(
+            for: request.inputText,
+            currentSourceLanguage: request.sourceLanguage,
+            targetLanguage: request.targetLanguage ?? snapshot.preferences.defaultTranslationTarget,
+            surface: surface
+        ) else {
+            return request
+        }
+        var updated = request
+        updated.sourceLanguage = detected.language
+        return updated
+    }
+
+    private func webPageSourceLanguageIfNeeded(
+        segments: [WebPageTranslationSegment],
+        payload: WebPageTranslateSegmentsPayload
+    ) async -> String {
+        guard !sourceLanguageIsExplicit(payload.sourceLanguage) else {
+            return payload.sourceLanguage
+        }
+        let sample = languageDetectionSample(segments.map(\.text))
+        if let scriptLanguage = scriptDetectedSourceLanguage(for: sample) {
+            return scriptLanguage
+        }
+        var routingPreferences = snapshot.preferences.languageRouting
+        routingPreferences.enabled = true
+        routingPreferences.useForWebpage = true
+        return await detectedSourceLanguageIfNeeded(
+            for: sample,
+            currentSourceLanguage: payload.sourceLanguage,
+            targetLanguage: payload.targetLanguage,
+            surface: .webpage,
+            preferencesOverride: routingPreferences
+        )?.language ?? payload.sourceLanguage
+    }
+
+    private func subtitleSegmentsWithDetectedSourceLanguageIfNeeded(
+        _ segments: [SubtitleSegment],
+        targetLanguage: String
+    ) async -> [SubtitleSegment] {
+        let currentSource = segments.compactMap(\.sourceLanguage).first
+        let sample = languageDetectionSample(segments.map(\.originalText))
+        guard let detected = await detectedSourceLanguageIfNeeded(
+            for: sample,
+            currentSourceLanguage: currentSource,
+            targetLanguage: targetLanguage,
+            surface: .subtitles
+        ) else {
+            return segments
+        }
+        return segments.map { segment in
+            guard !sourceLanguageIsExplicit(segment.sourceLanguage) else {
+                return segment
+            }
+            var updated = segment
+            updated.sourceLanguage = detected.language
+            updated.languageConfidence = detected.confidence
+            updated.sourceLanguageDetectorModel = detected.detectorModel
+            return updated
+        }
+    }
+
+    private func detectedSourceLanguageIfNeeded(
+        for text: String,
+        currentSourceLanguage: String?,
+        targetLanguage: String?,
+        surface: LanguageRoutingSurface,
+        confidenceBoost: Double = 0,
+        preferencesOverride: LanguageRoutingPreferences? = nil
+    ) async -> LanguageDetectionResult? {
+        let preferences = preferencesOverride ?? snapshot.preferences.languageRouting
+        guard languageRoutingEnabled(for: surface, preferences: preferences),
+              !sourceLanguageIsExplicit(currentSourceLanguage) else {
+            return nil
+        }
+        let sample = languageDetectionSample([text])
+        guard !sample.isEmpty else {
+            return nil
+        }
+        do {
+            var result = try await languageDetectionService.detect(
+                text: sample,
+                preferences: preferences
+            )
+            guard let language = result.language else {
+                return nil
+            }
+            let effectiveConfidence = min(max(result.confidence + confidenceBoost, 0), 1)
+            guard effectiveConfidence >= preferences.lowConfidenceThreshold else {
+                return nil
+            }
+            result.language = language
+            result.confidence = effectiveConfidence
+            result.isReliable = true
+            return result
+        } catch {
+            return nil
+        }
+    }
+
+    private func languageRoutingEnabled(
+        for surface: LanguageRoutingSurface,
+        preferences: LanguageRoutingPreferences
+    ) -> Bool {
+        guard preferences.enabled else {
+            return false
+        }
+        switch surface {
+        case .text:
+            return preferences.useForTextTasks
+        case .webpage:
+            return preferences.useForWebpage
+        case .ocr:
+            return preferences.useForOCR
+        case .subtitles:
+            return preferences.useForSubtitles
+        }
+    }
+
+    private func sourceLanguageIsExplicit(_ value: String?) -> Bool {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return false
+        }
+        return value.lowercased() != "auto"
+    }
+
+    private func languageDetectionSample(_ texts: [String], maxCharacters: Int = 4_000) -> String {
+        var sample = ""
+        for text in texts {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            if !sample.isEmpty {
+                sample += "\n"
+            }
+            let remaining = maxCharacters - sample.count
+            guard remaining > 0 else {
+                break
+            }
+            sample += String(trimmed.prefix(remaining))
+            if sample.count >= maxCharacters {
+                break
+            }
+        }
+        return sample
+    }
+
+    private func scriptDetectedSourceLanguage(for text: String) -> String? {
+        var kanaCount = 0
+        var hangulCount = 0
+        var thaiCount = 0
+        var arabicCount = 0
+        var devanagariCount = 0
+        var cyrillicCount = 0
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x3040...0x30FF, 0xFF66...0xFF9F:
+                kanaCount += 1
+            case 0x1100...0x11FF, 0x3130...0x318F, 0xAC00...0xD7AF:
+                hangulCount += 1
+            case 0x0E00...0x0E7F:
+                thaiCount += 1
+            case 0x0600...0x06FF, 0x0750...0x077F, 0x08A0...0x08FF:
+                arabicCount += 1
+            case 0x0900...0x097F:
+                devanagariCount += 1
+            case 0x0400...0x04FF, 0x0500...0x052F:
+                cyrillicCount += 1
+            default:
+                continue
+            }
+        }
+        if kanaCount >= 2 {
+            return "ja"
+        }
+        if hangulCount >= 2 {
+            return "ko"
+        }
+        if thaiCount >= 2 {
+            return "th"
+        }
+        if arabicCount >= 2 {
+            return "ar"
+        }
+        if devanagariCount >= 2 {
+            return "hi"
+        }
+        if cyrillicCount >= 2 {
+            return "ru"
+        }
+        return nil
     }
 
     private func translateWebPageSegmentsBySplitting(
@@ -925,10 +1485,15 @@ public actor TaskEngine {
         if segments.count == 1 {
             let segment = segments[0]
             do {
+                let sourceLanguage = await webPageSourceLanguageIfNeeded(
+                    segments: [segment],
+                    payload: payload
+                )
                 let result = try await run(
                     request: TaskRequest(
                         task: .translate,
                         inputText: segment.text,
+                        sourceLanguage: sourceLanguage,
                         targetLanguage: payload.targetLanguage
                     ),
                     modelID: model.id,
@@ -1162,13 +1727,23 @@ public actor TaskEngine {
         jobID: String,
         modelName: String,
         segments: [WebPageTranslationSegment],
-        translations: [WebPageSegmentTranslation]
+        translations: [WebPageSegmentTranslation],
+        translationEngineID: String = TranslationEngineID.llm.rawValue,
+        translationModelID: String? = nil,
+        detectedSourceLanguage: String? = nil,
+        elapsedMilliseconds: Int? = nil,
+        fallbackReason: String? = nil
     ) -> WebPageTranslateSegmentsResult {
         let sourceCharacters = segments.reduce(0) { $0 + $1.text.count }
         let targetCharacters = translations.reduce(0) { $0 + $1.translation.count }
         return WebPageTranslateSegmentsResult(
             jobID: jobID,
             modelName: modelName,
+            translationEngineID: translationEngineID,
+            translationModelID: translationModelID,
+            detectedSourceLanguage: detectedSourceLanguage,
+            elapsedMilliseconds: elapsedMilliseconds,
+            fallbackReason: fallbackReason,
             translations: translations,
             usage: WebPageTranslationUsage(
                 sourceCharacters: sourceCharacters,
@@ -1368,7 +1943,7 @@ public actor TaskEngine {
             return 2
         case .qwen3ASR06B:
             return 3
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal, .none:
+        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
             return 4
         }
     }
@@ -1376,7 +1951,7 @@ public actor TaskEngine {
     private func appendHistory(model: ModelDescriptor, result: TaskResult, request: TaskRequest) {
         let entry = HistoryItem(
             task: request.task,
-            modelName: model.name,
+            modelName: result.modelName,
             inputPreview: request.inputText.prefix(160).description,
             outputPreview: result.text.prefix(240).description
         )
@@ -1488,5 +2063,9 @@ public actor TaskEngine {
         default:
             return "60m+"
         }
+    }
+
+    private func elapsedMilliseconds(since startedAt: Date) -> Int {
+        max(0, Int(Date().timeIntervalSince(startedAt) * 1000))
     }
 }

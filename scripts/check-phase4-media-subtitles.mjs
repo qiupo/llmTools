@@ -59,14 +59,25 @@ async function run() {
 
   for (const relativePath of [
 				    "scripts/check-phase4-local-asr-runtime.mjs",
+				    "scripts/check-phase4x-language-routing.mjs",
+				    "scripts/check-phase4x-speaker-diarization.mjs",
+				    "scripts/check-phase4x-fast-mt.mjs",
 				    "scripts/llmtools-mlx-asr-runner.sh",
 				    "scripts/llmtools-streaming-asr-sidecar.py",
+				    "scripts/llmtools-lid-sidecar.py",
+				    "scripts/llmtools-fastmt-sidecar.py",
+				    "scripts/llmtools-pyannote-diarization-sidecar.py",
 				    "scripts/llmtools-whisper-coreml-runner.sh",
 				    "scripts/install-phase4-mlx-asr-runtime.sh",
 		    "scripts/install-phase4-funasr-mlx-runtime.sh",
 		    "scripts/install-phase4-funasr-nano-mlx-runtime.sh",
 		    "scripts/install-phase4-sensevoice-mlx-runtime.sh",
-		    "scripts/install-phase4-whisper-coreml-runtime.sh"
+		    "scripts/install-phase4-whisper-coreml-runtime.sh",
+		    "scripts/install-phase4x-fasttext-lid.sh",
+		    "scripts/install-phase4x-ctranslate2-en-zh.sh",
+		    "scripts/install-phase4x-nllb-200-distilled-600m.sh",
+		    "scripts/install-phase4x-argos.sh",
+		    "scripts/install-phase4x-pyannote-diarization.sh"
 		  ]) {
     await assertFile(relativePath);
   }
@@ -87,6 +98,8 @@ async function run() {
   const appDelegate = await read("Sources/LLMToolsApp/AppDelegate.swift");
   const appState = await read("Sources/LLMToolsApp/AppState.swift");
   const captureService = await read("Sources/LLMToolsApp/LiveSubtitleCaptureService.swift");
+  const modelTypes = await read("Sources/LLMToolsCore/ModelTypes.swift");
+  const languageNormalizer = await read("Sources/LLMToolsCore/LanguageCodeNormalizer.swift");
   const mediaTypes = await read("Sources/LLMToolsCore/MediaSubtitleTypes.swift");
   const mediaServices = await read("Sources/LLMToolsCore/MediaSubtitleServices.swift");
   const settingsView = await read("Sources/LLMToolsApp/Views.swift");
@@ -104,6 +117,16 @@ async function run() {
     "offscreen-audio.html",
     "tabCapture"
   ], "browser extension background");
+  for (const needle of [
+    "webPageTranslationCacheV2",
+    "TRANSLATION_CACHE_KEY_V1",
+    "migrateTranslationCacheV1ToV2",
+    "translationEngineID",
+    "translationEngineModelID",
+    "sourceLanguage"
+  ]) {
+    assertIncludes(background, needle, "browser extension webpage cache v2");
+  }
   assertExcludes(contentScript, [
     "liveSubtitleStart",
     "liveSubtitleEvents",
@@ -214,12 +237,45 @@ async function run() {
   );
 
   for (const needle of [
+    "LanguagePair",
+    "TranslationEngineID",
+    "languageID",
+    "speakerDiarization",
+    "fastTranslation",
+    "LanguageRoutingPreferences",
+    "SpeakerDiarizationPreferences",
+    "FastTranslationPreferences"
+  ]) {
+    assertIncludes(modelTypes, needle, "Phase 4.x foundation model types");
+  }
+  for (const needle of [
+    "LanguageCodeNormalizer",
+    "normalizedBCP47",
+    "nllbCode",
+    "argosCode",
+    "LLMTOOLS_LID_FIXTURE_JSON",
+    "LLMTOOLS_FAST_MT_FIXTURE_JSON",
+    "LLMTOOLS_DIARIZATION_FIXTURE_JSON"
+  ]) {
+    assertIncludes(languageNormalizer, needle, "Phase 4.x language normalization and fixture names");
+  }
+  for (const needle of [
     "funASRCommandTemplate",
     "senseVoiceCommandTemplate",
 	    "qwen3ASRCommandTemplate",
 	    "whisperCommandTemplate",
 	    "genericASRCommandTemplate",
     "sourceLanguageHint",
+    "sourceLanguageDetectorModel",
+    "speakerID",
+    "speakerLabel",
+    "speakerConfidence",
+    "speakerCount",
+				    "diarizationModelID",
+				    "diarizationErrorCode",
+				    "diarizationErrorMessage",
+    "SubtitleExportOptions",
+    "translationEngineID",
     "liveAudioSource",
     "liveWindowOpacity",
     "ASRRuntimeSource",
@@ -384,12 +440,20 @@ async function run() {
 		  assertIncludes(packageScript, "browser-extension", "packaged app resources");
 				  assertIncludes(packageScript, "llmtools-mlx-asr-runner.sh", "packaged app ASR resources");
 				  assertIncludes(packageScript, "llmtools-streaming-asr-sidecar.py", "packaged app streaming ASR resources");
+				  assertIncludes(packageScript, "llmtools-lid-sidecar.py", "packaged app LID resources");
+				  assertIncludes(packageScript, "llmtools-fastmt-sidecar.py", "packaged app fast MT resources");
+				  assertIncludes(packageScript, "llmtools-pyannote-diarization-sidecar.py", "packaged app diarization resources");
 				  assertIncludes(packageScript, "llmtools-whisper-coreml-runner.sh", "packaged app whisper CoreML ASR resources");
 			  assertIncludes(packageScript, "install-phase4-mlx-asr-runtime.sh", "packaged app ASR installer resources");
 			  assertIncludes(packageScript, "install-phase4-funasr-mlx-runtime.sh", "packaged app Fun-ASR ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-funasr-nano-mlx-runtime.sh", "packaged app Fun-ASR-Nano ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-sensevoice-mlx-runtime.sh", "packaged app SenseVoice ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-whisper-coreml-runtime.sh", "packaged app whisper CoreML ASR installer resources");
+				  assertIncludes(packageScript, "install-phase4x-fasttext-lid.sh", "packaged app LID installer resources");
+				  assertIncludes(packageScript, "install-phase4x-ctranslate2-en-zh.sh", "packaged app CTranslate2 fast MT installer resources");
+				  assertIncludes(packageScript, "install-phase4x-nllb-200-distilled-600m.sh", "packaged app NLLB fast MT installer resources");
+				  assertIncludes(packageScript, "install-phase4x-argos.sh", "packaged app Argos fast MT installer resources");
+				  assertIncludes(packageScript, "install-phase4x-pyannote-diarization.sh", "packaged app diarization installer resources");
 	  assertIncludes(packageScript, "chmod +x", "packaged app ASR script executability");
   assertIncludes(packageManifest, "LLMToolsMediaSmoke", "Phase 4 media smoke executable");
 

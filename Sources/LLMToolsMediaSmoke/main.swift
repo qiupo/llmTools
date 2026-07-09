@@ -57,6 +57,34 @@ struct LLMToolsMediaSmoke {
         guard translated.contains(where: { ($0.translatedText ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false }) else {
             throw SmokeError("Subtitle translation produced no translated text.")
         }
+        let fastMTFixture = FastMTFixture(
+            engine: TranslationEngineID.ctranslate2.rawValue,
+            model: "fixture-opus-mt-en-zh",
+            supportedPairs: [LanguagePair(source: "en", target: "zh-Hans")],
+            segments: fileResult.segments.map {
+                FastMTFixtureSegment(id: $0.id.uuidString, translation: "fast fixture \($0.index)")
+            },
+            latencyMilliseconds: 12
+        )
+        let fastMTFixtureData = try JSONEncoder().encode(fastMTFixture)
+        setenv(Phase4XFixtureEnvironment.fastTranslationJSON, String(data: fastMTFixtureData, encoding: .utf8) ?? "{}", 1)
+        defer {
+            unsetenv(Phase4XFixtureEnvironment.fastTranslationJSON)
+        }
+        var fastMTPreferences = await engine.registry().preferences
+        fastMTPreferences.fastTranslation.subtitleEngine = .fastMT
+        fastMTPreferences.fastTranslation.fallbackPolicy = .showError
+        try await engine.setPreferences(fastMTPreferences)
+        let fastMTInput = fileResult.segments.map { segment -> SubtitleSegment in
+            var updated = segment
+            updated.sourceLanguage = "en"
+            updated.languageConfidence = 0.99
+            return updated
+        }
+        let fastMTTranslated = try await engine.translateSubtitleSegments(fastMTInput, targetLanguage: "zh-Hans")
+        guard fastMTTranslated.allSatisfy({ $0.translationEngineID == TranslationEngineID.ctranslate2.rawValue }) else {
+            throw SmokeError("Fast MT fixture path did not mark subtitle translations with the fast MT engine.")
+        }
 
         var exported: [String: String] = [:]
         for format in SubtitleExportFormat.allCases {
@@ -74,6 +102,7 @@ struct LLMToolsMediaSmoke {
             segmentCount: fileResult.segments.count,
             firstTranscript: fileResult.segments.first?.originalText ?? "",
             firstTranslation: translated.first?.translatedText ?? "",
+            fastMTFirstTranslation: fastMTTranslated.first?.translatedText ?? "",
             exported: exported,
             diagnostics: fileResult.diagnostics
         )
@@ -180,8 +209,34 @@ private struct MediaSmokeSummary: Encodable {
     var segmentCount: Int
     var firstTranscript: String
     var firstTranslation: String
+    var fastMTFirstTranslation: String
     var exported: [String: String]
     var diagnostics: MediaSubtitleDiagnostics
+}
+
+private struct FastMTFixture: Encodable {
+    var protocolName = "llmtools.fastmt/v1"
+    var type = "translation"
+    var engine: String
+    var model: String
+    var supportedPairs: [LanguagePair]
+    var segments: [FastMTFixtureSegment]
+    var latencyMilliseconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case protocolName = "protocol"
+        case type
+        case engine
+        case model
+        case supportedPairs
+        case segments
+        case latencyMilliseconds
+    }
+}
+
+private struct FastMTFixtureSegment: Encodable {
+    var id: String
+    var translation: String
 }
 
 private struct SmokeError: Error, CustomStringConvertible {

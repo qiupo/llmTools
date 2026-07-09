@@ -6,7 +6,8 @@ const REMOTE_SEGMENTS_PER_BATCH = 5;
 const REMOTE_CHARS_PER_BATCH = 900;
 const MENU_TOGGLE_ID = "llmtools-toggle-page";
 const TARGET_LANGUAGE = "zh-Hans";
-const TRANSLATION_CACHE_KEY = "webPageTranslationCacheV1";
+const TRANSLATION_CACHE_KEY_V1 = "webPageTranslationCacheV1";
+const TRANSLATION_CACHE_KEY = "webPageTranslationCacheV2";
 const TRANSLATION_CACHE_MAX_ENTRIES = 2000;
 const DOMAIN_RULES_KEY = "webPageDomainRulesV1";
 const PAGE_DEFAULTS_KEY = "webPageDomainDefaultsV1";
@@ -22,6 +23,11 @@ const DISCOVERY_SCOPE_PAGE = "page";
 const QUALITY_MODE_NATURAL = "natural";
 const QUALITY_MODE_LITERAL = "literal";
 const QUALITY_MODE_TECHNICAL = "technical";
+const TRANSLATION_ENGINE_AUTO = "auto";
+const TRANSLATION_ENGINE_LLM = "llm";
+const TRANSLATION_ENGINE_FAST_MT = "fastMT";
+const TRANSLATION_ENGINE_ID_FAST_MT = "ctranslate2";
+const SOURCE_LANGUAGE_AUTO = "auto";
 const DEFAULT_PENDING_INDICATOR_STYLE = "loading";
 const NATIVE_REQUEST_TIMEOUT_MS = 130000;
 const LOCAL_MODEL_CONCURRENCY = 1;
@@ -34,10 +40,10 @@ const EXTENSION_TEXT = {
     pageChangedReady: "页面已变化。就绪。",
     translated: "已翻译。",
     localAppConnected: "本地应用已连接。",
-    discoveringVisibleEnglish: "正在发现可见英文文本...",
-    discoveringPageEnglish: "正在发现整页英文文本...",
-    noVisibleEnglishText: "没有找到可见英文文本。",
-    noPageEnglishText: "没有找到页面英文文本。",
+    discoveringVisibleText: "正在发现可见文本...",
+    discoveringPageText: "正在发现整页文本...",
+    noVisibleText: "没有找到可翻译的可见文本。",
+    noPageText: "没有找到可翻译的页面文本。",
     unsupportedBrowserPage: "当前浏览器页面不支持网页翻译。请打开 http:// 或 https:// 网页后再试。",
     unsupportedPdfPage: "当前 PDF 页面暂不支持网页翻译。请先下载 PDF，或等待后续文档翻译流程。",
     contentScriptInjectionFailed: "无法访问当前页面进行翻译。浏览器可能禁止扩展在此页面运行。",
@@ -94,10 +100,10 @@ const EXTENSION_TEXT = {
     pageChangedReady: "Page changed. Ready.",
     translated: "Translated.",
     localAppConnected: "Local app connected.",
-    discoveringVisibleEnglish: "Discovering visible English text...",
-    discoveringPageEnglish: "Discovering full-page English text...",
-    noVisibleEnglishText: "No visible English text found.",
-    noPageEnglishText: "No English page text found.",
+    discoveringVisibleText: "Discovering visible text...",
+    discoveringPageText: "Discovering full-page text...",
+    noVisibleText: "No translatable visible text found.",
+    noPageText: "No translatable page text found.",
     unsupportedBrowserPage: "This browser page cannot be translated. Open an http:// or https:// webpage and try again.",
     unsupportedPdfPage: "PDF pages cannot be translated here yet. Download the PDF or use a later document-translation flow.",
     contentScriptInjectionFailed: "Cannot access this page for translation. The browser may block extensions on this page.",
@@ -159,6 +165,10 @@ let nativeDisabledDomains = [];
 let nativeDomainRulesLoaded = false;
 let nativeDomainReadingModes = {};
 let nativeDomainTranslationQualities = {};
+let nativeDomainTranslationEngines = {};
+let nativeWebPageTranslationEngine = TRANSLATION_ENGINE_LLM;
+let nativeWebPageTranslationEngineID = TRANSLATION_ENGINE_LLM;
+let nativeWebPageTranslationEngineModelID = "";
 let nativePageDefaultsLoaded = false;
 let pendingIndicatorStyle = DEFAULT_PENDING_INDICATOR_STYLE;
 let currentAppLanguage = DEFAULT_APP_LANGUAGE;
@@ -229,14 +239,14 @@ function discoveryScopeLabel(scope, language = currentAppLanguage) {
 
 function discoveringMessageForScope(scope, language = currentAppLanguage) {
   return normalizeDiscoveryScope(scope) === DISCOVERY_SCOPE_PAGE
-    ? t("discoveringPageEnglish", {}, language)
-    : t("discoveringVisibleEnglish", {}, language);
+    ? t("discoveringPageText", {}, language)
+    : t("discoveringVisibleText", {}, language);
 }
 
 function noTextMessageForScope(scope, language = currentAppLanguage) {
   return normalizeDiscoveryScope(scope) === DISCOVERY_SCOPE_PAGE
-    ? t("noPageEnglishText", {}, language)
-    : t("noVisibleEnglishText", {}, language);
+    ? t("noPageText", {}, language)
+    : t("noVisibleText", {}, language);
 }
 
 function normalizeTranslationQuality(mode) {
@@ -258,6 +268,47 @@ function optionalTranslationQuality(mode) {
     return mode;
   }
   return "";
+}
+
+function normalizeTranslationEngine(engine) {
+  if (engine === TRANSLATION_ENGINE_FAST_MT || engine === TRANSLATION_ENGINE_AUTO) {
+    return engine;
+  }
+  return TRANSLATION_ENGINE_LLM;
+}
+
+function optionalTranslationEngine(engine) {
+  const normalized = normalizeTranslationEngine(engine);
+  return normalized === TRANSLATION_ENGINE_LLM ? "" : normalized;
+}
+
+function translationEngineIDForPreference(engine) {
+  switch (normalizeTranslationEngine(engine)) {
+  case TRANSLATION_ENGINE_FAST_MT:
+    return TRANSLATION_ENGINE_ID_FAST_MT;
+  case TRANSLATION_ENGINE_AUTO:
+    return TRANSLATION_ENGINE_AUTO;
+  case TRANSLATION_ENGINE_LLM:
+  default:
+    return TRANSLATION_ENGINE_LLM;
+  }
+}
+
+function translationEngineModelIDForPreference(engine, fallbackModelID = "") {
+  switch (normalizeTranslationEngine(engine)) {
+  case TRANSLATION_ENGINE_FAST_MT:
+    return "fastmt";
+  case TRANSLATION_ENGINE_AUTO:
+    return TRANSLATION_ENGINE_AUTO;
+  case TRANSLATION_ENGINE_LLM:
+  default:
+    return fallbackModelID || "";
+  }
+}
+
+function normalizeSourceLanguage(language) {
+  const normalized = String(language || SOURCE_LANGUAGE_AUTO).trim().toLowerCase();
+  return normalized || SOURCE_LANGUAGE_AUTO;
 }
 
 function translationQualityLabel(mode, language = currentAppLanguage) {
@@ -312,6 +363,10 @@ function normalizedReadingModeDefaults(value) {
 
 function normalizedTranslationQualityDefaults(value) {
   return normalizedModeMap(value, optionalTranslationQuality);
+}
+
+function normalizedTranslationEngineDefaults(value) {
+  return normalizedModeMap(value, optionalTranslationEngine);
 }
 
 function permissionOriginsForDomain(domain = "") {
@@ -504,6 +559,15 @@ function redactedDiagnosticsForState(state = {}) {
         Boolean(state.modelIsRemoteProvider)
       )
     },
+    translation: {
+      engine: state.translationEngine || "",
+      engineID: state.translationEngineID || "",
+      engineModelID: state.translationEngineModelID || "",
+      detectedSource: state.detectedSourceLanguage || "",
+      target: state.targetLanguage || TARGET_LANGUAGE,
+      elapsedMs: Math.max(0, Number(state.translationElapsedMs) || 0),
+      fallbackReason: state.translationFallbackReason || ""
+    },
     controls: {
       readingMode: normalizeReadingMode(state.readingMode),
       translationQuality: normalizeTranslationQuality(state.translationQuality),
@@ -636,7 +700,8 @@ async function handleMessage(message, sender) {
     case "setDomainPageDefaults":
       return setDomainPageDefaultsForTab(tabID, message?.tabURL || sender?.tab?.url || "", {
         readingMode: message?.readingMode,
-        translationQuality: message?.translationQuality
+        translationQuality: message?.translationQuality,
+        translationEngine: message?.translationEngine
       });
     case "llmToolsRouteChanged":
       return handleContentRouteChanged(tabID, message);
@@ -673,6 +738,14 @@ function getState(tabID) {
       translationQuality: QUALITY_MODE_NATURAL,
       translationQualityLabel: translationQualityLabel(QUALITY_MODE_NATURAL),
       translationQualityOverridden: false,
+      translationEngine: TRANSLATION_ENGINE_LLM,
+      translationEngineID: TRANSLATION_ENGINE_LLM,
+      translationEngineModelID: "",
+      domainTranslationEngineDefault: "",
+      detectedSourceLanguage: "",
+      targetLanguage: TARGET_LANGUAGE,
+      translationElapsedMs: 0,
+      translationFallbackReason: "",
       pendingIndicatorStyle: DEFAULT_PENDING_INDICATOR_STYLE,
       pendingIndicatorStyleLabel: pendingIndicatorStyleLabel(DEFAULT_PENDING_INDICATOR_STYLE),
       unsupportedEmbeddedContent: emptyUnsupportedEmbeddedContent(),
@@ -696,6 +769,9 @@ function stateFor(tabID, status, message, patch = {}) {
   const readingMode = normalizeReadingMode(patch.readingMode || current.readingMode);
   const discoveryScope = normalizeDiscoveryScope(patch.discoveryScope || current.discoveryScope);
   const translationQuality = normalizeTranslationQuality(patch.translationQuality || current.translationQuality);
+  const translationEngine = normalizeTranslationEngine(patch.translationEngine || current.translationEngine || nativeWebPageTranslationEngine);
+  const translationEngineID = patch.translationEngineID || current.translationEngineID || translationEngineIDForPreference(translationEngine);
+  const translationEngineModelID = patch.translationEngineModelID || current.translationEngineModelID || translationEngineModelIDForPreference(translationEngine, nativeWebPageTranslationEngineModelID);
   const nextPendingIndicatorStyle = normalizePendingIndicatorStyle(
     patch.pendingIndicatorStyle || current.pendingIndicatorStyle || pendingIndicatorStyle
   );
@@ -715,6 +791,9 @@ function stateFor(tabID, status, message, patch = {}) {
     discoveryScopeLabel: discoveryScopeLabel(discoveryScope, appLanguage),
     translationQuality,
     translationQualityLabel: translationQualityLabel(translationQuality, appLanguage),
+    translationEngine,
+    translationEngineID,
+    translationEngineModelID,
     pendingIndicatorStyle: nextPendingIndicatorStyle,
     pendingIndicatorStyleLabel: pendingIndicatorStyleLabel(nextPendingIndicatorStyle, appLanguage),
     unsupportedEmbeddedContent,
@@ -865,17 +944,18 @@ async function saveDomainRules(rules) {
 
 async function loadPageDefaults() {
   if (!chrome.storage?.local) {
-    return { readingModes: {}, translationQualities: {} };
+    return { readingModes: {}, translationQualities: {}, translationEngines: {} };
   }
   try {
     const result = await chrome.storage.local.get(PAGE_DEFAULTS_KEY);
     const defaults = result?.[PAGE_DEFAULTS_KEY];
     return {
       readingModes: normalizedReadingModeDefaults(defaults?.readingModes),
-      translationQualities: normalizedTranslationQualityDefaults(defaults?.translationQualities)
+      translationQualities: normalizedTranslationQualityDefaults(defaults?.translationQualities),
+      translationEngines: normalizedTranslationEngineDefaults(defaults?.translationEngines)
     };
   } catch {
-    return { readingModes: {}, translationQualities: {} };
+    return { readingModes: {}, translationQualities: {}, translationEngines: {} };
   }
 }
 
@@ -886,7 +966,8 @@ async function savePageDefaults(defaults) {
   await chrome.storage.local.set({
     [PAGE_DEFAULTS_KEY]: {
       readingModes: normalizedReadingModeDefaults(defaults?.readingModes),
-      translationQualities: normalizedTranslationQualityDefaults(defaults?.translationQualities)
+      translationQualities: normalizedTranslationQualityDefaults(defaults?.translationQualities),
+      translationEngines: normalizedTranslationEngineDefaults(defaults?.translationEngines)
     }
   }).catch(() => {});
 }
@@ -941,17 +1022,20 @@ async function domainPageDefaultsForURL(url = "") {
   if (!domain) {
     return {
       domainReadingModeDefault: "",
-      domainTranslationQualityDefault: ""
+      domainTranslationQualityDefault: "",
+      domainTranslationEngineDefault: ""
     };
   }
   const localDefaults = nativePageDefaultsLoaded
-    ? { readingModes: {}, translationQualities: {} }
+    ? { readingModes: {}, translationQualities: {}, translationEngines: {} }
     : await loadPageDefaults();
   const nativeReadingMode = nativePageDefaultsLoaded ? nativeDomainReadingModes[domain] : "";
   const nativeTranslationQuality = nativePageDefaultsLoaded ? nativeDomainTranslationQualities[domain] : "";
+  const nativeTranslationEngine = nativePageDefaultsLoaded ? nativeDomainTranslationEngines[domain] : "";
   return {
     domainReadingModeDefault: optionalReadingMode(nativeReadingMode || localDefaults.readingModes?.[domain]),
-    domainTranslationQualityDefault: optionalTranslationQuality(nativeTranslationQuality || localDefaults.translationQualities?.[domain])
+    domainTranslationQualityDefault: optionalTranslationQuality(nativeTranslationQuality || localDefaults.translationQualities?.[domain]),
+    domainTranslationEngineDefault: optionalTranslationEngine(nativeTranslationEngine || localDefaults.translationEngines?.[domain])
   };
 }
 
@@ -961,7 +1045,8 @@ async function domainStatePatch(tabID, fallbackURL = "", options = {}) {
       domain: "",
       domainRule: DOMAIN_RULE_ASK,
       domainReadingModeDefault: "",
-      domainTranslationQualityDefault: ""
+      domainTranslationQualityDefault: "",
+      domainTranslationEngineDefault: ""
     };
   }
   const url = await currentTabURL(tabID, fallbackURL);
@@ -977,6 +1062,11 @@ async function domainStatePatch(tabID, fallbackURL = "", options = {}) {
   }
   if ((options.forcePageDefaults || !current.translationQualityOverridden) && defaultsPatch.domainTranslationQualityDefault) {
     patch.translationQuality = defaultsPatch.domainTranslationQualityDefault;
+  }
+  if (defaultsPatch.domainTranslationEngineDefault) {
+    patch.translationEngine = defaultsPatch.domainTranslationEngineDefault;
+    patch.translationEngineID = translationEngineIDForPreference(defaultsPatch.domainTranslationEngineDefault);
+    patch.translationEngineModelID = translationEngineModelIDForPreference(defaultsPatch.domainTranslationEngineDefault, nativeWebPageTranslationEngineModelID);
   }
   return patch;
 }
@@ -1093,23 +1183,27 @@ async function setDomainPageDefaultsForTab(tabID, fallbackURL = "", requestedDef
       appLanguage: language,
       domain: "",
       domainReadingModeDefault: "",
-      domainTranslationQualityDefault: ""
+      domainTranslationQualityDefault: "",
+      domainTranslationEngineDefault: ""
     });
   }
   const readingMode = optionalReadingMode(requestedDefaults.readingMode);
   const translationQuality = optionalTranslationQuality(requestedDefaults.translationQuality);
+  const translationEngine = optionalTranslationEngine(requestedDefaults.translationEngine);
 
   try {
     const response = await nativeRequest("setDomainPageDefaults", {
       domain,
       ...(readingMode ? { readingMode } : {}),
-      ...(translationQuality ? { translationQuality } : {})
+      ...(translationQuality ? { translationQuality } : {}),
+      ...(translationEngine ? { translationEngine } : {})
     }, { tabID });
     const payload = response?.payload || {};
     nativeDomainReadingModes = normalizedReadingModeDefaults(payload.domainReadingModes);
     nativeDomainTranslationQualities = normalizedTranslationQualityDefaults(payload.domainTranslationQualities);
+    nativeDomainTranslationEngines = normalizedTranslationEngineDefaults(payload.domainTranslationEngines);
     nativePageDefaultsLoaded = true;
-    await savePageDefaults({ readingModes: {}, translationQualities: {} });
+    await savePageDefaults({ readingModes: {}, translationQualities: {}, translationEngines: {} });
   } catch {
     nativePageDefaultsLoaded = false;
     const defaults = await loadPageDefaults();
@@ -1118,6 +1212,9 @@ async function setDomainPageDefaultsForTab(tabID, fallbackURL = "", requestedDef
     }
     if (translationQuality) {
       defaults.translationQualities[domain] = translationQuality;
+    }
+    if (translationEngine) {
+      defaults.translationEngines[domain] = translationEngine;
     }
     await savePageDefaults(defaults);
   }
@@ -1132,6 +1229,9 @@ async function setDomainPageDefaultsForTab(tabID, fallbackURL = "", requestedDef
     ...defaultPatch,
     readingMode: defaultPatch.domainReadingModeDefault || current.readingMode,
     translationQuality: defaultPatch.domainTranslationQualityDefault || current.translationQuality,
+    translationEngine: defaultPatch.domainTranslationEngineDefault || current.translationEngine,
+    translationEngineID: translationEngineIDForPreference(defaultPatch.domainTranslationEngineDefault || current.translationEngine),
+    translationEngineModelID: translationEngineModelIDForPreference(defaultPatch.domainTranslationEngineDefault || current.translationEngine, nativeWebPageTranslationEngineModelID),
     readingModeOverridden: readingMode ? false : current.readingModeOverridden,
     translationQualityOverridden: translationQuality ? false : current.translationQualityOverridden,
     notice: true
@@ -1167,6 +1267,11 @@ function getJob(tabID) {
       discoveryScope: normalizeDiscoveryScope(getState(tabID).discoveryScope),
       readingMode: normalizeReadingMode(getState(tabID).readingMode),
       translationQuality: normalizeTranslationQuality(getState(tabID).translationQuality),
+      translationEngine: normalizeTranslationEngine(getState(tabID).translationEngine),
+      translationEngineID: getState(tabID).translationEngineID || TRANSLATION_ENGINE_LLM,
+      translationEngineModelID: getState(tabID).translationEngineModelID || "",
+      sourceLanguage: SOURCE_LANGUAGE_AUTO,
+      cacheSourceLanguage: SOURCE_LANGUAGE_AUTO,
       unsupportedEmbeddedContent: emptyUnsupportedEmbeddedContent()
     });
   }
@@ -1196,11 +1301,15 @@ async function checkStatus(tabID) {
   );
   const localPendingIndicatorStyle = await loadLocalPendingIndicatorStyle();
   pendingIndicatorStyle = normalizePendingIndicatorStyle(payload.pendingIndicatorStyle || localPendingIndicatorStyle);
+  nativeWebPageTranslationEngine = normalizeTranslationEngine(payload.webPageTranslationEngine);
+  nativeWebPageTranslationEngineID = payload.webPageTranslationEngineID || translationEngineIDForPreference(nativeWebPageTranslationEngine);
+  nativeWebPageTranslationEngineModelID = payload.webPageTranslationEngineModelID || translationEngineModelIDForPreference(nativeWebPageTranslationEngine);
   nativeAutoTranslateDomains = normalizedDomainList(payload.autoTranslateDomains);
   nativeDisabledDomains = normalizedDomainList(payload.disabledDomains);
   nativeDomainRulesLoaded = true;
   nativeDomainReadingModes = normalizedReadingModeDefaults(payload.domainReadingModes);
   nativeDomainTranslationQualities = normalizedTranslationQualityDefaults(payload.domainTranslationQualities);
+  nativeDomainTranslationEngines = normalizedTranslationEngineDefaults(payload.domainTranslationEngines);
   nativePageDefaultsLoaded = true;
   const current = await getSyncedState(tabID).catch(() => getState(tabID));
   const domainPatch = await domainStatePatch(tabID).catch(() => ({
@@ -1214,6 +1323,9 @@ async function checkStatus(tabID) {
       modelName,
       modelIsRemoteProvider,
       maxConcurrentTranslationRequests,
+      translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
+      translationEngineID: translationEngineIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine),
+      translationEngineModelID: translationEngineModelIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine, nativeWebPageTranslationEngineModelID),
       pendingIndicatorStyle
     });
   }
@@ -1223,6 +1335,9 @@ async function checkStatus(tabID) {
     modelName,
     modelIsRemoteProvider,
     maxConcurrentTranslationRequests,
+    translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
+    translationEngineID: translationEngineIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine),
+    translationEngineModelID: translationEngineModelIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine, nativeWebPageTranslationEngineModelID),
     pendingIndicatorStyle,
     hasTranslations: false,
     done: 0,
@@ -1399,6 +1514,11 @@ async function translatePage(tabID, options = {}) {
     discoveryScope: requestedDiscoveryScope,
     readingMode: normalizeReadingMode(getState(tabID).readingMode),
     translationQuality: normalizeTranslationQuality(getState(tabID).translationQuality),
+    translationEngine: normalizeTranslationEngine(domainPatch.domainTranslationEngineDefault || status.translationEngine || nativeWebPageTranslationEngine),
+    translationEngineID: translationEngineIDForPreference(domainPatch.domainTranslationEngineDefault || status.translationEngine || nativeWebPageTranslationEngine),
+    translationEngineModelID: translationEngineModelIDForPreference(domainPatch.domainTranslationEngineDefault || status.translationEngine || nativeWebPageTranslationEngine, nativeWebPageTranslationEngineModelID),
+    sourceLanguage: SOURCE_LANGUAGE_AUTO,
+    cacheSourceLanguage: SOURCE_LANGUAGE_AUTO,
     unsupportedEmbeddedContent: emptyUnsupportedEmbeddedContent()
   };
   tabJobs.set(tabID, job);
@@ -1413,6 +1533,11 @@ async function translatePage(tabID, options = {}) {
     done: 0,
     failed: 0,
     discoveryScope: job.discoveryScope,
+    translationEngine: job.translationEngine,
+    translationEngineID: job.translationEngineID,
+    translationEngineModelID: job.translationEngineModelID,
+    targetLanguage: job.targetLanguage,
+    detectedSourceLanguage: job.sourceLanguage,
     total: 0,
     hasTranslations: false,
     pageSessionID: job.pageSessionID,
@@ -1650,9 +1775,10 @@ async function translateAndApplyBatch(tabID, job, batch) {
   updateTranslatingState(tabID, job);
   const result = await nativeRequest("translateSegments", {
     jobID: job.jobID,
-    sourceLanguage: "en",
+    sourceLanguage: job.sourceLanguage || SOURCE_LANGUAGE_AUTO,
     targetLanguage: TARGET_LANGUAGE,
     translationQuality: job.translationQuality,
+    translationEngine: job.translationEngine,
     urlHash: job.urlHash,
     title: job.title,
     segments: batch.toTranslate.map((segment) => ({
@@ -1672,6 +1798,14 @@ async function translateAndApplyBatch(tabID, job, batch) {
   const translationsByHash = new Map();
   const cacheEntries = [];
   job.modelName = result?.payload?.modelName || job.modelName;
+  job.translationEngineID = result?.payload?.translationEngineID || job.translationEngineID;
+  job.translationEngineModelID = result?.payload?.translationModelID || job.translationEngineModelID;
+  job.sourceLanguage = result?.payload?.detectedSourceLanguage || job.sourceLanguage || SOURCE_LANGUAGE_AUTO;
+  job.translationElapsedMs = result?.payload?.elapsedMilliseconds || job.translationElapsedMs || 0;
+  job.translationFallbackReason = result?.payload?.fallbackReason || "";
+  job.translationEngine = job.translationEngineID === TRANSLATION_ENGINE_ID_FAST_MT
+    ? TRANSLATION_ENGINE_FAST_MT
+    : normalizeTranslationEngine(job.translationEngine);
   for (const translation of translations) {
     const source = batch.toTranslate.find((segment) => segment.segmentID === translation.segmentID);
     if (source) {
@@ -1715,6 +1849,13 @@ function updateTranslatingState(tabID, job) {
     modelName: job.modelName,
     modelIsRemoteProvider: job.modelIsRemoteProvider,
     maxConcurrentTranslationRequests: job.maxConcurrentTranslationRequests,
+    translationEngine: job.translationEngine,
+    translationEngineID: job.translationEngineID,
+    translationEngineModelID: job.translationEngineModelID,
+    detectedSourceLanguage: job.sourceLanguage,
+    targetLanguage: job.targetLanguage,
+    translationElapsedMs: job.translationElapsedMs,
+    translationFallbackReason: job.translationFallbackReason,
     pageSessionID: job.pageSessionID,
     jobID: job.jobID,
     diagnosticStartedAt: job.startedAt,
@@ -2003,7 +2144,7 @@ async function hydrateJobCache(job, segments) {
   }
   const cache = await loadJobStorageCache(job);
   for (const segment of segments) {
-    const entry = cache[translationCacheID(job, segment)];
+    const entry = findStoredTranslationCacheEntry(job, segment, cache);
     if (entry?.sourceText === segment.text && entry.translation) {
       setCachedTranslation(job, segment, entry.translation);
     }
@@ -2025,8 +2166,61 @@ function setCachedTranslation(job, segment, translation) {
   job.cache.set(translationCacheID(job, segment), translation);
 }
 
+function findStoredTranslationCacheEntry(job, segment, cache) {
+  const directEntry = cache?.[translationCacheID(job, segment)];
+  if (translationCacheEntryMatches(job, segment, directEntry, { allowAnySource: true })) {
+    return directEntry;
+  }
+  if (normalizeSourceLanguage(job.cacheSourceLanguage || job.sourceLanguage) !== SOURCE_LANGUAGE_AUTO) {
+    return null;
+  }
+  let newestMatch = null;
+  for (const entry of Object.values(cache || {})) {
+    if (!translationCacheEntryMatches(job, segment, entry, { allowAnySource: true })) {
+      continue;
+    }
+    if (!newestMatch || (entry.updatedAt || 0) > (newestMatch.updatedAt || 0)) {
+      newestMatch = entry;
+    }
+  }
+  return newestMatch;
+}
+
+function translationCacheEntryMatches(job, segment, entry, options = {}) {
+  if (!entry?.translation || entry.sourceText !== segment.text || entry.textHash !== segment.textHash) {
+    return false;
+  }
+  const target = job.targetLanguage || TARGET_LANGUAGE;
+  if ((entry.targetLanguage || TARGET_LANGUAGE) !== target) {
+    return false;
+  }
+  const domain = normalizeDomain(job.domain || "");
+  if (normalizeDomain(entry.domain || "") !== domain) {
+    return false;
+  }
+  const engineID = job.translationEngineID || translationEngineIDForPreference(job.translationEngine);
+  if ((entry.translationEngineID || TRANSLATION_ENGINE_LLM) !== engineID) {
+    return false;
+  }
+  const engineModelID = job.translationEngineModelID || "";
+  const entryEngineModelID = entry.translationEngineModelID || "";
+  if (entryEngineModelID !== engineModelID) {
+    return false;
+  }
+  if (options.allowAnySource) {
+    return true;
+  }
+  return normalizeSourceLanguage(entry.sourceLanguage) === normalizeSourceLanguage(job.cacheSourceLanguage || job.sourceLanguage);
+}
+
 function translationCacheID(job, segment) {
-  return `${job.targetLanguage || TARGET_LANGUAGE}:${normalizeTranslationQuality(job.translationQuality)}:${job.urlHash || ""}:${segment.textHash}`;
+  const target = job.targetLanguage || TARGET_LANGUAGE;
+  const engineID = job.translationEngineID || translationEngineIDForPreference(job.translationEngine);
+  const engineModelID = job.translationEngineModelID || "";
+  const source = normalizeSourceLanguage(job.cacheSourceLanguage || job.sourceLanguage);
+  const domain = normalizeDomain(job.domain || "");
+  const material = `${segment.textHash || ""}|${domain}|${target}|${engineID}|${engineModelID}|${source}`;
+  return `v2:${redactedHash(material)}`;
 }
 
 function cacheEntryForSegment(job, segment, translation) {
@@ -2036,6 +2230,10 @@ function cacheEntryForSegment(job, segment, translation) {
     translation,
     targetLanguage: job.targetLanguage || TARGET_LANGUAGE,
     translationQuality: normalizeTranslationQuality(job.translationQuality),
+    translationEngineID: job.translationEngineID || translationEngineIDForPreference(job.translationEngine),
+    translationEngineModelID: job.translationEngineModelID || "",
+    sourceLanguage: normalizeSourceLanguage(job.cacheSourceLanguage || job.sourceLanguage),
+    detectedSourceLanguage: normalizeSourceLanguage(job.sourceLanguage),
     urlHash: job.urlHash || "",
     domain: job.domain || "",
     textHash: segment.textHash,
@@ -2068,12 +2266,50 @@ async function loadTranslationCache() {
     return {};
   }
   try {
-    const result = await chrome.storage.local.get(TRANSLATION_CACHE_KEY);
+    const result = await chrome.storage.local.get([TRANSLATION_CACHE_KEY, TRANSLATION_CACHE_KEY_V1]);
     const cache = result?.[TRANSLATION_CACHE_KEY];
-    return cache && typeof cache === "object" ? cache : {};
+    if (cache && typeof cache === "object") {
+      return cache;
+    }
+    const legacyCache = result?.[TRANSLATION_CACHE_KEY_V1];
+    if (!legacyCache || typeof legacyCache !== "object") {
+      return {};
+    }
+    const migrated = migrateTranslationCacheV1ToV2(legacyCache);
+    await chrome.storage.local.set({ [TRANSLATION_CACHE_KEY]: migrated }).catch(() => {});
+    return migrated;
   } catch {
     return {};
   }
+}
+
+function migrateTranslationCacheV1ToV2(cacheV1) {
+  const migrated = {};
+  for (const entry of Object.values(cacheV1 || {})) {
+    if (!entry?.textHash || !entry.translation) {
+      continue;
+    }
+    const target = entry.targetLanguage || TARGET_LANGUAGE;
+    const domain = normalizeDomain(entry.domain || "");
+    const source = normalizeSourceLanguage(entry.cacheSourceLanguage || SOURCE_LANGUAGE_AUTO);
+    const engineID = entry.translationEngineID || TRANSLATION_ENGINE_LLM;
+    const engineModelID = entry.translationEngineModelID || entry.modelName || "";
+    const material = `${entry.textHash}|${domain}|${target}|${engineID}|${engineModelID}|${source}`;
+    const id = `v2:${redactedHash(material)}`;
+    migrated[id] = {
+      ...entry,
+      id,
+      targetLanguage: target,
+      domain,
+      sourceLanguage: source,
+      detectedSourceLanguage: normalizeSourceLanguage(entry.detectedSourceLanguage || entry.sourceLanguage || source),
+      translationEngineID: engineID,
+      translationEngineModelID: engineModelID,
+      migratedFrom: TRANSLATION_CACHE_KEY_V1,
+      updatedAt: entry.updatedAt || Date.now()
+    };
+  }
+  return migrated;
 }
 
 async function clearStoredTranslationsForURL(urlHash, targetLanguage = TARGET_LANGUAGE) {
@@ -2107,7 +2343,7 @@ async function clearStoredTranslations() {
   const cache = await loadTranslationCache();
   const removed = Object.keys(cache).length;
   if (removed > 0) {
-    await chrome.storage.local.set({ [TRANSLATION_CACHE_KEY]: {} }).catch(() => {});
+    await chrome.storage.local.set({ [TRANSLATION_CACHE_KEY]: {}, [TRANSLATION_CACHE_KEY_V1]: {} }).catch(() => {});
   }
   return removed;
 }

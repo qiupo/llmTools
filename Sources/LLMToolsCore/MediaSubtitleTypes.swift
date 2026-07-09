@@ -13,6 +13,7 @@ public enum SpeechModelFamily: String, Codable, Sendable, CaseIterable, Identifi
     case senseVoiceSmall
     case qwen3ASR06B
     case qwen3ASRSherpaOnnx
+    case vibeVoiceASR
     case whisperCppCoreML
     case customLocal
 
@@ -48,6 +49,7 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
     public var modes: [SpeechRuntimeMode]
     public var supportedLanguageHints: [String]
     public var requiresLocalSidecar: Bool
+    public var canEmitSpeakerLabels: Bool
     public var source: ModelCapabilitySource
     public var confidence: Double
     public var note: String?
@@ -59,6 +61,7 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
         modes: [SpeechRuntimeMode],
         supportedLanguageHints: [String] = [],
         requiresLocalSidecar: Bool = true,
+        canEmitSpeakerLabels: Bool = false,
         source: ModelCapabilitySource = .unknown,
         confidence: Double = 0.5,
         note: String? = nil,
@@ -69,11 +72,57 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
         self.modes = SpeechModelCapabilities.normalizedModes(modes)
         self.supportedLanguageHints = Array(Set(supportedLanguageHints)).sorted()
         self.requiresLocalSidecar = requiresLocalSidecar
+        self.canEmitSpeakerLabels = canEmitSpeakerLabels
         self.source = source
         self.confidence = min(max(confidence, 0), 1)
         self.note = note
         self.lastCheckedAt = lastCheckedAt
         self.lastFailureMessage = lastFailureMessage
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case family
+        case modes
+        case supportedLanguageHints
+        case requiresLocalSidecar
+        case canEmitSpeakerLabels
+        case source
+        case confidence
+        case note
+        case lastCheckedAt
+        case lastFailureMessage
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        family = try container.decode(SpeechModelFamily.self, forKey: .family)
+        modes = SpeechModelCapabilities.normalizedModes(
+            try container.decodeIfPresent([SpeechRuntimeMode].self, forKey: .modes) ?? []
+        )
+        supportedLanguageHints = Array(Set(
+            try container.decodeIfPresent([String].self, forKey: .supportedLanguageHints) ?? []
+        )).sorted()
+        requiresLocalSidecar = try container.decodeIfPresent(Bool.self, forKey: .requiresLocalSidecar) ?? true
+        canEmitSpeakerLabels = try container.decodeIfPresent(Bool.self, forKey: .canEmitSpeakerLabels) ?? false
+        source = try container.decodeIfPresent(ModelCapabilitySource.self, forKey: .source) ?? .unknown
+        confidence = min(max(try container.decodeIfPresent(Double.self, forKey: .confidence) ?? 0.5, 0), 1)
+        note = try container.decodeIfPresent(String.self, forKey: .note)
+        lastCheckedAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckedAt)
+        lastFailureMessage = try container.decodeIfPresent(String.self, forKey: .lastFailureMessage)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(family, forKey: .family)
+        try container.encode(modes, forKey: .modes)
+        try container.encode(supportedLanguageHints, forKey: .supportedLanguageHints)
+        try container.encode(requiresLocalSidecar, forKey: .requiresLocalSidecar)
+        try container.encode(canEmitSpeakerLabels, forKey: .canEmitSpeakerLabels)
+        try container.encode(source, forKey: .source)
+        try container.encode(confidence, forKey: .confidence)
+        try container.encodeIfPresent(note, forKey: .note)
+        try container.encodeIfPresent(lastCheckedAt, forKey: .lastCheckedAt)
+        try container.encodeIfPresent(lastFailureMessage, forKey: .lastFailureMessage)
     }
 
     public func supports(_ mode: SpeechRuntimeMode) -> Bool {
@@ -189,6 +238,23 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
         )
     }
 
+    public static func vibeVoiceASR(
+        source: ModelCapabilitySource = .inferred,
+        confidence: Double = 0.8,
+        note: String? = "VibeVoice-ASR local ASR model. Heavy file-only rich transcription model that can emit text with speaker and timestamp metadata when the configured runtime preserves it."
+    ) -> SpeechModelCapabilities {
+        SpeechModelCapabilities(
+            family: .vibeVoiceASR,
+            modes: [.fileOnly],
+            supportedLanguageHints: ["auto", "zh", "en"],
+            requiresLocalSidecar: true,
+            canEmitSpeakerLabels: true,
+            source: source,
+            confidence: confidence,
+            note: note
+        )
+    }
+
     private static func normalizedModes(_ modes: [SpeechRuntimeMode]) -> [SpeechRuntimeMode] {
         let unique = Set(modes)
         return SpeechRuntimeMode.allCases.filter { unique.contains($0) }
@@ -221,6 +287,27 @@ public enum SubtitleExportFormat: String, Codable, Sendable, CaseIterable, Ident
     }
 }
 
+public enum SpeakerPrefixFormat: String, Codable, Sendable, CaseIterable, Hashable {
+    case colon
+    case bracketed
+}
+
+public struct SubtitleExportOptions: Codable, Hashable, Sendable {
+    public var includeSpeakerLabels: Bool
+    public var speakerFormat: SpeakerPrefixFormat
+    public var includeTranslationMetadata: Bool
+
+    public init(
+        includeSpeakerLabels: Bool = true,
+        speakerFormat: SpeakerPrefixFormat = .colon,
+        includeTranslationMetadata: Bool = true
+    ) {
+        self.includeSpeakerLabels = includeSpeakerLabels
+        self.speakerFormat = speakerFormat
+        self.includeTranslationMetadata = includeTranslationMetadata
+    }
+}
+
 public enum ASRRuntimeSource: String, Codable, Sendable, Hashable {
     case settingsCommand
     case environmentCommand
@@ -230,6 +317,7 @@ public enum ASRRuntimeSource: String, Codable, Sendable, Hashable {
     case sherpaOnnxQwen3Runner
     case whisperCppCoreMLRunner
     case funASRGGUFAuto
+    case vibeVoiceASRRunner
     case unavailable
 }
 
@@ -253,6 +341,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     public var senseVoiceCommandTemplate: String
     public var funASRCommandTemplate: String
     public var qwen3ASRCommandTemplate: String
+    public var vibeVoiceASRCommandTemplate: String
     public var whisperCommandTemplate: String
     public var genericASRCommandTemplate: String
     public var liveAudioSource: LiveSubtitleAudioSource
@@ -274,6 +363,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         senseVoiceCommandTemplate: String = "",
         funASRCommandTemplate: String = "",
         qwen3ASRCommandTemplate: String = "",
+        vibeVoiceASRCommandTemplate: String = "",
         whisperCommandTemplate: String = "",
         genericASRCommandTemplate: String = "",
         liveAudioSource: LiveSubtitleAudioSource = .systemAndMicrophone,
@@ -294,6 +384,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         self.senseVoiceCommandTemplate = Self.normalizedCommandTemplate(senseVoiceCommandTemplate)
         self.funASRCommandTemplate = Self.normalizedCommandTemplate(funASRCommandTemplate)
         self.qwen3ASRCommandTemplate = Self.normalizedCommandTemplate(qwen3ASRCommandTemplate)
+        self.vibeVoiceASRCommandTemplate = Self.normalizedCommandTemplate(vibeVoiceASRCommandTemplate)
         self.whisperCommandTemplate = Self.normalizedCommandTemplate(whisperCommandTemplate)
         self.genericASRCommandTemplate = Self.normalizedCommandTemplate(genericASRCommandTemplate)
         self.liveAudioSource = liveAudioSource
@@ -316,6 +407,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         case senseVoiceCommandTemplate
         case funASRCommandTemplate
         case qwen3ASRCommandTemplate
+        case vibeVoiceASRCommandTemplate
         case whisperCommandTemplate
         case genericASRCommandTemplate
         case liveAudioSource
@@ -345,6 +437,9 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         )
         qwen3ASRCommandTemplate = Self.normalizedCommandTemplate(
             try container.decodeIfPresent(String.self, forKey: .qwen3ASRCommandTemplate) ?? defaults.qwen3ASRCommandTemplate
+        )
+        vibeVoiceASRCommandTemplate = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .vibeVoiceASRCommandTemplate) ?? defaults.vibeVoiceASRCommandTemplate
         )
         whisperCommandTemplate = Self.normalizedCommandTemplate(
             try container.decodeIfPresent(String.self, forKey: .whisperCommandTemplate) ?? defaults.whisperCommandTemplate
@@ -430,6 +525,10 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
             }
         case .qwen3ASRSherpaOnnx:
             break
+        case .vibeVoiceASR:
+            if let command = Self.nonEmpty(vibeVoiceASRCommandTemplate) {
+                return command
+            }
         case .whisperCppCoreML:
             if let command = Self.nonEmpty(whisperCommandTemplate) {
                 return command
@@ -464,9 +563,14 @@ public struct SubtitleSegment: Codable, Identifiable, Hashable, Sendable {
     public var translatedText: String?
     public var sourceLanguage: String?
     public var languageConfidence: Double?
+    public var sourceLanguageDetectorModel: String?
+    public var speakerID: String?
+    public var speakerLabel: String?
+    public var speakerConfidence: Double?
     public var isFinal: Bool
     public var asrModelID: String
     public var translationModelID: String?
+    public var translationEngineID: String?
 
     public init(
         id: UUID = UUID(),
@@ -478,9 +582,14 @@ public struct SubtitleSegment: Codable, Identifiable, Hashable, Sendable {
         translatedText: String? = nil,
         sourceLanguage: String? = nil,
         languageConfidence: Double? = nil,
+        sourceLanguageDetectorModel: String? = nil,
+        speakerID: String? = nil,
+        speakerLabel: String? = nil,
+        speakerConfidence: Double? = nil,
         isFinal: Bool = true,
         asrModelID: String,
-        translationModelID: String? = nil
+        translationModelID: String? = nil,
+        translationEngineID: String? = nil
     ) {
         self.id = id
         self.sessionID = sessionID
@@ -492,9 +601,14 @@ public struct SubtitleSegment: Codable, Identifiable, Hashable, Sendable {
         self.translatedText = translatedText
         self.sourceLanguage = sourceLanguage
         self.languageConfidence = languageConfidence
+        self.sourceLanguageDetectorModel = sourceLanguageDetectorModel
+        self.speakerID = speakerID
+        self.speakerLabel = speakerLabel
+        self.speakerConfidence = speakerConfidence.map { min(max($0, 0), 1) }
         self.isFinal = isFinal
         self.asrModelID = asrModelID
         self.translationModelID = translationModelID
+        self.translationEngineID = translationEngineID
     }
 }
 
@@ -575,6 +689,10 @@ public struct MediaSubtitleDiagnostics: Codable, Hashable, Sendable {
     public var targetLanguage: String
     public var elapsedMilliseconds: Int
     public var segmentCount: Int
+    public var speakerCount: Int?
+    public var diarizationModelID: String?
+    public var diarizationErrorCode: String?
+    public var diarizationErrorMessage: String?
     public var errorCode: String?
     public var urlHash: String?
     public var domainHash: String?
@@ -588,6 +706,10 @@ public struct MediaSubtitleDiagnostics: Codable, Hashable, Sendable {
         targetLanguage: String,
         elapsedMilliseconds: Int,
         segmentCount: Int,
+        speakerCount: Int? = nil,
+        diarizationModelID: String? = nil,
+        diarizationErrorCode: String? = nil,
+        diarizationErrorMessage: String? = nil,
         errorCode: String? = nil,
         urlHash: String? = nil,
         domainHash: String? = nil
@@ -600,6 +722,10 @@ public struct MediaSubtitleDiagnostics: Codable, Hashable, Sendable {
         self.targetLanguage = targetLanguage
         self.elapsedMilliseconds = elapsedMilliseconds
         self.segmentCount = segmentCount
+        self.speakerCount = speakerCount
+        self.diarizationModelID = diarizationModelID
+        self.diarizationErrorCode = diarizationErrorCode
+        self.diarizationErrorMessage = diarizationErrorMessage
         self.errorCode = errorCode
         self.urlHash = urlHash
         self.domainHash = domainHash

@@ -5,20 +5,25 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>llmTools</title>
   <style>
+    * {
+      box-sizing: border-box;
+    }
     body {
       margin: 0;
-      min-width: 270px;
-      font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      width: 420px;
+      min-width: 420px;
+      font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       color: #202124;
-      background: #ffffff;
+      background: #f8fafd;
     }
     .wrap {
-      padding: 12px;
+      padding: 10px;
       display: grid;
-      gap: 10px;
+      gap: 8px;
     }
     .top {
-      display: flex;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
       align-items: center;
       gap: 8px;
     }
@@ -33,27 +38,55 @@
       font-weight: 700;
     }
     .title {
+      min-width: 0;
       font-weight: 650;
+      line-height: 1.25;
     }
     .status {
       color: #5f6368;
-      min-height: 18px;
       line-height: 1.35;
+    }
+    #model {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .status-panel {
+      display: grid;
+      gap: 5px;
+      padding: 7px 8px 8px;
+      border: 1px solid #e3e6ea;
+      border-radius: 8px;
+      background: #ffffff;
     }
     .diagnostics {
       color: #6f7479;
-      font-size: 11px;
+      font-size: 10.5px;
       line-height: 1.35;
       overflow-wrap: anywhere;
     }
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 6px;
+    }
     .site-rule {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 8px;
+      grid-template-columns: 64px minmax(0, 1fr);
+      gap: 6px;
       align-items: center;
-      border: 1px solid #e8eaed;
-      border-radius: 6px;
-      padding: 7px 8px;
+      min-width: 0;
+      border: 1px solid #e3e6ea;
+      border-radius: 7px;
+      padding: 6px;
+      background: #ffffff;
+    }
+    .site-rule.wide {
+      grid-column: 1 / -1;
+      grid-template-columns: minmax(0, 1fr) 188px;
+    }
+    .site-rule.has-default {
+      grid-template-columns: 52px minmax(0, 1fr);
     }
     .site {
       min-width: 0;
@@ -64,26 +97,31 @@
       font-weight: 500;
     }
     select {
-      max-width: 145px;
+      width: 100%;
+      min-width: 0;
       border: 1px solid #dadce0;
       border-radius: 6px;
       background: #fff;
       color: #202124;
-      padding: 5px 7px;
+      padding: 4px 7px;
       font: inherit;
+      height: 28px;
     }
     .control-stack {
       display: grid;
-      gap: 5px;
-      justify-items: end;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 4px;
+      align-items: center;
+      min-width: 0;
     }
     .site-default {
-      padding: 4px 7px;
-      font-size: 11px;
+      min-width: 38px;
+      padding: 4px 5px;
+      font-size: 10.5px;
       line-height: 1.2;
     }
     .progress {
-      height: 6px;
+      height: 4px;
       border-radius: 999px;
       background: #e8eaed;
       overflow: hidden;
@@ -96,11 +134,10 @@
     }
     .actions {
       display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
+      grid-template-columns: 1.4fr 1fr 1fr 0.8fr 0.8fr;
+      gap: 6px;
     }
     .cache-actions {
-      grid-column: 1 / -1;
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 6px;
@@ -110,9 +147,12 @@
       border-radius: 6px;
       background: #fff;
       color: #202124;
-      padding: 7px 9px;
+      min-width: 0;
+      height: 30px;
+      padding: 5px 8px;
       font: inherit;
       cursor: pointer;
+      white-space: nowrap;
     }
     button.primary {
       background: #1a73e8;
@@ -134,65 +174,69 @@
         <div id="model" class="status">正在检查本地应用...</div>
       </div>
     </div>
-    <div id="status" class="status">就绪</div>
-    <div id="diagnostics" class="diagnostics" hidden></div>
-    <div class="site-rule">
-      <div id="domain" class="site">当前网站</div>
-      <select id="domainRule">
-        <option value="ask">手动翻译</option>
-        <option value="alwaysTranslate">自动翻译此网站</option>
-        <option value="neverTranslate">不翻译此网站</option>
-      </select>
+    <div class="status-panel">
+      <div id="status" class="status">就绪</div>
+      <div id="diagnostics" class="diagnostics" hidden></div>
+      <div class="progress"><div id="bar" class="bar"></div></div>
     </div>
-    <div class="site-rule">
-      <div class="site">阅读模式</div>
-      <div class="control-stack">
-        <select id="readingMode" aria-label="阅读模式">
-          <option value="replace">替换译文</option>
-          <option value="bilingual">双语对照</option>
-          <option value="original">原文</option>
+    <div class="settings-grid">
+      <div class="site-rule wide">
+        <div id="domain" class="site">当前网站</div>
+        <select id="domainRule">
+          <option value="ask">手动翻译</option>
+          <option value="alwaysTranslate">自动翻译此网站</option>
+          <option value="neverTranslate">不翻译此网站</option>
         </select>
-        <button id="saveReadingDefault" class="site-default" title="保存为当前网站默认阅读模式">站点默认</button>
+      </div>
+      <div class="site-rule has-default">
+        <label class="site" for="readingMode">阅读模式</label>
+        <div class="control-stack">
+          <select id="readingMode" aria-label="阅读模式">
+            <option value="replace">替换译文</option>
+            <option value="bilingual">双语对照</option>
+            <option value="original">原文</option>
+          </select>
+          <button id="saveReadingDefault" class="site-default" title="保存为当前网站默认阅读模式">默认</button>
+        </div>
+      </div>
+      <div class="site-rule">
+        <label class="site" for="discoveryScope">翻译范围</label>
+        <select id="discoveryScope" aria-label="翻译范围">
+          <option value="visible">可视区域优先</option>
+          <option value="page">全页预翻译</option>
+        </select>
+      </div>
+      <div class="site-rule has-default">
+        <label class="site" for="translationQuality">翻译质量</label>
+        <div class="control-stack">
+          <select id="translationQuality" aria-label="翻译质量">
+            <option value="natural">自然</option>
+            <option value="literal">直译</option>
+            <option value="technical">技术术语</option>
+          </select>
+          <button id="saveQualityDefault" class="site-default" title="保存为当前网站默认翻译质量">默认</button>
+        </div>
+      </div>
+      <div class="site-rule">
+        <label class="site" for="pendingIndicatorStyle">待翻译样式</label>
+        <select id="pendingIndicatorStyle" aria-label="待翻译样式">
+          <option value="loading">Loading</option>
+          <option value="flipText">翻牌</option>
+          <option value="none">无样式</option>
+        </select>
       </div>
     </div>
-    <div class="site-rule">
-      <div class="site">翻译范围</div>
-      <select id="discoveryScope" aria-label="翻译范围">
-        <option value="visible">可视区域优先</option>
-        <option value="page">全页预翻译</option>
-      </select>
-    </div>
-    <div class="site-rule">
-      <div class="site">翻译质量</div>
-      <div class="control-stack">
-        <select id="translationQuality" aria-label="翻译质量">
-          <option value="natural">自然</option>
-          <option value="literal">直译</option>
-          <option value="technical">技术术语</option>
-        </select>
-        <button id="saveQualityDefault" class="site-default" title="保存为当前网站默认翻译质量">站点默认</button>
-      </div>
-    </div>
-    <div class="site-rule">
-      <div class="site">待翻译样式</div>
-      <select id="pendingIndicatorStyle" aria-label="待翻译样式">
-        <option value="loading">Loading</option>
-        <option value="flipText">翻牌</option>
-        <option value="none">无样式</option>
-      </select>
-    </div>
-    <div class="progress"><div id="bar" class="bar"></div></div>
     <div class="actions">
       <button id="translate" class="primary">翻译页面</button>
       <button id="retranslate">重译</button>
       <button id="restore">恢复原文</button>
       <button id="cancel">取消</button>
       <button id="statusBtn">测试</button>
-      <div class="cache-actions">
-        <button id="clearPageCache" title="清除当前页面的缓存译文">清页</button>
-        <button id="clearDomainCache" title="清除当前网站的缓存译文">清站</button>
-        <button id="clearAllCache" title="清除全部网页缓存译文">清全</button>
-      </div>
+    </div>
+    <div class="cache-actions">
+      <button id="clearPageCache" title="清除当前页面的缓存译文">清页</button>
+      <button id="clearDomainCache" title="清除当前网站的缓存译文">清站</button>
+      <button id="clearAllCache" title="清除全部网页缓存译文">清全</button>
     </div>
   </div>
   <script src="popup.js"></script>

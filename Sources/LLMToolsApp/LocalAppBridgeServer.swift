@@ -141,16 +141,20 @@ final class LocalAppBridgeServer {
                         appName: "llmTools",
                         protocolVersion: 1,
                         bridgeReady: true,
-                        modelName: appState.webPageTranslationModelDisplayName(limit: 48),
-                        modelIsRemoteProvider: appState.webPageTranslationModelIsRemote,
+                        modelName: webPageTranslationBridgeModelName,
+                        modelIsRemoteProvider: webPageTranslationBridgeModelIsRemote,
                         maxConcurrentTranslationRequests: appState.webPageTranslationConcurrencyLimit,
                         appLanguage: appState.preferences.appLanguage.rawValue,
                         webPageTranslationEnabled: appState.preferences.webPageTranslation.enabled,
+                        webPageTranslationEngine: appState.preferences.fastTranslation.engine(for: .webPageTranslate).rawValue,
+                        webPageTranslationEngineID: webPageTranslationEngineID,
+                        webPageTranslationEngineModelID: webPageTranslationEngineModelID,
                         pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue,
                         autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
                         disabledDomains: appState.preferences.webPageTranslation.disabledDomains,
                         domainReadingModes: domainReadingModePayload,
                         domainTranslationQualities: domainTranslationQualityPayload,
+                        domainTranslationEngines: domainTranslationEnginePayload,
                         mediaSubtitlesEnabled: appState.preferences.mediaSubtitles.isEnabled,
                         liveSubtitleModelName: appState.selectedRealtimeASRModel?.name,
                         liveSubtitleTargetLanguage: appState.appLiveSubtitleTargetLanguage,
@@ -201,7 +205,8 @@ final class LocalAppBridgeServer {
                 let response = setDomainPageDefaults(
                     domain: payload.domain,
                     readingMode: payload.readingMode,
-                    translationQuality: payload.translationQuality
+                    translationQuality: payload.translationQuality,
+                    translationEngine: payload.translationEngine
                 )
                 sendResponse(connection: connection, statusCode: 200, payload: response)
             case ("POST", "/setPendingIndicatorStyle"):
@@ -378,14 +383,16 @@ final class LocalAppBridgeServer {
     private func setDomainPageDefaults(
         domain rawDomain: String,
         readingMode rawReadingMode: String?,
-        translationQuality rawTranslationQuality: String?
+        translationQuality rawTranslationQuality: String?,
+        translationEngine rawTranslationEngine: String?
     ) -> DomainPageDefaultsResponsePayload {
         let domain = normalizedDomain(rawDomain)
         guard !domain.isEmpty else {
             return DomainPageDefaultsResponsePayload(
                 domain: "",
                 domainReadingModes: domainReadingModePayload,
-                domainTranslationQualities: domainTranslationQualityPayload
+                domainTranslationQualities: domainTranslationQualityPayload,
+                domainTranslationEngines: domainTranslationEnginePayload
             )
         }
 
@@ -395,6 +402,9 @@ final class LocalAppBridgeServer {
             )
             preferences.webPageTranslation.domainTranslationQualities = self.normalizedQualityDefaults(
                 preferences.webPageTranslation.domainTranslationQualities
+            )
+            preferences.webPageTranslation.domainTranslationEngines = self.normalizedEngineDefaults(
+                preferences.webPageTranslation.domainTranslationEngines
             )
             if let rawReadingMode {
                 if let readingMode = WebPageReadingMode(rawValue: rawReadingMode) {
@@ -410,12 +420,20 @@ final class LocalAppBridgeServer {
                     preferences.webPageTranslation.domainTranslationQualities.removeValue(forKey: domain)
                 }
             }
+            if let rawTranslationEngine {
+                if let translationEngine = FastTranslationSurfaceEngine(rawValue: rawTranslationEngine), translationEngine != .auto {
+                    preferences.webPageTranslation.domainTranslationEngines[domain] = translationEngine
+                } else {
+                    preferences.webPageTranslation.domainTranslationEngines.removeValue(forKey: domain)
+                }
+            }
         }
 
         return DomainPageDefaultsResponsePayload(
             domain: domain,
             domainReadingModes: domainReadingModePayload,
-            domainTranslationQualities: domainTranslationQualityPayload
+            domainTranslationQualities: domainTranslationQualityPayload,
+            domainTranslationEngines: domainTranslationEnginePayload
         )
     }
 
@@ -447,6 +465,58 @@ final class LocalAppBridgeServer {
         }
     }
 
+    private var domainTranslationEnginePayload: [String: String] {
+        appState.preferences.webPageTranslation.domainTranslationEngines.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value.rawValue
+        }
+    }
+
+    private var webPageTranslationEngineID: String {
+        switch appState.preferences.fastTranslation.engine(for: .webPageTranslate) {
+        case .fastMT:
+            return TranslationEngineID.ctranslate2.rawValue
+        case .auto:
+            return "auto"
+        case .llm:
+            return TranslationEngineID.llm.rawValue
+        }
+    }
+
+    private var webPageTranslationEngineModelID: String {
+        switch appState.preferences.fastTranslation.engine(for: .webPageTranslate) {
+        case .fastMT:
+            return "fastmt"
+        case .auto:
+            return "auto"
+        case .llm:
+            return appState.webPageTranslationModelID?.uuidString ?? ""
+        }
+    }
+
+    private var webPageTranslationBridgeModelName: String {
+        switch appState.preferences.fastTranslation.engine(for: .webPageTranslate) {
+        case .fastMT:
+            return appState.preferences.appLanguage == .chinese ? "快速 MT (CTranslate2)" : "Fast MT (CTranslate2)"
+        case .auto:
+            return appState.preferences.appLanguage == .chinese ? "自动引擎" : "Auto engine"
+        case .llm:
+            return appState.webPageTranslationModelDisplayName(limit: 48)
+        }
+    }
+
+    private var webPageTranslationBridgeModelIsRemote: Bool {
+        switch appState.preferences.fastTranslation.engine(for: .webPageTranslate) {
+        case .fastMT, .auto:
+            return false
+        case .llm:
+            return appState.webPageTranslationModelIsRemote
+        }
+    }
+
     private func normalizedReadingModeDefaults(_ values: [String: WebPageReadingMode]) -> [String: WebPageReadingMode] {
         values.reduce(into: [:]) { result, item in
             let domain = normalizedDomain(item.key)
@@ -461,6 +531,16 @@ final class LocalAppBridgeServer {
         values.reduce(into: [:]) { result, item in
             let domain = normalizedDomain(item.key)
             guard !domain.isEmpty else {
+                return
+            }
+            result[domain] = item.value
+        }
+    }
+
+    private func normalizedEngineDefaults(_ values: [String: FastTranslationSurfaceEngine]) -> [String: FastTranslationSurfaceEngine] {
+        values.reduce(into: [:]) { result, item in
+            let domain = normalizedDomain(item.key)
+            guard !domain.isEmpty, item.value != .auto else {
                 return
             }
             result[domain] = item.value
@@ -527,11 +607,15 @@ private struct BridgeStatusPayload: Codable {
     var maxConcurrentTranslationRequests: Int
     var appLanguage: String
     var webPageTranslationEnabled: Bool
+    var webPageTranslationEngine: String
+    var webPageTranslationEngineID: String
+    var webPageTranslationEngineModelID: String
     var pendingIndicatorStyle: String
     var autoTranslateDomains: [String]
     var disabledDomains: [String]
     var domainReadingModes: [String: String]
     var domainTranslationQualities: [String: String]
+    var domainTranslationEngines: [String: String]
     var mediaSubtitlesEnabled: Bool
     var liveSubtitleModelName: String?
     var liveSubtitleTargetLanguage: String
@@ -556,6 +640,7 @@ private struct SetDomainPageDefaultsPayload: Codable {
     var domain: String
     var readingMode: String?
     var translationQuality: String?
+    var translationEngine: String?
 }
 
 private struct SetPendingIndicatorStylePayload: Codable {
@@ -573,6 +658,7 @@ private struct DomainPageDefaultsResponsePayload: Codable {
     var domain: String
     var domainReadingModes: [String: String]
     var domainTranslationQualities: [String: String]
+    var domainTranslationEngines: [String: String]
 }
 
 private struct PendingIndicatorStyleResponsePayload: Codable {

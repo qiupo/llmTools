@@ -167,10 +167,21 @@ final class AppState: ObservableObject {
     @Published var mediaSubtitleFileURL: URL?
     @Published var mediaSubtitleDescriptor: MediaFileDescriptor?
     @Published var mediaSubtitleSegments: [SubtitleSegment] = []
+    @Published var mediaSubtitleDiagnostics: MediaSubtitleDiagnostics?
     @Published var mediaSubtitleMode: SubtitleDisplayMode = .bilingual
     @Published var mediaSubtitleHealthReport: ASRHealthReport?
     @Published var mediaSubtitleHealthCheckMode: SpeechRuntimeMode?
     @Published var mediaSubtitleASRRepairMode: SpeechRuntimeMode?
+    @Published var languageDetectionHealthReport: LanguageDetectionHealth?
+    @Published var languageDetectionHealthCheckInProgress = false
+    @Published var languageDetectionRuntimeRepairInProgress = false
+    @Published var languageDetectionSampleText = "This is a language detection health check."
+    @Published var speakerDiarizationHealthReport: SpeakerDiarizationHealth?
+    @Published var speakerDiarizationHealthCheckInProgress = false
+    @Published var speakerDiarizationRuntimeRepairInProgress = false
+    @Published var fastTranslationHealthReport: FastTranslationHealth?
+    @Published var fastTranslationHealthCheckInProgress = false
+    @Published var fastTranslationRuntimeRepairInProgress = false
     @Published var appLiveSubtitleRunState: AppLiveSubtitleRunState = .stopped
     @Published var appLiveSubtitleSessionID: String?
     @Published var appLiveSubtitleAudioSource: LiveSubtitleAudioSource = .systemAndMicrophone
@@ -504,6 +515,7 @@ final class AppState: ObservableObject {
             mediaSubtitleFileURL = url
             mediaSubtitleDescriptor = descriptor
             mediaSubtitleSegments = []
+            mediaSubtitleDiagnostics = nil
             outputText = ""
             rawOutputText = ""
             showsRawOutput = false
@@ -700,6 +712,7 @@ final class AppState: ObservableObject {
         mediaSubtitleFileURL = nil
         mediaSubtitleDescriptor = nil
         mediaSubtitleSegments = []
+        mediaSubtitleDiagnostics = nil
         outputText = ""
         rawOutputText = ""
         showsRawOutput = false
@@ -715,6 +728,16 @@ final class AppState: ObservableObject {
             session.displayMode = mode
         }
         refreshMediaSubtitlePreview()
+    }
+
+    func setFileSpeakerDiarizationEnabled(_ enabled: Bool) {
+        let previous = preferences.speakerDiarization.enabledForFileSubtitles
+        updatePreferences { $0.speakerDiarization.enabledForFileSubtitles = enabled }
+        guard enabled, !previous, !mediaSubtitleSegments.isEmpty,
+              SpeakerTurnMapper.speakerCount(in: mediaSubtitleSegments) == 0 else {
+            return
+        }
+        statusMessage = t("Regenerate subtitles to apply speaker diarization")
     }
 
     func setMediaSubtitleTargetLanguage(_ targetLanguage: String) {
@@ -1021,7 +1044,7 @@ final class AppState: ObservableObject {
                     outputText = result.text
                     rawOutputText = result.rawText
                     showsRawOutput = false
-                    statusMessage = t("Finished")
+                    statusMessage = finishedStatusMessage(for: result)
                     isRunning = false
                     currentRunTask = nil
                     scheduleModelUnloadIfIdle()
@@ -1102,7 +1125,7 @@ final class AppState: ObservableObject {
                     outputText = result.text
                     rawOutputText = result.rawText
                     showsRawOutput = false
-                    statusMessage = t("Finished")
+                    statusMessage = finishedStatusMessage(for: result)
                     isRunning = false
                     currentRunTask = nil
                     scheduleModelUnloadIfIdle()
@@ -1159,7 +1182,9 @@ final class AppState: ObservableObject {
         outputText = ""
         rawOutputText = ""
         showsRawOutput = false
-        statusMessage = t("Preparing media")
+        mediaSubtitleDiagnostics = nil
+        let speakerDiarizationEnabled = preferences.speakerDiarization.enabledForFileSubtitles
+        statusMessage = speakerDiarizationEnabled ? t("Transcribing and separating speakers") : t("Transcribing media")
         currentRunTask = Task {
             do {
                 let resourceAccess = url.startAccessingSecurityScopedResource()
@@ -1179,6 +1204,7 @@ final class AppState: ObservableObject {
                     }
                     mediaSubtitleDescriptor = result.descriptor
                     mediaSubtitleSegments = result.segments
+                    mediaSubtitleDiagnostics = result.diagnostics
                     statusMessage = t("Translating subtitles")
                 }
                 let translated = try await engine.translateSubtitleSegments(
@@ -1199,7 +1225,7 @@ final class AppState: ObservableObject {
                     outputText = preview
                     rawOutputText = preview
                     showsRawOutput = false
-                    statusMessage = t("Finished")
+                    statusMessage = mediaSubtitleFinishedStatus(diagnostics: result.diagnostics)
                     isRunning = false
                     currentRunTask = nil
                     scheduleModelUnloadIfIdle()
@@ -1258,7 +1284,7 @@ final class AppState: ObservableObject {
                     outputText = preview
                     rawOutputText = preview
                     showsRawOutput = false
-                    statusMessage = t("Finished")
+                    statusMessage = mediaSubtitleFinishedStatus(diagnostics: mediaSubtitleDiagnostics)
                     isRunning = false
                     currentRunTask = nil
                     scheduleModelUnloadIfIdle()
@@ -1338,6 +1364,22 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func mediaSubtitleFinishedStatus(diagnostics: MediaSubtitleDiagnostics?) -> String {
+        guard preferences.speakerDiarization.enabledForFileSubtitles else {
+            return t("Finished")
+        }
+        if diagnostics?.diarizationErrorCode != nil {
+            let message = diagnostics?.diarizationErrorMessage ?? diagnostics?.diarizationErrorCode ?? ""
+            let suffix = message.isEmpty ? "" : ": \(message)"
+            return "\(t("Finished")) · \(t("Speaker diarization failed"))\(suffix)"
+        }
+        let speakerCount = diagnostics?.speakerCount ?? SpeakerTurnMapper.speakerCount(in: mediaSubtitleSegments)
+        if speakerCount > 0 {
+            return "\(t("Finished")) · \(speakerCount) \(t(speakerCount == 1 ? "speaker" : "speakers"))"
+        }
+        return "\(t("Finished")) · \(t("No speaker labels"))"
+    }
+
     func checkMediaSubtitleASRHealth(mode: SpeechRuntimeMode) {
         guard mediaSubtitleHealthCheckMode == nil else {
             return
@@ -1374,11 +1416,240 @@ final class AppState: ObservableObject {
               let modelID = report.modelID,
               let model = models.first(where: { $0.id == modelID }),
               let family = model.capabilities.speech?.family,
-              Self.supportsMLXASRRepair(family) else {
+              Self.supportsASRRepair(family) else {
             return false
         }
         let modelURL = model.resolvedPath ?? model.sourcePath
+        if family == .vibeVoiceASR {
+            return FileManager.default.fileExists(atPath: modelURL.path)
+        }
         return FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path)
+    }
+
+    func checkLanguageDetectionHealth() {
+        guard !languageDetectionHealthCheckInProgress else {
+            return
+        }
+        languageDetectionHealthCheckInProgress = true
+        validationError = nil
+        statusMessage = t("Checking language routing")
+        let preferences = preferences.languageRouting
+        let sampleText = languageDetectionSampleText
+        Task {
+            let health = await LanguageDetectionService().health(
+                preferences: preferences,
+                sampleText: sampleText
+            )
+            await MainActor.run {
+                languageDetectionHealthReport = health
+                languageDetectionHealthCheckInProgress = false
+                validationError = health.status == .ready || health.status == .disabled ? nil : health.message
+                statusMessage = health.status == .ready ? t("Language routing ready") : t("Language routing check finished")
+            }
+        }
+    }
+
+    func canRepairLanguageDetectionRuntime(report: LanguageDetectionHealth) -> Bool {
+        guard preferences.languageRouting.enabled else {
+            return false
+        }
+        switch report.status {
+        case .modelMissing, .runtimeMissing, .failed:
+            return report.source != .settingsCommand
+        case .ready, .disabled, .skippedShortText:
+            return false
+        }
+    }
+
+    func repairLanguageDetectionRuntime() {
+        guard !languageDetectionRuntimeRepairInProgress else {
+            return
+        }
+        languageDetectionRuntimeRepairInProgress = true
+        validationError = nil
+        statusMessage = t("Repairing language routing runtime")
+        Task {
+            do {
+                try await Task.detached {
+                    let installerPath = try Self.languageDetectionInstallerPath()
+                    try Self.runLanguageDetectionInstaller(at: installerPath)
+                }.value
+                await MainActor.run {
+                    languageDetectionRuntimeRepairInProgress = false
+                    validationError = nil
+                    statusMessage = t("Language routing runtime repaired")
+                    checkLanguageDetectionHealth()
+                }
+            } catch {
+                await MainActor.run {
+                    languageDetectionRuntimeRepairInProgress = false
+                    validationError = error.localizedDescription
+                    statusMessage = t("Language routing runtime repair failed")
+                }
+            }
+        }
+    }
+
+    func checkSpeakerDiarizationHealth() {
+        guard !speakerDiarizationHealthCheckInProgress else {
+            return
+        }
+        speakerDiarizationHealthCheckInProgress = true
+        validationError = nil
+        statusMessage = t("Checking speaker diarization")
+        Task {
+            let health = await engine.checkSpeakerDiarizationHealth()
+            await MainActor.run {
+                speakerDiarizationHealthReport = health
+                speakerDiarizationHealthCheckInProgress = false
+                validationError = health.status == .ready || health.status == .disabled ? nil : health.message
+                statusMessage = health.status == .ready ? t("Speaker diarization ready") : t("Speaker diarization check finished")
+            }
+        }
+    }
+
+    func saveSpeakerDiarizationHFToken(_ token: String) {
+        let normalizedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedToken.isEmpty else {
+            validationError = t("Paste a Hugging Face token first.")
+            statusMessage = t("Speaker diarization token not saved")
+            return
+        }
+        do {
+            try SpeakerDiarizationTokenStore.save(normalizedToken)
+            validationError = nil
+            statusMessage = t("HF token saved")
+            refreshSpeakerDiarizationHealth(preferences: preferences.speakerDiarization)
+        } catch {
+            validationError = error.localizedDescription
+            statusMessage = t("Failed to save HF token")
+        }
+    }
+
+    func deleteSpeakerDiarizationHFToken() {
+        do {
+            try SpeakerDiarizationTokenStore.delete()
+            validationError = nil
+            statusMessage = t("HF token removed")
+            refreshSpeakerDiarizationHealth(preferences: preferences.speakerDiarization)
+        } catch {
+            validationError = error.localizedDescription
+            statusMessage = t("Failed to remove HF token")
+        }
+    }
+
+    func canRepairSpeakerDiarizationRuntime(report: SpeakerDiarizationHealth) -> Bool {
+        guard preferences.speakerDiarization.enabledForFileSubtitles else {
+            return false
+        }
+        switch report.status {
+        case .runtimeMissing, .failed:
+            return report.source != .settingsCommand
+        case .ready, .disabled, .requiresUserToken:
+            return false
+        }
+    }
+
+    func repairSpeakerDiarizationRuntime() {
+        guard !speakerDiarizationRuntimeRepairInProgress else {
+            return
+        }
+        speakerDiarizationRuntimeRepairInProgress = true
+        validationError = nil
+        statusMessage = t("Repairing speaker diarization runtime")
+        Task {
+            do {
+                try await Task.detached {
+                    let installerPath = try Self.speakerDiarizationInstallerPath()
+                    try Self.runSpeakerDiarizationInstaller(at: installerPath)
+                }.value
+                await MainActor.run {
+                    speakerDiarizationRuntimeRepairInProgress = false
+                    validationError = nil
+                    statusMessage = t("Speaker diarization runtime repaired")
+                    checkSpeakerDiarizationHealth()
+                }
+            } catch {
+                await MainActor.run {
+                    speakerDiarizationRuntimeRepairInProgress = false
+                    validationError = error.localizedDescription
+                    statusMessage = t("Speaker diarization runtime repair failed")
+                }
+            }
+        }
+    }
+
+    private func refreshSpeakerDiarizationHealth(preferences: SpeakerDiarizationPreferences) {
+        speakerDiarizationHealthCheckInProgress = true
+        Task {
+            let health = await SpeakerDiarizationService().health(preferences: preferences)
+            await MainActor.run {
+                speakerDiarizationHealthReport = health
+                speakerDiarizationHealthCheckInProgress = false
+                validationError = health.status == .ready || health.status == .disabled ? nil : health.message
+                statusMessage = health.status == .ready ? t("Speaker diarization ready") : t("Speaker diarization check finished")
+            }
+        }
+    }
+
+    func checkFastTranslationHealth() {
+        guard !fastTranslationHealthCheckInProgress else {
+            return
+        }
+        fastTranslationHealthCheckInProgress = true
+        validationError = nil
+        statusMessage = t("Checking fast translation")
+        Task {
+            let health = await engine.checkFastTranslationHealth()
+            await MainActor.run {
+                fastTranslationHealthReport = health
+                fastTranslationHealthCheckInProgress = false
+                validationError = health.status == .ready || health.status == .disabled ? nil : health.message
+                statusMessage = health.status == .ready ? t("Fast translation ready") : t("Fast translation check finished")
+            }
+        }
+    }
+
+    func canRepairFastTranslationRuntime(report: FastTranslationHealth) -> Bool {
+        guard !preferences.fastTranslation.forceLLM else {
+            return false
+        }
+        switch report.status {
+        case .runtimeMissing, .unsupportedLanguagePair, .failed:
+            return report.source != .settingsCommand
+        case .ready, .disabled:
+            return false
+        }
+    }
+
+    func repairFastTranslationRuntime() {
+        guard !fastTranslationRuntimeRepairInProgress else {
+            return
+        }
+        fastTranslationRuntimeRepairInProgress = true
+        validationError = nil
+        statusMessage = t("Repairing fast translation runtime")
+        let modelVariant = preferences.fastTranslation.modelVariant
+        Task {
+            do {
+                try await Task.detached { [modelVariant] in
+                    let installerPath = try Self.fastTranslationInstallerPath(for: modelVariant)
+                    try Self.runFastTranslationInstaller(at: installerPath)
+                }.value
+                await MainActor.run {
+                    fastTranslationRuntimeRepairInProgress = false
+                    validationError = nil
+                    statusMessage = t("Fast translation runtime repaired")
+                    checkFastTranslationHealth()
+                }
+            } catch {
+                await MainActor.run {
+                    fastTranslationRuntimeRepairInProgress = false
+                    validationError = error.localizedDescription
+                    statusMessage = t("Fast translation runtime repair failed")
+                }
+            }
+        }
     }
 
     func repairMediaSubtitleASRRuntime(mode: SpeechRuntimeMode) {
@@ -1396,7 +1667,7 @@ final class AppState: ObservableObject {
         Task {
             do {
                 let commandTemplate = try await Task.detached {
-                    try Self.buildMLXASRCommandTemplateForRepair(model: model, family: family)
+                    try Self.buildASRCommandTemplateForRepair(model: model, family: family)
                 }.value
                 var updated = preferences
                 switch family {
@@ -1408,6 +1679,8 @@ final class AppState: ObservableObject {
                     updated.mediaSubtitles.qwen3ASRCommandTemplate = commandTemplate
                 case .qwen3ASRSherpaOnnx:
                     updated.mediaSubtitles.genericASRCommandTemplate = commandTemplate
+                case .vibeVoiceASR:
+                    updated.mediaSubtitles.vibeVoiceASRCommandTemplate = commandTemplate
                 case .whisperCppCoreML:
                     updated.mediaSubtitles.whisperCommandTemplate = commandTemplate
                 case .customLocal:
@@ -1436,12 +1709,35 @@ final class AppState: ObservableObject {
         }
     }
 
+    private nonisolated static func supportsASRRepair(_ family: SpeechModelFamily) -> Bool {
+        switch family {
+        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
+            return true
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+            return false
+        }
+    }
+
     private nonisolated static func supportsMLXASRRepair(_ family: SpeechModelFamily) -> Bool {
         switch family {
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
             return true
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal:
             return false
+        }
+    }
+
+    private nonisolated static func buildASRCommandTemplateForRepair(
+        model: ModelDescriptor,
+        family: SpeechModelFamily
+    ) throws -> String {
+        switch family {
+        case .vibeVoiceASR:
+            return try buildVibeVoiceASRCommandTemplateForRepair(model: model)
+        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
+            return try buildMLXASRCommandTemplateForRepair(model: model, family: family)
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+            throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is not available for this ASR family.")
         }
     }
 
@@ -1485,6 +1781,81 @@ final class AppState: ObservableObject {
             return path
         }
         throw MediaSubtitleError.asrRuntimeMissing("Bundled llmTools MLX ASR runner was not found.")
+    }
+
+    private nonisolated static func buildVibeVoiceASRCommandTemplateForRepair(
+        model: ModelDescriptor
+    ) throws -> String {
+        let modelURL = model.resolvedPath ?? model.sourcePath
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw MediaSubtitleError.asrModelMissing("VibeVoice-ASR model path is missing.")
+        }
+        let runnerPath = try vibeVoiceASRRunnerPath()
+        let venvPath = vibeVoiceASRVenvPath()
+        if !vibeVoiceASRVenvIsReady(venvPath) {
+            let installerPath = try vibeVoiceASRInstallerPath()
+            try runMLXASRInstaller(at: installerPath)
+        }
+        guard vibeVoiceASRVenvIsReady(venvPath) else {
+            throw MediaSubtitleError.asrRuntimeFailed("VibeVoice-ASR runtime was not found after installation.")
+        }
+        let pythonPath = URL(fileURLWithPath: venvPath).appendingPathComponent("bin/python").path
+        return "\(shellEscape(pythonPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
+    }
+
+    private nonisolated static func vibeVoiceASRRunnerPath() throws -> String {
+        let fileManager = FileManager.default
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("asr", isDirectory: true)
+                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw MediaSubtitleError.asrRuntimeMissing("Bundled VibeVoice-ASR runner was not found.")
+    }
+
+    private nonisolated static func vibeVoiceASRInstallerPath() throws -> String {
+        let fileManager = FileManager.default
+        let scriptName = "install-phase4-vibevoice-asr-runtime.sh"
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("asr", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw MediaSubtitleError.asrRuntimeMissing("Bundled VibeVoice-ASR installer was not found.")
+    }
+
+    private nonisolated static func vibeVoiceASRVenvPath() -> String {
+        if let envPath = ProcessInfo.processInfo.environment["LLMTOOLS_VIBEVOICE_ASR_VENV"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !envPath.isEmpty {
+            return envPath
+        }
+        return AppPaths.applicationSupportDirectory
+            .appendingPathComponent("asr-runtime", isDirectory: true)
+            .appendingPathComponent("vibevoice-venv", isDirectory: true)
+            .path(percentEncoded: false)
+    }
+
+    private nonisolated static func vibeVoiceASRVenvIsReady(_ venvPath: String) -> Bool {
+        let pythonPath = URL(fileURLWithPath: venvPath).appendingPathComponent("bin/python").path
+        return FileManager.default.isExecutableFile(atPath: pythonPath)
+            && pythonModuleExists(in: venvPath, moduleName: "vibevoice")
     }
 
     private nonisolated static func mlxASRInstallerPath(for family: SpeechModelFamily) throws -> String {
@@ -1539,7 +1910,7 @@ final class AppState: ObservableObject {
             moduleName = "sensevoice"
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal:
             return false
         }
         let fileManager = FileManager.default
@@ -1563,6 +1934,28 @@ final class AppState: ObservableObject {
         return false
     }
 
+    private nonisolated static func pythonModuleExists(in venvPath: String, moduleName: String) -> Bool {
+        let fileManager = FileManager.default
+        let libURL = URL(fileURLWithPath: venvPath).appendingPathComponent("lib", isDirectory: true)
+        guard let enumerator = fileManager.enumerator(
+            at: libURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        let suffix = "/site-packages/\(moduleName)"
+        while let element = enumerator.nextObject() {
+            guard let url = element as? URL else {
+                continue
+            }
+            if url.path.hasSuffix(suffix) {
+                return true
+            }
+        }
+        return false
+    }
+
     private nonisolated static func mlxASRInstallerScriptName(for family: SpeechModelFamily) -> String {
         switch family {
         case .funASRMLTNano:
@@ -1575,6 +1968,8 @@ final class AppState: ObservableObject {
             return "install-phase4-mlx-asr-runtime.sh"
         case .qwen3ASRSherpaOnnx:
             return "install-phase4-mlx-asr-runtime.sh"
+        case .vibeVoiceASR:
+            return "install-phase4-vibevoice-asr-runtime.sh"
         case .whisperCppCoreML:
             return "install-phase4-whisper-coreml-runtime.sh"
         case .customLocal:
@@ -1592,6 +1987,8 @@ final class AppState: ObservableObject {
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
             return "LLMTOOLS_ASR_VENV"
+        case .vibeVoiceASR:
+            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         case .customLocal:
@@ -1609,6 +2006,8 @@ final class AppState: ObservableObject {
             return "sensevoice-venv"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
             return "venv"
+        case .vibeVoiceASR:
+            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         case .customLocal:
@@ -1647,6 +2046,174 @@ final class AppState: ObservableObject {
                 .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
                 .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
             throw MediaSubtitleError.asrRuntimeFailed(message)
+        }
+    }
+
+    private nonisolated static func fastTranslationInstallerPath(for modelVariant: FastTranslationModelVariant) throws -> String {
+        let fileManager = FileManager.default
+        let scriptName: String
+        switch modelVariant {
+        case .opusMTEnZh:
+            scriptName = "install-phase4x-ctranslate2-en-zh.sh"
+        case .nllb200Distilled600M:
+            scriptName = "install-phase4x-nllb-200-distilled-600m.sh"
+        }
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("fastmt", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw FastTranslationError.runtimeMissing("Bundled fast translation installer was not found.")
+    }
+
+    private nonisolated static func runFastTranslationInstaller(at installerPath: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: installerPath)
+        process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
+        var environment = ProcessInfo.processInfo.environment
+        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
+            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
+        } else {
+            environment["PATH"] = defaultPATH
+        }
+        process.environment = environment
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw FastTranslationError.runtimeFailed(error.localizedDescription)
+        }
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let message = [
+                String(data: errorOutput, encoding: .utf8),
+                String(data: output, encoding: .utf8)
+            ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
+            throw FastTranslationError.runtimeFailed(message)
+        }
+    }
+
+    private nonisolated static func speakerDiarizationInstallerPath() throws -> String {
+        let fileManager = FileManager.default
+        let scriptName = "install-phase4x-pyannote-diarization.sh"
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("diarization", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw SpeakerDiarizationError.runtimeMissing("Bundled speaker diarization installer was not found.")
+    }
+
+    private nonisolated static func runSpeakerDiarizationInstaller(at installerPath: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: installerPath)
+        process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
+        var environment = ProcessInfo.processInfo.environment
+        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
+            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
+        } else {
+            environment["PATH"] = defaultPATH
+        }
+        process.environment = environment
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw SpeakerDiarizationError.runtimeFailed(error.localizedDescription)
+        }
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let message = [
+                String(data: errorOutput, encoding: .utf8),
+                String(data: output, encoding: .utf8)
+            ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
+            throw SpeakerDiarizationError.runtimeFailed(message)
+        }
+    }
+
+    private nonisolated static func languageDetectionInstallerPath() throws -> String {
+        let fileManager = FileManager.default
+        let scriptName = "install-phase4x-fasttext-lid.sh"
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("lid", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw LanguageDetectionError.runtimeMissing("Bundled language routing installer was not found.")
+    }
+
+    private nonisolated static func runLanguageDetectionInstaller(at installerPath: String) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: installerPath)
+        process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
+        var environment = ProcessInfo.processInfo.environment
+        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
+            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
+        } else {
+            environment["PATH"] = defaultPATH
+        }
+        process.environment = environment
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            throw LanguageDetectionError.runtimeFailed(error.localizedDescription)
+        }
+        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
+        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        guard process.terminationStatus == 0 else {
+            let message = [
+                String(data: errorOutput, encoding: .utf8),
+                String(data: output, encoding: .utf8)
+            ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
+            throw LanguageDetectionError.runtimeFailed(message)
         }
     }
 
@@ -2633,6 +3200,15 @@ final class AppState: ObservableObject {
         L10n.text(key, language: preferences.appLanguage)
     }
 
+    private func finishedStatusMessage(for result: TaskResult) -> String {
+        guard let sourceLanguage = result.sourceLanguage?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !sourceLanguage.isEmpty,
+              sourceLanguage.lowercased() != "auto" else {
+            return t("Finished")
+        }
+        return "\(t("Finished")) · \(t("Source")) \(sourceLanguage)"
+    }
+
     private func clearMissingWebPageModelPreference(
         _ preferences: inout AppPreferences,
         models: [ModelDescriptor]
@@ -2795,6 +3371,10 @@ final class AppState: ObservableObject {
     }
 
     var webPageTranslationConcurrencyLimit: Int {
+        let engine = preferences.fastTranslation.engine(for: .webPageTranslate)
+        if engine == .fastMT || engine == .auto {
+            return preferences.fastTranslation.maxConcurrentBatches
+        }
         if webPageTranslationModelIsRemote {
             return 4
         }
@@ -2888,7 +3468,7 @@ final class AppState: ObservableObject {
             return 2
         case .qwen3ASR06B:
             return 3
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal, .none:
+        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
             return 4
         }
     }

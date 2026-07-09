@@ -24,10 +24,36 @@ public enum ModelValidationState: String, Codable, Sendable, CaseIterable {
     case failed
 }
 
+public enum TranslationEngineID: String, Codable, Sendable, CaseIterable, Hashable {
+    case llm
+    case ctranslate2
+    case argos
+    case customCommand
+}
+
+public struct LanguagePair: Codable, Hashable, Sendable {
+    public var source: String
+    public var target: String
+
+    public init(source: String, target: String) {
+        self.source = LanguageCodeNormalizer.normalizedBCP47(source) ?? source
+        self.target = LanguageCodeNormalizer.normalizedBCP47(target) ?? target
+    }
+}
+
+public enum LanguageIDModelVariant: String, Codable, Sendable, CaseIterable, Hashable {
+    case ftz
+    case bin
+    case customCommand
+}
+
 public enum ModelInputCapability: String, Codable, Sendable, CaseIterable, Hashable {
     case text
     case image
     case speech
+    case languageID
+    case speakerDiarization
+    case fastTranslation
 }
 
 public enum ModelCapabilitySource: String, Codable, Sendable, CaseIterable, Hashable {
@@ -39,6 +65,133 @@ public enum ModelCapabilitySource: String, Codable, Sendable, CaseIterable, Hash
     case unknown
 }
 
+public struct LanguageIDModelCapabilities: Codable, Hashable, Sendable {
+    public var modelVariant: LanguageIDModelVariant
+    public var supportedLanguages: [String]
+    public var latencyMillisecondsPerKB: Int?
+    public var requiresLocalSidecar: Bool
+    public var source: ModelCapabilitySource
+    public var confidence: Double
+    public var note: String?
+    public var lastCheckedAt: Date?
+    public var lastFailureMessage: String?
+
+    public init(
+        modelVariant: LanguageIDModelVariant = .ftz,
+        supportedLanguages: [String] = [],
+        latencyMillisecondsPerKB: Int? = nil,
+        requiresLocalSidecar: Bool = true,
+        source: ModelCapabilitySource = .unknown,
+        confidence: Double = 0.5,
+        note: String? = nil,
+        lastCheckedAt: Date? = nil,
+        lastFailureMessage: String? = nil
+    ) {
+        self.modelVariant = modelVariant
+        self.supportedLanguages = Self.normalizedLanguages(supportedLanguages)
+        self.latencyMillisecondsPerKB = latencyMillisecondsPerKB.map { max(0, $0) }
+        self.requiresLocalSidecar = requiresLocalSidecar
+        self.source = source
+        self.confidence = min(max(confidence, 0), 1)
+        self.note = note
+        self.lastCheckedAt = lastCheckedAt
+        self.lastFailureMessage = lastFailureMessage
+    }
+
+    private static func normalizedLanguages(_ languages: [String]) -> [String] {
+        Array(Set(languages.compactMap { LanguageCodeNormalizer.normalizedBCP47($0) })).sorted()
+    }
+}
+
+public struct SpeakerDiarizationModelCapabilities: Codable, Hashable, Sendable {
+    public var supportsFile: Bool
+    public var supportsRealtime: Bool
+    public var requiresUserToken: Bool
+    public var requiresLocalSidecar: Bool
+    public var source: ModelCapabilitySource
+    public var confidence: Double
+    public var note: String?
+    public var lastCheckedAt: Date?
+    public var lastFailureMessage: String?
+
+    public init(
+        supportsFile: Bool = true,
+        supportsRealtime: Bool = false,
+        requiresUserToken: Bool = false,
+        requiresLocalSidecar: Bool = true,
+        source: ModelCapabilitySource = .unknown,
+        confidence: Double = 0.5,
+        note: String? = nil,
+        lastCheckedAt: Date? = nil,
+        lastFailureMessage: String? = nil
+    ) {
+        self.supportsFile = supportsFile
+        self.supportsRealtime = supportsRealtime
+        self.requiresUserToken = requiresUserToken
+        self.requiresLocalSidecar = requiresLocalSidecar
+        self.source = source
+        self.confidence = min(max(confidence, 0), 1)
+        self.note = note
+        self.lastCheckedAt = lastCheckedAt
+        self.lastFailureMessage = lastFailureMessage
+    }
+}
+
+public struct FastTranslationModelCapabilities: Codable, Hashable, Sendable {
+    public var engineID: TranslationEngineID
+    public var modelID: String?
+    public var supportedPairs: [LanguagePair]
+    public var supportsBatching: Bool
+    public var requiresLocalSidecar: Bool
+    public var source: ModelCapabilitySource
+    public var confidence: Double
+    public var note: String?
+    public var lastCheckedAt: Date?
+    public var lastFailureMessage: String?
+
+    public init(
+        engineID: TranslationEngineID = .ctranslate2,
+        modelID: String? = nil,
+        supportedPairs: [LanguagePair] = [],
+        supportsBatching: Bool = true,
+        requiresLocalSidecar: Bool = true,
+        source: ModelCapabilitySource = .unknown,
+        confidence: Double = 0.5,
+        note: String? = nil,
+        lastCheckedAt: Date? = nil,
+        lastFailureMessage: String? = nil
+    ) {
+        self.engineID = engineID
+        self.modelID = Self.normalizedOptionalString(modelID)
+        self.supportedPairs = Self.normalizedPairs(supportedPairs)
+        self.supportsBatching = supportsBatching
+        self.requiresLocalSidecar = requiresLocalSidecar
+        self.source = source
+        self.confidence = min(max(confidence, 0), 1)
+        self.note = note
+        self.lastCheckedAt = lastCheckedAt
+        self.lastFailureMessage = lastFailureMessage
+    }
+
+    public func supports(_ pair: LanguagePair) -> Bool {
+        supportedPairs.contains(pair)
+    }
+
+    private static func normalizedPairs(_ pairs: [LanguagePair]) -> [LanguagePair] {
+        Array(Set(pairs)).sorted {
+            if $0.source == $1.source {
+                return $0.target < $1.target
+            }
+            return $0.source < $1.source
+        }
+    }
+
+    private static func normalizedOptionalString(_ value: String?) -> String? {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return normalized.isEmpty ? nil : normalized
+    }
+}
+
 public struct ModelCapabilities: Codable, Hashable, Sendable {
     public var inputs: [ModelInputCapability]
     public var source: ModelCapabilitySource
@@ -47,6 +200,9 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
     public var lastCheckedAt: Date?
     public var lastFailureMessage: String?
     public var speech: SpeechModelCapabilities?
+    public var languageID: LanguageIDModelCapabilities?
+    public var speakerDiarization: SpeakerDiarizationModelCapabilities?
+    public var fastTranslation: FastTranslationModelCapabilities?
 
     public init(
         inputs: [ModelInputCapability] = [.text],
@@ -55,11 +211,23 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         note: String? = nil,
         lastCheckedAt: Date? = nil,
         lastFailureMessage: String? = nil,
-        speech: SpeechModelCapabilities? = nil
+        speech: SpeechModelCapabilities? = nil,
+        languageID: LanguageIDModelCapabilities? = nil,
+        speakerDiarization: SpeakerDiarizationModelCapabilities? = nil,
+        fastTranslation: FastTranslationModelCapabilities? = nil
     ) {
         var normalizedInputs = inputs
         if speech != nil, !normalizedInputs.contains(.speech) {
             normalizedInputs.append(.speech)
+        }
+        if languageID != nil, !normalizedInputs.contains(.languageID) {
+            normalizedInputs.append(.languageID)
+        }
+        if speakerDiarization != nil, !normalizedInputs.contains(.speakerDiarization) {
+            normalizedInputs.append(.speakerDiarization)
+        }
+        if fastTranslation != nil, !normalizedInputs.contains(.fastTranslation) {
+            normalizedInputs.append(.fastTranslation)
         }
         self.inputs = ModelCapabilities.normalizedInputs(normalizedInputs)
         self.source = source
@@ -68,6 +236,9 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         self.lastCheckedAt = lastCheckedAt
         self.lastFailureMessage = lastFailureMessage
         self.speech = speech
+        self.languageID = languageID
+        self.speakerDiarization = speakerDiarization
+        self.fastTranslation = fastTranslation
     }
 
     public func supports(_ capability: ModelInputCapability) -> Bool {
@@ -84,6 +255,18 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
 
     public var supportsSpeech: Bool {
         supports(.speech) && speech?.isSelectableASRBackend == true
+    }
+
+    public var supportsLanguageID: Bool {
+        supports(.languageID)
+    }
+
+    public var supportsSpeakerDiarization: Bool {
+        supports(.speakerDiarization)
+    }
+
+    public var supportsFastTranslation: Bool {
+        supports(.fastTranslation)
     }
 
     public var supportsRealtimeSpeech: Bool {
@@ -157,14 +340,29 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         case lastCheckedAt
         case lastFailureMessage
         case speech
+        case languageID
+        case speakerDiarization
+        case fastTranslation
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let decodedSpeech = try container.decodeIfPresent(SpeechModelCapabilities.self, forKey: .speech)
+        let decodedLanguageID = try container.decodeIfPresent(LanguageIDModelCapabilities.self, forKey: .languageID)
+        let decodedSpeakerDiarization = try container.decodeIfPresent(SpeakerDiarizationModelCapabilities.self, forKey: .speakerDiarization)
+        let decodedFastTranslation = try container.decodeIfPresent(FastTranslationModelCapabilities.self, forKey: .fastTranslation)
         var decodedInputs = try container.decodeIfPresent([ModelInputCapability].self, forKey: .inputs) ?? [.text]
         if decodedSpeech != nil, !decodedInputs.contains(.speech) {
             decodedInputs.append(.speech)
+        }
+        if decodedLanguageID != nil, !decodedInputs.contains(.languageID) {
+            decodedInputs.append(.languageID)
+        }
+        if decodedSpeakerDiarization != nil, !decodedInputs.contains(.speakerDiarization) {
+            decodedInputs.append(.speakerDiarization)
+        }
+        if decodedFastTranslation != nil, !decodedInputs.contains(.fastTranslation) {
+            decodedInputs.append(.fastTranslation)
         }
         inputs = ModelCapabilities.normalizedInputs(decodedInputs)
         source = try container.decodeIfPresent(ModelCapabilitySource.self, forKey: .source) ?? .unknown
@@ -173,6 +371,9 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
         lastCheckedAt = try container.decodeIfPresent(Date.self, forKey: .lastCheckedAt)
         lastFailureMessage = try container.decodeIfPresent(String.self, forKey: .lastFailureMessage)
         speech = decodedSpeech
+        languageID = decodedLanguageID
+        speakerDiarization = decodedSpeakerDiarization
+        fastTranslation = decodedFastTranslation
     }
 
     private static func inferOpenAICompatibleCapabilities(_ configuration: ProviderConfiguration) -> ModelCapabilities {
@@ -871,6 +1072,315 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     }
 }
 
+public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
+    public var enabled: Bool
+    public var modelVariant: LanguageIDModelVariant
+    public var shortTextMinimumCharactersLatin: Int
+    public var shortTextMinimumCharactersCJK: Int
+    public var lowConfidenceThreshold: Double
+    public var ocrConfidenceBoost: Double
+    public var useForTextTasks: Bool
+    public var useForWebpage: Bool
+    public var useForOCR: Bool
+    public var useForSubtitles: Bool
+    public var commandTemplate: String
+
+    public init(
+        enabled: Bool = false,
+        modelVariant: LanguageIDModelVariant = .ftz,
+        shortTextMinimumCharactersLatin: Int = 20,
+        shortTextMinimumCharactersCJK: Int = 3,
+        lowConfidenceThreshold: Double = 0.65,
+        ocrConfidenceBoost: Double = 0.1,
+        useForTextTasks: Bool = false,
+        useForWebpage: Bool = false,
+        useForOCR: Bool = false,
+        useForSubtitles: Bool = false,
+        commandTemplate: String = ""
+    ) {
+        self.enabled = enabled
+        self.modelVariant = modelVariant
+        self.shortTextMinimumCharactersLatin = max(1, shortTextMinimumCharactersLatin)
+        self.shortTextMinimumCharactersCJK = max(1, shortTextMinimumCharactersCJK)
+        self.lowConfidenceThreshold = Self.normalizedConfidence(lowConfidenceThreshold)
+        self.ocrConfidenceBoost = Self.normalizedConfidence(ocrConfidenceBoost)
+        self.useForTextTasks = useForTextTasks
+        self.useForWebpage = useForWebpage
+        self.useForOCR = useForOCR
+        self.useForSubtitles = useForSubtitles
+        self.commandTemplate = Self.normalizedCommandTemplate(commandTemplate)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case modelVariant
+        case shortTextMinimumCharactersLatin
+        case shortTextMinimumCharactersCJK
+        case lowConfidenceThreshold
+        case ocrConfidenceBoost
+        case useForTextTasks
+        case useForWebpage
+        case useForOCR
+        case useForSubtitles
+        case commandTemplate
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = LanguageRoutingPreferences()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? defaults.enabled
+        modelVariant = try container.decodeIfPresent(LanguageIDModelVariant.self, forKey: .modelVariant) ?? defaults.modelVariant
+        shortTextMinimumCharactersLatin = max(
+            1,
+            try container.decodeIfPresent(Int.self, forKey: .shortTextMinimumCharactersLatin)
+                ?? defaults.shortTextMinimumCharactersLatin
+        )
+        shortTextMinimumCharactersCJK = max(
+            1,
+            try container.decodeIfPresent(Int.self, forKey: .shortTextMinimumCharactersCJK)
+                ?? defaults.shortTextMinimumCharactersCJK
+        )
+        lowConfidenceThreshold = Self.normalizedConfidence(
+            try container.decodeIfPresent(Double.self, forKey: .lowConfidenceThreshold) ?? defaults.lowConfidenceThreshold
+        )
+        ocrConfidenceBoost = Self.normalizedConfidence(
+            try container.decodeIfPresent(Double.self, forKey: .ocrConfidenceBoost) ?? defaults.ocrConfidenceBoost
+        )
+        useForTextTasks = try container.decodeIfPresent(Bool.self, forKey: .useForTextTasks) ?? defaults.useForTextTasks
+        useForWebpage = try container.decodeIfPresent(Bool.self, forKey: .useForWebpage) ?? defaults.useForWebpage
+        useForOCR = try container.decodeIfPresent(Bool.self, forKey: .useForOCR) ?? defaults.useForOCR
+        useForSubtitles = try container.decodeIfPresent(Bool.self, forKey: .useForSubtitles) ?? defaults.useForSubtitles
+        commandTemplate = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .commandTemplate) ?? defaults.commandTemplate
+        )
+    }
+
+    public func shouldSkipDetection(for text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return true
+        }
+        let containsCJK = trimmed.unicodeScalars.contains { scalar in
+            (0x4E00...0x9FFF).contains(Int(scalar.value))
+                || (0x3040...0x30FF).contains(Int(scalar.value))
+                || (0xAC00...0xD7AF).contains(Int(scalar.value))
+        }
+        let minimum = containsCJK ? shortTextMinimumCharactersCJK : shortTextMinimumCharactersLatin
+        return trimmed.count < minimum
+    }
+
+    private static func normalizedConfidence(_ value: Double) -> Double {
+        guard value.isFinite else {
+            return 0
+        }
+        return min(max(value, 0), 1)
+    }
+
+    private static func normalizedCommandTemplate(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
+    public var enabledForFileSubtitles: Bool
+    public var enabledForLiveSubtitles: Bool
+    public var commandTemplate: String
+    public var persistSpeakerEmbeddings: Bool
+
+    public init(
+        enabledForFileSubtitles: Bool = false,
+        enabledForLiveSubtitles: Bool = false,
+        commandTemplate: String = "",
+        persistSpeakerEmbeddings: Bool = false
+    ) {
+        self.enabledForFileSubtitles = enabledForFileSubtitles
+        self.enabledForLiveSubtitles = false
+        self.commandTemplate = Self.normalizedCommandTemplate(commandTemplate)
+        self.persistSpeakerEmbeddings = persistSpeakerEmbeddings
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabledForFileSubtitles
+        case enabledForLiveSubtitles
+        case commandTemplate
+        case persistSpeakerEmbeddings
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = SpeakerDiarizationPreferences()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabledForFileSubtitles = try container.decodeIfPresent(Bool.self, forKey: .enabledForFileSubtitles)
+            ?? defaults.enabledForFileSubtitles
+        _ = try container.decodeIfPresent(Bool.self, forKey: .enabledForLiveSubtitles)
+        enabledForLiveSubtitles = false
+        commandTemplate = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .commandTemplate) ?? defaults.commandTemplate
+        )
+        persistSpeakerEmbeddings = try container.decodeIfPresent(Bool.self, forKey: .persistSpeakerEmbeddings)
+            ?? defaults.persistSpeakerEmbeddings
+    }
+
+    private static func normalizedCommandTemplate(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+public enum FastTranslationSurfaceEngine: String, Codable, Sendable, CaseIterable, Hashable {
+    case auto
+    case llm
+    case fastMT
+}
+
+public enum FastTranslationFallbackPolicy: String, Codable, Sendable, CaseIterable, Hashable {
+    case showError
+    case fallbackToLLM
+}
+
+public enum FastTranslationModelVariant: String, Codable, Sendable, CaseIterable, Hashable {
+    case opusMTEnZh
+    case nllb200Distilled600M
+}
+
+public struct FastTranslationCommandTemplates: Codable, Sendable, Hashable {
+    public var ctranslate2: String
+    public var argos: String
+    public var generic: String
+
+    public init(
+        ctranslate2: String = "{python} {sidecar} --engine ctranslate2 --model {model_ct2}",
+        argos: String = "{python} {sidecar} --engine argos",
+        generic: String = ""
+    ) {
+        self.ctranslate2 = Self.normalizedCommandTemplate(ctranslate2)
+        self.argos = Self.normalizedCommandTemplate(argos)
+        self.generic = Self.normalizedCommandTemplate(generic)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ctranslate2
+        case argos
+        case generic
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = FastTranslationCommandTemplates()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ctranslate2 = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .ctranslate2) ?? defaults.ctranslate2
+        )
+        argos = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .argos) ?? defaults.argos
+        )
+        generic = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .generic) ?? defaults.generic
+        )
+    }
+
+    public func template(for engineID: TranslationEngineID) -> String? {
+        let template: String
+        switch engineID {
+        case .ctranslate2:
+            template = ctranslate2
+        case .argos:
+            template = argos
+        case .customCommand:
+            template = generic
+        case .llm:
+            template = ""
+        }
+        return template.isEmpty ? nil : template
+    }
+
+    private static func normalizedCommandTemplate(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+public struct FastTranslationPreferences: Codable, Sendable, Hashable {
+    public var subtitleEngine: FastTranslationSurfaceEngine
+    public var webpageEngine: FastTranslationSurfaceEngine
+    public var textEngine: FastTranslationSurfaceEngine
+    public var modelVariant: FastTranslationModelVariant
+    public var fallbackPolicy: FastTranslationFallbackPolicy
+    public var commandTemplates: FastTranslationCommandTemplates
+    public var maxConcurrentBatches: Int
+    public var forceLLM: Bool
+
+    public init(
+        subtitleEngine: FastTranslationSurfaceEngine = .llm,
+        webpageEngine: FastTranslationSurfaceEngine = .llm,
+        textEngine: FastTranslationSurfaceEngine = .llm,
+        modelVariant: FastTranslationModelVariant = .nllb200Distilled600M,
+        fallbackPolicy: FastTranslationFallbackPolicy = .fallbackToLLM,
+        commandTemplates: FastTranslationCommandTemplates = FastTranslationCommandTemplates(),
+        maxConcurrentBatches: Int = 1,
+        forceLLM: Bool = false
+    ) {
+        self.subtitleEngine = subtitleEngine
+        self.webpageEngine = webpageEngine
+        self.textEngine = textEngine
+        self.modelVariant = modelVariant
+        self.fallbackPolicy = fallbackPolicy
+        self.commandTemplates = commandTemplates
+        self.maxConcurrentBatches = Self.normalizedMaxConcurrentBatches(maxConcurrentBatches)
+        self.forceLLM = forceLLM
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case subtitleEngine
+        case webpageEngine
+        case textEngine
+        case modelVariant
+        case fallbackPolicy
+        case commandTemplates
+        case maxConcurrentBatches
+        case forceLLM
+    }
+
+    public init(from decoder: Decoder) throws {
+        let defaults = FastTranslationPreferences()
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        subtitleEngine = try container.decodeIfPresent(FastTranslationSurfaceEngine.self, forKey: .subtitleEngine)
+            ?? defaults.subtitleEngine
+        webpageEngine = try container.decodeIfPresent(FastTranslationSurfaceEngine.self, forKey: .webpageEngine)
+            ?? defaults.webpageEngine
+        textEngine = try container.decodeIfPresent(FastTranslationSurfaceEngine.self, forKey: .textEngine)
+            ?? defaults.textEngine
+        modelVariant = try container.decodeIfPresent(FastTranslationModelVariant.self, forKey: .modelVariant)
+            ?? defaults.modelVariant
+        fallbackPolicy = try container.decodeIfPresent(FastTranslationFallbackPolicy.self, forKey: .fallbackPolicy)
+            ?? defaults.fallbackPolicy
+        commandTemplates = try container.decodeIfPresent(FastTranslationCommandTemplates.self, forKey: .commandTemplates)
+            ?? defaults.commandTemplates
+        maxConcurrentBatches = Self.normalizedMaxConcurrentBatches(
+            try container.decodeIfPresent(Int.self, forKey: .maxConcurrentBatches) ?? defaults.maxConcurrentBatches
+        )
+        forceLLM = try container.decodeIfPresent(Bool.self, forKey: .forceLLM) ?? defaults.forceLLM
+    }
+
+    public func engine(for task: TaskKind) -> FastTranslationSurfaceEngine {
+        guard !forceLLM else {
+            return .llm
+        }
+        switch task {
+        case .webPageTranslate:
+            return webpageEngine
+        case .translate:
+            return textEngine
+        case .polish, .summarize, .explain, .extractTodos, .ocr:
+            return .llm
+        }
+    }
+
+    public func engineForSubtitles() -> FastTranslationSurfaceEngine {
+        forceLLM ? .llm : subtitleEngine
+    }
+
+    private static func normalizedMaxConcurrentBatches(_ value: Int) -> Int {
+        min(max(value, 1), 8)
+    }
+}
+
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
     public var autoCollapseWidget: Bool
@@ -893,6 +1403,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var webPageTranslation: WebPageTranslationPreferences
     public var ocr: OCRPreferences
     public var mediaSubtitles: MediaSubtitlePreferences
+    public var languageRouting: LanguageRoutingPreferences
+    public var speakerDiarization: SpeakerDiarizationPreferences
+    public var fastTranslation: FastTranslationPreferences
     public var promptTemplates: PromptTemplatePreferences
     public var quickActionShortcut: KeyboardShortcutPreference
     public var quickActionWithoutSelectionShortcut: KeyboardShortcutPreference
@@ -923,6 +1436,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
         ocr: OCRPreferences = OCRPreferences(),
         mediaSubtitles: MediaSubtitlePreferences = MediaSubtitlePreferences(),
+        languageRouting: LanguageRoutingPreferences = LanguageRoutingPreferences(),
+        speakerDiarization: SpeakerDiarizationPreferences = SpeakerDiarizationPreferences(),
+        fastTranslation: FastTranslationPreferences = FastTranslationPreferences(),
         promptTemplates: PromptTemplatePreferences = PromptTemplatePreferences(),
         quickActionShortcut: KeyboardShortcutPreference = .optionSpace,
         quickActionWithoutSelectionShortcut: KeyboardShortcutPreference = .optionShiftSpace,
@@ -950,6 +1466,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.webPageTranslation = webPageTranslation
         self.ocr = ocr
         self.mediaSubtitles = mediaSubtitles
+        self.languageRouting = languageRouting
+        self.speakerDiarization = speakerDiarization
+        self.fastTranslation = fastTranslation
         self.promptTemplates = promptTemplates
         self.quickActionShortcut = quickActionShortcut
         self.quickActionWithoutSelectionShortcut = quickActionWithoutSelectionShortcut
@@ -980,6 +1499,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case webPageTranslation
         case ocr
         case mediaSubtitles
+        case languageRouting
+        case speakerDiarization
+        case fastTranslation
         case promptTemplates
         case quickActionShortcut
         case quickActionWithoutSelectionShortcut
@@ -1023,6 +1545,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
         ocr = try container.decodeIfPresent(OCRPreferences.self, forKey: .ocr) ?? OCRPreferences()
         mediaSubtitles = try container.decodeIfPresent(MediaSubtitlePreferences.self, forKey: .mediaSubtitles) ?? MediaSubtitlePreferences()
+        languageRouting = try container.decodeIfPresent(LanguageRoutingPreferences.self, forKey: .languageRouting) ?? LanguageRoutingPreferences()
+        speakerDiarization = try container.decodeIfPresent(SpeakerDiarizationPreferences.self, forKey: .speakerDiarization) ?? SpeakerDiarizationPreferences()
+        fastTranslation = try container.decodeIfPresent(FastTranslationPreferences.self, forKey: .fastTranslation) ?? FastTranslationPreferences()
         promptTemplates = try container.decodeIfPresent(PromptTemplatePreferences.self, forKey: .promptTemplates) ?? PromptTemplatePreferences()
         quickActionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionShortcut) ?? .optionSpace
         quickActionWithoutSelectionShortcut = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .quickActionWithoutSelectionShortcut) ?? .optionShiftSpace
@@ -1053,6 +1578,9 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(webPageTranslation, forKey: .webPageTranslation)
         try container.encode(ocr, forKey: .ocr)
         try container.encode(mediaSubtitles, forKey: .mediaSubtitles)
+        try container.encode(languageRouting, forKey: .languageRouting)
+        try container.encode(speakerDiarization, forKey: .speakerDiarization)
+        try container.encode(fastTranslation, forKey: .fastTranslation)
         try container.encode(promptTemplates, forKey: .promptTemplates)
         try container.encode(quickActionShortcut, forKey: .quickActionShortcut)
         try container.encode(quickActionWithoutSelectionShortcut, forKey: .quickActionWithoutSelectionShortcut)
@@ -1170,11 +1698,13 @@ public struct TaskResult: Sendable, Hashable {
     public var rawText: String
     public var modelName: String
     public var task: TaskKind
+    public var sourceLanguage: String?
 
-    public init(text: String, rawText: String? = nil, modelName: String, task: TaskKind) {
+    public init(text: String, rawText: String? = nil, modelName: String, task: TaskKind, sourceLanguage: String? = nil) {
         self.text = text
         self.rawText = rawText ?? text
         self.modelName = modelName
         self.task = task
+        self.sourceLanguage = sourceLanguage
     }
 }

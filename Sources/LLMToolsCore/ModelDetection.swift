@@ -147,6 +147,16 @@ public enum ModelDetection {
                 note: "Detected SenseVoiceSmall-style local ASR files. Uses short-window local ASR when a runtime/sidecar is configured."
             )
         }
+        if searchable.contains("vibevoice-asr")
+            || searchable.contains("vibevoice_asr")
+            || searchable.contains("vibevoiceasr")
+            || configModelType(at: url)?.lowercased().contains("vibevoice") == true {
+            return .vibeVoiceASR(
+                source: .detected,
+                confidence: 0.82,
+                note: "Detected VibeVoice-ASR-style local ASR files. This is a heavy file-only rich transcription model; use it for local media/file transcription, not realtime subtitles."
+            )
+        }
         if searchable.contains("qwen3-asr") || searchable.contains("qwen-asr") {
             return .qwen3ASR06B(
                 source: .detected,
@@ -308,6 +318,15 @@ public enum ModelDetection {
             }
         }
         return names
+    }
+
+    private static func configModelType(at url: URL) -> String? {
+        guard let directory = localModelDirectory(for: url),
+              let config = jsonDictionary(at: directory.appendingPathComponent("config.json")),
+              let modelType = config["model_type"] as? String else {
+            return nil
+        }
+        return modelType
     }
 
     private static func jsonDictionary(at url: URL) -> [String: Any]? {

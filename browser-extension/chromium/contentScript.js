@@ -417,11 +417,11 @@
       return false;
     }
     const lightDomText = normalizeText(element.textContent || "");
-    if (isEnglishDominant(lightDomText)) {
+    if (isTranslatableText(lightDomText)) {
       return false;
     }
     const label = closedShadowAccessibleText(element);
-    if (isEnglishDominant(label)) {
+    if (isTranslatableText(label)) {
       return true;
     }
     return hasClosedShadowComponentSignal(element, lightDomText);
@@ -466,7 +466,7 @@
       image.getAttribute("title") || "",
       image.getAttribute("aria-label") || ""
     ].join(" ");
-    return isEnglishDominant(label);
+    return isTranslatableText(label);
   }
 
   function isPdfEmbed(element) {
@@ -541,7 +541,7 @@
     const element = node.parentElement;
     if (!element || shouldSkipElement(element) || !isVisible(element)) return false;
     const text = normalizeText(node.nodeValue);
-    if (!isEnglishDominant(text)) return false;
+    if (!isTranslatableText(text)) return false;
     if (normalizeDiscoveryScope(options.discoveryScope || state.discoveryScope) === DISCOVERY_SCOPE_VISIBLE && !nearViewport(element)) return false;
     return true;
   }
@@ -1015,15 +1015,28 @@
     return rect.bottom >= -margin && rect.top <= view.innerHeight + margin;
   }
 
-  function isEnglishDominant(text) {
-    const letters = text.match(/\p{L}/gu) || [];
-    const latin = text.match(/[A-Za-z]/g) || [];
-    const cjk = text.match(/[\u3400-\u9fff]/g) || [];
-    if (latin.length < 3) return false;
-    if (cjk.length / Math.max(letters.length, 1) >= 0.25) return false;
-    if (/^(https?:\/\/|www\.|[\w.-]+@[\w.-]+)$/.test(text)) return false;
-    if (/^[A-Z0-9_\-./#]+$/.test(text) && text.length < 18) return false;
-    return latin.length / Math.max(letters.length, 1) >= 0.6;
+  function isTranslatableText(text) {
+    const normalized = normalizeText(text);
+    const letters = normalized.match(/\p{L}/gu) || [];
+    if (letters.length < 2) return false;
+    if (/^(https?:\/\/|www\.|[\w.-]+@[\w.-]+)$/.test(normalized)) return false;
+    if (/^[A-Z0-9_\-./#]+$/.test(normalized) && normalized.length < 18) return false;
+
+    const latin = normalized.match(/\p{Script=Latin}/gu) || [];
+    const cjk = normalized.match(/[\u3400-\u9fff]/g) || [];
+    const hiragana = normalized.match(/[\u3040-\u309f]/g) || [];
+    const katakana = normalized.match(/[\u30a0-\u30ff\uff66-\uff9f]/g) || [];
+    const hangul = normalized.match(/[\u1100-\u11ff\u3130-\u318f\uac00-\ud7af]/g) || [];
+    const kanaCount = hiragana.length + katakana.length;
+    const letterCount = Math.max(letters.length, 1);
+
+    if (kanaCount >= 2 || (kanaCount >= 1 && cjk.length >= 1)) return true;
+    if (hangul.length >= 2) return true;
+    if (cjk.length / letterCount >= 0.25) return false;
+    if (latin.length >= 3 && latin.length / letterCount >= 0.5) return true;
+
+    const otherNonLatin = letters.length - latin.length - cjk.length - kanaCount - hangul.length;
+    return otherNonLatin >= 2;
   }
 
   function normalizeText(text) {

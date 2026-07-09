@@ -215,6 +215,13 @@ struct QuickActionView: View {
         markdownPreviewAvailable && !showsMarkdownSource
     }
 
+    private var shouldRenderMediaSubtitlePreview: Bool {
+        appState.quickActionMode == .media
+            && !appState.showsRawOutput
+            && !showsMarkdownSource
+            && !appState.mediaSubtitleSegments.isEmpty
+    }
+
     private var imagePreviewPresentation: Binding<Bool> {
         Binding(
             get: { isImagePreviewPresented && appState.ocrImageInput != nil },
@@ -643,6 +650,8 @@ struct QuickActionView: View {
                     .foregroundStyle(report.status == .ready ? Color.secondary : Color.red)
                     .lineLimit(3)
             }
+
+            mediaSpeakerStatusView
         }
         .padding(10)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -733,6 +742,114 @@ struct QuickActionView: View {
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var mediaSpeakerStatusView: some View {
+        if let status = mediaSpeakerStatus {
+            Label {
+                Text(status.text)
+                    .font(.caption)
+                    .foregroundStyle(status.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            } icon: {
+                Image(systemName: status.icon)
+                    .foregroundStyle(status.color)
+            }
+        }
+    }
+
+    private var mediaSpeakerStatus: (text: String, icon: String, color: Color)? {
+        guard appState.preferences.speakerDiarization.enabledForFileSubtitles else {
+            return nil
+        }
+        if appState.isRunning && appState.quickActionMode == .media {
+            return (
+                localizedMediaSpeakerStatus(
+                    chinese: "说话人分离会在文件 ASR 后运行",
+                    english: "Speaker diarization runs after file ASR"
+                ),
+                "person.wave.2",
+                .secondary
+            )
+        }
+        guard !appState.mediaSubtitleSegments.isEmpty else {
+            return (
+                localizedMediaSpeakerStatus(
+                    chinese: "已启用；下次生成文件字幕时会运行说话人分离",
+                    english: "Enabled for the next file subtitle generation"
+                ),
+                "checkmark.circle",
+                .secondary
+            )
+        }
+        if let errorCode = appState.mediaSubtitleDiagnostics?.diarizationErrorCode {
+            let message = appState.mediaSubtitleDiagnostics?.diarizationErrorMessage ?? errorCode
+            return (
+                mediaSpeakerFailureStatusText(message: message),
+                "exclamationmark.triangle.fill",
+                .red
+            )
+        }
+        let speakerCount = appState.mediaSubtitleDiagnostics?.speakerCount
+            ?? SpeakerTurnMapper.speakerCount(in: appState.mediaSubtitleSegments)
+        if speakerCount > 0 {
+            return (
+                localizedMediaSpeakerStatus(
+                    chinese: "已标注 \(speakerCount) 个说话人",
+                    english: "Labeled \(speakerCount) \(speakerCount == 1 ? "speaker" : "speakers")"
+                ),
+                "person.2.fill",
+                .secondary
+            )
+        }
+        return (
+            localizedMediaSpeakerStatus(
+                chinese: "当前结果没有说话人标签；请重新生成以应用说话人分离",
+                english: "Current result has no speaker labels; regenerate to apply diarization"
+            ),
+            "arrow.clockwise",
+            .orange
+        )
+    }
+
+    private func localizedMediaSpeakerStatus(chinese: String, english: String) -> String {
+        language == .chinese ? chinese : english
+    }
+
+    private func mediaSpeakerFailureStatusText(message: String) -> String {
+        let lowercased = message.lowercased()
+        let resolution: String
+        if lowercased.contains("token") || lowercased.contains("auth") {
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：保存本地 HF Token 后重新生成。",
+                english: "Fix: save the local HF token, then regenerate."
+            )
+        } else if lowercased.contains("terms") || lowercased.contains("gated") || lowercased.contains("repository") {
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：用同一个 Hugging Face 账号接受 pyannote 模型条款，再重新生成。",
+                english: "Fix: accept the pyannote model terms with the same Hugging Face account, then regenerate."
+            )
+        } else if lowercased.contains("no route") || lowercased.contains("network") || lowercased.contains("connection") || lowercased.contains("timed out") {
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：让本机可访问 huggingface.co，或预先缓存 pyannote 模型后重新生成。",
+                english: "Fix: make huggingface.co reachable, or pre-cache the pyannote model, then regenerate."
+            )
+        } else if lowercased.contains("python") || lowercased.contains("runtime") || lowercased.contains("module") || lowercased.contains("import") {
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：在设置里点击健康检查；如果提示运行时缺失，点击修复运行时。",
+                english: "Fix: run Health Check in Settings; if runtime is missing, click Repair Runtime."
+            )
+        } else {
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：在设置里运行健康检查，按提示修复后重新生成。",
+                english: "Fix: run Health Check in Settings, follow the repair prompt, then regenerate."
+            )
+        }
+        return localizedMediaSpeakerStatus(
+            chinese: "说话人分离失败：\(message)\n\(resolution)",
+            english: "Speaker diarization failed: \(message)\n\(resolution)"
+        )
     }
 
     private var imageInputPanel: some View {
@@ -943,6 +1060,12 @@ struct QuickActionView: View {
                 Text(resultPlaceholder)
                     .foregroundStyle(.secondary)
                     .padding(12)
+            } else if shouldRenderMediaSubtitlePreview {
+                MediaSubtitleResultPreview(
+                    segments: appState.mediaSubtitleSegments,
+                    mode: appState.mediaSubtitleMode,
+                    language: language
+                )
             } else if shouldRenderMarkdownPreview {
                 MarkdownResultPreview(markdown: displayedOutputText)
             } else {
@@ -1503,6 +1626,108 @@ struct ReadOnlyTextView: NSViewRepresentable {
         if let textView = textView as? CommandFriendlyTextView {
             textView.copyFallbackText = text
         }
+    }
+}
+
+private struct MediaSubtitleResultPreview: View {
+    var segments: [SubtitleSegment]
+    var mode: SubtitleDisplayMode
+    var language: AppLanguage
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(segments.enumerated()), id: \.element.id) { offset, segment in
+                    segmentRow(segment, offset: offset)
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+        .textSelection(.enabled)
+    }
+
+    private func segmentRow(_ segment: SubtitleSegment, offset: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .center, spacing: 8) {
+                Text(timeRange(segment))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if let speaker = normalized(segment.speakerLabel) ?? normalized(segment.speakerID) {
+                    Text(speaker)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
+                }
+                Spacer(minLength: 0)
+            }
+
+            ForEach(Array(displayLines(for: segment).enumerated()), id: \.offset) { _, line in
+                Text(line.text)
+                    .font(.system(size: line.isSecondary ? 12 : 13, weight: line.isSecondary ? .regular : .medium))
+                    .foregroundStyle(line.isSecondary ? Color.secondary : Color.primary)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(rowBackground(offset), in: RoundedRectangle(cornerRadius: 7))
+        .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.secondary.opacity(0.12), lineWidth: 0.7))
+    }
+
+    private func rowBackground(_ offset: Int) -> Color {
+        offset.isMultiple(of: 2)
+            ? Color.secondary.opacity(0.055)
+            : Color.secondary.opacity(0.025)
+    }
+
+    private struct DisplayLine {
+        var text: String
+        var isSecondary: Bool
+    }
+
+    private func displayLines(for segment: SubtitleSegment) -> [DisplayLine] {
+        let original = normalized(segment.originalText) ?? ""
+        let translated = normalized(segment.translatedText ?? "") ?? ""
+        switch mode {
+        case .original:
+            return [DisplayLine(text: original.isEmpty ? " " : original, isSecondary: false)]
+        case .translated:
+            let text = translated.isEmpty ? original : translated
+            return [DisplayLine(text: text.isEmpty ? " " : text, isSecondary: false)]
+        case .bilingual:
+            if translated.isEmpty || translated == original {
+                return [DisplayLine(text: original.isEmpty ? " " : original, isSecondary: false)]
+            }
+            return [
+                DisplayLine(text: original.isEmpty ? " " : original, isSecondary: false),
+                DisplayLine(text: translated, isSecondary: true)
+            ]
+        }
+    }
+
+    private func timeRange(_ segment: SubtitleSegment) -> String {
+        "\(timestamp(segment.startTime)) - \(timestamp(segment.endTime ?? (segment.startTime + 2)))"
+    }
+
+    private func timestamp(_ value: TimeInterval) -> String {
+        let clamped = max(0, value)
+        let hours = Int(clamped / 3600)
+        let minutes = Int((clamped.truncatingRemainder(dividingBy: 3600)) / 60)
+        let seconds = Int(clamped.truncatingRemainder(dividingBy: 60))
+        let milliseconds = Int((clamped - floor(clamped)) * 1000)
+        return String(format: "%02d:%02d:%02d.%03d", hours, minutes, seconds, milliseconds)
+    }
+
+    private func normalized(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 
@@ -3175,6 +3400,22 @@ private enum WebPageDomainRuleKind {
     case neverTranslate
 }
 
+private enum ModelSettingsPane: String, CaseIterable, Identifiable {
+    case settings
+    case management
+
+    var id: Self { self }
+
+    func title(language: AppLanguage) -> String {
+        switch self {
+        case .settings:
+            return L10n.text("Model Settings", language: language)
+        case .management:
+            return L10n.text("Model Management", language: language)
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var navigation: SettingsNavigationState
@@ -3191,6 +3432,8 @@ struct SettingsView: View {
     @State private var showSelectionLimitAppImporter = false
     @State private var selectionLimitDraftLineCount = 2
     @State private var webPageDomainDraft = ""
+    @State private var speakerDiarizationTokenDraft = ""
+    @State private var selectedModelSettingsPane: ModelSettingsPane = .settings
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -3557,6 +3800,38 @@ struct SettingsView: View {
 
     private var modelSettingsPage: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Picker("", selection: $selectedModelSettingsPane) {
+                ForEach(ModelSettingsPane.allCases) { pane in
+                    Text(pane.title(language: language)).tag(pane)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 240, alignment: .leading)
+
+            switch selectedModelSettingsPane {
+            case .settings:
+                modelConfigurationPage
+            case .management:
+                modelManagementPage
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var modelConfigurationPage: some View {
+        ScrollView {
+            settingsForm(maxWidth: 620) {
+                languageRoutingSettingsSection
+                fastTranslationSettingsSection
+            }
+            .padding(.bottom, 2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var modelManagementPage: some View {
+        VStack(alignment: .leading, spacing: 12) {
             modelSettingsHeader
                 .frame(maxWidth: 650, alignment: .topLeading)
                 .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -3739,6 +4014,8 @@ struct SettingsView: View {
                 webPageTranslationModelPicker
             }
 
+            webPageTranslationEngineSettingsSection
+
             settingRow(title: L10n.text("Site rules", language: language)) {
                 webPageDomainRulesControl
             }
@@ -3850,6 +4127,383 @@ struct SettingsView: View {
         }
     }
 
+    private var languageRoutingSettingsSection: some View {
+        settingRow(title: L10n.text("Language Routing", language: language)) {
+            VStack(alignment: .leading, spacing: 7) {
+                languageRoutingToggle(
+                    title: L10n.text("Enable language routing", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.languageRouting.enabled },
+                        set: { newValue in
+                            appState.updatePreferences { $0.languageRouting.enabled = newValue }
+                        }
+                    )
+                )
+
+                HStack(alignment: .center, spacing: 8) {
+                    Text(L10n.text("fastText model", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 96, alignment: .leading)
+                    languageRoutingModelPicker
+                }
+
+                HStack(alignment: .top, spacing: 18) {
+                    VStack(alignment: .leading, spacing: 5) {
+                        languageRoutingToggle(
+                            title: L10n.text("Use for text tasks", language: language),
+                            isOn: Binding(
+                                get: { appState.preferences.languageRouting.useForTextTasks },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.useForTextTasks = newValue }
+                                }
+                            )
+                        )
+                        languageRoutingToggle(
+                            title: L10n.text("Use for webpage translation", language: language),
+                            isOn: Binding(
+                                get: { appState.preferences.languageRouting.useForWebpage },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.useForWebpage = newValue }
+                                }
+                            )
+                        )
+                    }
+                    .frame(width: 188, alignment: .topLeading)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        languageRoutingToggle(
+                            title: L10n.text("Use for OCR", language: language),
+                            isOn: Binding(
+                                get: { appState.preferences.languageRouting.useForOCR },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.useForOCR = newValue }
+                                }
+                            )
+                        )
+                        languageRoutingToggle(
+                            title: L10n.text("Use for subtitles", language: language),
+                            isOn: Binding(
+                                get: { appState.preferences.languageRouting.useForSubtitles },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.useForSubtitles = newValue }
+                                }
+                            )
+                        )
+                    }
+                    .frame(width: 150, alignment: .topLeading)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Stepper(
+                        "\(L10n.text("Latin short-text minimum", language: language)): \(appState.preferences.languageRouting.shortTextMinimumCharactersLatin)",
+                        value: Binding(
+                            get: { appState.preferences.languageRouting.shortTextMinimumCharactersLatin },
+                            set: { newValue in
+                                appState.updatePreferences { $0.languageRouting.shortTextMinimumCharactersLatin = newValue }
+                            }
+                        ),
+                        in: 1...200
+                    )
+                    Stepper(
+                        "\(L10n.text("CJK short-text minimum", language: language)): \(appState.preferences.languageRouting.shortTextMinimumCharactersCJK)",
+                        value: Binding(
+                            get: { appState.preferences.languageRouting.shortTextMinimumCharactersCJK },
+                            set: { newValue in
+                                appState.updatePreferences { $0.languageRouting.shortTextMinimumCharactersCJK = newValue }
+                            }
+                        ),
+                        in: 1...80
+                    )
+                    HStack(spacing: 10) {
+                        Label(L10n.text("Low confidence threshold", language: language), systemImage: "gauge.with.dots.needle.33percent")
+                            .frame(width: 180, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { appState.preferences.languageRouting.lowConfidenceThreshold },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.lowConfidenceThreshold = newValue }
+                                }
+                            ),
+                            in: 0...1
+                        )
+                        Text(String(format: "%.2f", appState.preferences.languageRouting.lowConfidenceThreshold))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 42, alignment: .trailing)
+                    }
+                    .frame(width: 380, alignment: .leading)
+                    HStack(spacing: 10) {
+                        Label(L10n.text("OCR confidence boost", language: language), systemImage: "text.viewfinder")
+                            .frame(width: 180, alignment: .leading)
+                        Slider(
+                            value: Binding(
+                                get: { appState.preferences.languageRouting.ocrConfidenceBoost },
+                                set: { newValue in
+                                    appState.updatePreferences { $0.languageRouting.ocrConfidenceBoost = newValue }
+                                }
+                            ),
+                            in: 0...1
+                        )
+                        Text(String(format: "%.2f", appState.preferences.languageRouting.ocrConfidenceBoost))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: 42, alignment: .trailing)
+                    }
+                    .frame(width: 380, alignment: .leading)
+                }
+
+                mediaASRCommandField(
+                    title: L10n.text("Language ID command", language: language),
+                    text: Binding(
+                        get: { appState.preferences.languageRouting.commandTemplate },
+                        set: { newValue in
+                            appState.updatePreferences { $0.languageRouting.commandTemplate = newValue }
+                        }
+                    ),
+                    placeholder: "{python} {sidecar} --model {model_ftz}"
+                )
+                Text(L10n.text("Use {python}, {sidecar}, {model_ftz}, {model_bin}, and {variant}. Empty field uses the bundled fastText sidecar when the local model is installed.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                fieldStack(title: L10n.text("Sample detection text", language: language), width: 500) {
+                    CommandFriendlyTextField(
+                        text: $appState.languageDetectionSampleText,
+                        placeholder: L10n.text("This is a language detection health check.", language: language)
+                    )
+                }
+                HStack(spacing: 8) {
+                    Button {
+                        appState.checkLanguageDetectionHealth()
+                    } label: {
+                        Label(
+                            L10n.text("Health Check", language: language),
+                            systemImage: appState.languageDetectionHealthCheckInProgress ? "clock" : "stethoscope"
+                        )
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.languageDetectionHealthCheckInProgress)
+                    Text(L10n.text("Fixture mode uses LLMTOOLS_LID_FIXTURE_JSON for dependency-free checks.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let report = appState.languageDetectionHealthReport {
+                    languageDetectionHealthReportView(report)
+                }
+            }
+        }
+    }
+
+    private var languageRoutingModelPicker: some View {
+        Picker(L10n.text("fastText model", language: language), selection: Binding(
+            get: { appState.preferences.languageRouting.modelVariant },
+            set: { newValue in
+                appState.updatePreferences { $0.languageRouting.modelVariant = newValue }
+            }
+        )) {
+            ForEach(LanguageIDModelVariant.allCases, id: \.self) { variant in
+                Text(languageIDModelVariantName(variant)).tag(variant)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .controlSize(.small)
+        .frame(width: 260, alignment: .leading)
+    }
+
+    private func languageRoutingToggle(
+        title: String,
+        isOn: Binding<Bool>
+    ) -> some View {
+        Toggle(title, isOn: isOn)
+            .toggleStyle(.checkbox)
+            .font(.subheadline)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private func fastTranslationSurfaceEnginePicker(selection: Binding<FastTranslationSurfaceEngine>) -> some View {
+        Picker("", selection: selection) {
+            ForEach(FastTranslationSurfaceEngine.allCases, id: \.self) { engine in
+                Text(fastTranslationSurfaceEngineName(engine)).tag(engine)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .frame(width: 300, alignment: .leading)
+    }
+
+    private var textTranslationEngineSettingsSection: some View {
+        settingRow(title: L10n.text("Text translation engine", language: language)) {
+            VStack(alignment: .leading, spacing: 6) {
+                fastTranslationSurfaceEnginePicker(selection: Binding(
+                    get: { appState.preferences.fastTranslation.textEngine },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.textEngine = newValue }
+                    }
+                ))
+                Text(L10n.text("Only Translate can use fast MT. Polish, summary, explanation, and TODO always use the default LLM model.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var subtitleTranslationEngineSettingsSection: some View {
+        settingRow(title: L10n.text("Subtitle translation engine", language: language)) {
+            VStack(alignment: .leading, spacing: 6) {
+                fastTranslationSurfaceEnginePicker(selection: Binding(
+                    get: { appState.preferences.fastTranslation.subtitleEngine },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.subtitleEngine = newValue }
+                    }
+                ))
+                Text(L10n.text("Subtitles can use LLM or the shared Fast MT runtime configured under Models.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var webPageTranslationEngineSettingsSection: some View {
+        settingRow(title: L10n.text("Webpage translation engine", language: language)) {
+            VStack(alignment: .leading, spacing: 6) {
+                fastTranslationSurfaceEnginePicker(selection: Binding(
+                    get: { appState.preferences.fastTranslation.webpageEngine },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.webpageEngine = newValue }
+                    }
+                ))
+                Text(L10n.text("Webpage translation can use LLM or the shared Fast MT runtime configured under Models.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var fastTranslationSettingsSection: some View {
+        settingRow(title: L10n.text("Fast MT", language: language)) {
+            VStack(alignment: .leading, spacing: 8) {
+                checkboxLine(
+                    title: L10n.text("Force LLM translation", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.fastTranslation.forceLLM },
+                        set: { newValue in
+                            appState.updatePreferences { $0.fastTranslation.forceLLM = newValue }
+                        }
+                    )
+                )
+                Text(L10n.text("When enabled, all fast MT routes immediately fall back to the normal LLM path.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Picker(L10n.text("Fast MT model", language: language), selection: Binding(
+                    get: { appState.preferences.fastTranslation.modelVariant },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.modelVariant = newValue }
+                    }
+                )) {
+                    ForEach(FastTranslationModelVariant.allCases, id: \.self) { variant in
+                        Text(fastTranslationModelVariantName(variant)).tag(variant)
+                    }
+                }
+                .pickerStyle(.menu)
+                .frame(width: 300, alignment: .leading)
+                Text(L10n.text("OPUS is fastest for English to Chinese. NLLB 600M supports common multilingual pairs with higher latency but much better coverage.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Picker(L10n.text("Fallback policy", language: language), selection: Binding(
+                    get: { appState.preferences.fastTranslation.fallbackPolicy },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.fallbackPolicy = newValue }
+                    }
+                )) {
+                    ForEach(FastTranslationFallbackPolicy.allCases, id: \.self) { policy in
+                        Text(fastTranslationFallbackPolicyName(policy)).tag(policy)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 300, alignment: .leading)
+                Text(L10n.text("When fallback is enabled, any Fast MT route uses the normal LLM path if fast MT is unavailable or does not support the language pair.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Stepper(
+                    "\(L10n.text("Fast MT max concurrent batches", language: language)): \(appState.preferences.fastTranslation.maxConcurrentBatches)",
+                    value: Binding(
+                        get: { appState.preferences.fastTranslation.maxConcurrentBatches },
+                        set: { newValue in
+                            appState.updatePreferences { $0.fastTranslation.maxConcurrentBatches = newValue }
+                        }
+                    ),
+                    in: 1...8
+                )
+
+                mediaASRCommandField(
+                    title: L10n.text("CTranslate2 command", language: language),
+                    text: Binding(
+                        get: { appState.preferences.fastTranslation.commandTemplates.ctranslate2 },
+                        set: { newValue in
+                            appState.updatePreferences { $0.fastTranslation.commandTemplates.ctranslate2 = newValue }
+                        }
+                    ),
+                    placeholder: "{python} {sidecar} --engine ctranslate2 --model {model_ct2}"
+                )
+                mediaASRCommandField(
+                    title: L10n.text("Argos command", language: language),
+                    text: Binding(
+                        get: { appState.preferences.fastTranslation.commandTemplates.argos },
+                        set: { newValue in
+                            appState.updatePreferences { $0.fastTranslation.commandTemplates.argos = newValue }
+                        }
+                    ),
+                    placeholder: "{python} {sidecar} --engine argos"
+                )
+                mediaASRCommandField(
+                    title: L10n.text("Generic fast MT command", language: language),
+                    text: Binding(
+                        get: { appState.preferences.fastTranslation.commandTemplates.generic },
+                        set: { newValue in
+                            appState.updatePreferences { $0.fastTranslation.commandTemplates.generic = newValue }
+                        }
+                    ),
+                    placeholder: "fastmt-sidecar --stdio"
+                )
+                Text(L10n.text("Use {python}, {sidecar}, {engine}, and {model_ct2}. These commands are used only by fast MT routes.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Button {
+                        appState.checkFastTranslationHealth()
+                    } label: {
+                        Label(
+                            L10n.text("Health Check", language: language),
+                            systemImage: appState.fastTranslationHealthCheckInProgress ? "clock" : "stethoscope"
+                        )
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.fastTranslationHealthCheckInProgress)
+                    Text(L10n.text("Fixture mode uses LLMTOOLS_FAST_MT_FIXTURE_JSON for dependency-free checks.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let report = appState.fastTranslationHealthReport {
+                    fastTranslationHealthReportView(report)
+                }
+            }
+        }
+    }
+
     private var ocrSettingsModelPicker: some View {
         Picker("", selection: Binding<UUID?>(
             get: { appState.preferences.ocr.modelID },
@@ -3937,10 +4591,19 @@ struct SettingsView: View {
                 .help(L10n.text("Reset partial window to the tested default for this model.", language: language))
             }
             .frame(width: 420, alignment: .leading)
-            Text(L10n.text("This controls the partial ASR window/cadence, not the low-level PCM slice size. Lower values reduce first-subtitle latency; higher values give the ASR model more context for partial text. Default for the selected model: \(defaultValue) ms.", language: language))
+            Text(liveASRPartialWindowHelp(defaultValue: defaultValue))
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func liveASRPartialWindowHelp(defaultValue: Int) -> String {
+        switch language {
+        case .chinese:
+            return "控制 ASR partial 文本的窗口/节奏，不是底层 PCM 切片大小。数值越低首条字幕延迟越小，数值越高 partial 文本上下文越多。当前模型默认值：\(defaultValue) ms。"
+        case .english:
+            return "This controls the partial ASR window/cadence, not the low-level PCM slice size. Lower values reduce first-subtitle latency; higher values give the ASR model more context for partial text. Default for the selected model: \(defaultValue) ms."
         }
     }
 
@@ -4000,7 +4663,7 @@ struct SettingsView: View {
                         }
                         .controlSize(.small)
                         .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedFileASRModel == nil)
-                        Text(L10n.text("Qwen3-ASR-0.6B is quality-oriented for file transcription. Fun-ASR uses local streaming or GGUF sidecars for lower-latency live captions.", language: language))
+                        Text(L10n.text("VibeVoice-ASR is a heavy file-only rich transcription model; native speaker/timestamp output is used before external diarization.", language: language))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -4044,6 +4707,16 @@ struct SettingsView: View {
                         placeholder: "qwen3-asr --model {model} --audio {audio} --language {language}"
                     )
                     mediaASRCommandField(
+                        title: L10n.text("VibeVoice-ASR command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.mediaSubtitles.vibeVoiceASRCommandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.mediaSubtitles.vibeVoiceASRCommandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "vibevoice-asr --model {model} --audio {audio}"
+                    )
+                    mediaASRCommandField(
                         title: L10n.text("Whisper command", language: language),
                         text: Binding(
                             get: { appState.preferences.mediaSubtitles.whisperCommandTemplate },
@@ -4069,6 +4742,130 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+
+            settingRow(title: L10n.text("Speaker Diarization", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    checkboxLine(
+                        title: L10n.text("Enable for file subtitles", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.speakerDiarization.enabledForFileSubtitles },
+                            set: { newValue in
+                                appState.setFileSpeakerDiarizationEnabled(newValue)
+                            }
+                        )
+                    )
+                    checkboxLine(
+                        title: L10n.text("Enable for live subtitles", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.speakerDiarization.enabledForLiveSubtitles },
+                            set: { _ in }
+                        )
+                    )
+                    .disabled(true)
+                    Text(L10n.text("Live speaker diarization remains disabled until the realtime spike passes.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    mediaASRCommandField(
+                        title: L10n.text("Diarization command", language: language),
+                        text: Binding(
+                            get: { appState.preferences.speakerDiarization.commandTemplate },
+                            set: { newValue in
+                                appState.updatePreferences { $0.speakerDiarization.commandTemplate = newValue }
+                            }
+                        ),
+                        placeholder: "{python} {sidecar} --audio {audio_wav_16k_mono} --output {output_json}"
+                    )
+                    Text(L10n.text("Use {audio_wav_16k_mono}, {output_json}, and {hf_token}. Empty field uses the bundled pyannote sidecar when the local runtime is installed.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(L10n.text("HF token local storage", language: language))
+                            .font(.caption.weight(.semibold))
+                        Text(SpeakerDiarizationTokenStore.tokenFileURL.path)
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(alignment: .bottom, spacing: 8) {
+                        fieldStack(title: L10n.text("HF token", language: language), width: 360) {
+                            CommandFriendlyTextField(
+                                text: $speakerDiarizationTokenDraft,
+                                placeholder: "hf_...",
+                                isSecure: true
+                            )
+                        }
+                        Button {
+                            appState.saveSpeakerDiarizationHFToken(speakerDiarizationTokenDraft)
+                            speakerDiarizationTokenDraft = ""
+                        } label: {
+                            Label(L10n.text("Save Token", language: language), systemImage: "key.fill")
+                        }
+                        .controlSize(.small)
+                        .disabled(speakerDiarizationTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        Button {
+                            appState.deleteSpeakerDiarizationHFToken()
+                            speakerDiarizationTokenDraft = ""
+                        } label: {
+                            Label(L10n.text("Delete Token", language: language), systemImage: "trash")
+                        }
+                        .controlSize(.small)
+                    }
+                    HStack(spacing: 8) {
+                        Button {
+                            openExternalURL("https://huggingface.co/pyannote/speaker-diarization-3.1")
+                        } label: {
+                            Label(L10n.text("Open model terms", language: language), systemImage: "checkmark.seal")
+                        }
+                        .controlSize(.small)
+                        Button {
+                            openExternalURL("https://huggingface.co/settings/tokens")
+                        } label: {
+                            Label(L10n.text("Create HF token", language: language), systemImage: "safari")
+                        }
+                        .controlSize(.small)
+                    }
+                    checkboxLine(
+                        title: L10n.text("Persist speaker embeddings", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.speakerDiarization.persistSpeakerEmbeddings },
+                            set: { newValue in
+                                appState.updatePreferences { $0.speakerDiarization.persistSpeakerEmbeddings = newValue }
+                            }
+                        )
+                    )
+                    Text(L10n.text("pyannote requires accepting Hugging Face model terms. Tokens stay in a local Application Support file or environment variables; llmTools does not upload audio.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 8) {
+                        Button {
+                            appState.checkSpeakerDiarizationHealth()
+                        } label: {
+                            Label(
+                                L10n.text("Health Check", language: language),
+                                systemImage: appState.speakerDiarizationHealthCheckInProgress ? "clock" : "stethoscope"
+                            )
+                        }
+                        .controlSize(.small)
+                        .disabled(appState.speakerDiarizationHealthCheckInProgress)
+                        Text(L10n.text("Fixture mode uses LLMTOOLS_DIARIZATION_FIXTURE_JSON for dependency-free checks.", language: language))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if let report = appState.speakerDiarizationHealthReport {
+                        speakerDiarizationHealthReportView(report)
+                    }
+                }
+            }
+
+            subtitleTranslationEngineSettingsSection
 
             settingRow(title: L10n.text("Default subtitle settings", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
@@ -4405,9 +5202,15 @@ struct SettingsView: View {
     }
 
     private var defaultsSettingsPage: some View {
-        settingsForm(maxWidth: 540) {
-            settingRow(title: L10n.text("Default model", language: language)) {
-                defaultModelPicker
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Default LLM model", language: language)) {
+                VStack(alignment: .leading, spacing: 4) {
+                    defaultModelPicker
+                    Text(L10n.text("Used by text-mode LLM actions. Webpage translation can choose its own model on the Webpage tab.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             settingRow(title: L10n.text("Target", language: language)) {
@@ -4417,6 +5220,8 @@ struct SettingsView: View {
             settingRow(title: L10n.text("Translation quality", language: language)) {
                 defaultTranslationQualityPicker
             }
+
+            textTranslationEngineSettingsSection
 
             settingRow(title: L10n.text("Style", language: language)) {
                 polishStylePicker
@@ -4765,7 +5570,7 @@ struct SettingsView: View {
                 appState.updatePreferences { $0.webPageTranslation.modelID = newValue }
             }
         )) {
-            Text(L10n.text("Use default model", language: language)).tag(UUID?.none)
+            Text(L10n.text("Use text default model", language: language)).tag(UUID?.none)
             ForEach(appState.textCapableModels) { model in
                 Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
@@ -6194,6 +6999,409 @@ struct SettingsView: View {
         }
     }
 
+    private func languageIDModelVariantName(_ variant: LanguageIDModelVariant) -> String {
+        switch (language, variant) {
+        case (.chinese, .ftz):
+            return "FTZ 小模型"
+        case (.chinese, .bin):
+            return "BIN 高精度"
+        case (.chinese, .customCommand):
+            return "自定义命令"
+        case (.english, .ftz):
+            return "FTZ compact"
+        case (.english, .bin):
+            return "BIN full"
+        case (.english, .customCommand):
+            return "Custom command"
+        }
+    }
+
+    private func languageDetectionHealthStatusName(_ status: LanguageDetectionHealthStatus) -> String {
+        switch (language, status) {
+        case (.chinese, .ready):
+            return "可用"
+        case (.chinese, .disabled):
+            return "已关闭"
+        case (.chinese, .skippedShortText):
+            return "文本过短"
+        case (.chinese, .modelMissing):
+            return "模型缺失"
+        case (.chinese, .runtimeMissing):
+            return "运行时缺失"
+        case (.chinese, .failed):
+            return "失败"
+        case (.english, .ready):
+            return "Ready"
+        case (.english, .disabled):
+            return "Disabled"
+        case (.english, .skippedShortText):
+            return "Skipped short text"
+        case (.english, .modelMissing):
+            return "Model missing"
+        case (.english, .runtimeMissing):
+            return "Runtime missing"
+        case (.english, .failed):
+            return "Failed"
+        }
+    }
+
+    private func languageDetectionHealthIcon(_ status: LanguageDetectionHealthStatus) -> String {
+        switch status {
+        case .ready:
+            return "checkmark.seal.fill"
+        case .disabled, .skippedShortText:
+            return "pause.circle"
+        case .modelMissing, .runtimeMissing:
+            return "exclamationmark.triangle.fill"
+        case .failed:
+            return "xmark.octagon.fill"
+        }
+    }
+
+    @ViewBuilder
+    private func languageDetectionHealthReportView(_ report: LanguageDetectionHealth) -> some View {
+        statusBadge(
+            languageDetectionHealthStatusName(report.status),
+            systemImage: languageDetectionHealthIcon(report.status)
+        )
+        Text(report.message)
+            .font(.caption)
+            .foregroundStyle(report.status == .ready || report.status == .disabled ? Color.secondary : Color.red)
+            .fixedSize(horizontal: false, vertical: true)
+        Text("\(L10n.text("Runtime source", language: language)): \(languageDetectionRuntimeSourceName(report.source))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        if let result = report.sampleResult, let detectedLanguage = result.language {
+            Text("\(L10n.text("Detected source", language: language)): \(detectedLanguage) · \(String(format: "%.2f", result.confidence))")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(result.isReliable ? Color.secondary : Color.orange)
+        }
+        if appState.canRepairLanguageDetectionRuntime(report: report) {
+            HStack(spacing: 8) {
+                Button {
+                    appState.repairLanguageDetectionRuntime()
+                } label: {
+                    Label(
+                        L10n.text("Repair Runtime", language: language),
+                        systemImage: appState.languageDetectionRuntimeRepairInProgress ? "clock" : "wrench.and.screwdriver"
+                    )
+                }
+                .controlSize(.small)
+                .disabled(appState.languageDetectionRuntimeRepairInProgress || appState.languageDetectionHealthCheckInProgress)
+                Text(L10n.text("Installs or reuses the isolated fastText language routing runtime, downloads the compact model, then smoke-tests the sidecar.", language: language))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func languageDetectionRuntimeSourceName(_ source: LanguageDetectionRuntimeSource) -> String {
+        switch (language, source) {
+        case (.chinese, .fixtureJSON):
+            return "测试夹具"
+        case (.chinese, .settingsCommand):
+            return "设置命令"
+        case (.chinese, .bundledFastTextSidecar):
+            return "内置 fastText sidecar"
+        case (.chinese, .unavailable):
+            return "不可用"
+        case (.english, .fixtureJSON):
+            return "Fixture"
+        case (.english, .settingsCommand):
+            return "Settings command"
+        case (.english, .bundledFastTextSidecar):
+            return "Bundled fastText sidecar"
+        case (.english, .unavailable):
+            return "Unavailable"
+        }
+    }
+
+    private func fastTranslationSurfaceEngineName(_ engine: FastTranslationSurfaceEngine) -> String {
+        switch (language, engine) {
+        case (.chinese, .auto):
+            return "自动"
+        case (.chinese, .llm):
+            return "LLM"
+        case (.chinese, .fastMT):
+            return "快速 MT"
+        case (.english, .auto):
+            return "Auto"
+        case (.english, .llm):
+            return "LLM"
+        case (.english, .fastMT):
+            return "Fast MT"
+        }
+    }
+
+    private func fastTranslationModelVariantName(_ variant: FastTranslationModelVariant) -> String {
+        switch (language, variant) {
+        case (.chinese, .opusMTEnZh):
+            return "OPUS 英译中"
+        case (.chinese, .nllb200Distilled600M):
+            return "NLLB 200 600M 多语言"
+        case (.english, .opusMTEnZh):
+            return "OPUS English to Chinese"
+        case (.english, .nllb200Distilled600M):
+            return "NLLB 200 600M Multilingual"
+        }
+    }
+
+    private func fastTranslationFallbackPolicyName(_ policy: FastTranslationFallbackPolicy) -> String {
+        switch (language, policy) {
+        case (.chinese, .fallbackToLLM):
+            return "回退 LLM"
+        case (.chinese, .showError):
+            return "显示错误"
+        case (.english, .fallbackToLLM):
+            return "Fallback to LLM"
+        case (.english, .showError):
+            return "Show error"
+        }
+    }
+
+    private func fastTranslationHealthStatusName(_ status: FastTranslationHealthStatus) -> String {
+        switch (language, status) {
+        case (.chinese, .ready):
+            return "可用"
+        case (.chinese, .disabled):
+            return "已关闭"
+        case (.chinese, .runtimeMissing):
+            return "运行时缺失"
+        case (.chinese, .unsupportedLanguagePair):
+            return "语言对不支持"
+        case (.chinese, .failed):
+            return "失败"
+        case (.english, .ready):
+            return "Ready"
+        case (.english, .disabled):
+            return "Disabled"
+        case (.english, .runtimeMissing):
+            return "Runtime missing"
+        case (.english, .unsupportedLanguagePair):
+            return "Unsupported pair"
+        case (.english, .failed):
+            return "Failed"
+        }
+    }
+
+    private func fastTranslationHealthIcon(_ status: FastTranslationHealthStatus) -> String {
+        switch status {
+        case .ready:
+            return "checkmark.seal.fill"
+        case .disabled:
+            return "pause.circle"
+        case .runtimeMissing, .unsupportedLanguagePair:
+            return "exclamationmark.triangle.fill"
+        case .failed:
+            return "xmark.octagon.fill"
+        }
+    }
+
+    @ViewBuilder
+    private func fastTranslationHealthReportView(_ report: FastTranslationHealth) -> some View {
+        statusBadge(
+            fastTranslationHealthStatusName(report.status),
+            systemImage: fastTranslationHealthIcon(report.status)
+        )
+        Text(report.message)
+            .font(.caption)
+            .foregroundStyle(report.status == .ready || report.status == .disabled ? Color.secondary : Color.red)
+            .fixedSize(horizontal: false, vertical: true)
+        Text("\(L10n.text("Runtime source", language: language)): \(fastTranslationRuntimeSourceName(report.source))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        if let engineID = report.engineID {
+            Text("\(L10n.text("Engine", language: language)): \(engineID.rawValue)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        if let modelID = report.modelID {
+            Text("\(L10n.text("Model", language: language)): \(modelID)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        if !report.supportedPairs.isEmpty {
+            let preview = report.supportedPairs.prefix(12).map { "\($0.source)->\($0.target)" }.joined(separator: ", ")
+            let suffix = report.supportedPairs.count > 12 ? " … +\(report.supportedPairs.count - 12)" : ""
+            Text("\(L10n.text("Supported pairs", language: language)): \(preview)\(suffix)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+        }
+        if appState.canRepairFastTranslationRuntime(report: report) {
+            HStack(spacing: 8) {
+                Button {
+                    appState.repairFastTranslationRuntime()
+                } label: {
+                    Label(
+                        L10n.text("Repair Runtime", language: language),
+                        systemImage: appState.fastTranslationRuntimeRepairInProgress ? "clock" : "wrench.and.screwdriver"
+                    )
+                }
+                .controlSize(.small)
+                .disabled(appState.fastTranslationRuntimeRepairInProgress || appState.fastTranslationHealthCheckInProgress)
+                Text(L10n.text("Installs or reuses the isolated CTranslate2 fast MT runtime, converts the selected fast MT model, then smoke-tests the sidecar.", language: language))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func fastTranslationRuntimeSourceName(_ source: FastTranslationRuntimeSource) -> String {
+        switch (language, source) {
+        case (.chinese, .fixtureJSON):
+            return "测试夹具"
+        case (.chinese, .settingsCommand):
+            return "设置命令"
+        case (.chinese, .bundledCTranslate2Sidecar):
+            return "内置 CTranslate2 sidecar"
+        case (.chinese, .bundledArgosSidecar):
+            return "内置 Argos sidecar"
+        case (.chinese, .unavailable):
+            return "不可用"
+        case (.english, .fixtureJSON):
+            return "Fixture"
+        case (.english, .settingsCommand):
+            return "Settings command"
+        case (.english, .bundledCTranslate2Sidecar):
+            return "Bundled CTranslate2 sidecar"
+        case (.english, .bundledArgosSidecar):
+            return "Bundled Argos sidecar"
+        case (.english, .unavailable):
+            return "Unavailable"
+        }
+    }
+
+    private func speakerDiarizationHealthStatusName(_ status: SpeakerDiarizationHealthStatus) -> String {
+        switch (language, status) {
+        case (.chinese, .ready):
+            return "可用"
+        case (.chinese, .disabled):
+            return "已关闭"
+        case (.chinese, .requiresUserToken):
+            return "需要 Token"
+        case (.chinese, .runtimeMissing):
+            return "运行时缺失"
+        case (.chinese, .failed):
+            return "失败"
+        case (.english, .ready):
+            return "Ready"
+        case (.english, .disabled):
+            return "Disabled"
+        case (.english, .requiresUserToken):
+            return "Requires token"
+        case (.english, .runtimeMissing):
+            return "Runtime missing"
+        case (.english, .failed):
+            return "Failed"
+        }
+    }
+
+    private func speakerDiarizationHealthIcon(_ status: SpeakerDiarizationHealthStatus) -> String {
+        switch status {
+        case .ready:
+            return "checkmark.seal.fill"
+        case .disabled:
+            return "pause.circle"
+        case .requiresUserToken, .runtimeMissing:
+            return "exclamationmark.triangle.fill"
+        case .failed:
+            return "xmark.octagon.fill"
+        }
+    }
+
+    @ViewBuilder
+    private func speakerDiarizationHealthReportView(_ report: SpeakerDiarizationHealth) -> some View {
+        statusBadge(
+            speakerDiarizationHealthStatusName(report.status),
+            systemImage: speakerDiarizationHealthIcon(report.status)
+        )
+        Text(report.message)
+            .font(.caption)
+            .foregroundStyle(report.status == .ready || report.status == .disabled ? Color.secondary : Color.red)
+            .fixedSize(horizontal: false, vertical: true)
+        Text("\(L10n.text("Runtime source", language: language)): \(speakerDiarizationRuntimeSourceName(report.source))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        Text("\(L10n.text("Token present", language: language)): \(report.tokenPresent ? L10n.text("Yes", language: language) : L10n.text("No", language: language))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        speakerDiarizationResolutionView(report)
+    }
+
+    @ViewBuilder
+    private func speakerDiarizationResolutionView(_ report: SpeakerDiarizationHealth) -> some View {
+        if report.status == .requiresUserToken {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(L10n.text("Fix path", language: language))
+                    .font(.caption.weight(.semibold))
+                Text(L10n.text("1. Open the pyannote model page and accept the model terms with your Hugging Face account.", language: language))
+                    .font(.caption)
+                Text(L10n.text("2. Create a Hugging Face token, paste it into the HF token field above, then click Save Token.", language: language))
+                    .font(.caption)
+                Text(L10n.text("3. Run Health Check again. If the next status is runtime missing, click Repair Runtime here.", language: language))
+                    .font(.caption)
+                HStack(spacing: 8) {
+                    Button {
+                        openExternalURL("https://huggingface.co/pyannote/speaker-diarization-3.1")
+                    } label: {
+                        Label(L10n.text("Open model terms", language: language), systemImage: "checkmark.seal")
+                    }
+                    .controlSize(.small)
+                    Button {
+                        openExternalURL("https://huggingface.co/settings/tokens")
+                    } label: {
+                        Label(L10n.text("Create HF token", language: language), systemImage: "safari")
+                    }
+                    .controlSize(.small)
+                }
+            }
+            .padding(8)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+        }
+        if appState.canRepairSpeakerDiarizationRuntime(report: report) {
+            HStack(spacing: 8) {
+                Button {
+                    appState.repairSpeakerDiarizationRuntime()
+                } label: {
+                    Label(
+                        L10n.text("Repair Runtime", language: language),
+                        systemImage: appState.speakerDiarizationRuntimeRepairInProgress ? "clock" : "wrench.and.screwdriver"
+                    )
+                }
+                .controlSize(.small)
+                .disabled(appState.speakerDiarizationRuntimeRepairInProgress || appState.speakerDiarizationHealthCheckInProgress)
+                Text(L10n.text("Installs or reuses the local pyannote runtime used by file subtitle speaker diarization.", language: language))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func speakerDiarizationRuntimeSourceName(_ source: SpeakerDiarizationRuntimeSource) -> String {
+        switch (language, source) {
+        case (.chinese, .fixtureJSON):
+            return "测试夹具"
+        case (.chinese, .settingsCommand):
+            return "设置命令"
+        case (.chinese, .bundledPyannoteSidecar):
+            return "内置 pyannote sidecar"
+        case (.chinese, .unavailable):
+            return "不可用"
+        case (.english, .fixtureJSON):
+            return "Fixture"
+        case (.english, .settingsCommand):
+            return "Settings command"
+        case (.english, .bundledPyannoteSidecar):
+            return "Bundled pyannote sidecar"
+        case (.english, .unavailable):
+            return "Unavailable"
+        }
+    }
+
     private func mediaASRRuntimeSourceName(_ source: ASRRuntimeSource) -> String {
         switch (language, source) {
         case (.chinese, .settingsCommand):
@@ -6212,6 +7420,8 @@ struct SettingsView: View {
             return "whisper.cpp CoreML"
         case (.chinese, .funASRGGUFAuto):
             return "自动 FunASR GGUF"
+        case (.chinese, .vibeVoiceASRRunner):
+            return "VibeVoice-ASR"
         case (.chinese, .unavailable):
             return "未配置"
         case (.english, .settingsCommand):
@@ -6230,6 +7440,8 @@ struct SettingsView: View {
             return "whisper.cpp Core ML"
         case (.english, .funASRGGUFAuto):
             return "Auto FunASR GGUF"
+        case (.english, .vibeVoiceASRRunner):
+            return "VibeVoice-ASR"
         case (.english, .unavailable):
             return "Unavailable"
         }
@@ -6361,6 +7573,13 @@ struct SettingsView: View {
     private func openApplicationSupportFolder() {
         let url = AppPaths.applicationSupportDirectory
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openExternalURL(_ value: String) {
+        guard let url = URL(string: value) else {
+            return
+        }
         NSWorkspace.shared.open(url)
     }
 }

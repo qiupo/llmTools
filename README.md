@@ -163,6 +163,8 @@ Phase 4 adds media-first subtitle workflows. The native app can register speech-
 
 ASR is local-only. There is no remote ASR setting and no cloud fallback. On the current Apple Silicon test machine, Qwen3-ASR-0.6B bf16 through the MLX sidecar is the preferred mixed Chinese/English realtime candidate; in the packaged-app bridge benchmark with 100 ms realtime PCM transport chunks, the first partial appeared at about 1.59 s wall time and ASR-event responses measured about 157 ms median / 203 ms p90. Qwen3-ASR-0.6B 4bit remains the faster Qwen3 alternative when its quantized quality is acceptable. Fun-ASR-MLT-Nano, Fun-ASR-Nano, and SenseVoiceSmall remain supported realtime candidates with lower-latency or broader-language tradeoffs. Realtime partial subtitles use tested family-specific partial-window defaults: Qwen3 1350 ms, SenseVoice 1200 ms, Fun-ASR 1500 ms, and whisper.cpp Core ML 2000 ms. Settings -> Media -> Realtime ASR exposes a `Partial window` control for per-model manual tuning, while final subtitles still decode the complete buffered utterance. This control is not the model decoder's low-level audio-slice size; the bundled Qwen3, SenseVoice, Fun-ASR, and whisper realtime sidecars currently re-decode rolling windows instead of maintaining an incremental decoder state for every PCM slice.
 
+VibeVoice-ASR is supported as a heavy file-only rich transcription model. It is intentionally excluded from realtime/live-caption pickers. When its runtime returns speaker-attributed segments, llmTools uses the native speaker and timestamp metadata directly and skips external pyannote diarization. Other ASR commands can also return speaker metadata; any JSON segment with `speaker`, `speakerID`, or `speakerLabel` is treated as model/runtime-native speaker labeling. If no speaker metadata is returned and the selected model is not VibeVoice-ASR, the existing file-scope pyannote diarization path can still add speaker labels when enabled.
+
 The current Mac realtime ASR benchmark notes are kept in [Phase 4 ASR realtime latency report](docs/phase-4-asr-realtime-latency-report.md). That report separates live first-subtitle latency from offline file throughput and records the tested MLX, whisper.cpp Core ML, Apple SpeechAnalyzer, FluidAudio/Parakeet, and removed sherpa-onnx Qwen3-ASR paths.
 
 Official Fun-ASR acceleration paths split by hardware. The vLLM path targets CUDA/NVIDIA servers and provides the highest throughput/streaming service. The llama.cpp/GGUF path targets CPU/edge/on-device use with a single `llama-funasr-cli` binary and built-in FSMN-VAD when compatible GGUF files are present. The checked Fun-ASR GitHub docs do not document Apple MPS/Metal as a supported acceleration path, so llmTools does not assume `device="mps"` for Fun-ASR runtimes.
@@ -173,16 +175,18 @@ Local ASR runtime integration is command-based so the app can work with installe
 LLMTOOLS_FUN_ASR_COMMAND='your-fun-asr-command --model {model} --audio {audio} --language {language}'
 LLMTOOLS_SENSEVOICE_COMMAND='your-sensevoice-command --model {model} --audio {audio}'
 LLMTOOLS_QWEN3_ASR_COMMAND='your-qwen3-asr-command --model {model} --audio {audio}'
+LLMTOOLS_VIBEVOICE_ASR_COMMAND='your-vibevoice-asr-command --model {model} --audio {audio}'
 LLMTOOLS_ASR_COMMAND='your-generic-local-asr-command --model {model} --audio {audio}'
 ```
 
-The command must print either plain transcript text or JSON subtitle segments such as `{"segments":[{"start":0,"end":2.5,"text":"Hello"}]}`. `{audio}` is the normalized 16 kHz mono WAV path and `{model}` is the selected local model folder. Settings commands take priority over environment variables. Fun-ASR GGUF folders can be detected automatically when `llama-funasr-cli` is in `PATH` and the selected model folder contains compatible Fun-ASR encoder and Qwen3 decoder GGUF files. SenseVoiceSmall can also use `sherpa-onnx-offline` from `PATH` when the selected model folder contains `model.onnx` and `tokens.txt`. safetensors/MLX ASR folders use the bundled `llmtools-mlx-asr-runner.sh` with family-specific isolated runtimes: pinned `mlx-audio` for Qwen3, patched `mlx-audio` for SenseVoiceSmall and Fun-ASR-Nano, and `mlx-audio-plus` for Fun-ASR-MLT-Nano.
+The command must print either plain transcript text or JSON subtitle segments such as `{"segments":[{"start":0,"end":2.5,"speakerID":"0","speakerLabel":"Speaker 1","text":"Hello"}]}`. `{audio}` is the normalized 16 kHz mono WAV path and `{model}` is the selected local model folder. Settings commands take priority over environment variables. Fun-ASR GGUF folders can be detected automatically when `llama-funasr-cli` is in `PATH` and the selected model folder contains compatible Fun-ASR encoder and Qwen3 decoder GGUF files. SenseVoiceSmall can also use `sherpa-onnx-offline` from `PATH` when the selected model folder contains `model.onnx` and `tokens.txt`. safetensors/MLX ASR folders use the bundled `llmtools-mlx-asr-runner.sh` with family-specific isolated runtimes: pinned `mlx-audio` for Qwen3, patched `mlx-audio` for SenseVoiceSmall and Fun-ASR-Nano, and `mlx-audio-plus` for Fun-ASR-MLT-Nano. VibeVoice-ASR folders use `scripts/llmtools-vibevoice-asr-runner.py` with a separate Python runtime and preserve the model's rich transcription speaker/timestamp fields.
 
 ```sh
 ./scripts/install-phase4-mlx-asr-runtime.sh
 ./scripts/install-phase4-funasr-mlx-runtime.sh
 ./scripts/install-phase4-funasr-nano-mlx-runtime.sh
 ./scripts/install-phase4-sensevoice-mlx-runtime.sh
+./scripts/install-phase4-vibevoice-asr-runtime.sh
 ```
 
 Health checks show the runtime source: Settings command, environment variable, fixture transcript, local MLX runner, automatic sherpa-onnx, or unavailable. The Settings health check can offer a repair button for supported safetensors/MLX model folders when the matching local runtime is missing.
@@ -211,6 +215,7 @@ Privacy defaults stay restrictive: raw audio, full transcripts, translated subti
 | Install Phase 4 Fun-ASR-MLT MLX runtime | `./scripts/install-phase4-funasr-mlx-runtime.sh` |
 | Install Phase 4 Fun-ASR-Nano MLX runtime | `./scripts/install-phase4-funasr-nano-mlx-runtime.sh` |
 | Install Phase 4 SenseVoice MLX runtime | `./scripts/install-phase4-sensevoice-mlx-runtime.sh` |
+| Install Phase 4 VibeVoice-ASR runtime | `./scripts/install-phase4-vibevoice-asr-runtime.sh` |
 | Phase 4 real media pipeline smoke | `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke` |
 | Package app | `./scripts/package-app.sh` |
 | Verify packaged code signature | `codesign --verify --deep --strict --verbose=2 dist/llmTools.app` |

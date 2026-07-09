@@ -405,6 +405,8 @@ public struct LocalASRProcessRunner: Sendable {
                 return "Local whisper.cpp Core ML runtime is available."
             case .funASRGGUFAuto:
                 return "Local Fun-ASR llama.cpp/GGUF runtime is available."
+            case .vibeVoiceASRRunner:
+                return "Local VibeVoice-ASR rich transcription runtime is available."
             case .unavailable:
                 return "Local ASR runtime is not configured."
             }
@@ -435,6 +437,10 @@ public struct LocalASRProcessRunner: Sendable {
             }
         case .qwen3ASRSherpaOnnx:
             return nil
+        case .vibeVoiceASR:
+            if let value = nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_COMMAND"]) {
+                return ASRCommandResolution(template: value, source: .environmentCommand)
+            }
         case .whisperCppCoreML:
             if let value = nonEmpty(env["LLMTOOLS_WHISPER_CPP_COMMAND"]) {
                 return ASRCommandResolution(template: value, source: .environmentCommand)
@@ -454,6 +460,10 @@ public struct LocalASRProcessRunner: Sendable {
            let whisperTemplate = whisperCppCoreMLCommandTemplate(modelURL: modelURL) {
             return ASRCommandResolution(template: whisperTemplate, source: .whisperCppCoreMLRunner)
         }
+        if family == .vibeVoiceASR,
+           let vibeVoiceTemplate = vibeVoiceASRCommandTemplate() {
+            return ASRCommandResolution(template: vibeVoiceTemplate, source: .vibeVoiceASRRunner)
+        }
         if (family == .funASRNano || family == .funASRMLTNano || family == .senseVoiceSmall || family == .qwen3ASR06B),
            FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path),
            let mlxAudioTemplate = mlxAudioCommandTemplate(for: family) {
@@ -469,6 +479,55 @@ public struct LocalASRProcessRunner: Sendable {
             )
         }
         return nil
+    }
+
+    private func vibeVoiceASRCommandTemplate() -> String? {
+        guard let runnerPath = vibeVoiceASRRunnerPath(),
+              let pythonPath = vibeVoiceASRPythonPath() else {
+            return nil
+        }
+        return "\(shellEscape(pythonPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
+    }
+
+    private func vibeVoiceASRRunnerPath() -> String? {
+        let fileManager = FileManager.default
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("asr", isDirectory: true)
+                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .path
+        ].compactMap { $0 }
+        return candidates.first { fileManager.isExecutableFile(atPath: $0) }
+    }
+
+    private func vibeVoiceASRPythonPath() -> String? {
+        let fileManager = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+        if let envPython = nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_PYTHON"]),
+           fileManager.isExecutableFile(atPath: envPython) {
+            return envPython
+        }
+        let candidates = [
+            nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_VENV"]).map {
+                URL(fileURLWithPath: $0).appendingPathComponent("bin/python").path
+            },
+            AppPaths.applicationSupportDirectory
+                .appendingPathComponent("asr-runtime", isDirectory: true)
+                .appendingPathComponent("vibevoice-venv", isDirectory: true)
+                .appendingPathComponent("bin/python")
+                .path(percentEncoded: false),
+            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
+                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/vibevoice-venv/bin/python")
+                .path(percentEncoded: false)
+        ].compactMap { $0 }
+        return candidates.first {
+            fileManager.isExecutableFile(atPath: $0)
+                && pythonModuleExists(in: URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().path, moduleName: "vibevoice")
+        }
     }
 
     private func whisperCppCoreMLCommandTemplate(modelURL: URL) -> String? {
@@ -693,6 +752,8 @@ public struct LocalASRProcessRunner: Sendable {
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
             return "LLMTOOLS_ASR_VENV"
+        case .vibeVoiceASR:
+            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         case .customLocal:
@@ -710,6 +771,8 @@ public struct LocalASRProcessRunner: Sendable {
             return "sensevoice-venv"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
             return "venv"
+        case .vibeVoiceASR:
+            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         case .customLocal:
@@ -729,6 +792,8 @@ public struct LocalASRProcessRunner: Sendable {
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
         case .qwen3ASRSherpaOnnx:
+            return false
+        case .vibeVoiceASR:
             return false
         case .whisperCppCoreML:
             return false
@@ -781,7 +846,7 @@ public struct LocalASRProcessRunner: Sendable {
     private func runtimeMissingMessage(for model: ModelDescriptor, family: SpeechModelFamily) -> String {
         let modelURL = model.resolvedPath ?? model.sourcePath
         var parts = [
-            "Configure a local ASR command in Media Subtitle settings, or set LLMTOOLS_FUN_ASR_COMMAND, LLMTOOLS_SENSEVOICE_COMMAND, LLMTOOLS_QWEN3_ASR_COMMAND, LLMTOOLS_WHISPER_CPP_COMMAND, or LLMTOOLS_ASR_COMMAND."
+            "Configure a local ASR command in Media Subtitle settings, or set LLMTOOLS_FUN_ASR_COMMAND, LLMTOOLS_SENSEVOICE_COMMAND, LLMTOOLS_QWEN3_ASR_COMMAND, LLMTOOLS_VIBEVOICE_ASR_COMMAND, LLMTOOLS_WHISPER_CPP_COMMAND, or LLMTOOLS_ASR_COMMAND."
         ]
         if family == .funASRMLTNano {
             parts.append("Fun-ASR-MLT-Nano is the preferred broad-language realtime family; safetensors/MLX directories require the bundled runner plus the isolated Fun-ASR mlx-audio-plus runtime, while official Fun-ASR realtime routes still require CUDA/vLLM or compatible GGUF/llama-funasr-cli files.")
@@ -799,6 +864,9 @@ public struct LocalASRProcessRunner: Sendable {
         }
         if family == .qwen3ASRSherpaOnnx {
             parts.append("The sherpa-onnx Qwen3-ASR backend has been removed because MLX Qwen3-ASR is faster on Apple Silicon.")
+        }
+        if family == .vibeVoiceASR {
+            parts.append("VibeVoice-ASR is file-only in llmTools. Use scripts/install-phase4-vibevoice-asr-runtime.sh for the local Python runtime, or configure a command that returns rich JSON segments with text, start/end timestamps, and speaker labels.")
         }
         if family == .whisperCppCoreML {
             parts.append("whisper.cpp Core ML directories require scripts/install-phase4-whisper-coreml-runtime.sh, whisper-cli built with WHISPER_COREML=1, a ggml model file, and its adjacent compiled encoder .mlmodelc directory.")
@@ -907,10 +975,28 @@ public struct LocalASRProcessRunner: Sendable {
                 originalText: text,
                 sourceLanguage: raw.sourceLanguage ?? raw.language,
                 languageConfidence: raw.languageConfidence ?? raw.confidence,
+                speakerID: raw.speakerID ?? raw.speaker,
+                speakerLabel: raw.speakerLabel ?? raw.speaker.map(Self.defaultSpeakerLabel(for:)),
+                speakerConfidence: raw.speakerConfidence,
                 isFinal: raw.isFinal ?? true,
                 asrModelID: model.id.uuidString
             )
         }
+    }
+
+    private static func defaultSpeakerLabel(for value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Speaker"
+        }
+        if let number = Int(trimmed) {
+            return "Speaker \(number + 1)"
+        }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("speaker") {
+            return trimmed
+        }
+        return trimmed
     }
 }
 
@@ -927,7 +1013,135 @@ private struct ASRSidecarSegment: Decodable {
     var sourceLanguage: String?
     var confidence: Double?
     var languageConfidence: Double?
+    var speaker: String?
+    var speakerID: String?
+    var speakerLabel: String?
+    var speakerConfidence: Double?
     var isFinal: Bool?
+
+    private enum CodingKeys: String, CodingKey {
+        case index
+        case start
+        case startTime
+        case start_time
+        case begin
+        case begin_time
+        case end
+        case endTime
+        case end_time
+        case stop
+        case stop_time
+        case text
+        case content
+        case transcript
+        case language
+        case sourceLanguage
+        case source_language
+        case confidence
+        case languageConfidence
+        case language_confidence
+        case speaker
+        case Speaker
+        case speakerID
+        case speaker_id
+        case speakerLabel
+        case speaker_label
+        case label
+        case speakerConfidence
+        case speaker_confidence
+        case isFinal
+        case is_final
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        index = try container.decodeIfPresent(Int.self, forKey: .index)
+        start = Self.decodeTime(
+            from: container,
+            keys: [.start, .startTime, .start_time, .begin, .begin_time]
+        )
+        end = Self.decodeTime(
+            from: container,
+            keys: [.end, .endTime, .end_time, .stop, .stop_time]
+        )
+        text = Self.decodeString(
+            from: container,
+            keys: [.text, .content, .transcript]
+        ) ?? ""
+        language = Self.decodeString(from: container, keys: [.language])
+        sourceLanguage = Self.decodeString(from: container, keys: [.sourceLanguage, .source_language])
+        confidence = try container.decodeIfPresent(Double.self, forKey: .confidence)
+        languageConfidence = try container.decodeIfPresent(Double.self, forKey: .languageConfidence)
+            ?? (try container.decodeIfPresent(Double.self, forKey: .language_confidence))
+        speaker = Self.decodeString(from: container, keys: [.speaker, .Speaker])
+        speakerID = Self.decodeString(from: container, keys: [.speakerID, .speaker_id])
+        speakerLabel = Self.decodeString(from: container, keys: [.speakerLabel, .speaker_label, .label])
+        speakerConfidence = try container.decodeIfPresent(Double.self, forKey: .speakerConfidence)
+            ?? (try container.decodeIfPresent(Double.self, forKey: .speaker_confidence))
+        isFinal = try container.decodeIfPresent(Bool.self, forKey: .isFinal)
+            ?? (try container.decodeIfPresent(Bool.self, forKey: .is_final))
+    }
+
+    private static func decodeString(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+            if let intValue = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return String(intValue)
+            }
+            if let doubleValue = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return String(doubleValue)
+            }
+        }
+        return nil
+    }
+
+    private static func decodeTime(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        keys: [CodingKeys]
+    ) -> TimeInterval? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return max(0, value)
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return max(0, TimeInterval(value))
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key),
+               let parsed = parseTimestamp(value) {
+                return max(0, parsed)
+            }
+        }
+        return nil
+    }
+
+    private static func parseTimestamp(_ rawValue: String) -> TimeInterval? {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let seconds = Double(value) {
+            return seconds
+        }
+        let parts = value.split(separator: ":").map(String.init)
+        guard !parts.isEmpty, parts.count <= 3 else {
+            return nil
+        }
+        var multiplier: TimeInterval = 1
+        var total: TimeInterval = 0
+        for part in parts.reversed() {
+            guard let component = Double(part) else {
+                return nil
+            }
+            total += component * multiplier
+            multiplier *= 60
+        }
+        return total
+    }
 }
 
 public final class StreamingASRProcessSession: @unchecked Sendable {
@@ -1028,6 +1242,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
             return (.mlxAudioRunner, "Local persistent MLX ASR streaming sidecar is available.")
         case .qwen3ASRSherpaOnnx:
+            return nil
+        case .vibeVoiceASR:
             return nil
         case .whisperCppCoreML:
             return (.whisperCppCoreMLRunner, "Local persistent whisper.cpp Core ML server sidecar is available.")
@@ -1199,10 +1415,28 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
                 originalText: text,
                 sourceLanguage: raw.sourceLanguage ?? raw.language,
                 languageConfidence: raw.languageConfidence ?? raw.confidence,
+                speakerID: raw.speakerID ?? raw.speaker,
+                speakerLabel: raw.speakerLabel ?? raw.speaker.map(Self.defaultSpeakerLabel(for:)),
+                speakerConfidence: raw.speakerConfidence,
                 isFinal: raw.isFinal ?? isFinal,
                 asrModelID: model.id.uuidString
             )
         }
+    }
+
+    private static func defaultSpeakerLabel(for value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Speaker"
+        }
+        if let number = Int(trimmed) {
+            return "Speaker \(number + 1)"
+        }
+        let lower = trimmed.lowercased()
+        if lower.hasPrefix("speaker") {
+            return trimmed
+        }
+        return trimmed
     }
 
     private func appendStderr(_ data: Data) {
@@ -1246,6 +1480,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             }
             return SidecarResolution(pythonPath: pythonPath, sidecarPath: sidecarPath)
         case .qwen3ASRSherpaOnnx:
+            return nil
+        case .vibeVoiceASR:
             return nil
         case .whisperCppCoreML:
             guard streamingWhisperCppModelBin(for: modelURL) != nil,
@@ -1387,6 +1623,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .customLocal:
             return "LLMTOOLS_ASR_VENV"
+        case .vibeVoiceASR:
+            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         }
@@ -1402,6 +1640,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "sensevoice-venv"
         case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .customLocal:
             return "venv"
+        case .vibeVoiceASR:
+            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         }
@@ -1419,6 +1659,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
         case .qwen3ASRSherpaOnnx:
+            return false
+        case .vibeVoiceASR:
             return false
         case .whisperCppCoreML:
             return false
@@ -1499,74 +1741,193 @@ public enum SubtitleExporter {
     public static func render(
         segments: [SubtitleSegment],
         format: SubtitleExportFormat,
-        mode: SubtitleDisplayMode
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions = SubtitleExportOptions()
     ) throws -> String {
         guard !segments.isEmpty else {
             throw MediaSubtitleError.exportFailed("No subtitle segments to export.")
         }
         switch format {
         case .srt:
-            return renderSRT(segments: segments, mode: mode)
+            return renderSRT(segments: segments, mode: mode, options: options)
         case .vtt:
-            return renderVTT(segments: segments, mode: mode)
+            return renderVTT(segments: segments, mode: mode, options: options)
         case .txt:
-            return renderText(segments: segments, mode: mode)
+            return renderText(segments: segments, mode: mode, options: options)
         case .markdown:
-            return renderMarkdown(segments: segments, mode: mode)
+            return renderMarkdown(segments: segments, mode: mode, options: options)
         }
     }
 
-    private static func text(for segment: SubtitleSegment, mode: SubtitleDisplayMode) -> String {
+    private static func text(
+        for segment: SubtitleSegment,
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions
+    ) -> String {
         let original = segment.originalText.trimmingCharacters(in: .whitespacesAndNewlines)
         let translated = segment.translatedText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let body: String
         switch mode {
         case .original:
-            return original
+            body = original
         case .translated:
-            return translated.isEmpty ? original : translated
+            body = translated.isEmpty ? original : translated
         case .bilingual:
             guard !translated.isEmpty, translated != original else {
-                return original
+                body = original
+                return prefixedSpeakerText(body, segment: segment, options: options)
             }
-            return "\(original)\n\(translated)"
+            body = "\(original)\n\(translated)"
         }
+        return prefixedSpeakerText(body, segment: segment, options: options)
     }
 
-    private static func renderSRT(segments: [SubtitleSegment], mode: SubtitleDisplayMode) -> String {
-        segments.enumerated().map { offset, segment in
+    private static func renderSRT(
+        segments: [SubtitleSegment],
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions
+    ) -> String {
+        let body = segments.enumerated().map { offset, segment in
             let end = segment.endTime ?? (segment.startTime + 2)
             return """
             \(offset + 1)
             \(srtTime(segment.startTime)) --> \(srtTime(end))
-            \(text(for: segment, mode: mode))
+            \(text(for: segment, mode: mode, options: options))
             """
         }.joined(separator: "\n\n") + "\n"
+        guard let metadata = translationMetadataLine(segments: segments, options: options) else {
+            return body
+        }
+        return "# \(metadata)\n\n" + body
     }
 
-    private static func renderVTT(segments: [SubtitleSegment], mode: SubtitleDisplayMode) -> String {
-        "WEBVTT\n\n" + segments.map { segment in
+    private static func renderVTT(
+        segments: [SubtitleSegment],
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions
+    ) -> String {
+        let metadata = translationMetadataLine(segments: segments, options: options)
+            .map { "NOTE \($0)\n\n" } ?? ""
+        return "WEBVTT\n\n" + metadata + segments.map { segment in
             let end = segment.endTime ?? (segment.startTime + 2)
             return """
             \(vttTime(segment.startTime)) --> \(vttTime(end))
-            \(text(for: segment, mode: mode))
+            \(text(for: segment, mode: mode, options: options))
             """
         }.joined(separator: "\n\n") + "\n"
     }
 
-    private static func renderText(segments: [SubtitleSegment], mode: SubtitleDisplayMode) -> String {
-        segments.map { text(for: $0, mode: mode) }.joined(separator: "\n\n") + "\n"
+    private static func renderText(
+        segments: [SubtitleSegment],
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions
+    ) -> String {
+        let body = segments.map { text(for: $0, mode: mode, options: options) }.joined(separator: "\n\n") + "\n"
+        guard let metadata = translationMetadataLine(segments: segments, options: options) else {
+            return body
+        }
+        return "# \(metadata)\n\n" + body
     }
 
-    private static func renderMarkdown(segments: [SubtitleSegment], mode: SubtitleDisplayMode) -> String {
-        var lines = ["| Time | Subtitle |", "| --- | --- |"]
+    private static func renderMarkdown(
+        segments: [SubtitleSegment],
+        mode: SubtitleDisplayMode,
+        options: SubtitleExportOptions
+    ) -> String {
+        let hasSpeakerLabels = options.includeSpeakerLabels
+            && segments.contains { nonEmpty($0.speakerLabel) != nil || nonEmpty($0.speakerID) != nil }
+        var lines = hasSpeakerLabels
+            ? ["| Time | Speaker | Subtitle |", "| --- | --- | --- |"]
+            : ["| Time | Subtitle |", "| --- | --- |"]
+        var bodyOptions = options
+        if hasSpeakerLabels {
+            bodyOptions.includeSpeakerLabels = false
+        }
         for segment in segments {
             let end = segment.endTime ?? (segment.startTime + 2)
-            let body = text(for: segment, mode: mode)
-                .replacingOccurrences(of: "\n", with: "<br>")
-                .replacingOccurrences(of: "|", with: "\\|")
-            lines.append("| \(vttTime(segment.startTime)) - \(vttTime(end)) | \(body) |")
+            let body = markdownCell(text(for: segment, mode: mode, options: bodyOptions))
+            let time = "\(vttTime(segment.startTime)) - \(vttTime(end))"
+            if hasSpeakerLabels {
+                let speaker = markdownCell(nonEmpty(segment.speakerLabel) ?? nonEmpty(segment.speakerID) ?? "")
+                lines.append("| \(time) | \(speaker) | \(body) |")
+            } else {
+                lines.append("| \(time) | \(body) |")
+            }
         }
-        return lines.joined(separator: "\n") + "\n"
+        let body = lines.joined(separator: "\n") + "\n"
+        guard let metadata = translationMetadata(segments: segments, options: options) else {
+            return body
+        }
+        return """
+        ---
+        translationEngine: \(metadata.engine)
+        translationModel: \(metadata.model ?? "")
+        ---
+
+        \(body)
+        """
+    }
+
+    private static func markdownCell(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\n", with: "<br>")
+            .replacingOccurrences(of: "|", with: "\\|")
+    }
+
+    private static func translationMetadataLine(
+        segments: [SubtitleSegment],
+        options: SubtitleExportOptions
+    ) -> String? {
+        guard let metadata = translationMetadata(segments: segments, options: options) else {
+            return nil
+        }
+        if let model = metadata.model {
+            return "Translation engine: \(metadata.engine); model: \(model)"
+        }
+        return "Translation engine: \(metadata.engine)"
+    }
+
+    private static func translationMetadata(
+        segments: [SubtitleSegment],
+        options: SubtitleExportOptions
+    ) -> (engine: String, model: String?)? {
+        guard options.includeTranslationMetadata else {
+            return nil
+        }
+        guard let engine = segments.compactMap({ nonEmpty($0.translationEngineID) }).first else {
+            return nil
+        }
+        let model = segments.compactMap { nonEmpty($0.translationModelID) }.first
+        return (engine, model)
+    }
+
+    private static func prefixedSpeakerText(
+        _ text: String,
+        segment: SubtitleSegment,
+        options: SubtitleExportOptions
+    ) -> String {
+        guard options.includeSpeakerLabels,
+              let label = segment.speakerLabel?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !label.isEmpty,
+              !text.isEmpty else {
+            return text
+        }
+        let prefix: String
+        switch options.speakerFormat {
+        case .colon:
+            prefix = "\(label): "
+        case .bracketed:
+            prefix = "[\(label)] "
+        }
+        guard let newlineRange = text.range(of: "\n") else {
+            return prefix + text
+        }
+        return prefix + text[..<newlineRange.lowerBound] + text[newlineRange.lowerBound...]
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func srtTime(_ value: TimeInterval) -> String {

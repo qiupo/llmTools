@@ -25,6 +25,10 @@ let package = Package(
             targets: ["LLMToolsMediaSmoke"]
         ),
         .executable(
+            name: "LLMToolsTranslationBench",
+            targets: ["LLMToolsTranslationBench"]
+        ),
+        .executable(
             name: "LLMToolsLiveOCRCheck",
             targets: ["LLMToolsLiveOCRCheck"]
         ),
@@ -72,6 +76,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "LLMToolsMediaSmoke",
+            dependencies: [
+                "LLMToolsCore"
+            ]
+        ),
+        .executableTarget(
+            name: "LLMToolsTranslationBench",
             dependencies: [
                 "LLMToolsCore"
             ]

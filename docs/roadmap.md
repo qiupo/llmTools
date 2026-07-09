@@ -31,6 +31,8 @@ The app should default to local processing. Remote provider entries can exist in
 - Remaining Phase 2 work is now limited to external/manual closure tasks: real Edge acceptance when Edge is available, real Chrome packaged-app smoke after the unpacked extension is loaded from this repo, and fixing defects found by that acceptance. Production Chrome distribution, Safari/Firefox, browser PDF translation, browser image/canvas OCR translation, form-writing assistance, and broader browser expansion are later-phase product decisions.
 - Phase 3 implementation baseline is complete as of 2026-07-04: native text-task prompts and follow-up actions are hardened, model capability metadata is persisted and visible, and native model-vision OCR plus screenshot/image explanation are available through a user-selected vision-capable model.
 - Phase 4 product direction is now media intake and live subtitles: local audio/video transcription, translated subtitles, and desktop live subtitles from system audio and/or microphone audio. The previous file/document intake plan is retained as supporting file-ingestion scope and later document-assistant work.
+- Phase 4.x language/speaker/fast-MT implementation is now in place: language-ID routing, file-scope speaker diarization, fast MT sidecar routing for subtitles/webpage translation, webpage cache v2 engine isolation, and dependency-free fixture checks.
+- Phase 4.x realtime speaker diarization is explicitly out of scope for the MVP. The live speaker toggle is hard-disabled until a later spike can prove that diarization never blocks ASR partial/final subtitle output.
 
 ## Confirmed Decisions
 
@@ -64,6 +66,9 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4 does not consider remote ASR. Speech recognition must run locally by default and should not include a cloud fallback path in MVP requirements.
 - Phase 4 realtime subtitles prefer Fun-ASR-MLT-Nano when a local Fun-ASR streaming runtime is configured, with Fun-ASR-Nano as the lower-latency Chinese/English/Japanese option. SenseVoiceSmall remains supported as a short-window low-latency runtime. Qwen3-ASR-0.6B is selectable as an experimental realtime ASR through a local vLLM/streaming runtime and remains available for audio/video file transcription.
 - Phase 4 translated subtitles reuse llmTools' existing text translation engine after ASR; ASR models should produce transcripts, not final Chinese translations.
+- Phase 4.x file subtitle diarization is file-scope only. Cross-file speaker identity and speaker embedding persistence are rejected for the MVP.
+- Phase 4.x fast MT has a global killswitch (`fastTranslation.forceLLM`) and must fall back to LLM when configured to do so. Webpage translation cache keys must include source language, target language, engine id, engine model id, domain, and text hash so LLM and fast MT outputs do not mix.
+- Phase 4.x realtime diarization status is tracked in `docs/phase-4x-realtime-diarization-spike.md`; no 4.x.6 implementation should start until that spike passes the latency gate.
 
 ## Phase 1: Native MVP - Completed
 

@@ -41,20 +41,46 @@ mkdir -p "$RESOURCES_DIR/asr"
 cp "$ROOT_DIR/scripts/llmtools-mlx-asr-runner.sh" "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh"
 cp "$ROOT_DIR/scripts/llmtools-streaming-asr-sidecar.py" "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py"
 cp "$ROOT_DIR/scripts/llmtools-whisper-coreml-runner.sh" "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh"
+cp "$ROOT_DIR/scripts/llmtools-vibevoice-asr-runner.py" "$RESOURCES_DIR/asr/llmtools-vibevoice-asr-runner.py"
 cp "$ROOT_DIR/scripts/install-phase4-mlx-asr-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-funasr-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-funasr-nano-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-sensevoice-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-whisper-coreml-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-vibevoice-asr-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-vibevoice-asr-runtime.sh"
 chmod +x \
     "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh" \
     "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py" \
     "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh" \
+    "$RESOURCES_DIR/asr/llmtools-vibevoice-asr-runner.py" \
     "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh" \
-    "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
+    "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-vibevoice-asr-runtime.sh"
+mkdir -p "$RESOURCES_DIR/lid"
+cp "$ROOT_DIR/scripts/llmtools-lid-sidecar.py" "$RESOURCES_DIR/lid/llmtools-lid-sidecar.py"
+cp "$ROOT_DIR/scripts/install-phase4x-fasttext-lid.sh" "$RESOURCES_DIR/lid/install-phase4x-fasttext-lid.sh"
+chmod +x \
+    "$RESOURCES_DIR/lid/llmtools-lid-sidecar.py" \
+    "$RESOURCES_DIR/lid/install-phase4x-fasttext-lid.sh"
+mkdir -p "$RESOURCES_DIR/fastmt"
+cp "$ROOT_DIR/scripts/llmtools-fastmt-sidecar.py" "$RESOURCES_DIR/fastmt/llmtools-fastmt-sidecar.py"
+cp "$ROOT_DIR/scripts/install-phase4x-ctranslate2-en-zh.sh" "$RESOURCES_DIR/fastmt/install-phase4x-ctranslate2-en-zh.sh"
+cp "$ROOT_DIR/scripts/install-phase4x-nllb-200-distilled-600m.sh" "$RESOURCES_DIR/fastmt/install-phase4x-nllb-200-distilled-600m.sh"
+cp "$ROOT_DIR/scripts/install-phase4x-argos.sh" "$RESOURCES_DIR/fastmt/install-phase4x-argos.sh"
+chmod +x \
+    "$RESOURCES_DIR/fastmt/llmtools-fastmt-sidecar.py" \
+    "$RESOURCES_DIR/fastmt/install-phase4x-ctranslate2-en-zh.sh" \
+    "$RESOURCES_DIR/fastmt/install-phase4x-nllb-200-distilled-600m.sh" \
+    "$RESOURCES_DIR/fastmt/install-phase4x-argos.sh"
+mkdir -p "$RESOURCES_DIR/diarization"
+cp "$ROOT_DIR/scripts/llmtools-pyannote-diarization-sidecar.py" "$RESOURCES_DIR/diarization/llmtools-pyannote-diarization-sidecar.py"
+cp "$ROOT_DIR/scripts/install-phase4x-pyannote-diarization.sh" "$RESOURCES_DIR/diarization/install-phase4x-pyannote-diarization.sh"
+chmod +x \
+    "$RESOURCES_DIR/diarization/llmtools-pyannote-diarization-sidecar.py" \
+    "$RESOURCES_DIR/diarization/install-phase4x-pyannote-diarization.sh"
 if [ ! -f "$ROOT_DIR/Resources/$APP_ICON_NAME.icns" ]; then
     echo "error: missing app icon at Resources/$APP_ICON_NAME.icns; run ./scripts/generate-app-icon.sh first." >&2
     exit 1
