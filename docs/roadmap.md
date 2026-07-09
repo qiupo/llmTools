@@ -10,6 +10,7 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 - direct web-page translation, where English text in a page can be translated into Chinese in place
 - native image OCR using explicitly configured vision-capable models
 - local-first media subtitles for audio, video, and desktop live playback, with direct Chinese translation
+- delayed live meeting transcription with speaker-aware notes as a separate work surface from live subtitles
 - a floating desktop widget that accepts pasted text and dragged files
 - local model reuse through user-selected model files or model folders
 - task-first interaction, with model selection hidden behind sensible defaults
@@ -33,6 +34,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4 product direction is now media intake and live subtitles: local audio/video transcription, translated subtitles, and desktop live subtitles from system audio and/or microphone audio. The previous file/document intake plan is retained as supporting file-ingestion scope and later document-assistant work.
 - Phase 4.x language/speaker/fast-MT implementation is now in place: language-ID routing, file-scope speaker diarization, fast MT sidecar routing for subtitles/webpage translation, webpage cache v2 engine isolation, and dependency-free fixture checks.
 - Phase 4.x realtime speaker diarization is explicitly out of scope for the MVP. The live speaker toggle is hard-disabled until a later spike can prove that diarization never blocks ASR partial/final subtitle output.
+- Phase 4.y live meeting transcription is a proposed separate product surface that allows delayed transcript, delayed speaker labels, speaker correction, and meeting-note generation without changing the low-latency live subtitle contract.
 
 ## Confirmed Decisions
 
@@ -69,6 +71,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4.x file subtitle diarization is file-scope only. Cross-file speaker identity and speaker embedding persistence are rejected for the MVP.
 - Phase 4.x fast MT has a global killswitch (`fastTranslation.forceLLM`) and must fall back to LLM when configured to do so. Webpage translation cache keys must include source language, target language, engine id, engine model id, domain, and text hash so LLM and fast MT outputs do not mix.
 - Phase 4.x realtime diarization status is tracked in `docs/phase-4x-realtime-diarization-spike.md`; no 4.x.6 implementation should start until that spike passes the latency gate.
+- Phase 4.y live meeting transcription is tracked in `docs/phase-4y-live-meeting-transcription-prd.md`; it is allowed to lag and should not be implemented by simply enabling speaker labels in the live subtitle overlay.
 
 ## Phase 1: Native MVP - Completed
 
@@ -332,6 +335,8 @@ Goal: make llmTools process audio, video, and desktop live audio into original a
 Detailed PRD: `docs/phase-4-media-live-subtitles-prd.md`.
 
 Phase 4.x enhancement PRD: `docs/phase-4x-language-speaker-fast-mt-prd.md`.
+
+Phase 4.y live meeting transcription PRD: `docs/phase-4y-live-meeting-transcription-prd.md`.
 
 Implementation status as of 2026-07-06:
 

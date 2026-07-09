@@ -1075,6 +1075,8 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
 public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
     public var enabled: Bool
     public var modelVariant: LanguageIDModelVariant
+    public var ftzModelPath: String
+    public var binModelPath: String
     public var shortTextMinimumCharactersLatin: Int
     public var shortTextMinimumCharactersCJK: Int
     public var lowConfidenceThreshold: Double
@@ -1088,6 +1090,8 @@ public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
     public init(
         enabled: Bool = false,
         modelVariant: LanguageIDModelVariant = .ftz,
+        ftzModelPath: String = "",
+        binModelPath: String = "",
         shortTextMinimumCharactersLatin: Int = 20,
         shortTextMinimumCharactersCJK: Int = 3,
         lowConfidenceThreshold: Double = 0.65,
@@ -1100,6 +1104,8 @@ public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
     ) {
         self.enabled = enabled
         self.modelVariant = modelVariant
+        self.ftzModelPath = Self.normalizedCommandTemplate(ftzModelPath)
+        self.binModelPath = Self.normalizedCommandTemplate(binModelPath)
         self.shortTextMinimumCharactersLatin = max(1, shortTextMinimumCharactersLatin)
         self.shortTextMinimumCharactersCJK = max(1, shortTextMinimumCharactersCJK)
         self.lowConfidenceThreshold = Self.normalizedConfidence(lowConfidenceThreshold)
@@ -1114,6 +1120,8 @@ public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case enabled
         case modelVariant
+        case ftzModelPath
+        case binModelPath
         case shortTextMinimumCharactersLatin
         case shortTextMinimumCharactersCJK
         case lowConfidenceThreshold
@@ -1130,6 +1138,12 @@ public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? defaults.enabled
         modelVariant = try container.decodeIfPresent(LanguageIDModelVariant.self, forKey: .modelVariant) ?? defaults.modelVariant
+        ftzModelPath = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .ftzModelPath) ?? defaults.ftzModelPath
+        )
+        binModelPath = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .binModelPath) ?? defaults.binModelPath
+        )
         shortTextMinimumCharactersLatin = max(
             1,
             try container.decodeIfPresent(Int.self, forKey: .shortTextMinimumCharactersLatin)
@@ -1182,19 +1196,27 @@ public struct LanguageRoutingPreferences: Codable, Sendable, Hashable {
 }
 
 public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
+    public static let defaultModelIdentifier = "pyannote/speaker-diarization-3.1"
+
     public var enabledForFileSubtitles: Bool
     public var enabledForLiveSubtitles: Bool
+    public var modelIdentifier: String
+    public var cacheDirectory: String
     public var commandTemplate: String
     public var persistSpeakerEmbeddings: Bool
 
     public init(
         enabledForFileSubtitles: Bool = false,
         enabledForLiveSubtitles: Bool = false,
+        modelIdentifier: String = Self.defaultModelIdentifier,
+        cacheDirectory: String = "",
         commandTemplate: String = "",
         persistSpeakerEmbeddings: Bool = false
     ) {
         self.enabledForFileSubtitles = enabledForFileSubtitles
         self.enabledForLiveSubtitles = false
+        self.modelIdentifier = Self.normalizedModelIdentifier(modelIdentifier)
+        self.cacheDirectory = Self.normalizedCommandTemplate(cacheDirectory)
         self.commandTemplate = Self.normalizedCommandTemplate(commandTemplate)
         self.persistSpeakerEmbeddings = persistSpeakerEmbeddings
     }
@@ -1202,6 +1224,8 @@ public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case enabledForFileSubtitles
         case enabledForLiveSubtitles
+        case modelIdentifier
+        case cacheDirectory
         case commandTemplate
         case persistSpeakerEmbeddings
     }
@@ -1213,6 +1237,12 @@ public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
             ?? defaults.enabledForFileSubtitles
         _ = try container.decodeIfPresent(Bool.self, forKey: .enabledForLiveSubtitles)
         enabledForLiveSubtitles = false
+        modelIdentifier = Self.normalizedModelIdentifier(
+            try container.decodeIfPresent(String.self, forKey: .modelIdentifier) ?? defaults.modelIdentifier
+        )
+        cacheDirectory = Self.normalizedCommandTemplate(
+            try container.decodeIfPresent(String.self, forKey: .cacheDirectory) ?? defaults.cacheDirectory
+        )
         commandTemplate = Self.normalizedCommandTemplate(
             try container.decodeIfPresent(String.self, forKey: .commandTemplate) ?? defaults.commandTemplate
         )
@@ -1222,6 +1252,10 @@ public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
 
     private static func normalizedCommandTemplate(_ value: String) -> String {
         value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func normalizedModelIdentifier(_ value: String) -> String {
+        normalizedCommandTemplate(value).isEmpty ? Self.defaultModelIdentifier : normalizedCommandTemplate(value)
     }
 }
 
@@ -1301,6 +1335,8 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
     public var webpageEngine: FastTranslationSurfaceEngine
     public var textEngine: FastTranslationSurfaceEngine
     public var modelVariant: FastTranslationModelVariant
+    public var opusMTEnZhCT2ModelPath: String
+    public var nllb200Distilled600MCT2ModelPath: String
     public var fallbackPolicy: FastTranslationFallbackPolicy
     public var commandTemplates: FastTranslationCommandTemplates
     public var maxConcurrentBatches: Int
@@ -1311,6 +1347,8 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
         webpageEngine: FastTranslationSurfaceEngine = .llm,
         textEngine: FastTranslationSurfaceEngine = .llm,
         modelVariant: FastTranslationModelVariant = .nllb200Distilled600M,
+        opusMTEnZhCT2ModelPath: String = "",
+        nllb200Distilled600MCT2ModelPath: String = "",
         fallbackPolicy: FastTranslationFallbackPolicy = .fallbackToLLM,
         commandTemplates: FastTranslationCommandTemplates = FastTranslationCommandTemplates(),
         maxConcurrentBatches: Int = 1,
@@ -1320,6 +1358,8 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
         self.webpageEngine = webpageEngine
         self.textEngine = textEngine
         self.modelVariant = modelVariant
+        self.opusMTEnZhCT2ModelPath = Self.normalizedPath(opusMTEnZhCT2ModelPath)
+        self.nllb200Distilled600MCT2ModelPath = Self.normalizedPath(nllb200Distilled600MCT2ModelPath)
         self.fallbackPolicy = fallbackPolicy
         self.commandTemplates = commandTemplates
         self.maxConcurrentBatches = Self.normalizedMaxConcurrentBatches(maxConcurrentBatches)
@@ -1331,6 +1371,8 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
         case webpageEngine
         case textEngine
         case modelVariant
+        case opusMTEnZhCT2ModelPath
+        case nllb200Distilled600MCT2ModelPath
         case fallbackPolicy
         case commandTemplates
         case maxConcurrentBatches
@@ -1348,6 +1390,12 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
             ?? defaults.textEngine
         modelVariant = try container.decodeIfPresent(FastTranslationModelVariant.self, forKey: .modelVariant)
             ?? defaults.modelVariant
+        opusMTEnZhCT2ModelPath = Self.normalizedPath(
+            try container.decodeIfPresent(String.self, forKey: .opusMTEnZhCT2ModelPath) ?? defaults.opusMTEnZhCT2ModelPath
+        )
+        nllb200Distilled600MCT2ModelPath = Self.normalizedPath(
+            try container.decodeIfPresent(String.self, forKey: .nllb200Distilled600MCT2ModelPath) ?? defaults.nllb200Distilled600MCT2ModelPath
+        )
         fallbackPolicy = try container.decodeIfPresent(FastTranslationFallbackPolicy.self, forKey: .fallbackPolicy)
             ?? defaults.fallbackPolicy
         commandTemplates = try container.decodeIfPresent(FastTranslationCommandTemplates.self, forKey: .commandTemplates)
@@ -1378,6 +1426,10 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
 
     private static func normalizedMaxConcurrentBatches(_ value: Int) -> Int {
         min(max(value, 1), 8)
+    }
+
+    private static func normalizedPath(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

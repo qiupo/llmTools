@@ -21,6 +21,7 @@ struct LLMToolsChecks {
         try await checkLanguageDetectionFixture()
         try await checkLanguageRoutingCallerWiring()
         try await checkSpeakerDiarizationFixtureAndMapping()
+        try await checkSpeakerDiarizationFailureMessageSanitization()
         try checkSubtitleExportWithSpeakers()
         try await checkSpeakerDiarizationFilePipeline()
         try await checkFastMTFixtureRoundTrip()
@@ -527,6 +528,8 @@ struct LLMToolsChecks {
         try require(preferences.languageRouting.shortTextMinimumCharactersCJK == 3, "Expected CJK short-text threshold to default to 3.")
         try require(preferences.languageRouting.lowConfidenceThreshold == 0.65, "Expected LID low-confidence threshold to default to 0.65.")
         try require(preferences.languageRouting.ocrConfidenceBoost == 0.1, "Expected OCR confidence boost to default to 0.1.")
+        try require(preferences.languageRouting.ftzModelPath.isEmpty, "Expected LID FTZ model path to default empty.")
+        try require(preferences.languageRouting.binModelPath.isEmpty, "Expected LID BIN model path to default empty.")
         try require(preferences.languageRouting.commandTemplate.isEmpty, "Expected LID command template to default empty.")
         try require(!preferences.speakerDiarization.enabledForFileSubtitles, "Expected speaker diarization file path to default off.")
         try require(!preferences.speakerDiarization.enabledForLiveSubtitles, "Expected live speaker diarization to default off.")
@@ -542,6 +545,8 @@ struct LLMToolsChecks {
 
         let languageRouting = LanguageRoutingPreferences(
             enabled: true,
+            ftzModelPath: "  /models/lid.176.ftz  ",
+            binModelPath: "  /models/lid.176.bin  ",
             shortTextMinimumCharactersLatin: 0,
             shortTextMinimumCharactersCJK: 0,
             lowConfidenceThreshold: 2,
@@ -552,6 +557,8 @@ struct LLMToolsChecks {
         try require(languageRouting.shortTextMinimumCharactersCJK == 1, "Expected CJK threshold to clamp to at least 1.")
         try require(languageRouting.lowConfidenceThreshold == 1, "Expected confidence threshold to clamp to 1.")
         try require(languageRouting.ocrConfidenceBoost == 0, "Expected OCR boost to clamp to 0.")
+        try require(languageRouting.ftzModelPath == "/models/lid.176.ftz", "Expected FTZ model path to trim whitespace.")
+        try require(languageRouting.binModelPath == "/models/lid.176.bin", "Expected BIN model path to trim whitespace.")
         try require(languageRouting.commandTemplate == "python lid.py", "Expected LID command template to trim whitespace.")
         try require(
             LanguageRoutingPreferences(shortTextMinimumCharactersLatin: 3).shouldSkipDetection(for: "hi"),
@@ -559,12 +566,25 @@ struct LLMToolsChecks {
         )
         try require(!LanguageRoutingPreferences().shouldSkipDetection(for: "你好世界"), "Expected non-short CJK text to allow LID.")
 
+        let decodedLanguageRouting = try JSONDecoder().decode(LanguageRoutingPreferences.self, from: Data("""
+        {
+          "enabled": true,
+          "modelVariant": "ftz"
+        }
+        """.utf8))
+        try require(decodedLanguageRouting.ftzModelPath.isEmpty, "Expected older LID preferences to use an empty FTZ model path.")
+        try require(decodedLanguageRouting.binModelPath.isEmpty, "Expected older LID preferences to use an empty BIN model path.")
+
         let speakerDiarization = SpeakerDiarizationPreferences(
             enabledForFileSubtitles: true,
             enabledForLiveSubtitles: true,
+            modelIdentifier: "  /models/pyannote/config.yaml  ",
+            cacheDirectory: "  /models/hf-cache  ",
             commandTemplate: "  pyannote run  ",
             persistSpeakerEmbeddings: true
         )
+        try require(speakerDiarization.modelIdentifier == "/models/pyannote/config.yaml", "Expected diarization model identifier to trim whitespace.")
+        try require(speakerDiarization.cacheDirectory == "/models/hf-cache", "Expected diarization cache directory to trim whitespace.")
         try require(speakerDiarization.commandTemplate == "pyannote run", "Expected diarization command template to trim whitespace.")
         try require(!speakerDiarization.enabledForLiveSubtitles, "Live speaker diarization must remain hard-disabled before the realtime spike passes.")
 
@@ -576,21 +596,35 @@ struct LLMToolsChecks {
         """.utf8))
         try require(decodedDiarization.enabledForFileSubtitles, "Expected file diarization preference to decode.")
         try require(!decodedDiarization.enabledForLiveSubtitles, "Expected live diarization decode to stay hard-disabled.")
+        try require(decodedDiarization.modelIdentifier == SpeakerDiarizationPreferences.defaultModelIdentifier, "Expected older diarization preferences to use the default pyannote model.")
 
         let fastTranslation = FastTranslationPreferences(
             subtitleEngine: .fastMT,
             webpageEngine: .auto,
             textEngine: .fastMT,
             modelVariant: .nllb200Distilled600M,
+            opusMTEnZhCT2ModelPath: "  /models/opus-ct2  ",
+            nllb200Distilled600MCT2ModelPath: "  /models/nllb-ct2  ",
             maxConcurrentBatches: 99,
             forceLLM: true
         )
         try require(fastTranslation.textEngine == .fastMT, "Expected text translation engine to allow fast MT.")
         try require(fastTranslation.modelVariant == .nllb200Distilled600M, "Expected fast translation model variant to allow NLLB selection.")
+        try require(fastTranslation.opusMTEnZhCT2ModelPath == "/models/opus-ct2", "Expected OPUS CT2 model path to trim whitespace.")
+        try require(fastTranslation.nllb200Distilled600MCT2ModelPath == "/models/nllb-ct2", "Expected NLLB CT2 model path to trim whitespace.")
         try require(fastTranslation.maxConcurrentBatches == 8, "Expected fast translation concurrency to clamp to 8.")
         try require(fastTranslation.engineForSubtitles() == .llm, "Expected forceLLM to override subtitle engine.")
         try require(fastTranslation.engine(for: .webPageTranslate) == .llm, "Expected forceLLM to override webpage engine.")
         try require(fastTranslation.engine(for: .polish) == .llm, "Expected polish to stay on LLM even when text translation uses fast MT.")
+
+        let decodedFastTranslation = try JSONDecoder().decode(FastTranslationPreferences.self, from: Data("""
+        {
+          "subtitleEngine": "auto",
+          "modelVariant": "nllb200Distilled600M"
+        }
+        """.utf8))
+        try require(decodedFastTranslation.opusMTEnZhCT2ModelPath.isEmpty, "Expected older fast MT preferences to use an empty OPUS model path.")
+        try require(decodedFastTranslation.nllb200Distilled600MCT2ModelPath.isEmpty, "Expected older fast MT preferences to use an empty NLLB model path.")
 
         try require(LanguageCodeNormalizer.normalizedBCP47("__label__eng") == "en", "Expected fastText English label to normalize.")
         try require(LanguageCodeNormalizer.normalizedBCP47("zho_Hans") == "zh-Hans", "Expected NLLB Simplified Chinese to normalize.")
@@ -684,6 +718,21 @@ struct LLMToolsChecks {
         try require(Phase4XFixtureEnvironment.languageIDJSON == "LLMTOOLS_LID_FIXTURE_JSON", "Expected LID fixture env var name.")
         try require(Phase4XFixtureEnvironment.fastTranslationJSON == "LLMTOOLS_FAST_MT_FIXTURE_JSON", "Expected fast MT fixture env var name.")
         try require(Phase4XFixtureEnvironment.diarizationJSON == "LLMTOOLS_DIARIZATION_FIXTURE_JSON", "Expected diarization fixture env var name.")
+
+        let lidRoot = try makeTemporaryDirectory(name: "lid-model-paths")
+        defer { try? FileManager.default.removeItem(at: lidRoot) }
+        let ftzModel = lidRoot.appendingPathComponent("lid.176.ftz")
+        let binModel = lidRoot.appendingPathComponent("lid.176.bin")
+        try Data().write(to: ftzModel)
+        try Data().write(to: binModel)
+        let ftzResolution = try FastTextLIDCommandRunner.commandResolution(
+            preferences: LanguageRoutingPreferences(modelVariant: .ftz, ftzModelPath: ftzModel.path)
+        )
+        try require(ftzResolution.command.contains(ftzModel.path), "Expected explicit FTZ LID model path to be used in the command.")
+        let binResolution = try FastTextLIDCommandRunner.commandResolution(
+            preferences: LanguageRoutingPreferences(modelVariant: .bin, binModelPath: binModel.path)
+        )
+        try require(binResolution.command.contains(binModel.path), "Expected explicit BIN LID model path to be used in the command.")
     }
 
     private static func checkLanguageDetectionFixture() async throws {
@@ -1032,6 +1081,37 @@ struct LLMToolsChecks {
         try require(!markdown.contains("Speaker 1:"), "Expected export option to hide speaker labels.")
     }
 
+    private static func checkSpeakerDiarizationFailureMessageSanitization() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelConfigURL = root.appendingPathComponent("pyannote-config.yaml")
+        try Data("pipeline:\n  name: pyannote.audio.pipelines.SpeakerDiarization\n".utf8).write(to: modelConfigURL)
+        let bundledResolution = try SpeakerDiarizationCommandRunner.commandResolution(
+            preferences: SpeakerDiarizationPreferences(
+                enabledForFileSubtitles: true,
+                modelIdentifier: modelConfigURL.path
+            )
+        )
+        try require(bundledResolution.command.contains("--model {diarization_model}"), "Expected bundled diarization command to pass the configured model.")
+
+        let wavURL = root.appendingPathComponent("speaker-failure.wav")
+        try writePCM16WAV(url: wavURL, duration: 0.2)
+        let preferences = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: #"/bin/sh -c 'printf "%s\n" "Traceback (most recent call last):" "requests.exceptions.ConnectionError: [Errno 65] No route to host thrown while requesting HEAD https://huggingface.co/pyannote/speaker-diarization-3.1/resolve/main/config.yaml" >&2; exit 1'"#
+        )
+
+        do {
+            _ = try await SpeakerDiarizationService().diarize(audioURL: wavURL, preferences: preferences)
+            try require(false, "Expected pyannote command failure to throw.")
+        } catch SpeakerDiarizationError.runtimeFailed(let message) {
+            try require(message.contains("pyannote model is not ready"), "Expected pyannote setup failure to be productized.")
+            try require(message.contains("Settings > Models > Model Settings > Speaker Diarization"), "Expected failure to point to model settings.")
+            try require(!message.contains("Traceback"), "Expected Python traceback to be hidden.")
+            try require(!message.contains("requests.exceptions"), "Expected low-level requests error to be hidden.")
+        }
+    }
+
     private static func checkSpeakerDiarizationFilePipeline() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -1239,6 +1319,32 @@ struct LLMToolsChecks {
             preferences: FastTranslationPreferences(modelVariant: .nllb200Distilled600M)
         )
         try require(nllbResolution.command.contains(nllbRoot.path), "Expected NLLB fast MT selection to resolve the NLLB model path.")
+
+        let explicitNLLBRoot = try makeTemporaryDirectory(name: "explicit-nllb-200-distilled-600m-ct2-int8")
+        defer { try? FileManager.default.removeItem(at: explicitNLLBRoot) }
+        let explicitNLLBResolution = try FastTranslationCommandRunner.commandResolution(
+            preferences: FastTranslationPreferences(
+                modelVariant: .nllb200Distilled600M,
+                nllb200Distilled600MCT2ModelPath: explicitNLLBRoot.path
+            )
+        )
+        try require(
+            explicitNLLBResolution.command.contains(explicitNLLBRoot.path),
+            "Expected explicit NLLB fast MT model path to be used in the command."
+        )
+
+        let explicitOPUSRoot = try makeTemporaryDirectory(name: "explicit-opus-mt-en-zh-ct2")
+        defer { try? FileManager.default.removeItem(at: explicitOPUSRoot) }
+        let explicitOPUSResolution = try FastTranslationCommandRunner.commandResolution(
+            preferences: FastTranslationPreferences(
+                modelVariant: .opusMTEnZh,
+                opusMTEnZhCT2ModelPath: explicitOPUSRoot.path
+            )
+        )
+        try require(
+            explicitOPUSResolution.command.contains(explicitOPUSRoot.path),
+            "Expected explicit OPUS fast MT model path to be used in the command."
+        )
     }
 
     private static func checkTranslationRoutingDecisionTable() throws {

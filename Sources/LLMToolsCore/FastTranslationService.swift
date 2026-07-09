@@ -252,9 +252,28 @@ public actor FastTranslationCommandRunner: FastTranslationService {
         public var key: String
     }
 
+    public static var defaultOPUSCT2ModelPath: String {
+        AppPaths.applicationSupportDirectory
+            .appendingPathComponent("fastmt-runtime", isDirectory: true)
+            .appendingPathComponent("opus-mt-en-zh-ct2", isDirectory: true)
+            .path
+    }
+
+    public static var defaultNLLB600MCT2ModelPath: String {
+        AppPaths.applicationSupportDirectory
+            .appendingPathComponent("fastmt-runtime", isDirectory: true)
+            .appendingPathComponent("nllb-200-distilled-600m-ct2-int8", isDirectory: true)
+            .path
+    }
+
     public static func commandResolution(preferences: FastTranslationPreferences) throws -> CommandResolution {
         if let template = preferences.commandTemplates.template(for: .customCommand) {
-            let command = renderCommandTemplate(template, engineID: .customCommand)
+            let command = renderCommandTemplate(
+                template,
+                engineID: .customCommand,
+                modelVariant: preferences.modelVariant,
+                preferences: preferences
+            )
             return CommandResolution(command: command, source: .settingsCommand, engineID: .customCommand, modelID: nil, key: "settings:\(command)")
         }
         guard let sidecarPath = sidecarPath() else {
@@ -264,9 +283,15 @@ public actor FastTranslationCommandRunner: FastTranslationService {
             throw FastTranslationError.runtimeMissing("Python runtime was not found for fast translation.")
         }
         if let template = preferences.commandTemplates.template(for: .ctranslate2) {
-            guard let modelPath = ctranslate2ModelPath(for: preferences.modelVariant) else {
+            if let configuredModelPath = configuredCTranslate2ModelPath(
+                for: preferences.modelVariant,
+                preferences: preferences
+            ), !FileManager.default.fileExists(atPath: configuredModelPath) {
+                throw FastTranslationError.runtimeMissing("Configured fast translation model was not found: \(configuredModelPath). Choose an existing CTranslate2 model folder under Models > Model Settings.")
+            }
+            guard let modelPath = ctranslate2ModelPath(for: preferences.modelVariant, preferences: preferences) else {
                 if preferences.modelVariant != .opusMTEnZh {
-                    throw FastTranslationError.runtimeMissing("Selected fast translation model is missing: \(preferences.modelVariant.rawValue).")
+                    throw FastTranslationError.runtimeMissing("Selected fast translation model is missing: \(preferences.modelVariant.rawValue). Configure the model folder under Models > Model Settings or install the Fast MT runtime.")
                 }
                 return try argosCommandResolution(
                     preferences: preferences,
@@ -280,7 +305,8 @@ public actor FastTranslationCommandRunner: FastTranslationService {
                 pythonPath: pythonPath,
                 sidecarPath: sidecarPath,
                 ctranslate2ModelPath: modelPath,
-                modelVariant: preferences.modelVariant
+                modelVariant: preferences.modelVariant,
+                preferences: preferences
             )
             return CommandResolution(
                 command: command,
@@ -307,7 +333,9 @@ public actor FastTranslationCommandRunner: FastTranslationService {
                 template,
                 engineID: .argos,
                 pythonPath: pythonPath,
-                sidecarPath: sidecarPath
+                sidecarPath: sidecarPath,
+                modelVariant: preferences.modelVariant,
+                preferences: preferences
             )
             return CommandResolution(
                 command: command,
@@ -474,37 +502,51 @@ public actor FastTranslationCommandRunner: FastTranslationService {
         pythonPath: String? = nil,
         sidecarPath: String? = nil,
         ctranslate2ModelPath: String? = nil,
-        modelVariant: FastTranslationModelVariant = .opusMTEnZh
+        modelVariant: FastTranslationModelVariant = .opusMTEnZh,
+        preferences: FastTranslationPreferences = FastTranslationPreferences()
     ) -> String {
         template
             .replacingOccurrences(of: "{python}", with: shellEscape(pythonPath ?? Self.pythonPath() ?? "python3"))
             .replacingOccurrences(of: "{sidecar}", with: shellEscape(sidecarPath ?? Self.sidecarPath() ?? "llmtools-fastmt-sidecar.py"))
             .replacingOccurrences(of: "{engine}", with: engineID.rawValue)
-            .replacingOccurrences(of: "{model_ct2}", with: shellEscape(ctranslate2ModelPath ?? Self.ctranslate2ModelPath(for: modelVariant) ?? ""))
+            .replacingOccurrences(of: "{model_ct2}", with: shellEscape(ctranslate2ModelPath ?? Self.ctranslate2ModelPath(for: modelVariant, preferences: preferences) ?? ""))
             .replacingOccurrences(of: "{model_variant}", with: modelVariant.rawValue)
     }
 
-    private static func ctranslate2ModelPath(for variant: FastTranslationModelVariant) -> String? {
+    private static func ctranslate2ModelPath(
+        for variant: FastTranslationModelVariant,
+        preferences: FastTranslationPreferences = FastTranslationPreferences()
+    ) -> String? {
         switch variant {
         case .opusMTEnZh:
             return firstExistingPath([
+                configuredCTranslate2ModelPath(for: .opusMTEnZh, preferences: preferences),
                 environmentValue("LLMTOOLS_FASTMT_CT2_MODEL"),
-                AppPaths.applicationSupportDirectory
-                    .appendingPathComponent("fastmt-runtime", isDirectory: true)
-                    .appendingPathComponent("opus-mt-en-zh-ct2", isDirectory: true)
-                    .path,
+                defaultOPUSCT2ModelPath,
                 "~/Library/Application Support/llmTools/fastmt-runtime/opus-mt-en-zh-ct2"
             ])
         case .nllb200Distilled600M:
             return firstExistingPath([
+                configuredCTranslate2ModelPath(for: .nllb200Distilled600M, preferences: preferences),
                 environmentValue("LLMTOOLS_FASTMT_NLLB_600M_MODEL"),
-                AppPaths.applicationSupportDirectory
-                    .appendingPathComponent("fastmt-runtime", isDirectory: true)
-                    .appendingPathComponent("nllb-200-distilled-600m-ct2-int8", isDirectory: true)
-                    .path,
+                defaultNLLB600MCT2ModelPath,
                 "~/Library/Application Support/llmTools/fastmt-runtime/nllb-200-distilled-600m-ct2-int8"
             ])
         }
+    }
+
+    private static func configuredCTranslate2ModelPath(
+        for variant: FastTranslationModelVariant,
+        preferences: FastTranslationPreferences
+    ) -> String? {
+        let rawValue: String
+        switch variant {
+        case .opusMTEnZh:
+            rawValue = preferences.opusMTEnZhCT2ModelPath
+        case .nllb200Distilled600M:
+            rawValue = preferences.nllb200Distilled600MCT2ModelPath
+        }
+        return expandedNonEmptyPath(rawValue)
     }
 
     private static func pythonPath() -> String? {
@@ -556,6 +598,14 @@ public actor FastTranslationCommandRunner: FastTranslationService {
         }
         let value = String(cString: rawValue).trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+
+    private static func expandedNonEmptyPath(_ value: String?) -> String? {
+        let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else {
+            return nil
+        }
+        return NSString(string: trimmed).expandingTildeInPath
     }
 
     private static func shellEscape(_ value: String) -> String {

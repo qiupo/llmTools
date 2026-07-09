@@ -819,37 +819,73 @@ struct QuickActionView: View {
 
     private func mediaSpeakerFailureStatusText(message: String) -> String {
         let lowercased = message.lowercased()
+        let displayMessage: String
         let resolution: String
-        if lowercased.contains("token") || lowercased.contains("auth") {
+        if isPyannoteSetupFailure(lowercased) {
+            displayMessage = localizedMediaSpeakerStatus(
+                chinese: "pyannote 模型未就绪。请先到 设置 > 模型 > 模型设置 > 说话人分离 完成 pyannote 配置。",
+                english: "pyannote model is not ready. Configure pyannote first in Settings > Models > Model Settings > Speaker Diarization."
+            )
+            resolution = localizedMediaSpeakerStatus(
+                chinese: "解决路径：按模型设置里的步骤接受 speaker-diarization-3.1 和 segmentation-3.0 两个 pyannote 条款、保存 HF Token、运行健康检查/修复运行时；如果本机无法访问 huggingface.co，请先缓存 pyannote 模型后重新生成。",
+                english: "Fix: accept both pyannote terms for speaker-diarization-3.1 and segmentation-3.0, save the HF token, run Health Check or Repair Runtime in Settings, and pre-cache the pyannote models if huggingface.co is unreachable."
+            )
+        } else if lowercased.contains("token") || lowercased.contains("auth") {
+            displayMessage = message
             resolution = localizedMediaSpeakerStatus(
                 chinese: "解决路径：保存本地 HF Token 后重新生成。",
                 english: "Fix: save the local HF token, then regenerate."
             )
         } else if lowercased.contains("terms") || lowercased.contains("gated") || lowercased.contains("repository") {
+            displayMessage = message
             resolution = localizedMediaSpeakerStatus(
-                chinese: "解决路径：用同一个 Hugging Face 账号接受 pyannote 模型条款，再重新生成。",
-                english: "Fix: accept the pyannote model terms with the same Hugging Face account, then regenerate."
+                chinese: "解决路径：用同一个 Hugging Face 账号接受 speaker-diarization-3.1 和 segmentation-3.0 两个 pyannote 条款，再重新生成。",
+                english: "Fix: accept both pyannote terms for speaker-diarization-3.1 and segmentation-3.0 with the same Hugging Face account, then regenerate."
             )
         } else if lowercased.contains("no route") || lowercased.contains("network") || lowercased.contains("connection") || lowercased.contains("timed out") {
+            displayMessage = message
             resolution = localizedMediaSpeakerStatus(
                 chinese: "解决路径：让本机可访问 huggingface.co，或预先缓存 pyannote 模型后重新生成。",
                 english: "Fix: make huggingface.co reachable, or pre-cache the pyannote model, then regenerate."
             )
         } else if lowercased.contains("python") || lowercased.contains("runtime") || lowercased.contains("module") || lowercased.contains("import") {
+            displayMessage = message
             resolution = localizedMediaSpeakerStatus(
                 chinese: "解决路径：在设置里点击健康检查；如果提示运行时缺失，点击修复运行时。",
                 english: "Fix: run Health Check in Settings; if runtime is missing, click Repair Runtime."
             )
         } else {
+            displayMessage = message
             resolution = localizedMediaSpeakerStatus(
                 chinese: "解决路径：在设置里运行健康检查，按提示修复后重新生成。",
                 english: "Fix: run Health Check in Settings, follow the repair prompt, then regenerate."
             )
         }
         return localizedMediaSpeakerStatus(
-            chinese: "说话人分离失败：\(message)\n\(resolution)",
-            english: "Speaker diarization failed: \(message)\n\(resolution)"
+            chinese: "说话人分离失败：\(displayMessage)\n\(resolution)",
+            english: "Speaker diarization failed: \(displayMessage)\n\(resolution)"
         )
+    }
+
+    private func isPyannoteSetupFailure(_ lowercased: String) -> Bool {
+        let mentionsPyannoteModel = lowercased.contains("pyannote")
+            || lowercased.contains("speaker-diarization")
+        let mentionsSettingsPath = lowercased.contains("settings > models > speaker diarization")
+            || lowercased.contains("settings > models > model settings > speaker diarization")
+        let mentionsHuggingFaceAccess = lowercased.contains("huggingface")
+            || lowercased.contains("hf token")
+            || lowercased.contains("hf_token")
+            || lowercased.contains("pyannote_auth_token")
+            || lowercased.contains("gated")
+            || lowercased.contains("model terms")
+            || lowercased.contains("repository")
+            || lowercased.contains("resolve/main")
+        let mentionsNetworkFailure = lowercased.contains("no route")
+            || lowercased.contains("cannot send a request")
+            || lowercased.contains("connection")
+            || lowercased.contains("timed out")
+            || lowercased.contains("network")
+        return mentionsSettingsPath || (mentionsPyannoteModel && (mentionsHuggingFaceAccess || mentionsNetworkFailure))
     }
 
     private var imageInputPanel: some View {
@@ -3358,6 +3394,280 @@ enum SettingsTab: CaseIterable, Identifiable {
     }
 }
 
+private struct SupportedModelDownloadSection: Identifiable {
+    var id: String
+    var chineseTitle: String
+    var englishTitle: String
+    var entries: [SupportedModelDownloadEntry]
+
+    func title(language: AppLanguage) -> String {
+        language == .chinese ? chineseTitle : englishTitle
+    }
+}
+
+private struct SupportedModelDownloadEntry: Identifiable {
+    var id: String
+    var chineseName: String
+    var englishName: String
+    var modelName: String
+    var downloadURL: String
+    var mirrorURL: String?
+    var copyCommand: String
+    var installerScript: String?
+    var chineseNote: String
+    var englishNote: String
+
+    func name(language: AppLanguage) -> String {
+        language == .chinese ? chineseName : englishName
+    }
+
+    func note(language: AppLanguage) -> String {
+        language == .chinese ? chineseNote : englishNote
+    }
+}
+
+private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
+    SupportedModelDownloadSection(
+        id: "text-ocr",
+        chineseTitle: "文本 / OCR",
+        englishTitle: "Text / OCR",
+        entries: [
+            SupportedModelDownloadEntry(
+                id: "mlx-text",
+                chineseName: "MLX 文本模型目录",
+                englishName: "MLX text model folder",
+                modelName: "MLX Swift LM-compatible text model",
+                downloadURL: "https://huggingface.co/models?library=mlx&pipeline_tag=text-generation",
+                mirrorURL: nil,
+                copyCommand: "huggingface-cli download <model-id> --local-dir ~/code/models/<model-id>",
+                installerScript: nil,
+                chineseNote: "用于翻译、润色、总结、解释、网页翻译等本地 LLM 任务；下载后在模型页添加包含 config/tokenizer/weights 的目录。",
+                englishNote: "Used for local LLM tasks such as translate, polish, summarize, explain, and webpage translation. Add the downloaded folder that contains config, tokenizer, and weights."
+            ),
+            SupportedModelDownloadEntry(
+                id: "mlx-vision",
+                chineseName: "MLX 视觉语言模型目录",
+                englishName: "MLX vision-language model folder",
+                modelName: "MLX Swift LM-compatible VLM",
+                downloadURL: "https://huggingface.co/models?library=mlx&pipeline_tag=image-text-to-text",
+                mirrorURL: nil,
+                copyCommand: "huggingface-cli download <model-id> --local-dir ~/code/models/<model-id>",
+                installerScript: nil,
+                chineseNote: "用于图片 OCR、结构化提取和图片解释；需要模型目录带 vision/processor 配置。",
+                englishNote: "Used for image OCR, structured extraction, and image explanation. The model folder must include vision and processor metadata."
+            ),
+            SupportedModelDownloadEntry(
+                id: "gguf-text",
+                chineseName: "GGUF 文本模型文件",
+                englishName: "GGUF text model file",
+                modelName: "GGUF text-generation model",
+                downloadURL: "https://huggingface.co/models?library=gguf&pipeline_tag=text-generation",
+                mirrorURL: nil,
+                copyCommand: "huggingface-cli download <model-id> <file.gguf> --local-dir ~/code/models/<model-id>",
+                installerScript: nil,
+                chineseNote: "用于本地文本 LLM；添加模型时选择具体 .gguf 文件。GGUF 当前不作为本地视觉 OCR 默认路径。",
+                englishNote: "Used for local text LLM tasks. Pick the exact .gguf file when adding it. GGUF is not the default local vision/OCR route."
+            )
+        ]
+    ),
+    SupportedModelDownloadSection(
+        id: "media-asr",
+        chineseTitle: "媒体 ASR",
+        englishTitle: "Media ASR",
+        entries: [
+            SupportedModelDownloadEntry(
+                id: "qwen3-asr-06b-bf16",
+                chineseName: "Qwen3-ASR-0.6B bf16",
+                englishName: "Qwen3-ASR-0.6B bf16",
+                modelName: "mlx-community/Qwen3-ASR-0.6B-bf16",
+                downloadURL: "https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-bf16",
+                mirrorURL: "https://hf-mirror.com/mlx-community/Qwen3-ASR-0.6B-bf16",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Qwen3-ASR-0.6B-bf16 --local-dir ~/code/models/mlx-community/Qwen3-ASR-0.6B-bf16",
+                installerScript: "scripts/install-phase4-mlx-asr-runtime.sh",
+                chineseNote: "当前中英混合实时字幕优先候选，也可用于文件转写。",
+                englishNote: "Current preferred mixed Chinese/English realtime candidate; also supports file transcription."
+            ),
+            SupportedModelDownloadEntry(
+                id: "qwen3-asr-06b-4bit",
+                chineseName: "Qwen3-ASR-0.6B 4bit",
+                englishName: "Qwen3-ASR-0.6B 4bit",
+                modelName: "mlx-community/Qwen3-ASR-0.6B-4bit",
+                downloadURL: "https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-4bit",
+                mirrorURL: "https://hf-mirror.com/mlx-community/Qwen3-ASR-0.6B-4bit",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Qwen3-ASR-0.6B-4bit --local-dir ~/code/models/mlx-community/Qwen3-ASR-0.6B-4bit",
+                installerScript: "scripts/install-phase4-mlx-asr-runtime.sh",
+                chineseNote: "Qwen3-ASR 低内存/更快备选；量化质量可接受时适合实时字幕。",
+                englishNote: "Lower-memory faster Qwen3-ASR alternative; useful for realtime subtitles when quantized quality is acceptable."
+            ),
+            SupportedModelDownloadEntry(
+                id: "qwen3-asr-17b-bf16",
+                chineseName: "Qwen3-ASR-1.7B bf16",
+                englishName: "Qwen3-ASR-1.7B bf16",
+                modelName: "mlx-community/Qwen3-ASR-1.7B-bf16",
+                downloadURL: "https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-bf16",
+                mirrorURL: "https://hf-mirror.com/mlx-community/Qwen3-ASR-1.7B-bf16",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Qwen3-ASR-1.7B-bf16 --local-dir ~/code/models/mlx-community/Qwen3-ASR-1.7B-bf16",
+                installerScript: "scripts/install-phase4-mlx-asr-runtime.sh",
+                chineseNote: "更大的 Qwen3-ASR 文件转写候选；实时性能取决于机器和窗口配置。",
+                englishNote: "Larger Qwen3-ASR file-transcription candidate; realtime performance depends on machine and window settings."
+            ),
+            SupportedModelDownloadEntry(
+                id: "fun-asr-mlt",
+                chineseName: "Fun-ASR-MLT-Nano",
+                englishName: "Fun-ASR-MLT-Nano",
+                modelName: "mlx-community/Fun-ASR-MLT-Nano-2512-fp16",
+                downloadURL: "https://huggingface.co/mlx-community/Fun-ASR-MLT-Nano-2512-fp16",
+                mirrorURL: "https://hf-mirror.com/mlx-community/Fun-ASR-MLT-Nano-2512-fp16",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Fun-ASR-MLT-Nano-2512-fp16 --local-dir ~/code/models/mlx-community/Fun-ASR-MLT-Nano-2512-fp16",
+                installerScript: "scripts/install-phase4-funasr-mlx-runtime.sh",
+                chineseNote: "多语言实时字幕候选；使用独立 mlx-audio-plus 运行时。",
+                englishNote: "Multilingual realtime subtitle candidate. Uses the isolated mlx-audio-plus runtime."
+            ),
+            SupportedModelDownloadEntry(
+                id: "fun-asr-nano",
+                chineseName: "Fun-ASR-Nano",
+                englishName: "Fun-ASR-Nano",
+                modelName: "mlx-community/Fun-ASR-Nano-2512-fp16",
+                downloadURL: "https://huggingface.co/mlx-community/Fun-ASR-Nano-2512-fp16",
+                mirrorURL: "https://hf-mirror.com/mlx-community/Fun-ASR-Nano-2512-fp16",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Fun-ASR-Nano-2512-fp16 --local-dir ~/code/models/mlx-community/Fun-ASR-Nano-2512-fp16",
+                installerScript: "scripts/install-phase4-funasr-nano-mlx-runtime.sh",
+                chineseNote: "中文/英文/日文低延迟实时字幕候选；也支持文件字幕。",
+                englishNote: "Low-latency Chinese/English/Japanese realtime candidate; also supports file subtitles."
+            ),
+            SupportedModelDownloadEntry(
+                id: "sensevoice",
+                chineseName: "SenseVoiceSmall",
+                englishName: "SenseVoiceSmall",
+                modelName: "mlx-community/SenseVoiceSmall",
+                downloadURL: "https://huggingface.co/mlx-community/SenseVoiceSmall",
+                mirrorURL: "https://hf-mirror.com/mlx-community/SenseVoiceSmall",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/SenseVoiceSmall --local-dir ~/code/models/mlx-community/SenseVoiceSmall",
+                installerScript: "scripts/install-phase4-sensevoice-mlx-runtime.sh",
+                chineseNote: "短窗口低延迟 ASR 备选；适合已有 SenseVoice 运行时的机器。",
+                englishNote: "Short-window low-latency ASR alternative, useful on machines that already have the SenseVoice runtime."
+            ),
+            SupportedModelDownloadEntry(
+                id: "vibevoice",
+                chineseName: "VibeVoice-ASR",
+                englishName: "VibeVoice-ASR",
+                modelName: "mlx-community/VibeVoice-ASR-4bit",
+                downloadURL: "https://huggingface.co/mlx-community/VibeVoice-ASR-4bit",
+                mirrorURL: "https://hf-mirror.com/mlx-community/VibeVoice-ASR-4bit",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/VibeVoice-ASR-4bit --local-dir ~/code/models/mlx-community/VibeVoice-ASR-4bit",
+                installerScript: "scripts/install-phase4-vibevoice-asr-runtime.sh",
+                chineseNote: "重型 file-only rich transcription 模型；可保留说话人和时间戳元数据。",
+                englishNote: "Heavy file-only rich transcription model that can preserve speaker and timestamp metadata."
+            ),
+            SupportedModelDownloadEntry(
+                id: "whisper-coreml",
+                chineseName: "whisper.cpp Core ML",
+                englishName: "whisper.cpp Core ML",
+                modelName: "OpenAI Whisper base / ggml-base.bin",
+                downloadURL: "https://github.com/ggml-org/whisper.cpp",
+                mirrorURL: nil,
+                copyCommand: "LLMTOOLS_WHISPER_CPP_MODEL=base ./scripts/install-phase4-whisper-coreml-runtime.sh",
+                installerScript: "scripts/install-phase4-whisper-coreml-runtime.sh",
+                chineseNote: "安装脚本会下载 Whisper checkpoint、转换 ggml，并生成相邻的 Core ML encoder。",
+                englishNote: "The installer downloads the Whisper checkpoint, converts ggml, and generates the adjacent Core ML encoder."
+            )
+        ]
+    ),
+    SupportedModelDownloadSection(
+        id: "diarization",
+        chineseTitle: "说话人分离",
+        englishTitle: "Speaker Diarization",
+        entries: [
+            SupportedModelDownloadEntry(
+                id: "pyannote",
+                chineseName: "pyannote speaker diarization 3.1",
+                englishName: "pyannote speaker diarization 3.1",
+                modelName: "pyannote/speaker-diarization-3.1 + pyannote/segmentation-3.0",
+                downloadURL: "https://huggingface.co/pyannote/speaker-diarization-3.1",
+                mirrorURL: "https://hf-mirror.com/pyannote/speaker-diarization-3.1",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download pyannote/speaker-diarization-3.1 --local-dir ~/code/models/pyannote/speaker-diarization-3.1 && HF_HUB_DISABLE_XET=1 HF_ENDPOINT=https://hf-mirror.com huggingface-cli download pyannote/segmentation-3.0 --local-dir ~/code/models/pyannote/segmentation-3.0 && HF_ENDPOINT=https://hf-mirror.com huggingface-cli download pyannote/wespeaker-voxceleb-resnet34-LM --local-dir ~/code/models/pyannote/wespeaker-voxceleb-resnet34-LM",
+                installerScript: "scripts/install-phase4x-pyannote-diarization.sh",
+                chineseNote: "需要先用同一个 Hugging Face 账号接受 speaker-diarization-3.1 和 segmentation-3.0 两个条款，并在设置里保存 HF Token。",
+                englishNote: "Requires accepting both speaker-diarization-3.1 and segmentation-3.0 terms with the same Hugging Face account and saving an HF token in Settings."
+            )
+        ]
+    ),
+    SupportedModelDownloadSection(
+        id: "language-id",
+        chineseTitle: "语言识别",
+        englishTitle: "Language ID",
+        entries: [
+            SupportedModelDownloadEntry(
+                id: "fasttext-ftz",
+                chineseName: "fastText lid.176.ftz",
+                englishName: "fastText lid.176.ftz",
+                modelName: "lid.176.ftz",
+                downloadURL: "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
+                mirrorURL: nil,
+                copyCommand: "curl -L -o ~/Library/Application\\ Support/llmTools/lid-runtime/lid.176.ftz https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz",
+                installerScript: "scripts/install-phase4x-fasttext-lid.sh",
+                chineseNote: "默认小模型；用于字幕、网页、OCR 或文本任务的本地语言识别。",
+                englishNote: "Default compact model for local language identification across subtitles, webpages, OCR, and text tasks."
+            ),
+            SupportedModelDownloadEntry(
+                id: "fasttext-bin",
+                chineseName: "fastText lid.176.bin",
+                englishName: "fastText lid.176.bin",
+                modelName: "lid.176.bin",
+                downloadURL: "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
+                mirrorURL: nil,
+                copyCommand: "curl -L -o ~/Library/Application\\ Support/llmTools/lid-runtime/lid.176.bin https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin",
+                installerScript: "LLMTOOLS_LID_MODEL_VARIANT=bin scripts/install-phase4x-fasttext-lid.sh",
+                chineseNote: "可选大模型；准确性/速度取舍更好，但文件明显更大。",
+                englishNote: "Optional larger model with a better accuracy/speed tradeoff, but much larger on disk."
+            )
+        ]
+    ),
+    SupportedModelDownloadSection(
+        id: "fast-mt",
+        chineseTitle: "快速机器翻译",
+        englishTitle: "Fast MT",
+        entries: [
+            SupportedModelDownloadEntry(
+                id: "opus-en-zh",
+                chineseName: "OPUS-MT 英译中",
+                englishName: "OPUS-MT en->zh",
+                modelName: "Helsinki-NLP/opus-mt-en-zh",
+                downloadURL: "https://huggingface.co/Helsinki-NLP/opus-mt-en-zh",
+                mirrorURL: "https://hf-mirror.com/Helsinki-NLP/opus-mt-en-zh",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com ./scripts/install-phase4x-ctranslate2-en-zh.sh",
+                installerScript: "scripts/install-phase4x-ctranslate2-en-zh.sh",
+                chineseNote: "最快的英译中 CTranslate2 路径；安装脚本会下载并转换模型。",
+                englishNote: "Fastest CTranslate2 path for English to Chinese. The installer downloads and converts the model."
+            ),
+            SupportedModelDownloadEntry(
+                id: "nllb-600m",
+                chineseName: "NLLB 200 distilled 600M",
+                englishName: "NLLB 200 distilled 600M",
+                modelName: "facebook/nllb-200-distilled-600M",
+                downloadURL: "https://huggingface.co/facebook/nllb-200-distilled-600M",
+                mirrorURL: "https://hf-mirror.com/facebook/nllb-200-distilled-600M",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com ./scripts/install-phase4x-nllb-200-distilled-600m.sh",
+                installerScript: "scripts/install-phase4x-nllb-200-distilled-600m.sh",
+                chineseNote: "覆盖常用多语言互译，延迟高于 OPUS；安装脚本会转换为 CTranslate2 int8。",
+                englishNote: "Covers common multilingual translation pairs with higher latency than OPUS. The installer converts it to CTranslate2 int8."
+            ),
+            SupportedModelDownloadEntry(
+                id: "argos",
+                chineseName: "Argos Translate en->zh package",
+                englishName: "Argos Translate en->zh package",
+                modelName: "Argos package index",
+                downloadURL: "https://github.com/argosopentech/argos-translate",
+                mirrorURL: nil,
+                copyCommand: "./scripts/install-phase4x-argos.sh",
+                installerScript: "scripts/install-phase4x-argos.sh",
+                chineseNote: "备用离线翻译引擎；安装脚本会从 Argos package index 安装英译中语言包。",
+                englishNote: "Fallback offline translation engine. The installer installs the en->zh language package from the Argos package index."
+            )
+        ]
+    )
+]
+
 @MainActor
 final class SettingsNavigationState: ObservableObject {
     @Published var selectedTab: SettingsTab = .general
@@ -3823,6 +4133,7 @@ struct SettingsView: View {
         ScrollView {
             settingsForm(maxWidth: 620) {
                 languageRoutingSettingsSection
+                speakerDiarizationSettingsSection
                 fastTranslationSettingsSection
             }
             .padding(.bottom, 2)
@@ -4148,6 +4459,8 @@ struct SettingsView: View {
                     languageRoutingModelPicker
                 }
 
+                languageRoutingModelPathFields
+
                 HStack(alignment: .top, spacing: 18) {
                     VStack(alignment: .leading, spacing: 5) {
                         languageRoutingToggle(
@@ -4313,6 +4626,37 @@ struct SettingsView: View {
         .frame(width: 260, alignment: .leading)
     }
 
+    private var languageRoutingModelPathFields: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            modelPathField(
+                title: L10n.text("FTZ model file", language: language),
+                text: Binding(
+                    get: { appState.preferences.languageRouting.ftzModelPath },
+                    set: { newValue in
+                        appState.updatePreferences { $0.languageRouting.ftzModelPath = newValue }
+                    }
+                ),
+                placeholder: FastTextLIDCommandRunner.defaultFTZModelPath,
+                chooseAction: { openLanguageRoutingModelPanel(.ftz) }
+            )
+            modelPathField(
+                title: L10n.text("BIN model file", language: language),
+                text: Binding(
+                    get: { appState.preferences.languageRouting.binModelPath },
+                    set: { newValue in
+                        appState.updatePreferences { $0.languageRouting.binModelPath = newValue }
+                    }
+                ),
+                placeholder: FastTextLIDCommandRunner.defaultBINModelPath,
+                chooseAction: { openLanguageRoutingModelPanel(.bin) }
+            )
+            Text(L10n.text("Leave empty to use the installed fastText model under Application Support, or the LLMTOOLS_LID_MODEL_* environment variables.", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private func languageRoutingToggle(
         title: String,
         isOn: Binding<Bool>
@@ -4321,6 +4665,197 @@ struct SettingsView: View {
             .toggleStyle(.checkbox)
             .font(.subheadline)
             .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var speakerDiarizationSettingsSection: some View {
+        settingRow(title: L10n.text("Speaker Diarization", language: language)) {
+            VStack(alignment: .leading, spacing: 8) {
+                checkboxLine(
+                    title: L10n.text("Enable for file subtitles", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.speakerDiarization.enabledForFileSubtitles },
+                        set: { newValue in
+                            appState.setFileSpeakerDiarizationEnabled(newValue)
+                        }
+                    )
+                )
+                checkboxLine(
+                    title: L10n.text("Enable for live subtitles", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.speakerDiarization.enabledForLiveSubtitles },
+                        set: { _ in }
+                    )
+                )
+                .disabled(true)
+                Text(L10n.text("Live speaker diarization remains disabled until the realtime spike passes.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                fieldStack(title: L10n.text("pyannote model", language: language), width: 500) {
+                    CommandFriendlyTextField(
+                        text: Binding(
+                            get: { appState.preferences.speakerDiarization.modelIdentifier },
+                            set: { newValue in
+                                appState.updatePreferences { $0.speakerDiarization.modelIdentifier = newValue }
+                            }
+                        ),
+                        placeholder: SpeakerDiarizationPreferences.defaultModelIdentifier
+                    )
+                }
+                HStack(spacing: 8) {
+                    Button {
+                        appState.updatePreferences {
+                            $0.speakerDiarization.modelIdentifier = SpeakerDiarizationPreferences.defaultModelIdentifier
+                        }
+                    } label: {
+                        Label(L10n.text("Use default model", language: language), systemImage: "arrow.counterclockwise")
+                    }
+                    .controlSize(.small)
+                    Button {
+                        openSpeakerDiarizationModelPanel()
+                    } label: {
+                        Label(L10n.text("Choose local pyannote config", language: language), systemImage: "folder")
+                    }
+                    .controlSize(.small)
+                }
+                Text(L10n.text("Use a Hugging Face repo id such as pyannote/speaker-diarization-3.1, or choose a local pyannote config.yaml if the model is already downloaded.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                fieldStack(title: L10n.text("HF cache directory", language: language), width: 500) {
+                    CommandFriendlyTextField(
+                        text: Binding(
+                            get: { appState.preferences.speakerDiarization.cacheDirectory },
+                            set: { newValue in
+                                appState.updatePreferences { $0.speakerDiarization.cacheDirectory = newValue }
+                            }
+                        ),
+                        placeholder: SpeakerDiarizationCommandRunner.defaultHFHomeDirectory.path
+                    )
+                }
+                HStack(spacing: 8) {
+                    Button {
+                        openSpeakerDiarizationCachePanel()
+                    } label: {
+                        Label(L10n.text("Choose cache folder", language: language), systemImage: "folder")
+                    }
+                    .controlSize(.small)
+                    Button {
+                        revealSpeakerDiarizationCacheFolder()
+                    } label: {
+                        Label(L10n.text("Open cache folder", language: language), systemImage: "arrow.up.forward.app")
+                    }
+                    .controlSize(.small)
+                }
+                Text(
+                    String(
+                        format: L10n.text("Leave empty to use the Hugging Face default cache: %@.", language: language),
+                        SpeakerDiarizationCommandRunner.defaultHFHomeDirectory.path
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+                mediaASRCommandField(
+                    title: L10n.text("Diarization command", language: language),
+                    text: Binding(
+                        get: { appState.preferences.speakerDiarization.commandTemplate },
+                        set: { newValue in
+                            appState.updatePreferences { $0.speakerDiarization.commandTemplate = newValue }
+                        }
+                    ),
+                    placeholder: "{python} {sidecar} --model {diarization_model} --audio {audio_wav_16k_mono} --output {output_json}"
+                )
+                Text(L10n.text("Use {audio_wav_16k_mono}, {output_json}, {diarization_model}, {hf_cache}, and {hf_token}. Empty field uses the bundled pyannote sidecar when the local runtime is installed.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(L10n.text("HF token local storage", language: language))
+                        .font(.caption.weight(.semibold))
+                    Text(SpeakerDiarizationTokenStore.tokenFileURL.path)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                HStack(alignment: .bottom, spacing: 8) {
+                    fieldStack(title: L10n.text("HF token", language: language), width: 360) {
+                        CommandFriendlyTextField(
+                            text: $speakerDiarizationTokenDraft,
+                            placeholder: "hf_...",
+                            isSecure: true
+                        )
+                    }
+                    Button {
+                        appState.saveSpeakerDiarizationHFToken(speakerDiarizationTokenDraft)
+                        speakerDiarizationTokenDraft = ""
+                    } label: {
+                        Label(L10n.text("Save Token", language: language), systemImage: "key.fill")
+                    }
+                    .controlSize(.small)
+                    .disabled(speakerDiarizationTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button {
+                        appState.deleteSpeakerDiarizationHFToken()
+                        speakerDiarizationTokenDraft = ""
+                    } label: {
+                        Label(L10n.text("Delete Token", language: language), systemImage: "trash")
+                    }
+                    .controlSize(.small)
+                }
+                HStack(spacing: 8) {
+                    Button {
+                        openPyannoteModelTerms()
+                    } label: {
+                        Label(L10n.text("Open model terms", language: language), systemImage: "checkmark.seal")
+                    }
+                    .controlSize(.small)
+                    Button {
+                        openExternalURL("https://huggingface.co/settings/tokens")
+                    } label: {
+                        Label(L10n.text("Create HF token", language: language), systemImage: "safari")
+                    }
+                    .controlSize(.small)
+                }
+                checkboxLine(
+                    title: L10n.text("Persist speaker embeddings", language: language),
+                    isOn: Binding(
+                        get: { appState.preferences.speakerDiarization.persistSpeakerEmbeddings },
+                        set: { newValue in
+                            appState.updatePreferences { $0.speakerDiarization.persistSpeakerEmbeddings = newValue }
+                        }
+                    )
+                )
+                Text(L10n.text("pyannote requires accepting the Hugging Face terms for both speaker-diarization-3.1 and segmentation-3.0 unless you point to a fully cached local config. Tokens stay in a local Application Support file or environment variables; llmTools does not upload audio.", language: language))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Button {
+                        appState.checkSpeakerDiarizationHealth()
+                    } label: {
+                        Label(
+                            L10n.text("Health Check", language: language),
+                            systemImage: appState.speakerDiarizationHealthCheckInProgress ? "clock" : "stethoscope"
+                        )
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.speakerDiarizationHealthCheckInProgress)
+                    Text(L10n.text("Fixture mode uses LLMTOOLS_DIARIZATION_FIXTURE_JSON for dependency-free checks.", language: language))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let report = appState.speakerDiarizationHealthReport {
+                    speakerDiarizationHealthReportView(report)
+                }
+            }
+        }
     }
 
     private func fastTranslationSurfaceEnginePicker(selection: Binding<FastTranslationSurfaceEngine>) -> some View {
@@ -4419,6 +4954,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
+                fastTranslationModelPathFields
+
                 Picker(L10n.text("Fallback policy", language: language), selection: Binding(
                     get: { appState.preferences.fastTranslation.fallbackPolicy },
                     set: { newValue in
@@ -4501,6 +5038,37 @@ struct SettingsView: View {
                     fastTranslationHealthReportView(report)
                 }
             }
+        }
+    }
+
+    private var fastTranslationModelPathFields: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            modelPathField(
+                title: L10n.text("OPUS CTranslate2 model folder", language: language),
+                text: Binding(
+                    get: { appState.preferences.fastTranslation.opusMTEnZhCT2ModelPath },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.opusMTEnZhCT2ModelPath = newValue }
+                    }
+                ),
+                placeholder: FastTranslationCommandRunner.defaultOPUSCT2ModelPath,
+                chooseAction: { openFastTranslationModelPanel(.opusMTEnZh) }
+            )
+            modelPathField(
+                title: L10n.text("NLLB CTranslate2 model folder", language: language),
+                text: Binding(
+                    get: { appState.preferences.fastTranslation.nllb200Distilled600MCT2ModelPath },
+                    set: { newValue in
+                        appState.updatePreferences { $0.fastTranslation.nllb200Distilled600MCT2ModelPath = newValue }
+                    }
+                ),
+                placeholder: FastTranslationCommandRunner.defaultNLLB600MCT2ModelPath,
+                chooseAction: { openFastTranslationModelPanel(.nllb200Distilled600M) }
+            )
+            Text(L10n.text("Leave empty to use the installed Fast MT model under Application Support, or the LLMTOOLS_FASTMT_* environment variables.", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -4754,113 +5322,31 @@ struct SettingsView: View {
                             }
                         )
                     )
-                    checkboxLine(
-                        title: L10n.text("Enable for live subtitles", language: language),
-                        isOn: Binding(
-                            get: { appState.preferences.speakerDiarization.enabledForLiveSubtitles },
-                            set: { _ in }
-                        )
-                    )
-                    .disabled(true)
-                    Text(L10n.text("Live speaker diarization remains disabled until the realtime spike passes.", language: language))
+                    Text(L10n.text("pyannote model, token, cache, command, and runtime are managed under Models > Model Settings.", language: language))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-
-                    mediaASRCommandField(
-                        title: L10n.text("Diarization command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.speakerDiarization.commandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.speakerDiarization.commandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "{python} {sidecar} --audio {audio_wav_16k_mono} --output {output_json}"
-                    )
-                    Text(L10n.text("Use {audio_wav_16k_mono}, {output_json}, and {hf_token}. Empty field uses the bundled pyannote sidecar when the local runtime is installed.", language: language))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(L10n.text("HF token local storage", language: language))
-                            .font(.caption.weight(.semibold))
-                        Text(SpeakerDiarizationTokenStore.tokenFileURL.path)
-                            .font(.caption2.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .lineLimit(2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    HStack(alignment: .bottom, spacing: 8) {
-                        fieldStack(title: L10n.text("HF token", language: language), width: 360) {
-                            CommandFriendlyTextField(
-                                text: $speakerDiarizationTokenDraft,
-                                placeholder: "hf_...",
-                                isSecure: true
-                            )
-                        }
-                        Button {
-                            appState.saveSpeakerDiarizationHFToken(speakerDiarizationTokenDraft)
-                            speakerDiarizationTokenDraft = ""
-                        } label: {
-                            Label(L10n.text("Save Token", language: language), systemImage: "key.fill")
-                        }
-                        .controlSize(.small)
-                        .disabled(speakerDiarizationTokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                        Button {
-                            appState.deleteSpeakerDiarizationHFToken()
-                            speakerDiarizationTokenDraft = ""
-                        } label: {
-                            Label(L10n.text("Delete Token", language: language), systemImage: "trash")
-                        }
-                        .controlSize(.small)
-                    }
                     HStack(spacing: 8) {
                         Button {
-                            openExternalURL("https://huggingface.co/pyannote/speaker-diarization-3.1")
+                            navigation.selectedTab = .models
+                            selectedModelSettingsPane = .settings
                         } label: {
-                            Label(L10n.text("Open model terms", language: language), systemImage: "checkmark.seal")
+                            Label(L10n.text("Configure pyannote in Model Settings", language: language), systemImage: "slider.horizontal.3")
                         }
                         .controlSize(.small)
-                        Button {
-                            openExternalURL("https://huggingface.co/settings/tokens")
-                        } label: {
-                            Label(L10n.text("Create HF token", language: language), systemImage: "safari")
-                        }
-                        .controlSize(.small)
-                    }
-                    checkboxLine(
-                        title: L10n.text("Persist speaker embeddings", language: language),
-                        isOn: Binding(
-                            get: { appState.preferences.speakerDiarization.persistSpeakerEmbeddings },
-                            set: { newValue in
-                                appState.updatePreferences { $0.speakerDiarization.persistSpeakerEmbeddings = newValue }
-                            }
-                        )
-                    )
-                    Text(L10n.text("pyannote requires accepting Hugging Face model terms. Tokens stay in a local Application Support file or environment variables; llmTools does not upload audio.", language: language))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    HStack(spacing: 8) {
-                        Button {
-                            appState.checkSpeakerDiarizationHealth()
-                        } label: {
-                            Label(
-                                L10n.text("Health Check", language: language),
-                                systemImage: appState.speakerDiarizationHealthCheckInProgress ? "clock" : "stethoscope"
-                            )
-                        }
-                        .controlSize(.small)
-                        .disabled(appState.speakerDiarizationHealthCheckInProgress)
-                        Text(L10n.text("Fixture mode uses LLMTOOLS_DIARIZATION_FIXTURE_JSON for dependency-free checks.", language: language))
+                        Label(appState.preferences.speakerDiarization.modelIdentifier, systemImage: "person.wave.2")
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 280, alignment: .leading)
+                            .help(appState.preferences.speakerDiarization.modelIdentifier)
                     }
                     if let report = appState.speakerDiarizationHealthReport {
-                        speakerDiarizationHealthReportView(report)
+                        Text(report.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
@@ -5479,7 +5965,7 @@ struct SettingsView: View {
     }
 
     private var aboutSettingsPage: some View {
-        settingsForm(maxWidth: 560) {
+        settingsForm(maxWidth: 640) {
             settingRow(title: L10n.text("Application", language: language)) {
                 VStack(alignment: .leading, spacing: 7) {
                     Text("llmTools")
@@ -5514,6 +6000,10 @@ struct SettingsView: View {
                 }
             }
 
+            settingRow(title: localizedSettingsText(chinese: "模型下载", english: "Model Downloads")) {
+                modelDownloadChecklist
+            }
+
             settingRow(title: L10n.text("Quit", language: language)) {
                 Button {
                     NSApp.terminate(nil)
@@ -5523,6 +6013,104 @@ struct SettingsView: View {
                 .controlSize(.small)
             }
         }
+    }
+
+    private var modelDownloadChecklist: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(localizedSettingsText(
+                chinese: "新电脑迁移时，先按用途下载下面的模型/运行时文件，再回到模型页添加本地目录或运行对应安装脚本。",
+                english: "On a new Mac, download the model or runtime files below by use case, then add the local folder on the Models tab or run the matching installer script."
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            ForEach(supportedModelDownloadSections) { section in
+                VStack(alignment: .leading, spacing: 7) {
+                    Text(section.title(language: language))
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.primary)
+                    ForEach(section.entries) { entry in
+                        modelDownloadEntryView(entry)
+                    }
+                }
+            }
+        }
+    }
+
+    private func modelDownloadEntryView(_ entry: SupportedModelDownloadEntry) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(entry.name(language: language))
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                HStack(spacing: 6) {
+                    Button {
+                        openExternalURL(entry.downloadURL)
+                    } label: {
+                        Label(localizedSettingsText(chinese: "打开", english: "Open"), systemImage: "safari")
+                    }
+                    .controlSize(.small)
+
+                    if let mirrorURL = entry.mirrorURL {
+                        Button {
+                            openExternalURL(mirrorURL)
+                        } label: {
+                            Label(localizedSettingsText(chinese: "镜像", english: "Mirror"), systemImage: "globe.asia.australia")
+                        }
+                        .controlSize(.small)
+                    }
+
+                    Button {
+                        copyToPasteboard(entry.copyCommand)
+                    } label: {
+                        Label(L10n.text("Copy", language: language), systemImage: "doc.on.doc")
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            modelDownloadLine(
+                title: localizedSettingsText(chinese: "模型", english: "Model"),
+                value: entry.modelName
+            )
+            modelDownloadLine(
+                title: localizedSettingsText(chinese: "地址", english: "URL"),
+                value: entry.downloadURL
+            )
+            if let installerScript = entry.installerScript {
+                modelDownloadLine(
+                    title: localizedSettingsText(chinese: "脚本", english: "Script"),
+                    value: installerScript
+                )
+            }
+            Text(entry.note(language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 5)
+    }
+
+    private func modelDownloadLine(title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(title)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(width: 38, alignment: .leading)
+            Text(value)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(value)
+        }
+    }
+
+    private func localizedSettingsText(chinese: String, english: String) -> String {
+        language == .chinese ? chinese : english
     }
 
     private var appLanguagePicker: some View {
@@ -5913,12 +6501,188 @@ struct SettingsView: View {
         }
     }
 
+    private func openLanguageRoutingModelPanel(_ variant: LanguageIDModelVariant) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("Choose fastText model file", language: language)
+        panel.prompt = L10n.text("Choose", language: language)
+        panel.message = languageRoutingModelPanelMessage(variant)
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            appState.updatePreferences { preferences in
+                switch variant {
+                case .ftz, .customCommand:
+                    preferences.languageRouting.ftzModelPath = url.path
+                case .bin:
+                    preferences.languageRouting.binModelPath = url.path
+                }
+            }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private func openFastTranslationModelPanel(_ variant: FastTranslationModelVariant) {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("Choose CTranslate2 model folder", language: language)
+        panel.prompt = L10n.text("Choose", language: language)
+        panel.message = fastTranslationModelPanelMessage(variant)
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            appState.updatePreferences { preferences in
+                switch variant {
+                case .opusMTEnZh:
+                    preferences.fastTranslation.opusMTEnZhCT2ModelPath = url.path
+                case .nllb200Distilled600M:
+                    preferences.fastTranslation.nllb200Distilled600MCT2ModelPath = url.path
+                }
+            }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private func openSpeakerDiarizationModelPanel() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("Choose local pyannote config", language: language)
+        panel.prompt = L10n.text("Choose", language: language)
+        panel.message = speakerDiarizationModelPanelMessage
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.resolvesAliases = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            appState.updatePreferences { $0.speakerDiarization.modelIdentifier = url.path }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private func openSpeakerDiarizationCachePanel() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSOpenPanel()
+        panel.title = L10n.text("Choose cache folder", language: language)
+        panel.prompt = L10n.text("Choose", language: language)
+        panel.message = speakerDiarizationCachePanelMessage
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.resolvesAliases = true
+
+        let completion: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            appState.updatePreferences { $0.speakerDiarization.cacheDirectory = url.path }
+        }
+
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(panel.runModal())
+        }
+    }
+
+    private func revealSpeakerDiarizationCacheFolder() {
+        let configured = appState.preferences.speakerDiarization.cacheDirectory
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = configured.isEmpty
+            ? SpeakerDiarizationCommandRunner.defaultHFHomeDirectory
+            : URL(fileURLWithPath: NSString(string: configured).expandingTildeInPath, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        NSWorkspace.shared.open(url)
+    }
+
     private var localModelPanelMessage: String {
         switch language {
         case .chinese:
             return "选择 GGUF 文件、MLX 模型目录或其他本地模型文件。"
         case .english:
             return "Choose a GGUF file, MLX model folder, or another local model file."
+        }
+    }
+
+    private func languageRoutingModelPanelMessage(_ variant: LanguageIDModelVariant) -> String {
+        switch (language, variant) {
+        case (.chinese, .ftz), (.chinese, .customCommand):
+            return "选择 fastText 语言识别小模型文件，通常名为 lid.176.ftz。"
+        case (.chinese, .bin):
+            return "选择 fastText 语言识别高精度模型文件，通常名为 lid.176.bin。"
+        case (.english, .ftz), (.english, .customCommand):
+            return "Choose the compact fastText language ID model file, usually named lid.176.ftz."
+        case (.english, .bin):
+            return "Choose the full fastText language ID model file, usually named lid.176.bin."
+        }
+    }
+
+    private func fastTranslationModelPanelMessage(_ variant: FastTranslationModelVariant) -> String {
+        switch (language, variant) {
+        case (.chinese, .opusMTEnZh):
+            return "选择 OPUS 英译中 CTranslate2 模型目录。目录内应包含 model.bin、config.json 等文件。"
+        case (.chinese, .nllb200Distilled600M):
+            return "选择 NLLB 200 distilled 600M CTranslate2 模型目录。目录内应包含 model.bin、config.json 等文件。"
+        case (.english, .opusMTEnZh):
+            return "Choose the OPUS English-to-Chinese CTranslate2 model folder. It should contain files such as model.bin and config.json."
+        case (.english, .nllb200Distilled600M):
+            return "Choose the NLLB 200 distilled 600M CTranslate2 model folder. It should contain files such as model.bin and config.json."
+        }
+    }
+
+    private var speakerDiarizationModelPanelMessage: String {
+        switch language {
+        case .chinese:
+            return "选择本地 pyannote pipeline 的 config.yaml，或选择包含 config.yaml 的模型目录。"
+        case .english:
+            return "Choose the local pyannote pipeline config.yaml, or a model folder that contains config.yaml."
+        }
+    }
+
+    private var speakerDiarizationCachePanelMessage: String {
+        switch language {
+        case .chinese:
+            return "选择 Hugging Face cache 目录。留空时默认使用 ~/.cache/huggingface。"
+        case .english:
+            return "Choose the Hugging Face cache directory. Empty uses ~/.cache/huggingface."
         }
     }
 
@@ -5965,6 +6729,33 @@ struct SettingsView: View {
             content()
         }
         .frame(width: width, alignment: .topLeading)
+    }
+
+    private func modelPathField(
+        title: String,
+        text: Binding<String>,
+        placeholder: String,
+        chooseAction: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(alignment: .center, spacing: 8) {
+                CommandFriendlyTextField(
+                    text: text,
+                    placeholder: placeholder
+                )
+                .frame(width: 392)
+                Button {
+                    chooseAction()
+                } label: {
+                    Label(L10n.text("Choose", language: language), systemImage: "folder")
+                }
+                .controlSize(.small)
+            }
+        }
+        .frame(width: 500, alignment: .topLeading)
     }
 
     private func mediaASRCommandField(
@@ -7276,7 +8067,7 @@ struct SettingsView: View {
     private func speakerDiarizationHealthStatusName(_ status: SpeakerDiarizationHealthStatus) -> String {
         switch (language, status) {
         case (.chinese, .ready):
-            return "可用"
+            return "运行时已配置"
         case (.chinese, .disabled):
             return "已关闭"
         case (.chinese, .requiresUserToken):
@@ -7286,7 +8077,7 @@ struct SettingsView: View {
         case (.chinese, .failed):
             return "失败"
         case (.english, .ready):
-            return "Ready"
+            return "Runtime configured"
         case (.english, .disabled):
             return "Disabled"
         case (.english, .requiresUserToken):
@@ -7336,7 +8127,7 @@ struct SettingsView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text(L10n.text("Fix path", language: language))
                     .font(.caption.weight(.semibold))
-                Text(L10n.text("1. Open the pyannote model page and accept the model terms with your Hugging Face account.", language: language))
+                Text(L10n.text("1. Open the pyannote model pages and accept both speaker-diarization-3.1 and segmentation-3.0 terms with your Hugging Face account.", language: language))
                     .font(.caption)
                 Text(L10n.text("2. Create a Hugging Face token, paste it into the HF token field above, then click Save Token.", language: language))
                     .font(.caption)
@@ -7344,7 +8135,7 @@ struct SettingsView: View {
                     .font(.caption)
                 HStack(spacing: 8) {
                     Button {
-                        openExternalURL("https://huggingface.co/pyannote/speaker-diarization-3.1")
+                        openPyannoteModelTerms()
                     } label: {
                         Label(L10n.text("Open model terms", language: language), systemImage: "checkmark.seal")
                     }
@@ -7581,6 +8372,20 @@ struct SettingsView: View {
             return
         }
         NSWorkspace.shared.open(url)
+    }
+
+    private func openPyannoteModelTerms() {
+        for value in [
+            "https://huggingface.co/pyannote/speaker-diarization-3.1",
+            "https://huggingface.co/pyannote/segmentation-3.0"
+        ] {
+            openExternalURL(value)
+        }
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
     }
 }
 

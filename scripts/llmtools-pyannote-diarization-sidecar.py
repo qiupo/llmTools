@@ -10,20 +10,37 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+
+LOCAL_PYANNOTE_MODEL_ROOT: Optional[Path] = None
 
 
 def patch_huggingface_hub_auth_keyword() -> None:
     """Keep pyannote.audio 3.1.x working with huggingface_hub 1.x."""
-    try:
-        import pyannote.audio.core.pipeline as pipeline_module
-    except Exception:
-        return
+    module_names = [
+        "pyannote.audio.core.pipeline",
+        "pyannote.audio.core.model",
+        "pyannote.audio.pipelines.speaker_verification",
+    ]
+    for module_name in module_names:
+        try:
+            module = __import__(module_name, fromlist=["hf_hub_download"])
+        except Exception:
+            continue
+        patch_hf_hub_download(module)
 
-    original = pipeline_module.hf_hub_download
+
+def patch_hf_hub_download(module: Any) -> None:
+    original = getattr(module, "hf_hub_download", None)
+    if original is None or getattr(original, "_llmtools_auth_compat", False):
+        return
     parameters = inspect.signature(original).parameters
 
     def hf_hub_download_compat(*args: Any, use_auth_token: Any = None, token: Any = None, **kwargs: Any) -> Any:
+        local_file = local_hf_hub_file(args, kwargs)
+        if local_file is not None:
+            return local_file
         resolved_token = token if token is not None else use_auth_token
         if "token" in parameters:
             kwargs["token"] = resolved_token
@@ -31,7 +48,52 @@ def patch_huggingface_hub_auth_keyword() -> None:
             kwargs["use_auth_token"] = resolved_token
         return original(*args, **kwargs)
 
-    pipeline_module.hf_hub_download = hf_hub_download_compat
+    hf_hub_download_compat._llmtools_auth_compat = True
+    module.hf_hub_download = hf_hub_download_compat
+
+
+def local_hf_hub_file(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Optional[str]:
+    root = LOCAL_PYANNOTE_MODEL_ROOT
+    if root is None:
+        return None
+    repo_id = kwargs.get("repo_id")
+    filename = kwargs.get("filename")
+    if repo_id is None and len(args) >= 1:
+        repo_id = args[0]
+    if filename is None and len(args) >= 2:
+        filename = args[1]
+    if not isinstance(repo_id, str) or not isinstance(filename, str):
+        return None
+    local_dirs = {
+        "pyannote/segmentation-3.0": root / "segmentation-3.0",
+        "pyannote/wespeaker-voxceleb-resnet34-LM": root / "wespeaker-voxceleb-resnet34-LM",
+    }
+    local_dir = local_dirs.get(repo_id)
+    if local_dir is None:
+        return None
+    local_file = local_dir / filename
+    if local_file.is_file():
+        return str(local_file.resolve())
+    return None
+
+
+def patch_torch_load_weights_only_default() -> None:
+    """Keep pyannote.audio 3.1.x checkpoints loadable on PyTorch 2.6+."""
+    try:
+        import torch
+    except Exception:
+        return
+
+    original = torch.load
+    if getattr(original, "_llmtools_weights_only_compat", False):
+        return
+
+    def torch_load_compat(*args: Any, **kwargs: Any) -> Any:
+        kwargs["weights_only"] = False
+        return original(*args, **kwargs)
+
+    torch_load_compat._llmtools_weights_only_compat = True
+    torch.load = torch_load_compat
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,19 +114,21 @@ def main() -> int:
     args = parse_args()
     audio_path = Path(args.audio).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
+    model_reference = resolve_model_reference(args.model)
     if not audio_path.is_file():
         raise FileNotFoundError(f"Audio file not found: {audio_path}")
-    if not args.hf_token:
+    if not args.hf_token and not is_local_model_reference(model_reference):
         raise RuntimeError("Hugging Face token missing. Accept pyannote/speaker-diarization-3.1 terms and set PYANNOTE_AUTH_TOKEN.")
 
     started = time.perf_counter()
     from pyannote.audio import Pipeline
     patch_huggingface_hub_auth_keyword()
+    patch_torch_load_weights_only_default()
 
-    pipeline = Pipeline.from_pretrained(args.model, use_auth_token=args.hf_token)
+    pipeline = Pipeline.from_pretrained(model_reference, use_auth_token=args.hf_token or None)
     if pipeline is None:
         raise RuntimeError(
-            f"Could not load {args.model}. Accept the model terms with the same Hugging Face account "
+            f"Could not load {model_reference}. Accept the model terms with the same Hugging Face account "
             "used by this token, then run health check again."
         )
     diarization = pipeline(str(audio_path))
@@ -81,11 +145,45 @@ def main() -> int:
         })
     write_json(output_path, {
         "protocol": "llmtools.diarization/v1",
-        "model": args.model,
+        "model": model_reference,
         "turns": turns,
         "latencyMilliseconds": int((time.perf_counter() - started) * 1000),
     })
     return 0
+
+
+def resolve_model_reference(value: str) -> str:
+    candidate = Path(value).expanduser()
+    if candidate.is_dir():
+        config = candidate / "config.yaml"
+        if config.is_file():
+            register_local_pyannote_root(config)
+            return str(config.resolve())
+    if candidate.exists():
+        if candidate.name == "config.yaml":
+            register_local_pyannote_root(candidate)
+            return str(candidate.resolve())
+        return str(candidate.resolve())
+    return value
+
+
+def register_local_pyannote_root(config: Path) -> None:
+    global LOCAL_PYANNOTE_MODEL_ROOT
+    sibling_root = config.parent.parent
+    required = [
+        sibling_root / "segmentation-3.0",
+        sibling_root / "wespeaker-voxceleb-resnet34-LM",
+    ]
+    if all(is_pyannote_model_directory(path) for path in required):
+        LOCAL_PYANNOTE_MODEL_ROOT = sibling_root.resolve()
+
+
+def is_pyannote_model_directory(path: Path) -> bool:
+    return (path / "config.yaml").is_file() and (path / "pytorch_model.bin").is_file()
+
+
+def is_local_model_reference(value: str) -> bool:
+    return Path(value).expanduser().exists()
 
 
 if __name__ == "__main__":

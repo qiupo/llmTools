@@ -152,11 +152,22 @@ public actor SpeakerDiarizationService {
             )
         }
         let tokenPresent = SpeakerDiarizationCommandRunner.tokenPresent(preferences: preferences)
-        guard tokenPresent || SpeakerDiarizationCommandRunner.hasCustomCommand(preferences: preferences) else {
+        let localModel = SpeakerDiarizationCommandRunner.modelReferenceIsLocal(preferences.modelIdentifier)
+        if SpeakerDiarizationCommandRunner.modelReferenceLooksLocal(preferences.modelIdentifier), !localModel {
+            return SpeakerDiarizationHealth(
+                status: .failed,
+                source: .unavailable,
+                requiresUserToken: false,
+                tokenPresent: tokenPresent,
+                tokenAcceptedRecently: false,
+                message: "Configured pyannote model path was not found: \(preferences.modelIdentifier)"
+            )
+        }
+        guard tokenPresent || localModel || SpeakerDiarizationCommandRunner.hasCustomCommand(preferences: preferences) else {
             return SpeakerDiarizationHealth(
                 status: .requiresUserToken,
                 source: .unavailable,
-                requiresUserToken: true,
+                requiresUserToken: !localModel,
                 tokenPresent: false,
                 tokenAcceptedRecently: false,
                 message: "pyannote speaker diarization requires a Hugging Face token and accepted model terms."
@@ -167,7 +178,7 @@ public actor SpeakerDiarizationService {
             return SpeakerDiarizationHealth(
                 status: .ready,
                 source: resolution.source,
-                requiresUserToken: resolution.source != .settingsCommand,
+                requiresUserToken: resolution.source != .settingsCommand && !localModel,
                 tokenPresent: tokenPresent,
                 tokenAcceptedRecently: false,
                 message: "Speaker diarization runtime is configured."
@@ -258,6 +269,12 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         public var source: SpeakerDiarizationRuntimeSource
     }
 
+    public static var defaultHFHomeDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+    }
+
     public static func hasCustomCommand(preferences: SpeakerDiarizationPreferences) -> Bool {
         !preferences.commandTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -286,13 +303,16 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         if hasCustomCommand(preferences: preferences) {
             return CommandResolution(command: preferences.commandTemplate, source: .settingsCommand)
         }
+        if modelReferenceLooksLocal(preferences.modelIdentifier), !modelReferenceIsLocal(preferences.modelIdentifier) {
+            throw SpeakerDiarizationError.runtimeMissing("Configured pyannote model path was not found: \(preferences.modelIdentifier)")
+        }
         guard let sidecarPath = sidecarPath() else {
             throw SpeakerDiarizationError.runtimeMissing("Bundled speaker diarization sidecar was not found.")
         }
         guard let pythonPath = pythonPath() else {
             throw SpeakerDiarizationError.runtimeMissing("Python runtime was not found for speaker diarization.")
         }
-        let command = "{python} {sidecar} --audio {audio_wav_16k_mono} --output {output_json}"
+        let command = "{python} {sidecar} --model {diarization_model} --audio {audio_wav_16k_mono} --output {output_json}"
             .replacingOccurrences(of: "{python}", with: shellEscape(pythonPath))
             .replacingOccurrences(of: "{sidecar}", with: shellEscape(sidecarPath))
         return CommandResolution(command: command, source: .bundledPyannoteSidecar)
@@ -323,6 +343,10 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         if environment["PYANNOTE_AUTH_TOKEN"] == nil, let token = token(preferences: preferences) {
             environment["PYANNOTE_AUTH_TOKEN"] = token
         }
+        if let cacheDirectory = cacheDirectory(preferences: preferences) {
+            try? FileManager.default.createDirectory(atPath: cacheDirectory, withIntermediateDirectories: true)
+            environment["HF_HOME"] = cacheDirectory
+        }
         process.environment = environment
         let stdout = Pipe()
         let stderr = Pipe()
@@ -332,12 +356,14 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
             try process.run()
             process.waitUntilExit()
         } catch {
-            throw SpeakerDiarizationError.runtimeFailed(error.localizedDescription)
+            throw SpeakerDiarizationError.runtimeFailed(userVisibleRuntimeFailure(error.localizedDescription))
         }
         let stderrText = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard process.terminationStatus == 0 else {
-            throw SpeakerDiarizationError.runtimeFailed(stderrText.isEmpty ? "Speaker diarization command failed." : stderrText)
+            throw SpeakerDiarizationError.runtimeFailed(
+                userVisibleRuntimeFailure(stderrText.isEmpty ? "Speaker diarization command failed." : stderrText)
+            )
         }
         let data: Data
         if FileManager.default.fileExists(atPath: outputURL.path) {
@@ -372,6 +398,9 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         preferences: SpeakerDiarizationPreferences
     ) -> String {
         template
+            .replacingOccurrences(of: "{diarization_model}", with: shellEscape(preferences.modelIdentifier))
+            .replacingOccurrences(of: "{model}", with: shellEscape(preferences.modelIdentifier))
+            .replacingOccurrences(of: "{hf_cache}", with: shellEscape(cacheDirectory(preferences: preferences) ?? ""))
             .replacingOccurrences(of: "{audio_wav_16k_mono}", with: shellEscape(audioURL.path))
             .replacingOccurrences(of: "{output_json}", with: shellEscape(outputURL.path))
             .replacingOccurrences(of: "{hf_token}", with: shellEscape(token(preferences: preferences) ?? ""))
@@ -382,6 +411,34 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
             return token
         }
         return try? SpeakerDiarizationTokenStore.read()
+    }
+
+    public static func modelReferenceIsLocal(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return false
+        }
+        let expanded = NSString(string: normalized).expandingTildeInPath
+        return FileManager.default.fileExists(atPath: expanded)
+    }
+
+    public static func modelReferenceLooksLocal(_ value: String) -> Bool {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return false
+        }
+        return normalized.hasPrefix("/")
+            || normalized.hasPrefix("./")
+            || normalized.hasPrefix("../")
+            || normalized.hasPrefix("~")
+    }
+
+    private static func cacheDirectory(preferences: SpeakerDiarizationPreferences) -> String? {
+        let normalized = preferences.cacheDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return nil
+        }
+        return NSString(string: normalized).expandingTildeInPath
     }
 
     private static func pythonPath() -> String? {
@@ -433,6 +490,60 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         }
         let value = String(cString: rawValue).trimmingCharacters(in: .whitespacesAndNewlines)
         return value.isEmpty ? nil : value
+    }
+
+    private static func userVisibleRuntimeFailure(_ rawMessage: String) -> String {
+        let normalized = rawMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            return "Speaker diarization command failed."
+        }
+        let lowercased = normalized.lowercased()
+        if isPyannoteSetupFailure(lowercased) {
+            return "pyannote model is not ready. Open Settings > Models > Model Settings > Speaker Diarization, complete the pyannote setup, then regenerate subtitles. If this Mac cannot reach huggingface.co, pre-cache pyannote/speaker-diarization-3.1 first."
+        }
+        guard lowercased.contains("traceback") else {
+            return normalized
+        }
+        if let usefulLine = lastUsefulTracebackLine(in: normalized) {
+            return "Speaker diarization command failed: \(usefulLine)"
+        }
+        return "Speaker diarization command failed."
+    }
+
+    private static func isPyannoteSetupFailure(_ lowercased: String) -> Bool {
+        let mentionsPyannoteModel = lowercased.contains("pyannote")
+            || lowercased.contains("speaker-diarization")
+        let mentionsHuggingFaceAccess = lowercased.contains("huggingface")
+            || lowercased.contains("hf_token")
+            || lowercased.contains("pyannote_auth_token")
+            || lowercased.contains("use_auth_token")
+            || lowercased.contains("gated")
+            || lowercased.contains("model terms")
+            || lowercased.contains("repository")
+            || lowercased.contains("resolve/main")
+        let mentionsNetworkFailure = lowercased.contains("no route")
+            || lowercased.contains("cannot send a request")
+            || lowercased.contains("connection")
+            || lowercased.contains("timed out")
+            || lowercased.contains("network")
+        return mentionsPyannoteModel && (mentionsHuggingFaceAccess || mentionsNetworkFailure)
+    }
+
+    private static func lastUsefulTracebackLine(in message: String) -> String? {
+        message
+            .split(whereSeparator: \.isNewline)
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .reversed()
+            .first { line in
+                guard !line.isEmpty else {
+                    return false
+                }
+                let lowercased = line.lowercased()
+                return !lowercased.hasPrefix("traceback")
+                    && !lowercased.hasPrefix("file ")
+                    && !lowercased.hasPrefix("from ")
+                    && !lowercased.hasPrefix("return ")
+            }
     }
 
     private static func shellEscape(_ value: String) -> String {

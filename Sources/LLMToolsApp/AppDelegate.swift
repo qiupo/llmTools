@@ -32,6 +32,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     )
     private let liveSubtitleImmersiveTwoLineHeight: CGFloat = 96
     private let liveSubtitleImmersiveBilingualHeight: CGFloat = 128
+    private let statusMenuMessageLimit = 32
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
@@ -984,7 +985,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         if appState.appLiveSubtitlesAreRunning {
             return L10n.text("Live subtitles", language: appState.preferences.appLanguage)
         }
-        return appState.statusMessage
+        return compactMenuStatus(appState.statusMessage)
+    }
+
+    private func compactMenuStatus(_ text: String) -> String {
+        let normalized = text
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
+        guard normalized.count > statusMenuMessageLimit else {
+            return normalized
+        }
+        return "\(normalized.prefix(max(1, statusMenuMessageLimit - 1)))…"
     }
 
     private func refreshMenuTitles() {

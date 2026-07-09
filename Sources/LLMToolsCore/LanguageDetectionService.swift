@@ -203,6 +203,20 @@ public struct FastTextLIDCommandRunner: Sendable {
         public var key: String
     }
 
+    public static var defaultFTZModelPath: String {
+        AppPaths.applicationSupportDirectory
+            .appendingPathComponent("lid-runtime", isDirectory: true)
+            .appendingPathComponent("lid.176.ftz")
+            .path
+    }
+
+    public static var defaultBINModelPath: String {
+        AppPaths.applicationSupportDirectory
+            .appendingPathComponent("lid-runtime", isDirectory: true)
+            .appendingPathComponent("lid.176.bin")
+            .path
+    }
+
     public static func fixtureResult(preferences: LanguageRoutingPreferences) throws -> LanguageDetectionResult? {
         guard let value = environmentValue(Phase4XFixtureEnvironment.languageIDJSON) else {
             return nil
@@ -236,10 +250,15 @@ public struct FastTextLIDCommandRunner: Sendable {
         guard let pythonPath = pythonPath() else {
             throw LanguageDetectionError.runtimeMissing("Python runtime was not found for language detection.")
         }
-        guard modelPath(for: preferences.modelVariant) != nil else {
-            throw LanguageDetectionError.modelMissing("fastText language ID model is missing. Run scripts/install-phase4x-fasttext-lid.sh or configure a custom command.")
+        if let configuredModelPath = configuredModelPath(for: preferences.modelVariant, preferences: preferences),
+           !FileManager.default.fileExists(atPath: configuredModelPath) {
+            throw LanguageDetectionError.modelMissing("Configured fastText language ID model was not found: \(configuredModelPath). Choose an existing model under Models > Model Settings.")
         }
-        let template = "{python} {sidecar} --model {model_ftz}"
+        guard modelPath(for: preferences.modelVariant, preferences: preferences) != nil else {
+            throw LanguageDetectionError.modelMissing("fastText language ID model is missing. Run scripts/install-phase4x-fasttext-lid.sh, configure the model path under Models > Model Settings, or configure a custom command.")
+        }
+        let modelPlaceholder = preferences.modelVariant == .bin ? "{model_bin}" : "{model_ftz}"
+        let template = "{python} {sidecar} --model \(modelPlaceholder)"
         let command = renderCommandTemplate(
             template,
             preferences: preferences,
@@ -281,32 +300,45 @@ public struct FastTextLIDCommandRunner: Sendable {
         template
             .replacingOccurrences(of: "{python}", with: shellEscape(pythonPath ?? Self.pythonPath() ?? "python3"))
             .replacingOccurrences(of: "{sidecar}", with: shellEscape(sidecarPath ?? Self.sidecarPath() ?? "llmtools-lid-sidecar.py"))
-            .replacingOccurrences(of: "{model_ftz}", with: shellEscape(modelPath(for: .ftz) ?? ""))
-            .replacingOccurrences(of: "{model_bin}", with: shellEscape(modelPath(for: .bin) ?? ""))
+            .replacingOccurrences(of: "{model_ftz}", with: shellEscape(modelPath(for: .ftz, preferences: preferences) ?? ""))
+            .replacingOccurrences(of: "{model_bin}", with: shellEscape(modelPath(for: .bin, preferences: preferences) ?? ""))
             .replacingOccurrences(of: "{variant}", with: preferences.modelVariant.rawValue)
     }
 
-    private static func modelPath(for variant: LanguageIDModelVariant) -> String? {
+    private static func modelPath(
+        for variant: LanguageIDModelVariant,
+        preferences: LanguageRoutingPreferences = LanguageRoutingPreferences()
+    ) -> String? {
         switch variant {
         case .ftz, .customCommand:
             return firstExistingPath([
+                configuredModelPath(for: .ftz, preferences: preferences),
                 environmentValue("LLMTOOLS_LID_MODEL_FTZ"),
-                AppPaths.applicationSupportDirectory
-                    .appendingPathComponent("lid-runtime", isDirectory: true)
-                    .appendingPathComponent("lid.176.ftz")
-                    .path,
+                defaultFTZModelPath,
                 "~/Library/Application Support/llmTools/lid-runtime/lid.176.ftz"
             ])
         case .bin:
             return firstExistingPath([
+                configuredModelPath(for: .bin, preferences: preferences),
                 environmentValue("LLMTOOLS_LID_MODEL_BIN"),
-                AppPaths.applicationSupportDirectory
-                    .appendingPathComponent("lid-runtime", isDirectory: true)
-                    .appendingPathComponent("lid.176.bin")
-                    .path,
+                defaultBINModelPath,
                 "~/Library/Application Support/llmTools/lid-runtime/lid.176.bin"
             ])
         }
+    }
+
+    private static func configuredModelPath(
+        for variant: LanguageIDModelVariant,
+        preferences: LanguageRoutingPreferences
+    ) -> String? {
+        let rawValue: String
+        switch variant {
+        case .ftz, .customCommand:
+            rawValue = preferences.ftzModelPath
+        case .bin:
+            rawValue = preferences.binModelPath
+        }
+        return expandedNonEmptyPath(rawValue)
     }
 
     private static func pythonPath() -> String? {
@@ -363,6 +395,13 @@ public struct FastTextLIDCommandRunner: Sendable {
     private static func nonEmpty(_ value: String?) -> String? {
         let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func expandedNonEmptyPath(_ value: String?) -> String? {
+        guard let trimmed = nonEmpty(value) else {
+            return nil
+        }
+        return NSString(string: trimmed).expandingTildeInPath
     }
 
     private static func shellEscape(_ value: String) -> String {

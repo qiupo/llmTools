@@ -6,6 +6,8 @@ Date: 2026-07-08
 
 Realtime speaker diarization is rejected for the Phase 4.x MVP. File subtitle diarization remains in scope, but live subtitle speaker labels stay hard-disabled until a later milestone proves the latency budget.
 
+This decision applies to the low-latency live subtitle overlay. It does not reject the separate Phase 4.y live meeting transcription window, where transcript rows, speaker labels, and notes are allowed to lag and be corrected retroactively.
+
 ## Acceptance Gate
 
 Realtime diarization may only move back into scope if a later spike demonstrates both conditions on the packaged app path:

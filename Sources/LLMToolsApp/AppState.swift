@@ -1369,9 +1369,7 @@ final class AppState: ObservableObject {
             return t("Finished")
         }
         if diagnostics?.diarizationErrorCode != nil {
-            let message = diagnostics?.diarizationErrorMessage ?? diagnostics?.diarizationErrorCode ?? ""
-            let suffix = message.isEmpty ? "" : ": \(message)"
-            return "\(t("Finished")) · \(t("Speaker diarization failed"))\(suffix)"
+            return "\(t("Finished")) · \(t("Speaker diarization failed"))"
         }
         let speakerCount = diagnostics?.speakerCount ?? SpeakerTurnMapper.speakerCount(in: mediaSubtitleSegments)
         if speakerCount > 0 {
@@ -1503,7 +1501,7 @@ final class AppState: ObservableObject {
                 speakerDiarizationHealthReport = health
                 speakerDiarizationHealthCheckInProgress = false
                 validationError = health.status == .ready || health.status == .disabled ? nil : health.message
-                statusMessage = health.status == .ready ? t("Speaker diarization ready") : t("Speaker diarization check finished")
+                statusMessage = health.status == .ready ? t("Speaker diarization runtime configured") : t("Speaker diarization check finished")
             }
         }
     }
@@ -1587,7 +1585,7 @@ final class AppState: ObservableObject {
                 speakerDiarizationHealthReport = health
                 speakerDiarizationHealthCheckInProgress = false
                 validationError = health.status == .ready || health.status == .disabled ? nil : health.message
-                statusMessage = health.status == .ready ? t("Speaker diarization ready") : t("Speaker diarization check finished")
+                statusMessage = health.status == .ready ? t("Speaker diarization runtime configured") : t("Speaker diarization check finished")
             }
         }
     }
