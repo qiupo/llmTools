@@ -102,6 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument("--model", default="pyannote/speaker-diarization-3.1")
     parser.add_argument("--hf-token", default=os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN") or "")
+    parser.add_argument("--speaker-count-hint", default="auto", help="auto or an expected positive speaker count")
     return parser.parse_args()
 
 
@@ -112,6 +113,10 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def main() -> int:
     args = parse_args()
+    # Runtime inference is strictly local-only. Installation is a separate explicit
+    # repair flow; a missing cache must fail back to transcript-only in the app.
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     audio_path = Path(args.audio).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     model_reference = resolve_model_reference(args.model)
@@ -131,7 +136,16 @@ def main() -> int:
             f"Could not load {model_reference}. Accept the model terms with the same Hugging Face account "
             "used by this token, then run health check again."
         )
-    diarization = pipeline(str(audio_path))
+    inference_kwargs: dict[str, Any] = {}
+    if args.speaker_count_hint != "auto":
+        try:
+            speaker_count = int(args.speaker_count_hint)
+        except ValueError as exc:
+            raise RuntimeError("speaker-count-hint must be auto or a positive integer") from exc
+        if speaker_count <= 0:
+            raise RuntimeError("speaker-count-hint must be auto or a positive integer")
+        inference_kwargs["num_speakers"] = speaker_count
+    diarization = pipeline(str(audio_path), **inference_kwargs)
     speaker_labels: dict[str, str] = {}
     turns: list[dict[str, Any]] = []
     for turn, _, speaker in diarization.itertracks(yield_label=True):

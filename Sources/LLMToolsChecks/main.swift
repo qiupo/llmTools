@@ -18,11 +18,13 @@ struct LLMToolsChecks {
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
         try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
         try checkPhase4XFoundationTypesAndPreferences()
+        try await checkLiveMeetingTranscriptionFixtures()
         try await checkLanguageDetectionFixture()
         try await checkLanguageRoutingCallerWiring()
         try await checkSpeakerDiarizationFixtureAndMapping()
         try await checkSpeakerDiarizationFailureMessageSanitization()
         try await checkSpeakerDiarizationCommandDrainsLargeStderr()
+        try await checkSpeakerDiarizationCommandCancellation()
         try checkSubtitleExportWithSpeakers()
         try await checkSpeakerDiarizationFilePipeline()
         try await checkFastMTFixtureRoundTrip()
@@ -54,7 +56,12 @@ struct LLMToolsChecks {
         try await checkWebPageTranslationBatchFallback()
         try await checkWebPageTranslationBatchRetriesOnlyMissingSegments()
         try await checkSpeechModelDetectionPreferencesAndHealth()
+        try await checkLocalASRCommandCancellation()
+        try await checkAudioExtractionWorkspaceCleanup()
+        try await checkAudioExtractionCancellationCleanup()
         try await checkSubtitleTranslationCoordinatorUsesTextRunner()
+        try await checkSubtitleTranslationSplitsLongLLMBatches()
+        try await checkSubtitleTranslationSplitsOversizedSingleSegment()
         try await checkMediaFileSubtitlePipelineWithConfiguredLocalCommand()
         try checkSubtitlePromptExporterAndPrivacyDefaults()
         try checkVisibleOutputHidesThinkBlock()
@@ -496,6 +503,11 @@ struct LLMToolsChecks {
         try require(preferences.mediaSubtitles.liveWindowWidth == MediaSubtitlePreferences.defaultLiveWindowWidth, "Expected live subtitle window width to use the default.")
         try require(preferences.mediaSubtitles.liveWindowHeight == MediaSubtitlePreferences.defaultLiveWindowHeight, "Expected live subtitle window height to use the default.")
         try require(preferences.mediaSubtitles.liveASRPartialMillisecondsByModelID.isEmpty, "Expected live ASR partial-window overrides to default empty.")
+        try require(preferences.liveMeeting.defaultAudioSource == .microphone, "Expected live meeting input to default to microphone.")
+        try require(preferences.liveMeeting.sourceLanguageHint == .auto, "Expected live meeting source language to default to auto.")
+        try require(preferences.liveMeeting.realtimeASRModelID == nil && preferences.liveMeeting.fileASRModelID == nil && preferences.liveMeeting.notesModelID == nil, "Expected older registries to decode empty meeting model selections.")
+        let invalidMeetingSource = LiveMeetingPreferences(defaultAudioSource: .localFile)
+        try require(invalidMeetingSource.defaultAudioSource == .microphone, "Meeting defaults must reject local-file capture as a live source.")
         let tinyWindowPreferences = MediaSubtitlePreferences(liveWindowWidth: 10, liveWindowHeight: 10)
         try require(tinyWindowPreferences.liveWindowWidth == MediaSubtitlePreferences.minimumLiveWindowWidth, "Expected live subtitle window width to clamp to the minimum.")
         try require(tinyWindowPreferences.liveWindowHeight == MediaSubtitlePreferences.minimumLiveWindowHeight, "Expected live subtitle window height to clamp to the minimum.")
@@ -734,6 +746,687 @@ struct LLMToolsChecks {
             preferences: LanguageRoutingPreferences(modelVariant: .bin, binModelPath: binModel.path)
         )
         try require(binResolution.command.contains(binModel.path), "Expected explicit BIN LID model path to be used in the command.")
+    }
+
+    private static func checkLiveMeetingTranscriptionFixtures() async throws {
+        let root = try makeTemporaryDirectory(name: "live-meeting-fixture")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let localModelID = UUID(uuidString: "00000000-0000-0000-0000-000000004001")!
+        let sessionID = UUID(uuidString: "00000000-0000-0000-0000-000000004002")!
+        var session = LiveMeetingSession(
+            id: sessionID,
+            source: .microphone,
+            asrModelID: localModelID,
+            asrModelName: "Fixture Local MLX",
+            state: .running,
+            temporaryAudioDirectory: root.appendingPathComponent("temporary-audio").path
+        )
+        session.startedAt = Date(timeIntervalSinceNow: -(60 * 60 + 1))
+        try require(session.hasReachedLongSessionThreshold, "Expected microphone meeting session to show the 60-minute reminder without stopping.")
+        try require(LiveMeetingAudioSource.allCases == [.microphone, .systemAudio, .localFile], "Meeting must support microphone, system-audio, and local-file sources without a mixed capture mode.")
+        let systemAudioSession = LiveMeetingSession(
+            source: .systemAudio,
+            startedAt: Date(timeIntervalSinceNow: -(60 * 60 + 1)),
+            asrModelID: localModelID,
+            asrModelName: "Fixture Local MLX"
+        )
+        try require(systemAudioSession.hasReachedLongSessionThreshold, "Expected system-audio meeting sessions to retain the 60-minute reminder.")
+        try require(LiveMeetingAudioSource.systemAudio.liveSubtitleCaptureSource == .systemAudio, "Expected system-audio meetings to reuse native system capture.")
+        try require(LiveMeetingSpeakerCountHint.allCases.map(\.displayName) == ["Auto", "2", "3", "4", "5+"], "Expected V1 speaker-count hints.")
+
+        let nativeSpeakerCapabilities = ModelCapabilities(
+            inputs: [.speech],
+            source: .manual,
+            confidence: 1,
+            speech: .vibeVoiceASR(source: .manual, confidence: 1)
+        )
+        try require(
+            nativeSpeakerCapabilities.supportsMeetingCaptureSpeech
+                && !nativeSpeakerCapabilities.supportsRealtimeSpeech
+                && nativeSpeakerCapabilities.meetingCaptureRuntimeMode == .fileOnly,
+            "A file-only native-speaker ASR such as VibeVoice must remain selectable for delayed meeting capture without becoming a Live Subtitles model."
+        )
+        try require(
+            !LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.postTargetPauseMilliseconds,
+                batchDurationMilliseconds: LiveMeetingNativeBatchPolicy.preferredBatchMilliseconds - 1
+            ),
+            "Native speaker ASR must keep a batch open before the preferred duration when there is no clear interruption."
+        )
+        try require(
+            LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.clearInterruptionMilliseconds,
+                batchDurationMilliseconds: 10_000
+            ),
+            "Native speaker ASR must flush after a clear 2.5-second audio interruption."
+        )
+        try require(
+            !LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: 30 * 60 * 1_000,
+                trailingSilenceMilliseconds: 0,
+                batchDurationMilliseconds: 30 * 60 * 1_000
+            ),
+            "A native logical turn must not close solely because continuous speech is long."
+        )
+        try require(
+            !LiveMeetingNativeTechnicalWindowPolicy.shouldSeal(
+                sourceDurationMilliseconds: LiveMeetingNativeTechnicalWindowPolicy.maximumInferenceWindowMilliseconds - 1
+            ) && LiveMeetingNativeTechnicalWindowPolicy.shouldSeal(
+                sourceDurationMilliseconds: LiveMeetingNativeTechnicalWindowPolicy.maximumInferenceWindowMilliseconds
+            ),
+            "Native speaker ASR must seal a bounded 120-second technical inference window without closing the logical turn."
+        )
+        try require(
+            !LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: 90_000,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.postTargetPauseMilliseconds - 1,
+                batchDurationMilliseconds: LiveMeetingNativeBatchPolicy.preferredBatchMilliseconds
+            ),
+            "Native speaker ASR must wait for a reliable post-target pause instead of cutting at the preferred duration."
+        )
+        try require(
+            LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: 90_000,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.postTargetPauseMilliseconds,
+                batchDurationMilliseconds: LiveMeetingNativeBatchPolicy.preferredBatchMilliseconds
+            ),
+            "Native speaker ASR must flush at the next short natural pause after the preferred duration."
+        )
+        try require(
+            !LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds - 1,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.clearInterruptionMilliseconds,
+                batchDurationMilliseconds: LiveMeetingNativeBatchPolicy.preferredBatchMilliseconds
+            ),
+            "Silence-only or noise-only capture must not start a native ASR batch."
+        )
+        try require(
+            LiveMeetingNativeBatchPolicy.shouldDiscardNoise(
+                speechMilliseconds: LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds - 1,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.clearInterruptionMilliseconds
+            ),
+            "A sub-threshold noise burst must be discarded after a clear interruption instead of keeping the native batch open."
+        )
+        try require(
+            !LiveMeetingNativeBatchPolicy.shouldDiscardNoise(
+                speechMilliseconds: LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingNativeBatchPolicy.clearInterruptionMilliseconds
+            ),
+            "A valid native speech batch must be flushed rather than discarded."
+        )
+
+        try require(
+            LiveMeetingDelayedSpeakerPolicy.shouldFlushTranscript(
+                speechMilliseconds: 4_000,
+                trailingSilenceMilliseconds: LiveMeetingTurnSegmentationPolicy.pauseMilliseconds
+            ),
+            "Ordinary live ASR must flush on a natural pause without waiting for speaker stabilization."
+        )
+        try require(
+            LiveMeetingDelayedSpeakerPolicy.stableThroughMilliseconds(
+                capturedMilliseconds: 60_000,
+                final: false
+            ) == 30_000,
+            "Delayed speaker labeling must keep only a bounded 30-second unstable tail."
+        )
+        try require(
+            !LiveMeetingDelayedSpeakerPolicy.shouldRefreshSpeakerLabels(
+                capturedMilliseconds: 59_999,
+                lastAttemptMilliseconds: 0,
+                labeledThroughMilliseconds: 0
+            ) && LiveMeetingDelayedSpeakerPolicy.shouldRefreshSpeakerLabels(
+                capturedMilliseconds: 60_000,
+                lastAttemptMilliseconds: 0,
+                labeledThroughMilliseconds: 0
+            ),
+            "Speaker labeling must start only after a complete stable window, independently of transcript flushing."
+        )
+        try require(
+            LiveMeetingDelayedSpeakerPolicy.shouldRefreshSpeakerLabels(
+                capturedMilliseconds: 10_000,
+                lastAttemptMilliseconds: 0,
+                labeledThroughMilliseconds: 0,
+                final: true
+            ),
+            "Stopping must allow the final captured speaker window to be labeled immediately."
+        )
+        let delayedStrategy = LiveMeetingRecognitionStrategy.delayedSpeakerLabels
+        try require(
+            delayedStrategy.displayName.contains("Transcript first"),
+            "Live ordinary ASR must expose transcript-first delayed speaker labeling as a distinct strategy."
+        )
+        try require(
+            delayedStrategy.requiresFullSessionAudioBuffer
+                && LiveMeetingRecognitionStrategy.diarizationFirst.requiresFullSessionAudioBuffer
+                && !LiveMeetingRecognitionStrategy.nativeSpeakerASR.requiresFullSessionAudioBuffer
+                && !LiveMeetingRecognitionStrategy.transcriptOnly.requiresFullSessionAudioBuffer,
+            "Only delayed diarization strategies may retain a full-session in-memory audio buffer."
+        )
+        try require(
+            !LiveMeetingASRBackpressurePolicy.shouldStopCapture(pendingBatchCount: 1)
+                && LiveMeetingASRBackpressurePolicy.shouldStopCapture(
+                    pendingBatchCount: LiveMeetingASRBackpressurePolicy.maximumQueuedBatches
+                ),
+            "Meeting capture must stop before a slow ASR can build an unbounded in-memory batch queue."
+        )
+
+        let backToBackSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 4, speakerID: "A", speakerLabel: "Speaker 1", confidence: 0.92),
+                SpeakerTurn(startTime: 4, endTime: 8, speakerID: "B", speakerLabel: "Speaker 2", confidence: 0.91)
+            ],
+            processedThrough: 0,
+            stableThrough: 8
+        )
+        try require(
+            backToBackSlices.count == 2
+                && backToBackSlices.map(\.speakerID) == ["A", "B"]
+                && backToBackSlices[0].endTime == backToBackSlices[1].startTime,
+            "Back-to-back speakers without silence must become separate ASR audio slices before transcription."
+        )
+        let fragmentedSameSpeakerSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 4, speakerID: "A", confidence: 0.92),
+                SpeakerTurn(startTime: 4.9, endTime: 10, speakerID: "A", confidence: 0.91),
+                SpeakerTurn(startTime: 11.3, endTime: 15, speakerID: "A", confidence: 0.90)
+            ],
+            processedThrough: 0,
+            stableThrough: 15
+        )
+        try require(
+            fragmentedSameSpeakerSlices.count == 2
+                && fragmentedSameSpeakerSlices[0].startTime == 0
+                && fragmentedSameSpeakerSlices[0].endTime == 10
+                && fragmentedSameSpeakerSlices[1].startTime == 11.3,
+            "Sub-1.2-second VAD gaps from the same speaker must stay in one readable turn, while a longer real pause starts a new row."
+        )
+        let dominantOverlapSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 8, speakerID: "A", confidence: 0.95),
+                SpeakerTurn(startTime: 3, endTime: 4, speakerID: "B", confidence: 0.87)
+            ],
+            processedThrough: 0,
+            stableThrough: 8
+        )
+        try require(
+            dominantOverlapSlices.count == 1 && dominantOverlapSlices[0].speakerID == "A" && !dominantOverlapSlices[0].isLowConfidence,
+            "Brief overlap must retain the clear primary speaker and stay as one readable turn."
+        )
+        let ambiguousOverlapSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 4, speakerID: "A", confidence: 0.91),
+                SpeakerTurn(startTime: 0, endTime: 4, speakerID: "B", confidence: 0.90)
+            ],
+            processedThrough: 0,
+            stableThrough: 4
+        )
+        try require(
+            ambiguousOverlapSlices.count == 1
+                && ambiguousOverlapSlices[0].speakerID == nil
+                && ambiguousOverlapSlices[0].speakerLabel == "Unknown"
+                && ambiguousOverlapSlices[0].isLowConfidence,
+            "Complex overlap must emit one Unknown low-confidence primary speaker in V1."
+        )
+        let longSpeakerSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: [SpeakerTurn(startTime: 0, endTime: 305, speakerID: "A", confidence: 0.94)],
+            processedThrough: 0,
+            stableThrough: 305
+        )
+        try require(
+            longSpeakerSlices.count == 3
+                && longSpeakerSlices.allSatisfy { $0.speakerID == "A" && $0.endTime - $0.startTime <= 120 },
+            "A long uninterrupted speaker turn may use bounded ASR slices while preserving one speaker identity for later paragraph collapse."
+        )
+        let groupedSpeakerSlice = LiveMeetingTranscriptReducer.groupSpeakerSlice(
+            [
+                LiveMeetingSegment(index: 0, startTime: 0, endTime: 1.8, text: "第一句", speakerID: "A"),
+                LiveMeetingSegment(index: 1, startTime: 1.8, endTime: 4, text: "第二句", speakerID: "A")
+            ],
+            slice: LiveMeetingSpeakerAudioSlice(
+                startTime: 0,
+                endTime: 4,
+                speakerID: "A",
+                speakerLabel: "Speaker 1",
+                confidence: 0.93
+            ),
+            index: 0
+        )
+        try require(
+            groupedSpeakerSlice?.text == "第一句 第二句"
+                && groupedSpeakerSlice?.startTime == 0
+                && groupedSpeakerSlice?.endTime == 4
+                && groupedSpeakerSlice?.speakerID == "A",
+            "Technical ASR segments inside one diarized speaker slice must render as one meeting transcript row."
+        )
+
+        let wavFixture = root.appendingPathComponent("speaker-slice.wav")
+        let pcmFixture = Data(repeating: 0x2A, count: 16_000 * 2 * 2)
+        try LiveMeetingAudioStorage.writePCM16WAV(data: pcmFixture, to: wavFixture)
+        let decodedPCM = try LiveMeetingAudioStorage.readPCM16WAV(at: wavFixture)
+        let secondHalf = LiveMeetingAudioStorage.slicePCM16(
+            decodedPCM.data,
+            sampleRate: decodedPCM.sampleRate,
+            startTime: 1,
+            endTime: 2
+        )
+        try require(
+            decodedPCM.sampleRate == 16_000 && decodedPCM.data == pcmFixture && secondHalf.count == 16_000 * 2,
+            "Meeting speaker-turn WAV parsing and PCM slicing must preserve the exact local audio samples."
+        )
+        try require(
+            !LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingTurnSegmentationPolicy.minimumSpeechMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingTurnSegmentationPolicy.pauseMilliseconds - 1
+            ),
+            "Meeting transcription must keep an active turn open before the natural-pause threshold."
+        )
+        try require(
+            LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingTurnSegmentationPolicy.minimumSpeechMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingTurnSegmentationPolicy.pauseMilliseconds
+            ),
+            "Meeting transcription must flush a complete turn after the natural-pause threshold."
+        )
+        try require(
+            !LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingTurnSegmentationPolicy.preferredBatchMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingTurnSegmentationPolicy.postTargetPauseMilliseconds - 1
+            ) && LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingTurnSegmentationPolicy.preferredBatchMilliseconds,
+                trailingSilenceMilliseconds: LiveMeetingTurnSegmentationPolicy.postTargetPauseMilliseconds
+            ),
+            "A long ordinary-ASR batch must use the next short pause instead of waiting for a full natural-pause threshold."
+        )
+        try require(
+            LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: LiveMeetingTurnSegmentationPolicy.maximumContinuousSpeechMilliseconds,
+                trailingSilenceMilliseconds: 0
+            ),
+            "Ordinary meeting ASR must flush continuous speech at the 30-second latency ceiling."
+        )
+        let longTurnContext = ASRTranscriptionContext(
+            mode: .realtime,
+            maximumTokens: 1_024,
+            chunkDurationSeconds: 30
+        )
+        try require(longTurnContext.maximumTokens == 1_024 && longTurnContext.chunkDurationSeconds == 30, "Expected transcript-only meeting ASR to retain a bounded local inference window.")
+
+        var segments = [
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 1.2, text: "原始第一句", speakerID: "A", speakerLabel: "Speaker 1"),
+            LiveMeetingSegment(index: 1, startTime: 1.4, endTime: 2.5, text: "原始第二句", speakerID: "B", speakerLabel: "Speaker 2"),
+            LiveMeetingSegment(index: 2, startTime: 2.6, endTime: 2.9, text: "短句", speakerID: "B", speakerLabel: "Speaker 2")
+        ]
+        var speakers = [
+            LiveMeetingSpeaker(id: "A", label: "Speaker 1"),
+            LiveMeetingSpeaker(id: "B", label: "Speaker 2")
+        ]
+        let editedID = segments[0].id
+        try require(LiveMeetingTranscriptReducer.editText(id: editedID, text: "用户修订后的第一句", segments: &segments), "Expected finalized transcript text editing.")
+        try require(segments[0].userEditedText, "Expected transcript text edit marker.")
+
+        LiveMeetingTranscriptReducer.applySpeakerTurns(
+            [
+                SpeakerTurn(startTime: 0, endTime: 1.2, speakerID: "B", speakerLabel: "Model Label", confidence: 0.9),
+                SpeakerTurn(startTime: 1.4, endTime: 2.9, speakerID: "B", speakerLabel: "Model Label", confidence: 0.91)
+            ],
+            to: &segments,
+            speakers: &speakers
+        )
+        try require(segments[0].text == "用户修订后的第一句", "Delayed speaker labels must never overwrite edited transcript text.")
+        try require(segments[0].speakerID == "B", "Expected delayed speaker labels to backfill the existing row.")
+        try require(segments[1].speakerID == "B", "Expected diarization to assign primary speaker.")
+
+        var stabilizationSegments = [
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 10, text: "稳定内容"),
+            LiveMeetingSegment(index: 1, startTime: 30, endTime: 40, text: "仍在稳定窗口内")
+        ]
+        var stabilizationSpeakers: [LiveMeetingSpeaker] = []
+        LiveMeetingTranscriptReducer.applySpeakerTurns(
+            [
+                SpeakerTurn(startTime: 0, endTime: 10, speakerID: "A"),
+                SpeakerTurn(startTime: 30, endTime: 40, speakerID: "B")
+            ],
+            to: &stabilizationSegments,
+            speakers: &stabilizationSpeakers,
+            through: 30
+        )
+        try require(
+            stabilizationSegments[0].speakerID == "A" && stabilizationSegments[1].speakerID == nil,
+            "Delayed diarization must backfill only rows outside the unstable speaker window."
+        )
+
+        var sequentialTurnSegments = [
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 8, text: "连续讲话的完整内容", state: .lowConfidence)
+        ]
+        var sequentialTurnSpeakers: [LiveMeetingSpeaker] = []
+        LiveMeetingTranscriptReducer.applySpeakerTurns(
+            [
+                SpeakerTurn(startTime: 0, endTime: 2.4, speakerID: "A", speakerLabel: "Speaker 1"),
+                SpeakerTurn(startTime: 2.4, endTime: 7.2, speakerID: "A", speakerLabel: "Speaker 1"),
+                SpeakerTurn(startTime: 7.2, endTime: 8, speakerID: "B", speakerLabel: "Speaker 2")
+            ],
+            to: &sequentialTurnSegments,
+            speakers: &sequentialTurnSpeakers
+        )
+        try require(sequentialTurnSegments[0].speakerID == "A" && sequentialTurnSegments[0].state == .final, "Sequential diarization turns must choose the dominant speaker instead of becoming Unknown.")
+
+        var dominantOverlapSegments = [
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 8, text: "主讲人内容", state: .lowConfidence)
+        ]
+        var dominantOverlapSpeakers: [LiveMeetingSpeaker] = []
+        LiveMeetingTranscriptReducer.applySpeakerTurns(
+            [
+                SpeakerTurn(startTime: 0, endTime: 8, speakerID: "A", speakerLabel: "Speaker 1"),
+                SpeakerTurn(startTime: 3, endTime: 4, speakerID: "B", speakerLabel: "Speaker 2")
+            ],
+            to: &dominantOverlapSegments,
+            speakers: &dominantOverlapSpeakers
+        )
+        try require(dominantOverlapSegments[0].speakerID == "A" && dominantOverlapSegments[0].state == .final, "A clear primary speaker must survive brief overlap instead of becoming Unknown.")
+
+        let longSpeakerText = String(repeating: "长", count: 160)
+        let collapsedTurns = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+            [
+                LiveMeetingSegment(index: 0, startTime: 0, endTime: 4, text: longSpeakerText, speakerID: "A", speakerLabel: "Speaker 1"),
+                LiveMeetingSegment(index: 1, startTime: 4.1, endTime: 8, text: longSpeakerText, speakerID: "A", speakerLabel: "Speaker 1")
+            ],
+            speakers: [LiveMeetingSpeaker(id: "A", label: "Speaker 1")]
+        )
+        try require(collapsedTurns.count == 1 && collapsedTurns[0].text.count > 220, "Confirmed adjacent speaker turns must be allowed to form a readable long paragraph rather than retaining the old short subtitle cap.")
+        let recentTurns = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+            [
+                LiveMeetingSegment(index: 0, startTime: 0, endTime: 4, text: "稳定段", speakerID: "A", speakerLabel: "Speaker 1"),
+                LiveMeetingSegment(index: 1, startTime: 4.1, endTime: 8, text: "仍在标签稳定窗口", speakerID: "A", speakerLabel: "Speaker 1")
+            ],
+            speakers: [LiveMeetingSpeaker(id: "A", label: "Speaker 1")],
+            collapseThrough: 6
+        )
+        try require(recentTurns.count == 2, "Live speaker grouping must not collapse a row that still extends into the stabilization window.")
+        var editedCollapseSegments = [
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 4, text: "用户编辑", speakerID: "A", speakerLabel: "Speaker 1"),
+            LiveMeetingSegment(index: 1, startTime: 4.1, endTime: 8, text: "后续内容", speakerID: "A", speakerLabel: "Speaker 1")
+        ]
+        let editedCollapseID = editedCollapseSegments[0].id
+        try require(LiveMeetingTranscriptReducer.editText(id: editedCollapseID, text: "用户编辑后的内容", segments: &editedCollapseSegments), "Expected edited grouping fixture.")
+        let protectedEditedTurns = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+            editedCollapseSegments,
+            speakers: [LiveMeetingSpeaker(id: "A", label: "Speaker 1")]
+        )
+        try require(protectedEditedTurns.count == 2 && protectedEditedTurns[0].text == "用户编辑后的内容", "Speaker grouping must preserve user-edited rows without merging or rewriting them.")
+
+        LiveMeetingTranscriptReducer.applySpeakerTurns(
+            [
+                SpeakerTurn(startTime: 1.4, endTime: 2.5, speakerID: "A", confidence: 0.92),
+                SpeakerTurn(startTime: 1.45, endTime: 2.4, speakerID: "B", confidence: 0.9)
+            ],
+            to: &segments,
+            speakers: &speakers
+        )
+        try require(segments[1].speakerLabel == "Unknown" && segments[1].state == .lowConfidence, "Overlap must render a single Unknown/low-confidence primary speaker in V1.")
+
+        try require(LiveMeetingTranscriptReducer.renameSpeaker(id: "B", name: "王工", speakers: &speakers), "Expected speaker rename.")
+        try require(LiveMeetingTranscriptReducer.mergeSpeaker(sourceID: "A", into: "B", speakers: &speakers, segments: &segments), "Expected speaker merge.")
+        try require(speakers.first(where: { $0.id == "A" })?.mergedIntoSpeakerID == "B", "Expected merge overlay to retain source speaker ID.")
+        try require(segments[0].text == "用户修订后的第一句", "Speaker merge must preserve user-edited transcript text.")
+
+        let beforeFinalize = segments.map(\.text)
+        let finalized = LiveMeetingTranscriptReducer.finalize(segments, speakers: speakers)
+        try require(finalized.first?.text == "用户修订后的第一句", "Manual finalization must preserve transcript edits.")
+        try require(finalized.first?.state == .final, "Manual finalization must only clean completed segments.")
+        try require(beforeFinalize.contains("用户修订后的第一句"), "Finalize fixture must not rerun ASR.")
+
+        var notes: MeetingNoteState? = MeetingNoteState(
+            summary: "中文摘要",
+            decisions: ["采用本地方案"],
+            actionItems: ["补充检查"],
+            openQuestions: ["是否需要更多模型"],
+            topics: ["本地转写"],
+            sourceSegmentCount: finalized.count,
+            generationState: .completed,
+            chunkCount: 3
+        )
+        LiveMeetingTranscriptReducer.markNotesStale(&notes, reason: "文本已编辑")
+        try require(notes?.isStale == true && notes?.chunkCount == 3, "Expected chunked Chinese notes to become stale after transcript changes.")
+        let cancelledFinalize = finalized
+        let cancelledNotes = notes
+        try require(cancelledFinalize == finalized && cancelledNotes == notes, "Cancelling finalize/notes must preserve current transcript and notes.")
+        let finalizationCancellation = Task<Void, Error> {
+            try await Task.sleep(for: .seconds(1))
+            try Task.checkCancellation()
+        }
+        finalizationCancellation.cancel()
+        do {
+            _ = try await finalizationCancellation.value
+            throw CheckError("Expected finalization fixture task cancellation.")
+        } catch is CancellationError {
+        }
+        try require(finalized == cancelledFinalize, "Cancelled finalization must not replace the existing transcript.")
+        let notesCancellation = Task<Void, Error> {
+            try await Task.sleep(for: .seconds(1))
+            try Task.checkCancellation()
+        }
+        notesCancellation.cancel()
+        do {
+            _ = try await notesCancellation.value
+            throw CheckError("Expected notes fixture task cancellation.")
+        } catch is CancellationError {
+        }
+        try require(notes == cancelledNotes, "Cancelled notes generation must not delete the existing notes.")
+
+        session.state = .stopped
+        session.stoppedAt = Date()
+        let markdown = LiveMeetingMarkdownExporter.markdown(session: session, segments: finalized, speakers: speakers, notes: notes)
+        try require(markdown.hasPrefix("# 会议纪要\n\n## 元信息"), "Expected fixed Chinese Markdown export template.")
+        try require(markdown.contains("## 关键决策") && markdown.contains("## 待办事项") && markdown.contains("## 完整转写"), "Expected all fixed meeting-note sections.")
+        try require(markdown.contains("用户修订后的第一句"), "Export must use edited finalized transcript text.")
+        let exportName = LiveMeetingMarkdownExporter.baseFileName(session: session, date: Date(timeIntervalSince1970: 1_720_000_000))
+        try require(exportName.hasPrefix("meeting-notes-") && exportName.count == "meeting-notes-YYYYMMDD-HHMM".count, "Expected deterministic microphone export name.")
+        var fileSession = session
+        fileSession.source = .localFile
+        fileSession.sourceFileName = "客户访谈.mp4"
+        fileSession.sourceMediaKind = .video
+        let fileExportName = LiveMeetingMarkdownExporter.baseFileName(session: fileSession, date: Date(timeIntervalSince1970: 1_720_000_000))
+        try require(fileExportName.hasPrefix("客户访谈-meeting-notes-"), "Expected deterministic Local File export name.")
+
+        let temporaryAudioRoot = root.appendingPathComponent("temporary-audio", isDirectory: true)
+        let sessionAudioDirectory = try LiveMeetingAudioStorage.makeTemporaryDirectory(
+            sessionID: session.id,
+            rootDirectory: temporaryAudioRoot,
+            ownerProcessIdentifier: Int32.max
+        )
+        let sessionAudioFile = sessionAudioDirectory.appendingPathComponent("private-audio.wav")
+        let ownerMarkerFile = sessionAudioDirectory.appendingPathComponent(".owner.json")
+        try LiveMeetingAudioStorage.writePCM16WAV(data: Data(repeating: 0, count: 320), to: sessionAudioFile)
+        let temporaryAudioRootPermissions = try posixPermissions(at: temporaryAudioRoot)
+        let sessionAudioDirectoryPermissions = try posixPermissions(at: sessionAudioDirectory)
+        let sessionAudioFilePermissions = try posixPermissions(at: sessionAudioFile)
+        let ownerMarkerFilePermissions = try posixPermissions(at: ownerMarkerFile)
+        try require(temporaryAudioRootPermissions == 0o700, "Meeting temporary-audio root must be owner-only.")
+        try require(sessionAudioDirectoryPermissions == 0o700, "Meeting session audio directory must be owner-only.")
+        try require(sessionAudioFilePermissions == 0o600, "Meeting temporary WAV files must be owner-only.")
+        try require(ownerMarkerFilePermissions == 0o600, "Meeting temporary-audio owner markers must be owner-only.")
+
+        let recoveryDirectory = root.appendingPathComponent("recovery", isDirectory: true)
+        let recoveryFile = recoveryDirectory.appendingPathComponent("recovery-draft.json")
+        let draftStore = LiveMeetingRecoveryStore(
+            fileURL: recoveryFile,
+            temporaryAudioRootURL: temporaryAudioRoot
+        )
+        let draft = LiveMeetingRecoveryDraft(session: session, segments: finalized, speakers: speakers, notes: notes)
+        try draftStore.save(draft)
+        let recoveryDirectoryPermissions = try posixPermissions(at: recoveryDirectory)
+        let recoveryFilePermissions = try posixPermissions(at: recoveryFile)
+        try require(recoveryDirectoryPermissions == 0o700, "Meeting recovery directory must be owner-only.")
+        try require(recoveryFilePermissions == 0o600, "Meeting recovery draft must be owner-only.")
+        let recoveryJSON = try String(contentsOf: recoveryFile, encoding: .utf8)
+        try require(!recoveryJSON.contains(root.path), "Recovery storage must strip temporary-audio paths before encoding the draft.")
+        let restored = try draftStore.loadDiscardingTemporaryAudio()
+        try require(restored?.segments.first?.text == "用户修订后的第一句", "Recovery draft must preserve edited transcript text.")
+        try require(restored?.speakers.first(where: { $0.id == "A" })?.mergedIntoSpeakerID == "B", "Recovery draft must preserve speaker merge edits.")
+        try require(restored?.session.temporaryAudioDirectory == nil, "Recovery drafts must never persist a temporary-audio path.")
+        try require(!FileManager.default.fileExists(atPath: sessionAudioDirectory.path), "Loading a crash-recovery draft must discard matching temporary audio.")
+
+        let recreatedSessionAudioDirectory = try LiveMeetingAudioStorage.makeTemporaryDirectory(
+            sessionID: session.id,
+            rootDirectory: temporaryAudioRoot,
+            ownerProcessIdentifier: Int32.max
+        )
+        try draftStore.save(draft)
+        try draftStore.delete()
+        let deletedDraft = try draftStore.load()
+        try require(deletedDraft == nil, "Recovery draft delete must remove the local draft.")
+        try require(!FileManager.default.fileExists(atPath: recreatedSessionAudioDirectory.path), "Deleting a recovery draft must discard matching temporary audio.")
+
+        let staleSessionID = UUID()
+        let freshSessionID = UUID()
+        let staleDirectory = temporaryAudioRoot.appendingPathComponent(staleSessionID.uuidString, isDirectory: true)
+        let freshDirectory = temporaryAudioRoot.appendingPathComponent(freshSessionID.uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: staleDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: freshDirectory, withIntermediateDirectories: true)
+        let liveOwnerDirectory = try LiveMeetingAudioStorage.makeTemporaryDirectory(
+            sessionID: UUID(),
+            rootDirectory: temporaryAudioRoot,
+            ownerProcessIdentifier: getpid()
+        )
+        let deadOwnerDirectory = try LiveMeetingAudioStorage.makeTemporaryDirectory(
+            sessionID: UUID(),
+            rootDirectory: temporaryAudioRoot,
+            ownerProcessIdentifier: Int32.max
+        )
+        let unrelatedDirectory = temporaryAudioRoot.appendingPathComponent("keep-me", isDirectory: true)
+        try FileManager.default.createDirectory(at: unrelatedDirectory, withIntermediateDirectories: true)
+        let oldDate = Date(timeIntervalSinceNow: -(48 * 60 * 60))
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: staleDirectory.path)
+        try FileManager.default.setAttributes([.modificationDate: oldDate], ofItemAtPath: unrelatedDirectory.path)
+        try LiveMeetingAudioStorage.deleteOrphanedTemporaryDirectories(
+            olderThan: Date(timeIntervalSinceNow: -(24 * 60 * 60)),
+            rootDirectory: temporaryAudioRoot
+        )
+        try require(!FileManager.default.fileExists(atPath: staleDirectory.path), "Old UUID-named meeting audio directories must be removed as orphans.")
+        try require(FileManager.default.fileExists(atPath: freshDirectory.path), "Recent meeting audio directories must not be removed as orphans.")
+        try require(FileManager.default.fileExists(atPath: liveOwnerDirectory.path), "Orphan cleanup must preserve a meeting directory owned by a live process.")
+        try require(!FileManager.default.fileExists(atPath: deadOwnerDirectory.path), "Orphan cleanup must remove a meeting directory owned by a dead process.")
+        try require(FileManager.default.fileExists(atPath: unrelatedDirectory.path), "Orphan cleanup must ignore non-session directories.")
+
+        let diagnostics = LiveMeetingDiagnostics(
+            session: session,
+            transcriptSegmentCount: finalized.count,
+            speakerCount: 1,
+            recoveryDraftState: "deleted"
+        )
+        let diagnosticsJSON = String(data: try JSONEncoder().encode(diagnostics), encoding: .utf8) ?? ""
+        try require(!diagnosticsJSON.contains("用户修订后的第一句") && !diagnosticsJSON.contains("王工") && !diagnosticsJSON.contains(root.path), "Meeting diagnostics must redact transcript, speaker names, and paths.")
+
+        setenv("LLMTOOLS_MEETING_DIARIZATION_FIXTURE_JSON", """
+        {"turns":[{"startTime":0,"endTime":1,"speakerID":"FIXTURE_A","confidence":0.93}],"modelID":"fixture-diart","runtimeSource":"fixtureJSON"}
+        """, 1)
+        defer { unsetenv("LLMTOOLS_MEETING_DIARIZATION_FIXTURE_JSON") }
+        let diarization = LiveMeetingDiarizationService()
+        let health = await diarization.health()
+        try require(health.isReady && health.source == .fixtureJSON, "Expected fixture meeting diarization to be ready without a real runtime.")
+        let diarizationResult = try await diarization.diarize(audioURL: root.appendingPathComponent("missing.wav"))
+        try require(diarizationResult.turns.first?.speakerID == "FIXTURE_A", "Expected fixture delayed-speaker contract.")
+        unsetenv("LLMTOOLS_MEETING_DIARIZATION_FIXTURE_JSON")
+
+        let fileDiarizationWAV = root.appendingPathComponent("local-only-diarization.wav")
+        try writePCM16WAV(url: fileDiarizationWAV, duration: 0.2)
+        let localOnlyPreferences = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: #"/usr/bin/env | /usr/bin/grep HF_HUB_OFFLINE > /dev/null && /bin/echo '{"turns":[]}'"#
+        )
+        let localOnlyResult = try await SpeakerDiarizationService().diarize(
+            audioURL: fileDiarizationWAV,
+            preferences: localOnlyPreferences
+        )
+        try require(localOnlyResult.turns.isEmpty, "Expected local-only diarization environment guard to execute.")
+
+        let arbitraryMeetingCommand = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: "/bin/echo '{\"turns\":[]}'"
+        )
+        do {
+            _ = try await LiveMeetingDiarizationService().diarize(
+                audioURL: fileDiarizationWAV,
+                preferences: arbitraryMeetingCommand
+            )
+            throw CheckError("Expected meeting diarization to reject arbitrary configured commands.")
+        } catch let error as LiveMeetingDiarizationError {
+            try require(error.localizedDescription.contains("不使用自定义"), "Expected meeting diarization to preserve the local-only command boundary.")
+        }
+
+        let localModel = ModelDescriptor(
+            id: localModelID,
+            name: "Local Notes",
+            sourcePath: root.appendingPathComponent("local-model"),
+            format: .mlx,
+            sizeClass: "4b",
+            role: .default,
+            contextLength: 4096,
+            capabilities: .textOnly(source: .manual)
+        )
+        let remoteModel = ModelDescriptor(
+            name: "Remote Notes",
+            sourcePath: URL(fileURLWithPath: "/remote"),
+            format: .openAICompatible,
+            sizeClass: "remote",
+            role: .default,
+            contextLength: 4096,
+            providerConfiguration: ProviderConfiguration(
+                providerID: .customOpenAICompatible,
+                apiStyle: .openAICompatible,
+                baseURL: URL(string: "https://example.invalid"),
+                modelID: "remote"
+            )
+        )
+        let runner = StubRunner(output: """
+        ## 摘要
+        本地中文纪要
+        ## 关键决策
+        - 保持 local-only
+        ## 待办事项
+        - 补充测试
+        ## 开放问题
+        - 无
+        ## 讨论主题
+        - 会议转写
+        """)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        try await engine.addModelDescriptorForTesting(localModel)
+        try await engine.addModelDescriptorForTesting(remoteModel)
+        try await engine.updatePreferences { preferences in
+            preferences.liveMeeting.notesModelID = localModelID
+            preferences.liveMeeting.defaultAudioSource = .systemAudio
+        }
+        let meetingPreferences = await engine.registry().preferences.liveMeeting
+        try require(meetingPreferences.notesModelID == localModelID && meetingPreferences.defaultAudioSource == .systemAudio, "Expected independent meeting settings to persist a local notes model and system-audio default.")
+        let generatedNotes = try await engine.generateLocalMeetingNotes(segments: finalized, speakers: speakers, modelID: localModelID)
+        try require(generatedNotes.summary == "本地中文纪要" && generatedNotes.language == "zh-Hans", "Expected Chinese notes from the local model only.")
+        do {
+            _ = try await engine.generateLocalMeetingNotes(segments: finalized, speakers: speakers, modelID: remoteModel.id)
+            throw CheckError("Expected remote meeting-note provider to be rejected.")
+        } catch LiveMeetingError.remoteTextModelForbidden {
+        }
+        try await engine.updatePreferences { preferences in
+            preferences.liveMeeting.notesModelID = remoteModel.id
+        }
+        let sanitizedMeetingPreferences = await engine.registry().preferences.liveMeeting
+        try require(sanitizedMeetingPreferences.notesModelID == nil, "Meeting settings must reject remote note models.")
+        try await engine.updatePreferences { preferences in
+            preferences.speakerDiarization.commandTemplate = "/bin/echo '{\"turns\":[]}'"
+        }
+        do {
+            _ = try await engine.diarizeMeetingFile(at: fileDiarizationWAV)
+            throw CheckError("Expected meeting diarization to reject arbitrary configured commands.")
+        } catch SpeakerDiarizationError.runtimeMissing(let message) {
+            try require(message.contains("does not use arbitrary"), "Expected explicit local-only meeting diarization rejection.")
+        }
     }
 
     private static func checkLanguageDetectionFixture() async throws {
@@ -1129,6 +1822,35 @@ struct LLMToolsChecks {
         )
         try require(result.modelID == "pipe-fixture", "Expected diarization command result after large stderr output.")
         try require(result.turns.first?.speakerID == "SPEAKER_A", "Expected pipe-drain command output to be parsed.")
+    }
+
+    private static func checkSpeakerDiarizationCommandCancellation() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let wavURL = root.appendingPathComponent("speaker-cancellation.wav")
+        try writePCM16WAV(url: wavURL, duration: 0.2)
+        let preferences = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: "exec /bin/sleep 10"
+        )
+        let task = Task {
+            try await SpeakerDiarizationService().diarize(
+                audioURL: wavURL,
+                preferences: preferences
+            )
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let cancellationStarted = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            try require(false, "Expected speaker diarization cancellation to throw.")
+        } catch is CancellationError {
+        }
+        try require(
+            Date().timeIntervalSince(cancellationStarted) < 2,
+            "Speaker diarization cancellation must terminate the local process promptly."
+        )
     }
 
     private static func checkSpeakerDiarizationFilePipeline() async throws {
@@ -2521,6 +3243,111 @@ struct LLMToolsChecks {
         try require(history.isEmpty, "Subtitle translation history must default off.")
     }
 
+    private static func checkSubtitleTranslationSplitsLongLLMBatches() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let runner = SubtitleJSONEchoRunner(format: .openAICompatible)
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.openAICompatible: runner]
+        )
+        let descriptor = try await engine.addProviderModel(
+            providerID: .customOpenAICompatible,
+            name: "Small subtitle translator",
+            modelID: "subtitle-json-echo",
+            apiKey: "test-key",
+            baseURL: "https://example.com/v1",
+            contextLength: 4_096
+        )
+
+        let sessionID = UUID()
+        let sourceText = String(repeating: "Long subtitle phrase. ", count: 26)
+        let segments = (0..<10).map { index in
+            SubtitleSegment(
+                id: UUID(),
+                sessionID: sessionID,
+                index: index,
+                startTime: Double(index),
+                endTime: Double(index + 1),
+                originalText: "\(index): \(sourceText)",
+                asrModelID: "asr-fixture"
+            )
+        }
+
+        let translated = try await engine.translateSubtitleSegments(
+            segments,
+            targetLanguage: "zh-Hans",
+            modelID: descriptor.id
+        )
+        try require(translated.count == segments.count, "Expected every subtitle segment to survive batched translation.")
+        try require(
+            translated.allSatisfy { ($0.translatedText ?? "").hasPrefix("译文：") },
+            "Expected echo runner to translate every subtitle segment."
+        )
+
+        let requests = await runner.recordedRequests()
+        try require(requests.count > 1, "Expected long subtitle translation to split into multiple model requests.")
+        let limit = InputSizePolicy.maximumInputCharacters(forContextLength: descriptor.contextLength)
+        try require(
+            requests.allSatisfy { $0.inputText.count <= limit },
+            "Expected every subtitle translation batch to stay within the selected model input limit."
+        )
+        try require(
+            requests.allSatisfy { $0.task == .webPageTranslate },
+            "Expected split subtitle translation batches to keep using the JSON-capable text translation task."
+        )
+    }
+
+    private static func checkSubtitleTranslationSplitsOversizedSingleSegment() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let runner = StubRunner(
+            outputs: (1...8).map { "part \($0)" },
+            format: .openAICompatible
+        )
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(
+            registryStore: registryStore,
+            historyStore: historyStore,
+            runners: [.openAICompatible: runner]
+        )
+        let descriptor = try await engine.addProviderModel(
+            providerID: .customOpenAICompatible,
+            name: "Tiny subtitle translator",
+            modelID: "subtitle-text-chunker",
+            apiKey: "test-key",
+            baseURL: "https://example.com/v1",
+            contextLength: 2_048
+        )
+
+        let segment = SubtitleSegment(
+            id: UUID(),
+            sessionID: UUID(),
+            index: 0,
+            startTime: 0,
+            endTime: 60,
+            originalText: String(repeating: "One very long subtitle sentence. ", count: 90),
+            asrModelID: "asr-fixture"
+        )
+        let translated = try await engine.translateSubtitleSegments(
+            [segment],
+            targetLanguage: "zh-Hans",
+            modelID: descriptor.id
+        )
+        let requests = await runner.recordedRequests()
+        try require(requests.count > 1, "Expected oversized single subtitle segment to split into text translation chunks.")
+        try require(requests.allSatisfy { $0.task == .translate }, "Expected oversized single subtitle segment fallback to use text translation chunks.")
+        let limit = InputSizePolicy.maximumInputCharacters(forContextLength: descriptor.contextLength)
+        try require(requests.allSatisfy { $0.inputText.count <= limit }, "Expected oversized subtitle text chunks to fit the model input limit.")
+        try require(translated.first?.translatedText?.contains("part 1") == true, "Expected chunked text translation output to be applied to the subtitle segment.")
+    }
+
     private static func checkMediaFileSubtitlePipelineWithConfiguredLocalCommand() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2581,6 +3408,150 @@ struct LLMToolsChecks {
         try require(!diagnosticsJSON.contains(wavURL.path), "File diagnostics must not include full media path.")
         let history = await engine.recentHistory()
         try require(history.isEmpty, "File subtitle pipeline must not persist history by default.")
+
+        let meetingWorkspaceRoot = root.appendingPathComponent("meeting-workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: meetingWorkspaceRoot, withIntermediateDirectories: true)
+        let meetingResult = try await engine.transcribeMeetingFile(
+            at: wavURL,
+            modelID: speechModel.id,
+            temporaryDirectory: meetingWorkspaceRoot
+        )
+        try require(meetingResult.segments.map { $0.text } == ["file pipeline transcript"], "Expected meeting-file ASR transcript fixture.")
+        let successfulMeetingWorkspaceContents = try FileManager.default.contentsOfDirectory(atPath: meetingWorkspaceRoot.path)
+        try require(
+            successfulMeetingWorkspaceContents.isEmpty,
+            "Successful meeting-file transcription must remove its normalized-audio workspace."
+        )
+
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.senseVoiceCommandTemplate = "/bin/false"
+        }
+        do {
+            _ = try await engine.transcribeMeetingFile(
+                at: wavURL,
+                modelID: speechModel.id,
+                temporaryDirectory: meetingWorkspaceRoot
+            )
+            throw CheckError("Expected meeting-file ASR fixture failure.")
+        } catch let error as CheckError {
+            throw error
+        } catch {
+        }
+        let failedMeetingWorkspaceContents = try FileManager.default.contentsOfDirectory(atPath: meetingWorkspaceRoot.path)
+        try require(
+            failedMeetingWorkspaceContents.isEmpty,
+            "Failed meeting-file transcription must remove its normalized-audio workspace."
+        )
+    }
+
+    private static func checkAudioExtractionWorkspaceCleanup() async throws {
+        let root = try makeTemporaryDirectory(name: "audio-extraction-cleanup")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspaceRoot = root.appendingPathComponent("workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
+        let invalidWAV = root.appendingPathComponent("invalid.wav")
+        try Data("not-a-wave-file".utf8).write(to: invalidWAV)
+
+        do {
+            _ = try await AudioExtractionService.normalizeMediaFile(
+                at: invalidWAV,
+                temporaryDirectory: workspaceRoot
+            )
+            throw CheckError("Expected invalid WAV normalization to fail.")
+        } catch let error as CheckError {
+            throw error
+        } catch {
+        }
+        let failedExtractionWorkspaceContents = try FileManager.default.contentsOfDirectory(atPath: workspaceRoot.path)
+        try require(
+            failedExtractionWorkspaceContents.isEmpty,
+            "Failed audio normalization must remove its temporary workspace."
+        )
+    }
+
+    private static func checkAudioExtractionCancellationCleanup() async throws {
+        let root = try makeTemporaryDirectory(name: "audio-extraction-cancellation")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let workspaceRoot = root.appendingPathComponent("workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspaceRoot, withIntermediateDirectories: true)
+        let inputWAV = root.appendingPathComponent("input.wav")
+        try writePCM16WAV(url: inputWAV, duration: 0.2)
+        let markerURL = root.appendingPathComponent("converter-started")
+        let converterURL = root.appendingPathComponent("slow-afconvert")
+        let markerPath = markerURL.path.replacingOccurrences(of: "'", with: "'\\''")
+        try "#!/bin/sh\n: > '\(markerPath)'\nexec /bin/sleep 10\n"
+            .write(to: converterURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: converterURL.path)
+
+        let task = Task {
+            try await AudioExtractionService.normalizeMediaFile(
+                at: inputWAV,
+                temporaryDirectory: workspaceRoot,
+                audioConverterPath: converterURL.path
+            )
+        }
+        let markerDeadline = Date(timeIntervalSinceNow: 2)
+        while !FileManager.default.fileExists(atPath: markerURL.path), Date() < markerDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try require(FileManager.default.fileExists(atPath: markerURL.path), "Expected the cancellable audio converter fixture to start.")
+        let cancellationStarted = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            throw CheckError("Expected audio normalization cancellation.")
+        } catch let error as CheckError {
+            throw error
+        } catch is CancellationError {
+        }
+        try require(
+            Date().timeIntervalSince(cancellationStarted) < 2,
+            "Audio normalization cancellation must terminate the converter promptly."
+        )
+        let remainingWorkspaces = try FileManager.default.contentsOfDirectory(atPath: workspaceRoot.path)
+        try require(remainingWorkspaces.isEmpty, "Cancelled audio normalization must remove its temporary workspace.")
+    }
+
+    private static func checkLocalASRCommandCancellation() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("cancellable-asr", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        let audioURL = root.appendingPathComponent("cancellable-asr.wav")
+        try writePCM16WAV(url: audioURL, duration: 0.2)
+        let model = ModelDescriptor(
+            name: "Cancellation ASR Fixture",
+            sourcePath: modelDirectory,
+            format: .speech,
+            sizeClass: "fixture",
+            role: .fast,
+            contextLength: 4_096,
+            capabilities: .speech(.senseVoiceSmall(source: .manual, confidence: 1))
+        )
+        let preferences = MediaSubtitlePreferences(
+            senseVoiceCommandTemplate: "exec /bin/sleep 10"
+        )
+        let task = Task {
+            try await LocalASRProcessRunner().transcribe(
+                audioURL: audioURL,
+                model: model,
+                sessionID: UUID(),
+                duration: 0.2,
+                preferences: preferences
+            )
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let cancellationStarted = Date()
+        task.cancel()
+        do {
+            _ = try await task.value
+            try require(false, "Expected local ASR cancellation to throw.")
+        } catch is CancellationError {
+        }
+        try require(
+            Date().timeIntervalSince(cancellationStarted) < 2,
+            "Local ASR cancellation must terminate the local process promptly."
+        )
     }
 
     private static func checkSubtitlePromptExporterAndPrivacyDefaults() throws {
@@ -2857,6 +3828,14 @@ struct LLMToolsChecks {
         return url
     }
 
+    private static func posixPermissions(at url: URL) throws -> Int {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let permissions = attributes[.posixPermissions] as? NSNumber else {
+            throw CheckError("Missing POSIX permissions for \(url.lastPathComponent).")
+        }
+        return permissions.intValue & 0o777
+    }
+
     private static func makeMLXModelDirectory(root: URL, name: String = "Qwen3.5-4B-MLX-4bit") throws -> URL {
         let modelDirectory = root.appendingPathComponent(name, isDirectory: true)
         try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
@@ -3003,10 +3982,16 @@ private actor StubRunner: ModelRunner {
 }
 
 private actor SubtitleJSONEchoRunner: ModelRunner {
+    private let format: ModelFormat
     private var loadedID: UUID?
+    private var requests: [TaskRequest] = []
+
+    init(format: ModelFormat = .mlx) {
+        self.format = format
+    }
 
     func modelFormat() async -> ModelFormat {
-        .mlx
+        format
     }
 
     func loadedState() async -> Bool {
@@ -3026,6 +4011,7 @@ private actor SubtitleJSONEchoRunner: ModelRunner {
     }
 
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult {
+        requests.append(request)
         let marker = "Items:"
         guard let markerRange = request.inputText.range(of: marker) else {
             throw CheckError("Subtitle prompt did not contain Items marker.")
@@ -3053,6 +4039,10 @@ private actor SubtitleJSONEchoRunner: ModelRunner {
 
     func unload() async {
         loadedID = nil
+    }
+
+    func recordedRequests() -> [TaskRequest] {
+        requests
     }
 }
 

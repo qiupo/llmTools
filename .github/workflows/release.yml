@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag, for example v0.3.0"
+        description: "Release tag, for example v0.4.0"
         required: true
         type: string
       prerelease:
@@ -49,7 +49,7 @@ jobs:
             exit 1
           fi
           if [[ ! "$tag" =~ ^v[0-9]+(\.[0-9]+){1,2}([-+][0-9A-Za-z.-]+)?$ ]]; then
-            echo "Release tag must look like v0.3.0, got: $tag" >&2
+            echo "Release tag must look like v0.4.0, got: $tag" >&2
             exit 1
           fi
 
@@ -84,9 +84,9 @@ jobs:
           python3 --version
           python3.12 --version || true
 
-      - name: Build Swift checks
+      - name: Run Swift checks
         shell: bash
-        run: swift build --product LLMToolsChecks --jobs "$SWIFT_BUILD_JOBS"
+        run: swift run --jobs "$SWIFT_BUILD_JOBS" LLMToolsChecks
 
       - name: Check browser extension scripts
         shell: bash
@@ -106,6 +106,10 @@ jobs:
               echo "Skipping missing optional script: $script"
             fi
           done
+
+      - name: Run browser extension behavior checks
+        shell: bash
+        run: node scripts/check-browser-extension-dom.mjs
 
       - name: Install MLX runtime resource
         shell: bash
@@ -149,7 +153,12 @@ jobs:
           test -d dist/llmTools.app/Contents/Resources/browser-extension/chromium
           test -f dist/llmTools.app/Contents/MacOS/mlx.metallib
           codesign --verify --deep --strict --verbose=2 dist/llmTools.app
-          /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" dist/llmTools.app/Contents/Info.plist
+          packaged_version="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" dist/llmTools.app/Contents/Info.plist)"
+          extension_version="$(node -p "require('./dist/llmTools.app/Contents/Resources/browser-extension/chromium/manifest.json').version")"
+          test "$packaged_version" = "$APP_VERSION"
+          test "$extension_version" = "$APP_VERSION"
+          printf 'Packaged app version: %s\n' "$packaged_version"
+          printf 'Chromium extension version: %s\n' "$extension_version"
           /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" dist/llmTools.app/Contents/Info.plist
 
       - name: Create release assets
@@ -164,6 +173,8 @@ jobs:
             cd browser-extension
             ditto -c -k --keepParent chromium "../dist/${extension_asset}"
           )
+          archived_extension_version="$(unzip -p "dist/${extension_asset}" chromium/manifest.json | node -e 'let data=""; process.stdin.on("data", chunk => data += chunk); process.stdin.on("end", () => process.stdout.write(JSON.parse(data).version));')"
+          test "$archived_extension_version" = "$APP_VERSION"
 
           (
             cd dist
@@ -171,9 +182,15 @@ jobs:
             shasum -a 256 "${extension_asset}" > "${extension_asset}.sha256"
           )
 
-          cat > dist/release-notes.md <<EOF
-          ## llmTools ${RELEASE_TAG}
+          release_details="docs/releases/${RELEASE_TAG}.md"
+          if [[ -f "$release_details" ]]; then
+            cp "$release_details" dist/release-notes.md
+            printf '\n' >> dist/release-notes.md
+          else
+            printf '## llmTools %s\n\n' "$RELEASE_TAG" > dist/release-notes.md
+          fi
 
+          cat >> dist/release-notes.md <<EOF
           ### Assets
 
           - \`${app_asset}\`: macOS arm64 app bundle, ad-hoc signed.

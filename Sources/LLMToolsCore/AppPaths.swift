@@ -22,6 +22,18 @@ public enum AppPaths {
         applicationSupportDirectory.appendingPathComponent("web-page-bridge.json", isDirectory: false)
     }
 
+    public static var liveMeetingRecoveryDraftFileURL: URL {
+        applicationSupportDirectory
+            .appendingPathComponent("live-meeting", isDirectory: true)
+            .appendingPathComponent("recovery-draft.json", isDirectory: false)
+    }
+
+    public static var liveMeetingTemporaryDirectory: URL {
+        applicationSupportDirectory
+            .appendingPathComponent("live-meeting", isDirectory: true)
+            .appendingPathComponent("temporary-audio", isDirectory: true)
+    }
+
     private static func migrateLegacyApplicationSupportDirectoryIfNeeded(from legacy: URL, to current: URL) {
         let fm = FileManager.default
         guard !fm.fileExists(atPath: current.path),

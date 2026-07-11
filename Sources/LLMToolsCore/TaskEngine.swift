@@ -102,6 +102,16 @@ public actor TaskEngine {
         return descriptor
     }
 
+    public func addModelDescriptorForTesting(_ descriptor: ModelDescriptor) async throws {
+        snapshot.models.removeAll { $0.id == descriptor.id }
+        snapshot.models.append(descriptor)
+        if snapshot.preferences.defaultModelID == nil && descriptor.enabled && descriptor.capabilities.supportsText {
+            snapshot.preferences.defaultModelID = descriptor.id
+        }
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        try await registryStore.save(snapshot)
+    }
+
     public func addSpeechModel(
         from url: URL,
         name: String? = nil,
@@ -326,6 +336,15 @@ public actor TaskEngine {
         if snapshot.preferences.mediaSubtitles.fileASRModelID == id {
             snapshot.preferences.mediaSubtitles.fileASRModelID = nil
         }
+        if snapshot.preferences.liveMeeting.realtimeASRModelID == id {
+            snapshot.preferences.liveMeeting.realtimeASRModelID = nil
+        }
+        if snapshot.preferences.liveMeeting.fileASRModelID == id {
+            snapshot.preferences.liveMeeting.fileASRModelID = nil
+        }
+        if snapshot.preferences.liveMeeting.notesModelID == id {
+            snapshot.preferences.liveMeeting.notesModelID = nil
+        }
         sanitizePreferences(&snapshot.preferences, models: snapshot.models)
         try await registryStore.save(snapshot)
     }
@@ -358,10 +377,18 @@ public actor TaskEngine {
         snapshot.models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
     }
 
-    public func checkASRHealth(modelID: UUID? = nil, mode: SpeechRuntimeMode = .fileOnly) async throws -> ASRHealthReport {
+    public func checkASRHealth(
+        modelID: UUID? = nil,
+        mode: SpeechRuntimeMode = .fileOnly,
+        sourceLanguageHint: ASRSourceLanguageHint? = nil
+    ) async throws -> ASRHealthReport {
         let model = try resolveSpeechModel(for: modelID, mode: mode)
         let runner = LocalASRProcessRunner()
-        let report = runner.health(for: model, preferences: snapshot.preferences.mediaSubtitles, mode: mode)
+        var asrPreferences = snapshot.preferences.mediaSubtitles
+        if let sourceLanguageHint {
+            asrPreferences.sourceLanguageHint = sourceLanguageHint
+        }
+        let report = runner.health(for: model, preferences: asrPreferences, mode: mode)
         if let index = snapshot.models.firstIndex(where: { $0.id == model.id }),
            var speech = snapshot.models[index].capabilities.speech {
             speech.lastCheckedAt = report.checkedAt
@@ -846,6 +873,404 @@ public actor TaskEngine {
         )
     }
 
+    public func transcribeMeetingFile(
+        at url: URL,
+        modelID: UUID? = nil,
+        sourceLanguageHint: ASRSourceLanguageHint? = nil,
+        expectedSpeakerCount: Int? = nil,
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+    ) async throws -> LiveMeetingFileTranscriptionResult {
+        guard snapshot.preferences.mediaSubtitles.isEnabled else {
+            throw MediaSubtitleError.disabled
+        }
+        var descriptor = try MediaIntakeService.descriptor(for: url)
+        let selectedModelID = modelID ?? snapshot.preferences.liveMeeting.fileASRModelID
+        let model = try resolveSpeechModel(for: selectedModelID, mode: .fileOnly)
+        var meetingASRPreferences = snapshot.preferences.mediaSubtitles
+        meetingASRPreferences.sourceLanguageHint = sourceLanguageHint ?? snapshot.preferences.liveMeeting.sourceLanguageHint
+        let health = LocalASRProcessRunner().health(
+            for: model,
+            preferences: meetingASRPreferences,
+            mode: .fileOnly
+        )
+        guard health.status == .ready else {
+            switch health.status {
+            case .modelMissing, .incompatibleModel:
+                throw MediaSubtitleError.asrModelMissing(health.message)
+            case .runtimeMissing:
+                throw MediaSubtitleError.asrRuntimeMissing(health.message)
+            case .loadFailed, .inferenceFailed, .ready:
+                throw MediaSubtitleError.asrRuntimeFailed(health.message)
+            }
+        }
+        let normalizedAudio = try await AudioExtractionService.normalizeMediaFile(
+            at: url,
+            temporaryDirectory: temporaryDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(at: normalizedAudio.url.deletingLastPathComponent())
+        }
+        descriptor.duration = normalizedAudio.duration
+        let canEmitNativeSpeakers = model.capabilities.speech?.canEmitSpeakerLabels == true
+        var recognitionStrategy: LiveMeetingRecognitionStrategy = .transcriptOnly
+        var diarizationModelID: String?
+        var segments: [LiveMeetingSegment]
+
+        if canEmitNativeSpeakers {
+            let nativeSubtitles = try await transcribeMeetingAudio(
+                audioURL: normalizedAudio.url,
+                model: model,
+                duration: normalizedAudio.duration,
+                preferences: meetingASRPreferences,
+                maximumTokens: meetingMaximumTokens(for: model, duration: normalizedAudio.duration)
+            )
+            let nativeSegments = liveMeetingSegments(from: nativeSubtitles)
+            if nativeSegments.contains(where: { $0.speakerID != nil }) {
+                recognitionStrategy = .nativeSpeakerASR
+                diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
+                segments = nativeSegments
+            } else if let speakerAware = try? await transcribeMeetingBySpeakerTurns(
+                normalizedAudioURL: normalizedAudio.url,
+                duration: normalizedAudio.duration,
+                model: model,
+                preferences: meetingASRPreferences,
+                expectedSpeakerCount: expectedSpeakerCount
+            ), !speakerAware.segments.isEmpty {
+                recognitionStrategy = .diarizationFirst
+                diarizationModelID = speakerAware.diarizationModelID
+                segments = speakerAware.segments
+            } else {
+                segments = nativeSegments
+            }
+        } else if let speakerAware = try? await transcribeMeetingBySpeakerTurns(
+            normalizedAudioURL: normalizedAudio.url,
+            duration: normalizedAudio.duration,
+            model: model,
+            preferences: meetingASRPreferences,
+            expectedSpeakerCount: expectedSpeakerCount
+        ), !speakerAware.segments.isEmpty {
+            recognitionStrategy = .diarizationFirst
+            diarizationModelID = speakerAware.diarizationModelID
+            segments = speakerAware.segments
+        } else {
+            let subtitles = try await transcribeMeetingAudio(
+                audioURL: normalizedAudio.url,
+                model: model,
+                duration: normalizedAudio.duration,
+                preferences: meetingASRPreferences
+            )
+            segments = liveMeetingSegments(from: subtitles)
+        }
+        return LiveMeetingFileTranscriptionResult(
+            descriptor: descriptor,
+            segments: segments,
+            duration: normalizedAudio.duration,
+            asrRuntimeSource: health.runtimeSource,
+            recognitionStrategy: recognitionStrategy,
+            diarizationModelID: diarizationModelID
+        )
+    }
+
+    private func transcribeMeetingAudio(
+        audioURL: URL,
+        model: ModelDescriptor,
+        duration: TimeInterval?,
+        preferences: MediaSubtitlePreferences,
+        maximumTokens: Int? = nil
+    ) async throws -> [SubtitleSegment] {
+        try await LocalASRProcessRunner().transcribe(
+            audioURL: audioURL,
+            model: model,
+            sessionID: UUID(),
+            duration: duration,
+            preferences: preferences,
+            context: ASRTranscriptionContext(
+                mode: .fileOnly,
+                sourceLanguageHint: preferences.sourceLanguageHint,
+                isFinal: true,
+                maximumTokens: maximumTokens
+            )
+        )
+    }
+
+    private func transcribeMeetingBySpeakerTurns(
+        normalizedAudioURL: URL,
+        duration: TimeInterval?,
+        model: ModelDescriptor,
+        preferences: MediaSubtitlePreferences,
+        expectedSpeakerCount: Int?
+    ) async throws -> (segments: [LiveMeetingSegment], diarizationModelID: String?) {
+        let diarization = try await diarizeMeetingFile(
+            at: normalizedAudioURL,
+            expectedSpeakerCount: expectedSpeakerCount
+        )
+        let pcm = try LiveMeetingAudioStorage.readPCM16WAV(at: normalizedAudioURL)
+        let audioDuration = duration
+            ?? (Double(pcm.data.count / 2) / Double(pcm.sampleRate))
+        let slices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: diarization.turns,
+            processedThrough: 0,
+            stableThrough: audioDuration
+        )
+        guard !slices.isEmpty else { return ([], diarization.modelID) }
+
+        var result: [LiveMeetingSegment] = []
+        for (sliceIndex, slice) in slices.enumerated() {
+            try Task.checkCancellation()
+            let audio = LiveMeetingAudioStorage.slicePCM16(
+                pcm.data,
+                sampleRate: pcm.sampleRate,
+                startTime: slice.startTime,
+                endTime: slice.endTime
+            )
+            guard !audio.isEmpty else { continue }
+            let turnURL = normalizedAudioURL.deletingLastPathComponent()
+                .appendingPathComponent(String(format: "meeting-speaker-turn-%06d.wav", sliceIndex))
+            try LiveMeetingAudioStorage.writePCM16WAV(data: audio, sampleRate: pcm.sampleRate, to: turnURL)
+            defer { try? FileManager.default.removeItem(at: turnURL) }
+            let subtitles = try await transcribeMeetingAudio(
+                audioURL: turnURL,
+                model: model,
+                duration: slice.endTime - slice.startTime,
+                preferences: preferences,
+                maximumTokens: meetingMaximumTokens(for: model, duration: slice.endTime - slice.startTime)
+            )
+            let technicalSegments = liveMeetingSegments(
+                from: subtitles,
+                timeOffset: slice.startTime,
+                assignedSpeaker: slice,
+                startingIndex: result.count
+            )
+            if let grouped = LiveMeetingTranscriptReducer.groupSpeakerSlice(
+                technicalSegments,
+                slice: slice,
+                index: result.count
+            ) {
+                result.append(grouped)
+            }
+        }
+        return (result, diarization.modelID)
+    }
+
+    private func liveMeetingSegments(
+        from subtitles: [SubtitleSegment],
+        timeOffset: TimeInterval = 0,
+        assignedSpeaker: LiveMeetingSpeakerAudioSlice? = nil,
+        startingIndex: Int = 0
+    ) -> [LiveMeetingSegment] {
+        subtitles.enumerated().map { offset, segment in
+            let confidence = assignedSpeaker?.confidence ?? segment.speakerConfidence
+            return LiveMeetingSegment(
+                id: segment.id,
+                index: startingIndex + offset,
+                startTime: timeOffset + segment.startTime,
+                endTime: segment.endTime.map { timeOffset + $0 },
+                text: segment.originalText,
+                originalText: segment.originalText,
+                speakerID: assignedSpeaker?.speakerID ?? segment.speakerID,
+                speakerLabel: assignedSpeaker?.speakerLabel ?? segment.speakerLabel,
+                confidence: confidence,
+                state: assignedSpeaker?.isLowConfidence == true || confidence.map { $0 < 0.55 } == true
+                    ? .lowConfidence
+                    : .final
+            )
+        }
+    }
+
+    private func meetingMaximumTokens(
+        for model: ModelDescriptor,
+        duration: TimeInterval?
+    ) -> Int? {
+        guard model.capabilities.speech?.canEmitSpeakerLabels == true else { return nil }
+        let estimated = Int(max(0, duration ?? 0) * 10)
+        return min(32_768, max(8_192, estimated))
+    }
+
+    public func generateLocalMeetingNotes(
+        segments: [LiveMeetingSegment],
+        speakers: [LiveMeetingSpeaker],
+        modelID: UUID? = nil
+    ) async throws -> MeetingNoteState {
+        let model = try resolveLocalMeetingNotesModel(for: modelID)
+        let usable = segments.filter { $0.state != .partial && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !usable.isEmpty else {
+            return MeetingNoteState(
+                summary: "暂无可用于生成纪要的已完成转写。",
+                language: "zh-Hans",
+                sourceSegmentCount: 0,
+                generationState: .completed,
+                chunkCount: 0
+            )
+        }
+        let contextLimit = InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength)
+        let chunkLimit = max(800, min(5_000, contextLimit / 2))
+        let chunks = meetingTranscriptChunks(usable, maximumCharacters: chunkLimit)
+        var partialNotes: [String] = []
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let result = try await runLocalMeetingNotesPrompt(
+                meetingNotesChunkPrompt(chunk),
+                model: model
+            )
+            partialNotes.append(result)
+        }
+        let finalSource: String
+        if partialNotes.count == 1 {
+            finalSource = partialNotes[0]
+        } else {
+            finalSource = try await runLocalMeetingNotesPrompt(
+                meetingNotesMergePrompt(partialNotes),
+                model: model
+            )
+        }
+        return parseMeetingNotes(
+            finalSource,
+            sourceSegmentCount: usable.count,
+            chunkCount: chunks.count
+        )
+    }
+
+    public func diarizeMeetingFile(
+        at audioURL: URL,
+        expectedSpeakerCount: Int? = nil
+    ) async throws -> SpeakerDiarizationResult {
+        guard !SpeakerDiarizationCommandRunner.hasCustomCommand(preferences: snapshot.preferences.speakerDiarization) else {
+            throw SpeakerDiarizationError.runtimeMissing(
+                "Meeting transcription does not use arbitrary diarization commands. Use the configured local pyannote runtime."
+            )
+        }
+        var meetingPreferences = snapshot.preferences.speakerDiarization
+        meetingPreferences.enabledForFileSubtitles = true
+        return try await speakerDiarizationService.diarize(
+            audioURL: audioURL,
+            preferences: meetingPreferences,
+            expectedSpeakerCount: expectedSpeakerCount
+        )
+    }
+
+    private func resolveLocalMeetingNotesModel(for modelID: UUID?) throws -> ModelDescriptor {
+        let preferredID = modelID ?? snapshot.preferences.liveMeeting.notesModelID ?? snapshot.preferences.defaultModelID
+        let candidates = snapshot.models.filter {
+            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+        }
+        guard !candidates.isEmpty else { throw LiveMeetingError.missingLocalTextModel }
+        if let preferredID,
+           let model = candidates.first(where: { $0.id == preferredID }) {
+            return model
+        }
+        if let requested = modelID,
+           let model = snapshot.models.first(where: { $0.id == requested }) {
+            if model.isRemoteProvider { throw LiveMeetingError.remoteTextModelForbidden }
+            throw LiveMeetingError.missingLocalTextModel
+        }
+        return candidates.first(where: { $0.role == .default }) ?? candidates[0]
+    }
+
+    private func runLocalMeetingNotesPrompt(_ prompt: String, model: ModelDescriptor) async throws -> String {
+        let request = TaskRequest(task: .summarize, inputText: prompt)
+        try validateInputSize(request, for: model)
+        let runner = try runner(for: model)
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+        return try await runner.generate(request: request, preferences: snapshot.preferences).text
+    }
+
+    private func meetingTranscriptChunks(_ segments: [LiveMeetingSegment], maximumCharacters: Int) -> [[LiveMeetingSegment]] {
+        var result: [[LiveMeetingSegment]] = []
+        var current: [LiveMeetingSegment] = []
+        var size = 0
+        for segment in segments {
+            let lineLength = segment.text.count + (segment.speakerLabel?.count ?? 0) + 32
+            if !current.isEmpty && size + lineLength > maximumCharacters {
+                result.append(current)
+                current = []
+                size = 0
+            }
+            current.append(segment)
+            size += lineLength
+        }
+        if !current.isEmpty { result.append(current) }
+        return result
+    }
+
+    private func meetingNotesChunkPrompt(_ segments: [LiveMeetingSegment]) -> String {
+        let transcript = segments.map { segment in
+            let speaker = segment.speakerLabel ?? "Unknown"
+            return "[\(meetingTimestamp(segment.startTime))] \(speaker): \(segment.text)"
+        }.joined(separator: "\n")
+        return """
+        你是本地会议纪要整理器。基于以下转写，使用简体中文输出严格的 Markdown：
+        ## 摘要
+        一段简明摘要
+        ## 关键决策
+        - 决策
+        ## 待办事项
+        - 事项
+        ## 开放问题
+        - 问题
+        ## 讨论主题
+        - 主题
+
+        只输出该 Markdown，不要解释。转写：
+        \(transcript)
+        """
+    }
+
+    private func meetingNotesMergePrompt(_ partialNotes: [String]) -> String {
+        """
+        你是本地会议纪要整理器。请合并以下分块会议纪要，去重并使用简体中文输出严格的 Markdown：
+        ## 摘要
+        一段简明摘要
+        ## 关键决策
+        - 决策
+        ## 待办事项
+        - 事项
+        ## 开放问题
+        - 问题
+        ## 讨论主题
+        - 主题
+
+        只输出该 Markdown，不要解释。
+        \(partialNotes.enumerated().map { "### 分块\($0.offset + 1)\n\($0.element)" }.joined(separator: "\n\n"))
+        """
+    }
+
+    private func parseMeetingNotes(_ text: String, sourceSegmentCount: Int, chunkCount: Int) -> MeetingNoteState {
+        var sections: [String: [String]] = [:]
+        var current = "摘要"
+        for line in text.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("## ") {
+                current = String(trimmed.dropFirst(3))
+                continue
+            }
+            guard !trimmed.isEmpty else { continue }
+            sections[current, default: []].append(trimmed.hasPrefix("- ") ? String(trimmed.dropFirst(2)) : trimmed)
+        }
+        func values(_ keys: [String]) -> [String] {
+            keys.flatMap { sections[$0] ?? [] }
+        }
+        return MeetingNoteState(
+            summary: values(["摘要", "Summary"]).joined(separator: " "),
+            decisions: values(["关键决策", "决策", "Decisions"]),
+            actionItems: values(["待办事项", "行动项", "Action Items"]),
+            openQuestions: values(["开放问题", "问题", "Open Questions"]),
+            topics: values(["讨论主题", "主题", "Topics"]),
+            language: "zh-Hans",
+            sourceSegmentCount: sourceSegmentCount,
+            generationState: .completed,
+            isStale: false,
+            chunkCount: chunkCount
+        )
+    }
+
+    private func meetingTimestamp(_ value: TimeInterval) -> String {
+        let total = max(0, Int(value.rounded(.down)))
+        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+    }
+
     private static func userVisibleErrorMessage(_ error: Error) -> String {
         let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -884,7 +1309,7 @@ public actor TaskEngine {
         targetLanguage target: String,
         model: ModelDescriptor
     ) async throws -> [SubtitleSegment] {
-        var translatedByID = try await runSubtitleTranslationBatch(
+        var translatedByID = try await runSubtitleTranslationBatches(
             segments: routedSegments,
             targetLanguage: target,
             model: model,
@@ -892,7 +1317,7 @@ public actor TaskEngine {
         )
         if translatedByID.count < routedSegments.count {
             let missing = routedSegments.filter { translatedByID[$0.id.uuidString] == nil }
-            let retry = try await runSubtitleTranslationBatch(
+            let retry = try await runSubtitleTranslationBatches(
                 segments: missing,
                 targetLanguage: target,
                 model: model,
@@ -907,6 +1332,175 @@ public actor TaskEngine {
             updated.translationEngineID = TranslationEngineID.llm.rawValue
             return updated
         }
+    }
+
+    private func runSubtitleTranslationBatches(
+        segments: [SubtitleSegment],
+        targetLanguage: String,
+        model: ModelDescriptor,
+        isRetry: Bool
+    ) async throws -> [String: String] {
+        guard !segments.isEmpty else {
+            return [:]
+        }
+        let batches = try subtitleTranslationBatches(
+            segments: segments,
+            targetLanguage: targetLanguage,
+            model: model,
+            isRetry: isRetry
+        )
+        var translatedByID: [String: String] = [:]
+        for batch in batches {
+            try Task.checkCancellation()
+            if batch.count == 1,
+               let segment = batch.first,
+               try subtitleTranslationPromptLength(
+                   segments: batch,
+                   targetLanguage: targetLanguage,
+                   isRetry: isRetry
+               ) > InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength) {
+                translatedByID[segment.id.uuidString] = try await translateOversizedSubtitleSegment(
+                    segment,
+                    targetLanguage: targetLanguage,
+                    model: model
+                )
+                continue
+            }
+            let batchTranslations = try await runSubtitleTranslationBatch(
+                segments: batch,
+                targetLanguage: targetLanguage,
+                model: model,
+                isRetry: isRetry
+            )
+            translatedByID.merge(batchTranslations) { current, _ in current }
+        }
+        return translatedByID
+    }
+
+    private func subtitleTranslationBatches(
+        segments: [SubtitleSegment],
+        targetLanguage: String,
+        model: ModelDescriptor,
+        isRetry: Bool
+    ) throws -> [[SubtitleSegment]] {
+        let hardLimit = InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength)
+        let softLimit = subtitleTranslationSoftLimit(forHardLimit: hardLimit)
+        var batches: [[SubtitleSegment]] = []
+        var current: [SubtitleSegment] = []
+
+        for segment in segments {
+            let candidate = current + [segment]
+            let candidatePromptLength = try subtitleTranslationPromptLength(
+                segments: candidate,
+                targetLanguage: targetLanguage,
+                isRetry: isRetry
+            )
+            if !current.isEmpty && candidatePromptLength > softLimit {
+                batches.append(current)
+                current = [segment]
+            } else {
+                current = candidate
+            }
+        }
+
+        if !current.isEmpty {
+            batches.append(current)
+        }
+        return batches
+    }
+
+    private func subtitleTranslationSoftLimit(forHardLimit hardLimit: Int) -> Int {
+        let reserve = min(1_024, max(256, hardLimit / 5))
+        return max(1, hardLimit - reserve)
+    }
+
+    private func subtitleTranslationPromptLength(
+        segments: [SubtitleSegment],
+        targetLanguage: String,
+        isRetry: Bool
+    ) throws -> Int {
+        try PromptTemplates.subtitleBatchPrompt(
+            segments: segments,
+            targetLanguage: targetLanguage,
+            isRetry: isRetry
+        ).count
+    }
+
+    private func translateOversizedSubtitleSegment(
+        _ segment: SubtitleSegment,
+        targetLanguage: String,
+        model: ModelDescriptor
+    ) async throws -> String {
+        let limit = InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength)
+        let chunks = subtitleTextChunks(segment.originalText, hardLimit: limit)
+        var translatedChunks: [String] = []
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let request = TaskRequest(
+                task: .translate,
+                inputText: chunk,
+                sourceLanguage: segment.sourceLanguage ?? "auto",
+                targetLanguage: targetLanguage
+            )
+            try validateInputSize(request, for: model)
+            let result = try await run(
+                request: request,
+                modelID: model.id,
+                persistHistory: snapshot.preferences.mediaSubtitles.saveTranslatedSubtitleHistory
+            )
+            let translated = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !translated.isEmpty {
+                translatedChunks.append(translated)
+            }
+        }
+        return translatedChunks.joined(separator: "\n")
+    }
+
+    private func subtitleTextChunks(_ text: String, hardLimit: Int) -> [String] {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return []
+        }
+        let limit = max(1, subtitleTranslationSoftLimit(forHardLimit: hardLimit))
+        guard trimmed.count > limit else {
+            return [trimmed]
+        }
+        var chunks: [String] = []
+        var start = trimmed.startIndex
+        while start < trimmed.endIndex {
+            let hardEnd = trimmed.index(start, offsetBy: limit, limitedBy: trimmed.endIndex) ?? trimmed.endIndex
+            let end = preferredSubtitleChunkBoundary(in: trimmed, start: start, proposedEnd: hardEnd)
+            let chunk = String(trimmed[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !chunk.isEmpty {
+                chunks.append(chunk)
+            }
+            start = end
+            while start < trimmed.endIndex, trimmed[start].isWhitespace {
+                start = trimmed.index(after: start)
+            }
+        }
+        return chunks
+    }
+
+    private func preferredSubtitleChunkBoundary(
+        in text: String,
+        start: String.Index,
+        proposedEnd: String.Index
+    ) -> String.Index {
+        guard proposedEnd < text.endIndex else {
+            return text.endIndex
+        }
+        let minimumDistance = max(1, text.distance(from: start, to: proposedEnd) / 2)
+        let minimumIndex = text.index(start, offsetBy: minimumDistance, limitedBy: proposedEnd) ?? start
+        var index = proposedEnd
+        while index > minimumIndex {
+            let previous = text.index(before: index)
+            if text[previous].isWhitespace || ".!?。！？；;，,".contains(text[previous]) {
+                return index
+            }
+            index = previous
+        }
+        return proposedEnd
     }
 
     private func translateSubtitleSegmentsWithFastMTIfSelected(
@@ -1902,6 +2496,23 @@ public actor TaskEngine {
         }
         if preferences.mediaSubtitles.realtimeASRModelID == nil {
             preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+        }
+        if let modelID = preferences.liveMeeting.realtimeASRModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }) {
+            preferences.liveMeeting.realtimeASRModelID = nil
+        }
+        if let modelID = preferences.liveMeeting.fileASRModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }) {
+            preferences.liveMeeting.fileASRModelID = nil
+        }
+        if let modelID = preferences.liveMeeting.notesModelID,
+           !models.contains(where: {
+               $0.id == modelID && $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+           }) {
+            preferences.liveMeeting.notesModelID = nil
+        }
+        if !preferences.liveMeeting.defaultAudioSource.isLiveCapture {
+            preferences.liveMeeting.defaultAudioSource = .microphone
         }
     }
 

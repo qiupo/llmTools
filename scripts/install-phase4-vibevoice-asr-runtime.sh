@@ -32,7 +32,11 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 mkdir -p "$ASR_ROOT"
-uv venv --python "$PYTHON_BIN" "$VENV"
+if [ -x "$VENV/bin/python" ]; then
+    echo "Reusing existing VibeVoice-ASR virtual environment: $VENV"
+else
+    uv venv --clear --python "$PYTHON_BIN" "$VENV"
+fi
 
 # VibeVoice-ASR is heavy. This installs the runtime code only; users still provide a
 # local model directory in llmTools. Keep the command template explicit and local.

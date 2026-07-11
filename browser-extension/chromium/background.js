@@ -1,5 +1,5 @@
 const HOST_NAME = "com.llmtools.native_host";
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const LOCAL_SEGMENTS_PER_BATCH = 5;
 const LOCAL_CHARS_PER_BATCH = 800;
 const REMOTE_SEGMENTS_PER_BATCH = 5;

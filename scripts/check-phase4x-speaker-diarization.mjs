@@ -26,6 +26,7 @@ function assertIncludes(source, needle, label) {
 
 async function run() {
   for (const relativePath of [
+    "Sources/LLMToolsCore/CancellableProcessHandle.swift",
     "Sources/LLMToolsCore/SpeakerDiarizationService.swift",
     "docs/phase-4x-realtime-diarization-spike.md",
     "scripts/llmtools-pyannote-diarization-sidecar.py",
@@ -35,6 +36,7 @@ async function run() {
   }
 
   const service = await read("Sources/LLMToolsCore/SpeakerDiarizationService.swift");
+  const cancellableProcess = await read("Sources/LLMToolsCore/CancellableProcessHandle.swift");
   const languageNormalizer = await read("Sources/LLMToolsCore/LanguageCodeNormalizer.swift");
   const modelTypes = await read("Sources/LLMToolsCore/ModelTypes.swift");
   const realtimeSpike = await read("docs/phase-4x-realtime-diarization-spike.md");
@@ -61,6 +63,9 @@ async function run() {
   ]) {
     assertIncludes(service, needle, "speaker diarization service");
   }
+  assertIncludes(cancellableProcess, "process.terminate()", "cancellable local process handle");
+  assertIncludes(service, "withTaskCancellationHandler", "speaker diarization process cancellation");
+  assertIncludes(mediaServices, "withTaskCancellationHandler", "local ASR process cancellation");
   assertIncludes(
     languageNormalizer,
     "LLMTOOLS_DIARIZATION_FIXTURE_JSON",
@@ -124,10 +129,33 @@ async function run() {
   for (const needle of [
     "speakerDiarizationHealthReport",
     "speakerDiarizationHealthCheckInProgress",
-    "checkSpeakerDiarizationHealth"
+    "checkSpeakerDiarizationHealth",
+    "cancelLiveMeetingStop",
+    "liveMeetingStopWatchdogTask",
+    "liveMeetingStopCancellationRequested"
   ]) {
     assertIncludes(appState, needle, "speaker diarization app state");
   }
+  assert(
+    !appState.includes("chunk-%06d.pcm"),
+    "meeting capture must not persist unused raw PCM chunks"
+  );
+  assertIncludes(
+    appState,
+    "strategy.requiresFullSessionAudioBuffer",
+    "bounded meeting full-session audio buffering"
+  );
+  assertIncludes(
+    appState,
+    "LiveMeetingNativeTechnicalWindowPolicy.shouldSeal",
+    "bounded native speaker ASR inference windows"
+  );
+  assertIncludes(
+    appState,
+    "LiveMeetingASRBackpressurePolicy.shouldStopCapture",
+    "meeting ASR capture backpressure"
+  );
+  assertIncludes(settingsView, "结束收尾", "meeting stop UI");
 
   for (const needle of [
     "Speaker Diarization",
@@ -144,6 +172,8 @@ async function run() {
 
   for (const needle of [
     "checkSpeakerDiarizationFixtureAndMapping",
+    "checkSpeakerDiarizationCommandCancellation",
+    "checkLocalASRCommandCancellation",
     "checkSubtitleExportWithSpeakers",
     "checkSpeakerDiarizationFilePipeline",
     "Diarization failure must not drop transcript segments",

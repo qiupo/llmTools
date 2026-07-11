@@ -165,7 +165,22 @@ function modelFiles(modelPath) {
   for (const name of names) {
     files[name] = existsSync(path.join(modelPath, name));
   }
+  for (const name of readdirOrNull(modelPath) ?? []) {
+    if (name.endsWith(".safetensors")) {
+      files[name] = true;
+    }
+  }
   return files;
+}
+
+function safetensorsModelFilesExist(modelPath, files = {}) {
+  if (!modelPath) {
+    return false;
+  }
+  if (files["model.safetensors"] || files["model.safetensors.index.json"]) {
+    return true;
+  }
+  return Object.entries(files).some(([name, exists]) => exists && name.endsWith(".safetensors"));
 }
 
 function configModelType(modelPath) {
@@ -245,32 +260,42 @@ function resolveRuntime(model, preferences) {
     };
   }
 
+  const mlxAudio = mlxAudioRuntime(family);
+  if (
+    mlxAudio.ready &&
+    safetensorsModelFilesExist(modelPath, files) &&
+    supportsMLXASRRepair(family)
+  ) {
+    const tokenizer = family === "vibeVoiceASR" ? vibeVoiceTokenizerRuntime(modelPath) : { ready: true, path: null };
+    if (!tokenizer.ready) {
+      return {
+        ready: false,
+        source: "unavailable",
+        reason: "VibeVoice-ASR MLX weights require a local Qwen2.5 tokenizer sidecar. Run --repair, Settings > Media Subtitle > Repair runtime, or set LLMTOOLS_VIBEVOICE_TOKENIZER_DIR."
+      };
+    }
+    return {
+      ready: true,
+      source: "mlxAudioRunner",
+      reason: tokenizer.path
+        ? `Bundled llmTools mlx-audio runner is available with ${mlxAudio.venv}; VibeVoice tokenizer: ${tokenizer.path}.`
+        : `Bundled llmTools mlx-audio runner is available with ${mlxAudio.venv}.`
+    };
+  }
+
   if (family === "vibeVoiceASR") {
     const vibeVoice = vibeVoiceRuntime();
     if (vibeVoice.ready) {
       return {
         ready: true,
         source: "vibeVoiceASRRunner",
-        reason: `Bundled VibeVoice-ASR runner is available with ${vibeVoice.venv}.`
+        reason: `Bundled VibeVoice-ASR PyTorch runner is available with ${vibeVoice.venv}.`
       };
     }
     return {
       ready: false,
       source: "unavailable",
-      reason: "VibeVoice-ASR is a heavy file-only rich transcription model. Install the local Python runtime with scripts/install-phase4-vibevoice-asr-runtime.sh, or configure LLMTOOLS_VIBEVOICE_ASR_COMMAND / the VibeVoice-ASR command template. The command should preserve rich JSON segments with speaker and timestamp fields."
-    };
-  }
-
-  const mlxAudio = mlxAudioRuntime(family);
-  if (
-    mlxAudio.ready &&
-    files["model.safetensors"] &&
-    (family === "funASRNano" || family === "funASRMLTNano" || family === "senseVoiceSmall" || family === "qwen3ASR06B")
-  ) {
-    return {
-      ready: true,
-      source: "mlxAudioRunner",
-      reason: `Bundled llmTools mlx-audio runner is available with ${mlxAudio.venv}.`
+      reason: "VibeVoice-ASR is file-only in llmTools. The mlx-community converted model needs the bundled MLX ASR runner with the shared mlx-audio runtime; original PyTorch VibeVoice-ASR runtimes can still be configured with LLMTOOLS_VIBEVOICE_ASR_COMMAND / the VibeVoice-ASR command template."
     };
   }
 
@@ -345,6 +370,8 @@ function printToolStatus() {
   const funASRNanoMLX = mlxAudioRuntime("funASRNano");
   const senseVoiceMLX = mlxAudioRuntime("senseVoiceSmall");
   const whisper = whisperCppRuntime("");
+  const vibeVoiceMLX = mlxAudioRuntime("vibeVoiceASR");
+  const vibeVoiceTokenizer = vibeVoiceTokenizerRuntime();
   const vibeVoice = vibeVoiceRuntime();
   console.log(`- llmTools mlx-audio runner: ${mlxAudio.runner || funASRMLX.runner || funASRNanoMLX.runner || senseVoiceMLX.runner || "missing"}`);
   console.log(`- mlx-audio venv: ${mlxAudio.venv || "missing"}`);
@@ -353,8 +380,10 @@ function printToolStatus() {
   console.log(`- SenseVoice mlx-audio venv: ${senseVoiceMLX.venv || "missing"}`);
   console.log(`- whisper.cpp CoreML runner: ${whisper.runner || "missing"}`);
   console.log(`- whisper.cpp CoreML root: ${whisper.root || "missing"}`);
-  console.log(`- VibeVoice-ASR runner: ${vibeVoice.runner || "missing"}`);
-  console.log(`- VibeVoice-ASR venv: ${vibeVoice.venv || "missing"}`);
+  console.log(`- VibeVoice-ASR MLX venv: ${vibeVoiceMLX.venv || "missing"}`);
+  console.log(`- VibeVoice-ASR MLX tokenizer: ${vibeVoiceTokenizer.path || "missing"}`);
+  console.log(`- VibeVoice-ASR PyTorch runner: ${vibeVoice.runner || "missing"}`);
+  console.log(`- VibeVoice-ASR PyTorch venv: ${vibeVoice.venv || "missing"}`);
   console.log("- Apple MPS: not an official Fun-ASR acceleration path in the checked GitHub docs");
 }
 
@@ -521,11 +550,35 @@ function mlxAudioRuntime(family = "qwen3ASR06B") {
   };
 }
 
+function vibeVoiceTokenizerRuntime(modelPath = null) {
+  const candidates = [
+    modelPath,
+    process.env.LLMTOOLS_VIBEVOICE_TOKENIZER_DIR,
+    path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime", "qwen2.5-tokenizer"),
+    path.join(os.homedir(), "code", "models", "lmstudio-community", "Qwen2.5-0.5B-Instruct-MLX-4bit"),
+    path.join(os.homedir(), "code", "models", "mlx-community", "Qwen3-ASR-0.6B-4bit"),
+    path.join(os.homedir(), "code", "models", "mlx-community", "Qwen3-ASR-0.6B-bf16"),
+    path.join(os.homedir(), "code", "models", "mlx-community", "Qwen3-ASR-1.7B-bf16")
+  ].filter(Boolean);
+  const tokenizerPath = candidates.find(hasVibeVoiceTokenizerFiles) ?? null;
+  return {
+    ready: Boolean(tokenizerPath),
+    path: tokenizerPath
+  };
+}
+
+function hasVibeVoiceTokenizerFiles(candidate) {
+  return Boolean(candidate)
+    && existsSync(path.join(candidate, "tokenizer_config.json"))
+    && (existsSync(path.join(candidate, "tokenizer.json")) || existsSync(path.join(candidate, "vocab.json")));
+}
+
 function mlxAudioModelModule(family) {
   if (family === "funASRMLTNano") return "funasr";
   if (family === "funASRNano") return "fun_asr_nano";
   if (family === "senseVoiceSmall") return "sensevoice";
   if (family === "qwen3ASR06B") return "qwen3_asr";
+  if (family === "vibeVoiceASR") return "vibevoice_asr";
   return null;
 }
 
@@ -567,11 +620,11 @@ function mlxAudioInstaller(family) {
 }
 
 function supportsMLXASRRepair(family) {
-  return family === "funASRNano" || family === "funASRMLTNano" || family === "senseVoiceSmall" || family === "qwen3ASR06B";
+  return family === "funASRNano" || family === "funASRMLTNano" || family === "senseVoiceSmall" || family === "qwen3ASR06B" || family === "vibeVoiceASR";
 }
 
 function supportsASRRepair(family) {
-  return supportsMLXASRRepair(family) || family === "vibeVoiceASR";
+  return supportsMLXASRRepair(family);
 }
 
 function commandFieldForFamily(family) {
@@ -675,10 +728,7 @@ function repairRegistry(registry, registryPath, speechModels) {
     const family = model.capabilities?.speech?.family;
     const modelPath = sourcePathToFilePath(model.sourcePath);
     const files = modelPath ? modelFiles(modelPath) : {};
-    if (family === "vibeVoiceASR") {
-      return Boolean(modelPath && existsSync(modelPath));
-    }
-    return supportsMLXASRRepair(family) && files["model.safetensors"];
+    return supportsMLXASRRepair(family) && safetensorsModelFilesExist(modelPath, files);
   });
   if (repairable.length === 0) {
     console.log("Repair: no speech model is eligible for automatic ASR runtime repair.");
@@ -689,6 +739,7 @@ function repairRegistry(registry, registryPath, speechModels) {
   registry.preferences.mediaSubtitles ??= {};
 
   const updatedFields = new Set();
+  const repairedModelNames = new Set();
   for (const model of repairable) {
     const family = model.capabilities?.speech?.family;
     const field = commandFieldForFamily(family);
@@ -696,39 +747,24 @@ function repairRegistry(registry, registryPath, speechModels) {
       continue;
     }
     let commandTemplate = "";
-    if (family === "vibeVoiceASR") {
-      let runtime = vibeVoiceRuntime();
-      if (!runtime.ready) {
-        const installer = vibeVoiceInstaller();
-        if (!installer) {
-          throw new Error("Repair: bundled VibeVoice-ASR installer was not found.");
-        }
-        console.log(`Repair: installing ${family} runtime with ${installer}`);
-        runInstaller(installer);
-        runtime = vibeVoiceRuntime();
+    let runtime = mlxAudioRuntime(family);
+    if (!runtime.ready) {
+      const installer = mlxAudioInstaller(family);
+      if (!installer) {
+        throw new Error(`Repair: bundled mlx-audio installer was not found for ${family}.`);
       }
-      if (!runtime.ready) {
-        throw new Error("Repair: VibeVoice-ASR runtime is still unavailable after installation.");
-      }
-      commandTemplate = buildVibeVoiceCommandTemplate(runtime);
-    } else {
-      let runtime = mlxAudioRuntime(family);
-      if (!runtime.ready) {
-        const installer = mlxAudioInstaller(family);
-        if (!installer) {
-          throw new Error(`Repair: bundled mlx-audio installer was not found for ${family}.`);
-        }
-        console.log(`Repair: installing ${family} runtime with ${installer}`);
-        runInstaller(installer);
-        runtime = mlxAudioRuntime(family);
-      }
-      if (!runtime.ready) {
-        throw new Error(`Repair: mlx-audio runtime is still unavailable for ${family} after installation.`);
-      }
-      commandTemplate = buildMLXAudioCommandTemplate(runtime, family);
+      console.log(`Repair: installing ${family} runtime with ${installer}`);
+      runInstaller(installer);
+      runtime = mlxAudioRuntime(family);
     }
+    if (!runtime.ready) {
+      throw new Error(`Repair: mlx-audio runtime is still unavailable for ${family} after installation.`);
+    }
+    commandTemplate = buildMLXAudioCommandTemplate(runtime, family);
     registry.preferences.mediaSubtitles[field] = commandTemplate;
     updatedFields.add(field);
+    markSpeechModelReady(model);
+    repairedModelNames.add(model.name);
   }
 
   if (updatedFields.size === 0) {
@@ -741,8 +777,24 @@ function repairRegistry(registry, registryPath, speechModels) {
   copyFileSync(registryPath, backupPath);
   writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
   console.log(`Repair: wrote ${Array.from(updatedFields).join(", ")}.`);
+  if (repairedModelNames.size > 0) {
+    console.log(`Repair: marked ready ${Array.from(repairedModelNames).join(", ")}.`);
+  }
   console.log(`Repair: registry backup saved to ${backupPath}.`);
   return true;
+}
+
+function markSpeechModelReady(model) {
+  const checkedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  model.validationState = "ready";
+  model.lastErrorMessage = null;
+  model.capabilities ??= {};
+  model.capabilities.lastCheckedAt = checkedAt;
+  model.capabilities.lastFailureMessage = null;
+  if (model.capabilities.speech) {
+    model.capabilities.speech.lastCheckedAt = checkedAt;
+    model.capabilities.speech.lastFailureMessage = null;
+  }
 }
 
 async function run() {
@@ -800,7 +852,7 @@ async function run() {
     console.log(`- runtime ready: ${runtime.ready ? "yes" : "no"}`);
     console.log(`- runtime source: ${runtime.source}`);
     console.log(`- reason: ${runtime.reason}`);
-    if (files["model.safetensors"] && !files["model.onnx"]) {
+    if (safetensorsModelFilesExist(modelPath, files) && !files["model.onnx"]) {
     console.log("- note: safetensors/MLX ASR weights require the matching bundled MLX runner or another explicit local runtime command.");
     }
     console.log("");

@@ -9,6 +9,10 @@ import LLMToolsCore
 final class AppState: ObservableObject {
     private static let modelIdleUnloadDelayNanoseconds: UInt64 = 30 * 1_000_000_000
     private static let maxLiveSubtitleHistoryCount = 120
+    private static let liveMeetingStopTimeoutSeconds = 60
+    // Transcript-only meeting text is intentionally delayed and grouped by natural pauses.
+    private static let liveMeetingASRMaximumTokens = 1_024
+    private static let liveMeetingASRChunkDurationSeconds = 30
 
     enum InputOrigin: Equatable {
         case selection
@@ -20,6 +24,13 @@ final class AppState: ObservableObject {
         case text
         case image
         case media
+    }
+
+    private struct PendingLiveMeetingASRBatch {
+        let audio: Data
+        let startMilliseconds: Int
+        let durationMilliseconds: Int
+        let recognitionStrategy: LiveMeetingRecognitionStrategy
     }
 
     enum AppLiveSubtitleRunState: String, Equatable {
@@ -198,6 +209,23 @@ final class AppState: ObservableObject {
     @Published var appLiveSubtitleSpeechDetected: Bool = false
     @Published var appLiveSubtitleASRInFlight: Bool = false
     @Published var appLiveSubtitleIsImmersive: Bool = false
+    @Published var liveMeetingSession: LiveMeetingSession?
+    @Published var liveMeetingSegments: [LiveMeetingSegment] = []
+    @Published var liveMeetingSpeakers: [LiveMeetingSpeaker] = []
+    @Published var liveMeetingSpeakerCountHint: LiveMeetingSpeakerCountHint = .automatic
+    @Published var liveMeetingAudioSource: LiveMeetingAudioSource = .microphone
+    @Published var liveMeetingNotes: MeetingNoteState?
+    @Published var liveMeetingDiagnostics: LiveMeetingDiagnostics?
+    @Published var liveMeetingDiarizationHealth: LiveMeetingDiarizationHealth?
+    @Published var liveMeetingDiarizationMessage: String?
+    @Published var liveMeetingASRHealthReport: ASRHealthReport?
+    @Published var liveMeetingASRHealthCheckMode: SpeechRuntimeMode?
+    @Published var liveMeetingAudioLevel: Double = 0
+    @Published var liveMeetingASRInFlight = false
+    @Published var liveMeetingFinalizeTaskIsRunning = false
+    @Published var liveMeetingNotesTaskIsRunning = false
+    @Published var liveMeetingRecoveryDraft: LiveMeetingRecoveryDraft?
+    @Published var liveMeetingStatusMessage: String?
 
     let engine: TaskEngine
     private var preferenceSaveRevision = 0
@@ -210,6 +238,29 @@ final class AppState: ObservableObject {
     private var mediaOutputState = QuickActionOutputState()
     private var liveSubtitleSessions: [String: LiveSubtitleRuntimeSession] = [:]
     private var appLiveSubtitleSequence = -1
+    private var liveMeetingCaptureService: LiveSubtitleCaptureService?
+    private var liveMeetingAudioBuffer = Data()
+    private var liveMeetingAllAudioBuffer = Data()
+    private var liveMeetingAudioCapturedMilliseconds = 0
+    private var liveMeetingLastASRMilliseconds = 0
+    private var liveMeetingLastDiarizationMilliseconds = 0
+    private var liveMeetingProcessedAudioMilliseconds = 0
+    private var liveMeetingSpeakerProcessedMilliseconds = 0
+    private var liveMeetingTurnStartMilliseconds: Int?
+    private var liveMeetingSpeechMilliseconds = 0
+    private var liveMeetingSilenceMilliseconds = 0
+    private var liveMeetingPendingASRBatches: [PendingLiveMeetingASRBatch] = []
+    private var liveMeetingDiarizationInFlight = false
+    private var liveMeetingASRTask: Task<Bool, Never>?
+    private var liveMeetingDiarizationTask: Task<SpeakerDiarizationResult, Error>?
+    private var liveMeetingStopTask: Task<Void, Never>?
+    private var liveMeetingStopWatchdogTask: Task<Void, Never>?
+    private var liveMeetingStopCancellationRequested = false
+    private var liveMeetingAutomaticStopReason: String?
+    private var liveMeetingFinalizeTask: Task<Void, Never>?
+    private var liveMeetingNotesTask: Task<Void, Never>?
+    private let liveMeetingDiarizationService = LiveMeetingDiarizationService()
+    private let liveMeetingRecoveryStore = LiveMeetingRecoveryStore()
     private lazy var liveSubtitleCaptureService = LiveSubtitleCaptureService { [weak self] data in
         Task { @MainActor [weak self] in
             await self?.handleAppLiveAudioChunk(data)
@@ -227,6 +278,10 @@ final class AppState: ObservableObject {
         clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
         clearMissingOCRModelPreference(&preferences, models: snapshot.models)
         clearMissingMediaSubtitlePreferences(&preferences, models: snapshot.models)
+        clearMissingLiveMeetingPreferences(&preferences, models: snapshot.models)
+        if preferences != snapshot.preferences {
+            try? await engine.setPreferences(preferences)
+        }
         self.models = snapshot.models
         self.preferences = preferences
         self.ocrMode = preferences.ocr.defaultMode
@@ -234,8 +289,11 @@ final class AppState: ObservableObject {
         self.appLiveSubtitleAudioSource = preferences.mediaSubtitles.liveAudioSource
         self.appLiveSubtitleTargetLanguage = preferences.mediaSubtitles.defaultTargetLanguage
         self.appLiveSubtitleDisplayMode = preferences.mediaSubtitles.defaultSubtitleMode
+        self.liveMeetingAudioSource = preferences.liveMeeting.defaultAudioSource
         self.selectedModelID = preferences.defaultModelID ?? snapshot.models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
         self.history = await engine.recentHistory()
+        liveMeetingRecoveryDraft = try? liveMeetingRecoveryStore.loadDiscardingTemporaryAudio()
+        liveMeetingDiarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
         self.statusMessage = snapshot.models.isEmpty
             ? t("No model configured")
             : t("Ready")
@@ -267,6 +325,10 @@ final class AppState: ObservableObject {
         clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
         clearMissingOCRModelPreference(&preferences, models: snapshot.models)
         clearMissingMediaSubtitlePreferences(&preferences, models: snapshot.models)
+        clearMissingLiveMeetingPreferences(&preferences, models: snapshot.models)
+        if preferences != snapshot.preferences {
+            try? await engine.setPreferences(preferences)
+        }
         models = snapshot.models
         self.preferences = preferences
         if !OCRMode.allCases.contains(ocrMode) {
@@ -276,6 +338,9 @@ final class AppState: ObservableObject {
             appLiveSubtitleAudioSource = preferences.mediaSubtitles.liveAudioSource
             appLiveSubtitleTargetLanguage = preferences.mediaSubtitles.defaultTargetLanguage
             appLiveSubtitleDisplayMode = preferences.mediaSubtitles.defaultSubtitleMode
+        }
+        if !liveMeetingIsRunning {
+            liveMeetingAudioSource = preferences.liveMeeting.defaultAudioSource
         }
         if let currentModelID, snapshot.models.contains(where: { $0.id == currentModelID }) {
             selectedModelID = currentModelID
@@ -1419,9 +1484,9 @@ final class AppState: ObservableObject {
         }
         let modelURL = model.resolvedPath ?? model.sourcePath
         if family == .vibeVoiceASR {
-            return FileManager.default.fileExists(atPath: modelURL.path)
+            return Self.safetensorsModelFilesExist(at: modelURL)
         }
-        return FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path)
+        return Self.safetensorsModelFilesExist(at: modelURL)
     }
 
     func checkLanguageDetectionHealth() {
@@ -1718,9 +1783,9 @@ final class AppState: ObservableObject {
 
     private nonisolated static func supportsMLXASRRepair(_ family: SpeechModelFamily) -> Bool {
         switch family {
-        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
+        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
             return true
-        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal:
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             return false
         }
     }
@@ -1730,9 +1795,7 @@ final class AppState: ObservableObject {
         family: SpeechModelFamily
     ) throws -> String {
         switch family {
-        case .vibeVoiceASR:
-            return try buildVibeVoiceASRCommandTemplateForRepair(model: model)
-        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
+        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
             return try buildMLXASRCommandTemplateForRepair(model: model, family: family)
         case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is not available for this ASR family.")
@@ -1747,7 +1810,7 @@ final class AppState: ObservableObject {
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is only available for supported safetensors/MLX ASR models.")
         }
         let modelURL = model.resolvedPath ?? model.sourcePath
-        guard FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path) else {
+        guard safetensorsModelFilesExist(at: modelURL) else {
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair expects a safetensors/MLX ASR model directory.")
         }
         let runnerPath = try mlxASRRunnerPath()
@@ -1890,11 +1953,18 @@ final class AppState: ObservableObject {
     }
 
     private nonisolated static func mlxASRVenvIsReady(_ venvPath: String, family: SpeechModelFamily) -> Bool {
-        FileManager.default.isExecutableFile(
+        let venvReady = FileManager.default.isExecutableFile(
             atPath: URL(fileURLWithPath: venvPath)
                 .appendingPathComponent("bin/mlx_audio.stt.generate")
                 .path
         ) && mlxASRModelModuleExists(in: venvPath, family: family)
+        guard venvReady else {
+            return false
+        }
+        if family == .vibeVoiceASR {
+            return vibeVoiceTokenizerFilesExist()
+        }
+        return true
     }
 
     private nonisolated static func mlxASRModelModuleExists(in venvPath: String, family: SpeechModelFamily) -> Bool {
@@ -1908,7 +1978,9 @@ final class AppState: ObservableObject {
             moduleName = "sensevoice"
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
-        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal:
+        case .vibeVoiceASR:
+            moduleName = "vibevoice_asr"
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             return false
         }
         let fileManager = FileManager.default
@@ -1954,6 +2026,55 @@ final class AppState: ObservableObject {
         return false
     }
 
+    private nonisolated static func safetensorsModelFilesExist(at modelURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path)
+            || fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors.index.json").path) {
+            return true
+        }
+        guard let contents = try? fileManager.contentsOfDirectory(
+            at: modelURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        return contents.contains { $0.pathExtension.lowercased() == "safetensors" }
+    }
+
+    private nonisolated static func vibeVoiceTokenizerFilesExist() -> Bool {
+        let fileManager = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+        let homeURL = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]).map(URL.init(fileURLWithPath:)),
+            homeURL
+                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
+                .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/lmstudio-community/Qwen2.5-0.5B-Instruct-MLX-4bit", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-4bit", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-bf16", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-1.7B-bf16", isDirectory: true)
+        ].compactMap { $0 }
+        return candidates.contains { url in
+            fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer_config.json").path)
+                && (fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer.json").path)
+                    || fileManager.fileExists(atPath: url.appendingPathComponent("vocab.json").path))
+        }
+    }
+
+    private nonisolated static func nonEmpty(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
     private nonisolated static func mlxASRInstallerScriptName(for family: SpeechModelFamily) -> String {
         switch family {
         case .funASRMLTNano:
@@ -1962,12 +2083,10 @@ final class AppState: ObservableObject {
             return "install-phase4-funasr-nano-mlx-runtime.sh"
         case .senseVoiceSmall:
             return "install-phase4-sensevoice-mlx-runtime.sh"
-        case .qwen3ASR06B:
+        case .qwen3ASR06B, .vibeVoiceASR:
             return "install-phase4-mlx-asr-runtime.sh"
         case .qwen3ASRSherpaOnnx:
             return "install-phase4-mlx-asr-runtime.sh"
-        case .vibeVoiceASR:
-            return "install-phase4-vibevoice-asr-runtime.sh"
         case .whisperCppCoreML:
             return "install-phase4-whisper-coreml-runtime.sh"
         case .customLocal:
@@ -1983,10 +2102,8 @@ final class AppState: ObservableObject {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "LLMTOOLS_ASR_VENV"
-        case .vibeVoiceASR:
-            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         case .customLocal:
@@ -2002,10 +2119,8 @@ final class AppState: ObservableObject {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "venv"
-        case .vibeVoiceASR:
-            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         case .customLocal:
@@ -2335,6 +2450,1185 @@ final class AppState: ObservableObject {
         appLiveSubtitleRunState = .stopped
         resetAppLiveSubtitleRuntimeMeters()
         appLiveSubtitleIsImmersive = false
+    }
+
+    var liveMeetingIsRunning: Bool {
+        guard let session = liveMeetingSession else { return false }
+        return session.state == .starting || session.state == .running || session.state == .stopping
+    }
+
+    var liveMeetingHasUnresolvedRecoveryDraft: Bool {
+        liveMeetingRecoveryDraft != nil && liveMeetingSession == nil
+    }
+
+    var liveMeetingCanGenerateNotes: Bool {
+        !liveMeetingIsRunning && selectedLiveMeetingNotesModel != nil && !liveMeetingSegments.isEmpty
+    }
+
+    var liveMeetingNotesDisabledMessage: String? {
+        guard selectedLiveMeetingNotesModel == nil else { return nil }
+        return "生成纪要仅使用本地 GGUF 或 MLX 文本模型。请在设置 > 会议中选择或启用本地模型。"
+    }
+
+    func checkLiveMeetingASRHealth(mode: SpeechRuntimeMode) {
+        guard liveMeetingASRHealthCheckMode == nil else { return }
+        let modelID = mode == .realtime
+            ? preferences.liveMeeting.realtimeASRModelID
+            : preferences.liveMeeting.fileASRModelID
+        let runtimeMode = mode == .realtime
+            ? (selectedLiveMeetingRealtimeASRModel?.capabilities.meetingCaptureRuntimeMode ?? .realtime)
+            : .fileOnly
+        liveMeetingASRHealthCheckMode = mode
+        Task {
+            do {
+                let report = try await engine.checkASRHealth(
+                    modelID: modelID,
+                    mode: runtimeMode,
+                    sourceLanguageHint: preferences.liveMeeting.sourceLanguageHint
+                )
+                await reloadSnapshot()
+                await MainActor.run {
+                    liveMeetingASRHealthReport = report
+                    liveMeetingASRHealthCheckMode = nil
+                }
+            } catch {
+                await reloadSnapshot()
+                await MainActor.run {
+                    liveMeetingASRHealthCheckMode = nil
+                    liveMeetingASRHealthReport = nil
+                    liveMeetingStatusMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    var liveMeetingLongSessionReminderVisible: Bool {
+        guard let session = liveMeetingSession, session.source.isLiveCapture else { return false }
+        return session.longSessionReminderShownAt != nil || session.hasReachedLongSessionThreshold
+    }
+
+    func refreshLiveMeetingDiarizationHealth() {
+        Task { @MainActor in
+            liveMeetingDiarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
+        }
+    }
+
+    func setLiveMeetingAudioSource(_ source: LiveMeetingAudioSource) {
+        guard source.isLiveCapture, !liveMeetingIsRunning else { return }
+        liveMeetingAudioSource = source
+        updatePreferences { $0.liveMeeting.defaultAudioSource = source }
+    }
+
+    func startLiveMeeting() {
+        guard !liveMeetingHasUnresolvedRecoveryDraft else {
+            liveMeetingStatusMessage = "请先恢复或删除上次异常结束的会议草稿，再开始新会话。"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.startLiveMeetingCapture(source: self.liveMeetingAudioSource)
+        }
+    }
+
+    private func startLiveMeetingCapture(source: LiveMeetingAudioSource) async {
+        guard !liveMeetingIsRunning else { return }
+        guard source.isLiveCapture, let captureSource = source.liveSubtitleCaptureSource else { return }
+        guard let model = selectedLiveMeetingRealtimeASRModel else {
+            liveMeetingStatusMessage = "请先在设置 > 会议中选择已就绪的本地会议转写模型。"
+            return
+        }
+        let runtimeMode = model.capabilities.meetingCaptureRuntimeMode ?? .realtime
+        let health = LocalASRProcessRunner().health(
+            for: model,
+            preferences: liveMeetingASRPreferences,
+            mode: runtimeMode
+        )
+        guard health.status == .ready else {
+            liveMeetingStatusMessage = health.message
+            return
+        }
+        let recognitionStrategy: LiveMeetingRecognitionStrategy
+        if model.capabilities.speech?.canEmitSpeakerLabels == true {
+            recognitionStrategy = .nativeSpeakerASR
+            liveMeetingDiarizationMessage = "当前模型原生联合输出转写、时间戳和 speaker，不再二次运行 pyannote。"
+        } else {
+            let diarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
+            liveMeetingDiarizationHealth = diarizationHealth
+            if diarizationHealth.isReady {
+                recognitionStrategy = .delayedSpeakerLabels
+                liveMeetingDiarizationMessage = "本地说话人分离已就绪；转写会先输出，speaker 将在后台延迟回填。"
+            } else {
+                recognitionStrategy = .transcriptOnly
+                liveMeetingDiarizationMessage = "本地说话人分离不可用，本次会议继续仅转写：\(diarizationHealth.message)"
+            }
+        }
+        let sessionID = UUID()
+        do {
+            let directory = try LiveMeetingAudioStorage.makeTemporaryDirectory(sessionID: sessionID)
+            liveMeetingSession = LiveMeetingSession(
+                id: sessionID,
+                source: source,
+                asrModelID: model.id,
+                asrModelName: model.name,
+                notesModelID: selectedLiveMeetingNotesModel?.id,
+                notesModelName: selectedLiveMeetingNotesModel?.name,
+                state: .starting,
+                speakerCountHint: liveMeetingSpeakerCountHint,
+                temporaryAudioDirectory: directory.path,
+                recognitionStrategy: recognitionStrategy
+            )
+            liveMeetingSegments = []
+            liveMeetingSpeakers = []
+            liveMeetingNotes = nil
+            liveMeetingDiagnostics = nil
+            liveMeetingAudioBuffer = Data()
+            liveMeetingAllAudioBuffer = Data()
+            liveMeetingAudioCapturedMilliseconds = 0
+            liveMeetingLastASRMilliseconds = 0
+            liveMeetingLastDiarizationMilliseconds = 0
+            liveMeetingProcessedAudioMilliseconds = 0
+            liveMeetingSpeakerProcessedMilliseconds = 0
+            liveMeetingTurnStartMilliseconds = nil
+            liveMeetingSpeechMilliseconds = 0
+            liveMeetingSilenceMilliseconds = 0
+            liveMeetingPendingASRBatches = []
+            liveMeetingStopCancellationRequested = false
+            liveMeetingAutomaticStopReason = nil
+            liveMeetingAudioLevel = 0
+            liveMeetingStatusMessage = source == .microphone ? "正在请求麦克风权限..." : "正在请求系统音频捕获权限..."
+            saveLiveMeetingRecoveryDraft()
+            let service = LiveSubtitleCaptureService { [weak self] data in
+                Task { @MainActor [weak self] in
+                    await self?.handleLiveMeetingCaptureChunk(data)
+                }
+            }
+            liveMeetingCaptureService = service
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                do {
+                    try await service.start(source: captureSource)
+                    guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                    current.state = .running
+                    self.liveMeetingSession = current
+                    let sourceName = source == .microphone ? "麦克风" : "系统音频"
+                    switch recognitionStrategy {
+                    case .nativeSpeakerASR:
+                        self.liveMeetingStatusMessage = "\(sourceName)会议正在采集；优先在明显停顿后处理，连续讲话每约 120 秒封装技术推理窗口。"
+                    case .delayedSpeakerLabels:
+                        self.liveMeetingStatusMessage = "\(sourceName)会议正在转写；自然停顿后先出文字，连续讲话最迟约 30 秒提交；speaker 稍后回填。"
+                    case .diarizationFirst:
+                        self.liveMeetingStatusMessage = "\(sourceName)会议正在转写；文字最迟约 30 秒提交，speaker 稍后回填。"
+                    case .transcriptOnly:
+                        self.liveMeetingStatusMessage = "\(sourceName)会议正在转写；本地 speaker 运行时不可用，文字仍会在自然停顿或最迟约 30 秒输出。"
+                    }
+                    self.saveLiveMeetingRecoveryDraft()
+                } catch {
+                    self.liveMeetingCaptureService = nil
+                    guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                    current.state = .failed
+                    self.liveMeetingSession = current
+                    let captureError = error.localizedDescription
+                    let cleanedTemporaryAudio = self.cleanupLiveMeetingTemporaryAudioIfNeeded()
+                    self.liveMeetingStatusMessage = cleanedTemporaryAudio
+                        ? captureError
+                        : "\(captureError) 临时会议音频清理失败，将在下次启动时重试。"
+                    self.saveLiveMeetingRecoveryDraft()
+                }
+            }
+        } catch {
+            liveMeetingStatusMessage = error.localizedDescription
+        }
+    }
+
+    func stopLiveMeeting(reason: String? = nil) {
+        guard var session = liveMeetingSession else { return }
+        if session.state == .stopping {
+            cancelLiveMeetingStop()
+            return
+        }
+        guard session.state == .running || session.state == .starting else { return }
+        if let reason, !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            liveMeetingAutomaticStopReason = reason
+        }
+        session.state = .stopping
+        liveMeetingSession = session
+        liveMeetingStopCancellationRequested = false
+        liveMeetingStatusMessage = liveMeetingAutomaticStopReason ?? "正在停止音频采集..."
+        let sessionID = session.id
+        liveMeetingStopTask?.cancel()
+        liveMeetingStopWatchdogTask?.cancel()
+        liveMeetingStopWatchdogTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(Self.liveMeetingStopTimeoutSeconds))
+            } catch {
+                return
+            }
+            guard let self,
+                  self.liveMeetingSession?.id == sessionID,
+                  self.liveMeetingSession?.state == .stopping else { return }
+            self.requestLiveMeetingStopCancellation(
+                status: "收尾处理已超时，正在保留当前转写并结束。"
+            )
+        }
+        liveMeetingStopTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.liveMeetingCaptureService?.stop()
+            self.liveMeetingCaptureService = nil
+            if let reason = self.liveMeetingAutomaticStopReason {
+                self.liveMeetingStatusMessage = "\(reason) 音频采集已停止，正在处理已排队的转写。"
+            } else {
+                self.liveMeetingStatusMessage = "音频采集已停止，正在处理剩余转写和说话人。"
+            }
+            if self.liveMeetingStopCancellationRequested {
+                await self.finishCancelledLiveMeetingWork(sessionID: sessionID)
+                return
+            }
+            switch session.recognitionStrategy ?? .transcriptOnly {
+            case .nativeSpeakerASR:
+                await self.flushLiveMeetingASR(final: true)
+            case .delayedSpeakerLabels, .diarizationFirst:
+                await self.flushLiveMeetingASR(final: true)
+                if !self.liveMeetingStopCancellationRequested {
+                    await self.waitForLiveMeetingDiarizationToFinish()
+                }
+                if !self.liveMeetingStopCancellationRequested {
+                    await self.flushLiveMeetingDiarization(final: true)
+                }
+            case .transcriptOnly:
+                await self.flushLiveMeetingASR(final: true)
+            }
+            if self.liveMeetingStopCancellationRequested {
+                await self.finishCancelledLiveMeetingWork(sessionID: sessionID)
+            } else {
+                self.completeLiveMeetingStop(sessionID: sessionID, cancelled: false)
+            }
+        }
+    }
+
+    func cancelLiveMeetingStop() {
+        requestLiveMeetingStopCancellation(
+            status: "正在结束剩余处理并保留当前转写..."
+        )
+    }
+
+    private func requestLiveMeetingStopCancellation(status: String) {
+        guard liveMeetingSession?.state == .stopping else { return }
+        liveMeetingStopCancellationRequested = true
+        liveMeetingStatusMessage = status
+        liveMeetingASRTask?.cancel()
+        liveMeetingDiarizationTask?.cancel()
+    }
+
+    private func finishCancelledLiveMeetingWork(sessionID: UUID) async {
+        liveMeetingASRTask?.cancel()
+        liveMeetingDiarizationTask?.cancel()
+        if let task = liveMeetingASRTask {
+            _ = await task.value
+        }
+        if let task = liveMeetingDiarizationTask {
+            _ = try? await task.value
+        }
+        completeLiveMeetingStop(sessionID: sessionID, cancelled: true)
+    }
+
+    private func completeLiveMeetingStop(sessionID: UUID, cancelled: Bool) {
+        guard var current = liveMeetingSession, current.id == sessionID else { return }
+        current.state = .stopped
+        current.stoppedAt = .now
+        current.transcriptLagMilliseconds = 0
+        current.speakerLagMilliseconds = 0
+        liveMeetingSession = current
+        liveMeetingAudioLevel = 0
+        liveMeetingASRInFlight = false
+        liveMeetingDiarizationInFlight = false
+        liveMeetingPendingASRBatches.removeAll(keepingCapacity: false)
+        liveMeetingAudioBuffer.removeAll(keepingCapacity: false)
+        liveMeetingAllAudioBuffer.removeAll(keepingCapacity: false)
+        liveMeetingTurnStartMilliseconds = nil
+        liveMeetingSpeechMilliseconds = 0
+        liveMeetingSilenceMilliseconds = 0
+        liveMeetingASRTask = nil
+        liveMeetingDiarizationTask = nil
+        liveMeetingStopCancellationRequested = false
+        liveMeetingStopWatchdogTask?.cancel()
+        liveMeetingStopWatchdogTask = nil
+        liveMeetingStopTask = nil
+        let automaticStopReason = liveMeetingAutomaticStopReason
+        liveMeetingAutomaticStopReason = nil
+        if let automaticStopReason {
+            liveMeetingStatusMessage = "会议已自动停止：\(automaticStopReason) 可继续最终整理、生成纪要或导出。"
+        } else {
+            liveMeetingStatusMessage = cancelled
+                ? "会议已停止，已保留当前转写；未完成的收尾处理已跳过。"
+                : "会议已停止。可选择最终整理、生成纪要或导出。"
+        }
+        if cleanupLiveMeetingTemporaryAudioIfNeeded() {
+            deleteLiveMeetingRecoveryDraft()
+            updateLiveMeetingDiagnostics(recoveryState: "deleted")
+        } else {
+            liveMeetingStatusMessage = "会议已停止，但临时音频清理失败；下次启动会自动重试。"
+            updateLiveMeetingDiagnostics(recoveryState: "saved", errorCode: "temporary_audio_cleanup_failed")
+        }
+    }
+
+    func processLiveMeetingFile(_ url: URL) {
+        guard !liveMeetingIsRunning else { return }
+        guard !liveMeetingHasUnresolvedRecoveryDraft else {
+            liveMeetingStatusMessage = "请先恢复或删除上次异常结束的会议草稿，再处理本地文件。"
+            return
+        }
+        guard let model = selectedLiveMeetingFileASRModel else {
+            liveMeetingStatusMessage = "请先在设置 > 会议中选择已就绪的本地文件 ASR 模型。"
+            return
+        }
+        guard let descriptor = try? MediaIntakeService.descriptor(for: url) else {
+            liveMeetingStatusMessage = "请选择本地音频或视频文件。"
+            return
+        }
+        let sessionID = UUID()
+        liveMeetingSession = LiveMeetingSession(
+            id: sessionID,
+            source: .localFile,
+            sourceFileName: url.lastPathComponent,
+            sourceMediaKind: descriptor.mediaKind == "video" ? .video : .audio,
+            asrModelID: model.id,
+            asrModelName: model.name,
+            notesModelID: selectedLiveMeetingNotesModel?.id,
+            notesModelName: selectedLiveMeetingNotesModel?.name,
+            state: .running,
+            speakerCountHint: liveMeetingSpeakerCountHint
+        )
+        liveMeetingSegments = []
+        liveMeetingSpeakers = []
+        liveMeetingNotes = nil
+        liveMeetingDiagnostics = nil
+        liveMeetingStatusMessage = "正在离线处理本地文件..."
+        saveLiveMeetingRecoveryDraft()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.engine.transcribeMeetingFile(
+                    at: url,
+                    modelID: model.id,
+                    sourceLanguageHint: self.preferences.liveMeeting.sourceLanguageHint,
+                    expectedSpeakerCount: self.liveMeetingSession?.speakerCountHint.expectedSpeakerCount
+                )
+                guard self.liveMeetingSession?.id == sessionID else { return }
+                self.liveMeetingSegments = result.segments
+                self.seedLiveMeetingSpeakersFromSegments()
+                self.liveMeetingSegments = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+                    self.liveMeetingSegments,
+                    speakers: self.liveMeetingSpeakers
+                )
+                self.saveLiveMeetingRecoveryDraft()
+                if var current = self.liveMeetingSession, current.id == sessionID {
+                    current.state = .stopped
+                    current.stoppedAt = .now
+                    current.transcriptLagMilliseconds = 0
+                    current.recognitionStrategy = result.recognitionStrategy
+                    current.diarizationRuntimeID = result.diarizationModelID
+                    self.liveMeetingSession = current
+                }
+                switch result.recognitionStrategy {
+                case .nativeSpeakerASR:
+                    self.liveMeetingDiarizationMessage = "本地文件由 \(model.name) 原生联合输出转写与 speaker。"
+                case .delayedSpeakerLabels:
+                    self.liveMeetingDiarizationMessage = "本地文件转写已完成，speaker 已延迟回填。"
+                case .diarizationFirst:
+                    self.liveMeetingDiarizationMessage = "本地文件已先按 speaker turn 切分，再逐段转写。"
+                case .transcriptOnly:
+                    self.liveMeetingDiarizationMessage = "说话人能力不可用；本地文件已以仅转写模式完成。"
+                }
+                self.liveMeetingStatusMessage = "本地文件已完成。可选择最终整理、生成纪要或导出。"
+                self.deleteLiveMeetingRecoveryDraft()
+                self.updateLiveMeetingDiagnostics(recoveryState: "deleted")
+            } catch is CancellationError {
+                self.liveMeetingStatusMessage = "本地文件处理已取消。"
+            } catch {
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                current.state = .failed
+                self.liveMeetingSession = current
+                self.liveMeetingStatusMessage = error.localizedDescription
+                self.saveLiveMeetingRecoveryDraft()
+                self.updateLiveMeetingDiagnostics(recoveryState: "saved", errorCode: "file_asr_failed")
+            }
+        }
+    }
+
+    func updateLiveMeetingSpeakerCountHint(_ hint: LiveMeetingSpeakerCountHint) {
+        liveMeetingSpeakerCountHint = hint
+        if var session = liveMeetingSession {
+            session.speakerCountHint = hint
+            liveMeetingSession = session
+        }
+        markLiveMeetingNotesStale(reason: "讲话人数提示已更改")
+        saveLiveMeetingRecoveryDraft()
+    }
+
+    func editLiveMeetingSegmentText(id: UUID, text: String) {
+        guard LiveMeetingTranscriptReducer.editText(id: id, text: text, segments: &liveMeetingSegments) else { return }
+        markLiveMeetingNotesStale(reason: "转写文本已编辑")
+        saveLiveMeetingRecoveryDraft()
+    }
+
+    func renameLiveMeetingSpeaker(id: String, name: String) {
+        guard LiveMeetingTranscriptReducer.renameSpeaker(id: id, name: name, speakers: &liveMeetingSpeakers) else { return }
+        refreshLiveMeetingSpeakerLabels()
+        markLiveMeetingNotesStale(reason: "讲话人名称已修改")
+        saveLiveMeetingRecoveryDraft()
+    }
+
+    func mergeLiveMeetingSpeaker(sourceID: String, into targetID: String) {
+        guard LiveMeetingTranscriptReducer.mergeSpeaker(
+            sourceID: sourceID,
+            into: targetID,
+            speakers: &liveMeetingSpeakers,
+            segments: &liveMeetingSegments
+        ) else { return }
+        markLiveMeetingNotesStale(reason: "讲话人已合并")
+        saveLiveMeetingRecoveryDraft()
+    }
+
+    func finalizeLiveMeeting() {
+        guard var session = liveMeetingSession, session.state == .stopped || session.state == .restored,
+              !liveMeetingFinalizeTaskIsRunning else { return }
+        liveMeetingFinalizeTask?.cancel()
+        session.finalizationState = .running
+        liveMeetingSession = session
+        liveMeetingFinalizeTaskIsRunning = true
+        liveMeetingStatusMessage = "正在最终整理 speaker 与转写段落..."
+        let segments = liveMeetingSegments
+        let speakers = liveMeetingSpeakers
+        let sessionID = session.id
+        liveMeetingFinalizeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(20))
+                try Task.checkCancellation()
+                let finalized = LiveMeetingTranscriptReducer.finalize(segments, speakers: speakers)
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                self.liveMeetingSegments = finalized
+                current.finalizationState = .completed
+                self.liveMeetingSession = current
+                self.liveMeetingFinalizeTaskIsRunning = false
+                self.markLiveMeetingNotesStale(reason: "最终整理已完成")
+                if self.cleanupLiveMeetingTemporaryAudioIfNeeded() {
+                    self.deleteLiveMeetingRecoveryDraft()
+                    self.liveMeetingStatusMessage = "最终整理完成。"
+                    self.updateLiveMeetingDiagnostics(recoveryState: "deleted")
+                } else {
+                    self.liveMeetingStatusMessage = "最终整理完成，但临时音频清理失败；下次启动会自动重试。"
+                    self.updateLiveMeetingDiagnostics(
+                        recoveryState: "saved",
+                        errorCode: "temporary_audio_cleanup_failed"
+                    )
+                }
+            } catch is CancellationError {
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                current.finalizationState = .cancelled
+                self.liveMeetingSession = current
+                self.liveMeetingFinalizeTaskIsRunning = false
+                self.liveMeetingStatusMessage = "最终整理已取消，现有转写未变化。"
+            } catch {
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                current.finalizationState = .failed
+                self.liveMeetingSession = current
+                self.liveMeetingFinalizeTaskIsRunning = false
+                self.liveMeetingStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelLiveMeetingFinalization() {
+        liveMeetingFinalizeTask?.cancel()
+    }
+
+    func generateLiveMeetingNotes() {
+        guard var session = liveMeetingSession, session.state == .stopped || session.state == .restored,
+              !liveMeetingNotesTaskIsRunning else { return }
+        guard let model = selectedLiveMeetingNotesModel else {
+            liveMeetingStatusMessage = liveMeetingNotesDisabledMessage
+            return
+        }
+        liveMeetingNotesTask?.cancel()
+        session.noteGenerationState = .running
+        session.notesModelID = model.id
+        session.notesModelName = model.name
+        liveMeetingSession = session
+        liveMeetingNotesTaskIsRunning = true
+        liveMeetingStatusMessage = "正在用本地模型分块生成中文会议纪要..."
+        let segments = liveMeetingSegments
+        let speakers = liveMeetingSpeakers
+        let sessionID = session.id
+        liveMeetingNotesTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let notes = try await self.engine.generateLocalMeetingNotes(
+                    segments: segments,
+                    speakers: speakers,
+                    modelID: model.id
+                )
+                try Task.checkCancellation()
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                self.liveMeetingNotes = notes
+                current.noteGenerationState = .completed
+                self.liveMeetingSession = current
+                self.liveMeetingNotesTaskIsRunning = false
+                self.liveMeetingStatusMessage = "本地中文会议纪要已生成。"
+                self.updateLiveMeetingDiagnostics(recoveryState: "deleted")
+            } catch is CancellationError {
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                current.noteGenerationState = .cancelled
+                self.liveMeetingSession = current
+                self.liveMeetingNotesTaskIsRunning = false
+                self.liveMeetingStatusMessage = "会议纪要生成已取消，已有纪要未删除。"
+            } catch {
+                guard var current = self.liveMeetingSession, current.id == sessionID else { return }
+                current.noteGenerationState = .failed
+                self.liveMeetingSession = current
+                self.liveMeetingNotesTaskIsRunning = false
+                self.liveMeetingStatusMessage = error.localizedDescription
+            }
+        }
+    }
+
+    func cancelLiveMeetingNotes() {
+        liveMeetingNotesTask?.cancel()
+    }
+
+    func exportLiveMeeting(to directory: URL, format: String = "markdown") throws -> URL {
+        guard let session = liveMeetingSession else { throw LiveMeetingError.sessionNotStopped }
+        guard !liveMeetingIsRunning else { throw LiveMeetingError.sessionIsRunning }
+        guard FileManager.default.fileExists(atPath: directory.path) else { throw LiveMeetingError.invalidExportDirectory }
+        let baseName = LiveMeetingMarkdownExporter.baseFileName(session: session)
+        let url: URL
+        switch format {
+        case "txt":
+            url = directory.appendingPathComponent(baseName).appendingPathExtension("txt")
+            try LiveMeetingMarkdownExporter.plainText(
+                session: session, segments: liveMeetingSegments, speakers: liveMeetingSpeakers, notes: liveMeetingNotes
+            ).write(to: url, atomically: true, encoding: .utf8)
+        case "json":
+            url = directory.appendingPathComponent(baseName).appendingPathExtension("json")
+            try LiveMeetingMarkdownExporter.json(
+                session: session, segments: liveMeetingSegments, speakers: liveMeetingSpeakers, notes: liveMeetingNotes
+            ).write(to: url, options: .atomic)
+        default:
+            url = directory.appendingPathComponent(baseName).appendingPathExtension("md")
+            try LiveMeetingMarkdownExporter.markdown(
+                session: session, segments: liveMeetingSegments, speakers: liveMeetingSpeakers, notes: liveMeetingNotes
+            ).write(to: url, atomically: true, encoding: .utf8)
+        }
+        liveMeetingStatusMessage = "会议纪要已导出：\(url.lastPathComponent)"
+        updateLiveMeetingDiagnostics(recoveryState: liveMeetingRecoveryDraft == nil ? "deleted" : "saved")
+        return url
+    }
+
+    func exportLiveMeetingToDownloads(format: String = "markdown") {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        do {
+            let url = try exportLiveMeeting(to: downloads, format: format)
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            liveMeetingStatusMessage = error.localizedDescription
+        }
+    }
+
+    func restoreLiveMeetingRecoveryDraft() {
+        guard var draft = liveMeetingRecoveryDraft else { return }
+        draft.session.state = .restored
+        draft.session.stoppedAt = draft.session.stoppedAt ?? .now
+        draft.session.temporaryAudioDirectory = nil
+        liveMeetingSession = draft.session
+        liveMeetingSpeakerCountHint = draft.session.speakerCountHint
+        liveMeetingSegments = draft.segments
+        liveMeetingSpeakers = draft.speakers
+        liveMeetingNotes = draft.notes
+        liveMeetingStatusMessage = "已恢复本地会议草稿。临时音频未保留。"
+        updateLiveMeetingDiagnostics(recoveryState: "restored")
+    }
+
+    func deleteLiveMeetingRecoveryDraft() {
+        if liveMeetingSession?.temporaryAudioDirectory != nil {
+            _ = cleanupLiveMeetingTemporaryAudioIfNeeded()
+        }
+        try? liveMeetingRecoveryStore.delete()
+        liveMeetingRecoveryDraft = nil
+        if liveMeetingSession?.state == .restored {
+            liveMeetingStatusMessage = "恢复草稿已删除。"
+        }
+    }
+
+    func prepareLiveMeetingForAbnormalTermination() {
+        guard liveMeetingIsRunning else { return }
+        let sessionID = liveMeetingSession?.id
+        saveLiveMeetingRecoveryDraft()
+        liveMeetingCaptureService?.stopImmediately()
+        liveMeetingCaptureService = nil
+        liveMeetingStopTask?.cancel()
+        liveMeetingStopWatchdogTask?.cancel()
+        liveMeetingASRTask?.cancel()
+        liveMeetingDiarizationTask?.cancel()
+        liveMeetingFinalizeTask?.cancel()
+        liveMeetingNotesTask?.cancel()
+        if let sessionID {
+            try? LiveMeetingAudioStorage.deleteTemporaryDirectory(sessionID: sessionID)
+        }
+    }
+
+    private func handleLiveMeetingCaptureChunk(_ data: Data) async {
+        guard var session = liveMeetingSession, session.state == .running, session.source.isLiveCapture else { return }
+        let stats = pcm16Stats(data)
+        let milliseconds = Int((Double(data.count / 2) / 16_000) * 1_000)
+        let speechDetected = stats.rms > 180 || stats.peak > 1_400
+        let chunkStartMilliseconds = liveMeetingAudioCapturedMilliseconds
+        let strategy = session.recognitionStrategy ?? .transcriptOnly
+        liveMeetingAudioLevel = min(1, stats.rms / 2_000)
+        if strategy.requiresFullSessionAudioBuffer {
+            liveMeetingAllAudioBuffer.append(data)
+        }
+        liveMeetingAudioCapturedMilliseconds += milliseconds
+
+        switch strategy {
+        case .nativeSpeakerASR:
+            if speechDetected || !liveMeetingAudioBuffer.isEmpty {
+                if liveMeetingAudioBuffer.isEmpty {
+                    liveMeetingTurnStartMilliseconds = chunkStartMilliseconds
+                }
+                liveMeetingAudioBuffer.append(data)
+                if speechDetected {
+                    liveMeetingSpeechMilliseconds += milliseconds
+                    liveMeetingSilenceMilliseconds = 0
+                } else {
+                    liveMeetingSilenceMilliseconds += milliseconds
+                }
+            }
+        case .delayedSpeakerLabels, .diarizationFirst, .transcriptOnly:
+            if speechDetected {
+                if liveMeetingAudioBuffer.isEmpty {
+                    liveMeetingTurnStartMilliseconds = chunkStartMilliseconds
+                }
+                liveMeetingAudioBuffer.append(data)
+                liveMeetingSpeechMilliseconds += milliseconds
+                liveMeetingSilenceMilliseconds = 0
+            } else if !liveMeetingAudioBuffer.isEmpty {
+                // A short trailing pause improves utterance-final decoding.
+                liveMeetingAudioBuffer.append(data)
+                liveMeetingSilenceMilliseconds += milliseconds
+            }
+        }
+        switch strategy {
+        case .delayedSpeakerLabels, .diarizationFirst:
+            session.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
+            session.speakerLagMilliseconds = max(
+                0,
+                liveMeetingAudioCapturedMilliseconds - liveMeetingSpeakerProcessedMilliseconds
+            )
+        case .nativeSpeakerASR, .transcriptOnly:
+            session.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
+        }
+        if session.longSessionReminderShownAt == nil,
+           Date().timeIntervalSince(session.startedAt) >= 60 * 60 {
+            session.longSessionReminderShownAt = .now
+            liveMeetingStatusMessage = "会议已运行 60 分钟。建议停止后最终整理并导出；会议不会自动停止。"
+        }
+        liveMeetingSession = session
+        saveLiveMeetingRecoveryDraft()
+        switch strategy {
+        case .nativeSpeakerASR:
+            let batchDurationMilliseconds = liveMeetingPCM16DurationMilliseconds(liveMeetingAudioBuffer)
+            let reachedNaturalBoundary = LiveMeetingNativeBatchPolicy.shouldFlush(
+                speechMilliseconds: liveMeetingSpeechMilliseconds,
+                trailingSilenceMilliseconds: liveMeetingSilenceMilliseconds,
+                batchDurationMilliseconds: batchDurationMilliseconds
+            )
+            let reachedTechnicalBoundary = LiveMeetingNativeTechnicalWindowPolicy.shouldSeal(
+                sourceDurationMilliseconds: batchDurationMilliseconds
+            )
+            if reachedNaturalBoundary || reachedTechnicalBoundary {
+                await flushLiveMeetingASR(final: false)
+                if stopLiveMeetingIfASRBackpressured() { return }
+            } else if LiveMeetingNativeBatchPolicy.shouldDiscardNoise(
+                speechMilliseconds: liveMeetingSpeechMilliseconds,
+                trailingSilenceMilliseconds: liveMeetingSilenceMilliseconds
+            ) {
+                discardPendingLiveMeetingASRBuffer()
+            }
+        case .delayedSpeakerLabels, .diarizationFirst:
+            if LiveMeetingDelayedSpeakerPolicy.shouldFlushTranscript(
+                speechMilliseconds: liveMeetingSpeechMilliseconds,
+                trailingSilenceMilliseconds: liveMeetingSilenceMilliseconds
+            ) {
+                await flushLiveMeetingASR(final: false)
+                if stopLiveMeetingIfASRBackpressured() { return }
+            }
+            if LiveMeetingDelayedSpeakerPolicy.shouldRefreshSpeakerLabels(
+                capturedMilliseconds: liveMeetingAudioCapturedMilliseconds,
+                lastAttemptMilliseconds: liveMeetingLastDiarizationMilliseconds,
+                labeledThroughMilliseconds: liveMeetingSpeakerProcessedMilliseconds
+            ) {
+                await flushLiveMeetingDiarization(final: false)
+            }
+        case .transcriptOnly:
+            if LiveMeetingTurnSegmentationPolicy.shouldFlush(
+                speechMilliseconds: liveMeetingSpeechMilliseconds,
+                trailingSilenceMilliseconds: liveMeetingSilenceMilliseconds
+            ) {
+                await flushLiveMeetingASR(final: false)
+                if stopLiveMeetingIfASRBackpressured() { return }
+            }
+        }
+    }
+
+    @discardableResult
+    private func stopLiveMeetingIfASRBackpressured() -> Bool {
+        guard LiveMeetingASRBackpressurePolicy.shouldStopCapture(
+            pendingBatchCount: liveMeetingPendingASRBatches.count
+        ) else {
+            return false
+        }
+        stopLiveMeeting(
+            reason: "本地 ASR 处理速度低于采集速度，待处理音频已达到安全上限；为保护内存，已自动停止采集。"
+        )
+        return true
+    }
+
+    private func discardPendingLiveMeetingASRBuffer() {
+        liveMeetingAudioBuffer.removeAll(keepingCapacity: false)
+        liveMeetingTurnStartMilliseconds = nil
+        liveMeetingSpeechMilliseconds = 0
+        liveMeetingSilenceMilliseconds = 0
+        if var session = liveMeetingSession {
+            session.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
+            liveMeetingSession = session
+        }
+    }
+
+    private func liveMeetingTranscriptBacklogMilliseconds() -> Int {
+        let inFlight = liveMeetingASRInFlight
+            ? max(0, liveMeetingLastASRMilliseconds - liveMeetingProcessedAudioMilliseconds)
+            : 0
+        let queued = liveMeetingPendingASRBatches.reduce(0) { $0 + $1.durationMilliseconds }
+        return inFlight + queued + liveMeetingPCM16DurationMilliseconds(liveMeetingAudioBuffer)
+    }
+
+    private func formattedLiveMeetingTimestamp(_ seconds: TimeInterval) -> String {
+        let total = max(0, Int(seconds.rounded(.down)))
+        return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
+    private func flushLiveMeetingASR(final: Bool) async {
+        guard let session = liveMeetingSession, session.source.isLiveCapture else { return }
+        let strategy = session.recognitionStrategy ?? .transcriptOnly
+        if !liveMeetingAudioBuffer.isEmpty {
+            if strategy == .nativeSpeakerASR,
+               liveMeetingSpeechMilliseconds < LiveMeetingNativeBatchPolicy.minimumSpeechMilliseconds {
+                discardPendingLiveMeetingASRBuffer()
+            } else {
+                freezePendingLiveMeetingASRBuffer(recognitionStrategy: strategy)
+            }
+        }
+        // Freeze happens before this drain. If another batch is in flight, the
+        // natural boundary remains queued even when capture immediately resumes.
+        await drainPendingLiveMeetingASRBatches()
+        if final {
+            await waitForLiveMeetingASRToFinish()
+        }
+    }
+
+    private func freezePendingLiveMeetingASRBuffer(
+        recognitionStrategy: LiveMeetingRecognitionStrategy
+    ) {
+        guard !liveMeetingAudioBuffer.isEmpty else { return }
+        let audio = liveMeetingAudioBuffer
+        let totalDurationMilliseconds = liveMeetingPCM16DurationMilliseconds(audio)
+        let initialStart = liveMeetingTurnStartMilliseconds
+            ?? max(0, liveMeetingAudioCapturedMilliseconds - totalDurationMilliseconds)
+        let maximumWindowMilliseconds = recognitionStrategy == .nativeSpeakerASR
+            ? LiveMeetingNativeTechnicalWindowPolicy.maximumInferenceWindowMilliseconds
+            : LiveMeetingTurnSegmentationPolicy.maximumContinuousSpeechMilliseconds
+        let maximumWindowBytes = maximumWindowMilliseconds * 16_000 * 2 / 1_000
+        var offset = 0
+        var start = initialStart
+        while offset < audio.count {
+            let end = min(audio.count, offset + maximumWindowBytes)
+            let batchAudio = Data(audio[offset..<end])
+            let durationMilliseconds = liveMeetingPCM16DurationMilliseconds(batchAudio)
+            liveMeetingPendingASRBatches.append(PendingLiveMeetingASRBatch(
+                audio: batchAudio,
+                startMilliseconds: start,
+                durationMilliseconds: durationMilliseconds,
+                recognitionStrategy: recognitionStrategy
+            ))
+            start += durationMilliseconds
+            offset = end
+        }
+        liveMeetingAudioBuffer.removeAll(keepingCapacity: false)
+        liveMeetingTurnStartMilliseconds = nil
+        liveMeetingSpeechMilliseconds = 0
+        liveMeetingSilenceMilliseconds = 0
+    }
+
+    private func drainPendingLiveMeetingASRBatches() async {
+        guard !liveMeetingASRInFlight else { return }
+        while !liveMeetingPendingASRBatches.isEmpty {
+            guard !Task.isCancelled, !liveMeetingStopCancellationRequested else { return }
+            let batch = liveMeetingPendingASRBatches.removeFirst()
+            guard let session = liveMeetingSession, session.source.isLiveCapture else {
+                liveMeetingPendingASRBatches.removeAll(keepingCapacity: false)
+                return
+            }
+            liveMeetingASRInFlight = true
+            let task = Task { @MainActor [weak self] in
+                guard let self else { return false }
+                return await self.processLiveMeetingASRBatch(batch, session: session)
+            }
+            liveMeetingASRTask = task
+            let completedSuccessfully = await task.value
+            liveMeetingASRTask = nil
+            liveMeetingASRInFlight = false
+            guard completedSuccessfully else {
+                if liveMeetingSession?.id != session.id {
+                    liveMeetingPendingASRBatches.removeAll(keepingCapacity: false)
+                }
+                return
+            }
+        }
+    }
+
+    private func processLiveMeetingASRBatch(
+        _ batch: PendingLiveMeetingASRBatch,
+        session: LiveMeetingSession
+    ) async -> Bool {
+        let audio = batch.audio
+        let durationMilliseconds = batch.durationMilliseconds
+        let start = batch.startMilliseconds
+        let strategy = batch.recognitionStrategy
+        liveMeetingLastASRMilliseconds = max(
+            liveMeetingLastASRMilliseconds,
+            start + durationMilliseconds
+        )
+        let modelID = session.asrModelID
+        let sessionID = session.id
+        let temporaryDirectory = session.temporaryAudioDirectory
+        do {
+            guard let temporaryDirectory else { throw MediaSubtitleError.extractionFailed("Meeting temporary storage is unavailable.") }
+            let audioURL = URL(fileURLWithPath: temporaryDirectory, isDirectory: true)
+                .appendingPathComponent("asr-\(liveMeetingLastASRMilliseconds).wav")
+            try LiveMeetingAudioStorage.writePCM16WAV(data: audio, to: audioURL)
+            defer { try? FileManager.default.removeItem(at: audioURL) }
+            let transcript = try await self.transcribeLiveMeetingPCM(
+                audioURL: audioURL,
+                modelID: modelID,
+                startMilliseconds: start,
+                durationMilliseconds: durationMilliseconds,
+                isFinal: true
+            )
+            guard liveMeetingSession?.id == sessionID else { return false }
+            liveMeetingSegments = LiveMeetingTranscriptReducer.append(transcript, to: liveMeetingSegments)
+            liveMeetingProcessedAudioMilliseconds = max(
+                liveMeetingProcessedAudioMilliseconds,
+                start + durationMilliseconds
+            )
+            if strategy == .nativeSpeakerASR {
+                if transcript.contains(where: { $0.speakerID != nil }) {
+                    seedLiveMeetingSpeakersFromSegments()
+                    liveMeetingSegments = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+                        liveMeetingSegments,
+                        speakers: liveMeetingSpeakers
+                    )
+                    if var current = liveMeetingSession {
+                        let family = models.first(where: { $0.id == modelID })?.capabilities.speech?.family.rawValue ?? "asr"
+                        current.diarizationRuntimeID = "\(family)-native"
+                        liveMeetingSession = current
+                    }
+                    liveMeetingDiarizationMessage = "原生 speaker 模型已联合输出转写、时间戳和说话人。"
+                } else if var current = liveMeetingSession {
+                    current.recognitionStrategy = .transcriptOnly
+                    liveMeetingSession = current
+                    liveMeetingDiarizationMessage = "模型本批次未返回 speaker 字段；已保留转写并切换为仅转写模式。"
+                }
+            }
+            if var current = liveMeetingSession {
+                current.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
+                liveMeetingSession = current
+            }
+            markLiveMeetingNotesStale(reason: "新增转写内容")
+            saveLiveMeetingRecoveryDraft()
+            return true
+        } catch is CancellationError {
+            restorePendingLiveMeetingASRAudio(after: batch)
+            return false
+        } catch {
+            restorePendingLiveMeetingASRAudio(after: batch)
+            liveMeetingStatusMessage = "会议转写暂时失败：\(error.localizedDescription)"
+            saveLiveMeetingRecoveryDraft()
+            return false
+        }
+    }
+
+    private func restorePendingLiveMeetingASRAudio(
+        after failedBatch: PendingLiveMeetingASRBatch
+    ) {
+        var restored = failedBatch.audio
+        for queued in liveMeetingPendingASRBatches {
+            restored.append(queued.audio)
+        }
+        restored.append(liveMeetingAudioBuffer)
+        liveMeetingAudioBuffer = restored
+        liveMeetingPendingASRBatches.removeAll(keepingCapacity: false)
+        liveMeetingTurnStartMilliseconds = failedBatch.startMilliseconds
+        liveMeetingSpeechMilliseconds = liveMeetingPCM16DurationMilliseconds(restored)
+        liveMeetingSilenceMilliseconds = 0
+    }
+
+    private func waitForLiveMeetingASRToFinish() async {
+        while liveMeetingASRInFlight || !liveMeetingPendingASRBatches.isEmpty {
+            guard !Task.isCancelled, !liveMeetingStopCancellationRequested else { return }
+            liveMeetingStatusMessage = "正在完成已排队的本地转写，请稍候。"
+            if !liveMeetingASRInFlight, !liveMeetingPendingASRBatches.isEmpty {
+                await drainPendingLiveMeetingASRBatches()
+                continue
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func waitForLiveMeetingDiarizationToFinish() async {
+        var attempts = 0
+        while liveMeetingDiarizationInFlight && attempts < 1_200 {
+            guard !Task.isCancelled, !liveMeetingStopCancellationRequested else { return }
+            do {
+                try await Task.sleep(for: .milliseconds(50))
+            } catch {
+                return
+            }
+            attempts += 1
+        }
+    }
+
+    private func transcribeLiveMeetingPCM(
+        audioURL: URL,
+        modelID: UUID,
+        startMilliseconds: Int,
+        durationMilliseconds: Int,
+        isFinal: Bool
+    ) async throws -> [LiveMeetingSegment] {
+        guard let model = models.first(where: { $0.id == modelID }) else { throw MediaSubtitleError.missingASRModel }
+        let duration = Double(max(0, durationMilliseconds)) / 1_000
+        let nativeSpeakerASR = model.capabilities.speech?.canEmitSpeakerLabels == true
+        let maximumTokens = nativeSpeakerASR
+            ? min(32_768, max(8_192, Int(duration * 10)))
+            : Self.liveMeetingASRMaximumTokens
+        let runtimeMode = model.capabilities.meetingCaptureRuntimeMode ?? .realtime
+        let subtitles = try await LocalASRProcessRunner().transcribe(
+            audioURL: audioURL,
+            model: model,
+            sessionID: UUID(),
+            duration: duration,
+            preferences: liveMeetingASRPreferences,
+            context: ASRTranscriptionContext(
+                mode: runtimeMode,
+                sourceLanguageHint: preferences.liveMeeting.sourceLanguageHint,
+                isFinal: isFinal,
+                maximumTokens: maximumTokens,
+                chunkDurationSeconds: nativeSpeakerASR ? nil : Self.liveMeetingASRChunkDurationSeconds
+            )
+        )
+        return subtitles.enumerated().map { offset, segment in
+            LiveMeetingSegment(
+                id: segment.id,
+                index: liveMeetingSegments.count + offset,
+                startTime: Double(startMilliseconds) / 1_000 + segment.startTime,
+                endTime: segment.endTime.map { Double(startMilliseconds) / 1_000 + $0 },
+                text: segment.originalText,
+                originalText: segment.originalText,
+                speakerID: segment.speakerID,
+                speakerLabel: segment.speakerLabel,
+                confidence: segment.speakerConfidence,
+                state: segment.speakerConfidence.map { $0 < 0.55 } == true ? .lowConfidence : .final
+            )
+        }
+    }
+
+    private func flushLiveMeetingDiarization(final: Bool) async {
+        guard !liveMeetingDiarizationInFlight,
+              let session = liveMeetingSession,
+              session.source.isLiveCapture,
+              (session.recognitionStrategy == .delayedSpeakerLabels
+                || session.recognitionStrategy == .diarizationFirst),
+              !liveMeetingAllAudioBuffer.isEmpty,
+              let temporaryDirectory = session.temporaryAudioDirectory else { return }
+        let stableThroughMilliseconds = LiveMeetingDelayedSpeakerPolicy.stableThroughMilliseconds(
+            capturedMilliseconds: liveMeetingAudioCapturedMilliseconds,
+            final: final
+        )
+        guard LiveMeetingDelayedSpeakerPolicy.shouldRefreshSpeakerLabels(
+            capturedMilliseconds: liveMeetingAudioCapturedMilliseconds,
+            lastAttemptMilliseconds: liveMeetingLastDiarizationMilliseconds,
+            labeledThroughMilliseconds: liveMeetingSpeakerProcessedMilliseconds,
+            final: final
+        ) else { return }
+        liveMeetingDiarizationInFlight = true
+        liveMeetingLastDiarizationMilliseconds = liveMeetingAudioCapturedMilliseconds
+        defer {
+            liveMeetingDiarizationInFlight = false
+            liveMeetingLastDiarizationMilliseconds = liveMeetingAudioCapturedMilliseconds
+        }
+        let stableAudio = LiveMeetingAudioStorage.slicePCM16(
+            liveMeetingAllAudioBuffer,
+            sampleRate: 16_000,
+            startTime: 0,
+            endTime: Double(stableThroughMilliseconds) / 1_000
+        )
+        guard !stableAudio.isEmpty else { return }
+        let url = URL(fileURLWithPath: temporaryDirectory, isDirectory: true)
+            .appendingPathComponent(final ? "meeting-final.wav" : "meeting-live.wav")
+        do {
+            try LiveMeetingAudioStorage.writePCM16WAV(data: stableAudio, to: url)
+            defer { try? FileManager.default.removeItem(at: url) }
+            let task = Task { [liveMeetingDiarizationService, preferences] in
+                try await liveMeetingDiarizationService.diarize(
+                    audioURL: url,
+                    speakerCountHint: session.speakerCountHint,
+                    preferences: preferences.speakerDiarization
+                )
+            }
+            liveMeetingDiarizationTask = task
+            let result = try await task.value
+            liveMeetingDiarizationTask = nil
+            guard liveMeetingSession?.id == session.id else { return }
+            let stableThrough = Double(stableThroughMilliseconds) / 1_000
+            let stableTurns = result.turns.compactMap { turn -> SpeakerTurn? in
+                guard turn.startTime < stableThrough else { return nil }
+                var stableTurn = turn
+                stableTurn.endTime = min(turn.endTime, stableThrough)
+                return stableTurn.endTime - stableTurn.startTime >= 0.01 ? stableTurn : nil
+            }
+            let previousSegments = liveMeetingSegments
+            LiveMeetingTranscriptReducer.applySpeakerTurns(
+                stableTurns,
+                to: &liveMeetingSegments,
+                speakers: &liveMeetingSpeakers,
+                through: stableThrough
+            )
+            liveMeetingSpeakerProcessedMilliseconds = max(
+                liveMeetingSpeakerProcessedMilliseconds,
+                stableThroughMilliseconds
+            )
+            guard var current = liveMeetingSession, current.id == session.id else { return }
+            current.diarizationRuntimeID = result.modelID ?? "pyannote-local"
+            current.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
+            current.speakerLagMilliseconds = final ? 0 : max(
+                0,
+                liveMeetingAudioCapturedMilliseconds - liveMeetingSpeakerProcessedMilliseconds
+            )
+            liveMeetingSession = current
+            if stableTurns.isEmpty {
+                liveMeetingDiarizationMessage = "转写已先输出；本轮稳定音频未识别出可回填的 speaker。"
+            } else {
+                liveMeetingDiarizationMessage = "转写已先输出；本地 speaker 已延迟回填到 \(formattedLiveMeetingTimestamp(stableThrough))。"
+            }
+            if liveMeetingSegments != previousSegments {
+                markLiveMeetingNotesStale(reason: "speaker 标签已回填")
+            }
+            saveLiveMeetingRecoveryDraft()
+        } catch is CancellationError {
+            liveMeetingDiarizationTask = nil
+            return
+        } catch {
+            liveMeetingDiarizationTask = nil
+            guard var current = liveMeetingSession, current.id == session.id else { return }
+            current.recognitionStrategy = .transcriptOnly
+            current.speakerLagMilliseconds = 0
+            liveMeetingSession = current
+            liveMeetingDiarizationMessage = "speaker 回填不可用；转写不受影响，已继续仅转写：\(error.localizedDescription)"
+            saveLiveMeetingRecoveryDraft()
+        }
+    }
+
+    private func seedLiveMeetingSpeakersFromSegments() {
+        for segment in liveMeetingSegments {
+            guard let id = segment.speakerID,
+                  !liveMeetingSpeakers.contains(where: { $0.id == id }) else { continue }
+            liveMeetingSpeakers.append(LiveMeetingSpeaker(
+                id: id,
+                label: segment.speakerLabel ?? "Speaker \(liveMeetingSpeakers.count + 1)"
+            ))
+        }
+    }
+
+    private func refreshLiveMeetingSpeakerLabels() {
+        for index in liveMeetingSegments.indices {
+            guard let speakerID = liveMeetingSegments[index].speakerID,
+                  let speaker = liveMeetingSpeakers.first(where: { $0.id == speakerID }) else { continue }
+            liveMeetingSegments[index].speakerLabel = speaker.renderedName
+        }
+    }
+
+    private func markLiveMeetingNotesStale(reason: String) {
+        LiveMeetingTranscriptReducer.markNotesStale(&liveMeetingNotes, reason: reason)
+    }
+
+    private func saveLiveMeetingRecoveryDraft() {
+        guard let session = liveMeetingSession,
+              session.state == .starting || session.state == .running || session.state == .stopping || session.state == .failed else {
+            return
+        }
+        var draftSession = session
+        draftSession.temporaryAudioDirectory = nil
+        let draft = LiveMeetingRecoveryDraft(
+            session: draftSession,
+            segments: liveMeetingSegments,
+            speakers: liveMeetingSpeakers,
+            notes: liveMeetingNotes
+        )
+        do {
+            try liveMeetingRecoveryStore.save(draft)
+            liveMeetingRecoveryDraft = draft
+        } catch {
+            liveMeetingStatusMessage = "无法保存本地恢复草稿：\(error.localizedDescription)"
+        }
+    }
+
+    @discardableResult
+    private func cleanupLiveMeetingTemporaryAudioIfNeeded() -> Bool {
+        guard let session = liveMeetingSession, session.shouldDeleteTemporaryAudio else { return true }
+        do {
+            try LiveMeetingAudioStorage.deleteTemporaryDirectory(sessionID: session.id)
+            var updated = session
+            updated.temporaryAudioDirectory = nil
+            liveMeetingSession = updated
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func updateLiveMeetingDiagnostics(recoveryState: String, errorCode: String? = nil) {
+        guard let session = liveMeetingSession else { return }
+        liveMeetingDiagnostics = LiveMeetingDiagnostics(
+            session: session,
+            transcriptSegmentCount: liveMeetingSegments.count,
+            speakerCount: liveMeetingSpeakers.filter { $0.mergedIntoSpeakerID == nil }.count,
+            recoveryDraftState: recoveryState,
+            errorCode: errorCode
+        )
+    }
+
+    var selectedLiveMeetingNotesModel: ModelDescriptor? {
+        let candidates = models.filter {
+            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+        }
+        if let modelID = preferences.liveMeeting.notesModelID,
+           let selected = candidates.first(where: { $0.id == modelID }) { return selected }
+        if let defaultID = preferences.defaultModelID, let selected = candidates.first(where: { $0.id == defaultID }) { return selected }
+        return candidates.first(where: { $0.role == .default }) ?? candidates.first
     }
 
     func appLiveSubtitleStatusPayload() -> AppLiveSubtitleStatusPayload {
@@ -2964,6 +4258,10 @@ final class AppState: ObservableObject {
         return stats.rms > 180 || stats.peak > 1_400
     }
 
+    private func liveMeetingPCM16DurationMilliseconds(_ data: Data) -> Int {
+        chunkMilliseconds(data: data, sampleRate: 16_000)
+    }
+
     private func pcm16Stats(_ data: Data) -> (rms: Double, peak: Double) {
         guard data.count >= 2 else {
             return (0, 0)
@@ -3300,6 +4598,43 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func clearMissingLiveMeetingPreferences(
+        _ preferences: inout AppPreferences,
+        models: [ModelDescriptor]
+    ) {
+        let realtimeModels = models.filter { $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+        let fileModels = models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
+        let notesModels = models.filter {
+            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+        }
+        if let modelID = preferences.liveMeeting.realtimeASRModelID,
+           !realtimeModels.contains(where: { $0.id == modelID }) {
+            preferences.liveMeeting.realtimeASRModelID = nil
+        }
+        if let modelID = preferences.liveMeeting.fileASRModelID,
+           !fileModels.contains(where: { $0.id == modelID }) {
+            preferences.liveMeeting.fileASRModelID = nil
+        }
+        if let modelID = preferences.liveMeeting.notesModelID,
+           !notesModels.contains(where: { $0.id == modelID }) {
+            preferences.liveMeeting.notesModelID = nil
+        }
+        if preferences.liveMeeting.realtimeASRModelID == nil {
+            preferences.liveMeeting.realtimeASRModelID = preferences.mediaSubtitles.realtimeASRModelID ?? preferredRealtimeSpeechModel(in: models)?.id
+        }
+        if preferences.liveMeeting.fileASRModelID == nil {
+            preferences.liveMeeting.fileASRModelID = preferences.mediaSubtitles.fileASRModelID ?? fileModels.first?.id
+        }
+        if preferences.liveMeeting.notesModelID == nil {
+            preferences.liveMeeting.notesModelID = preferences.defaultModelID.flatMap { candidate in notesModels.first(where: { $0.id == candidate }) }?.id
+                ?? notesModels.first(where: { $0.role == .default })?.id
+                ?? notesModels.first?.id
+        }
+        if !preferences.liveMeeting.defaultAudioSource.isLiveCapture {
+            preferences.liveMeeting.defaultAudioSource = .microphone
+        }
+    }
+
     private func finishLoadingOCRImage(_ image: OCRImageInput, statusMessage loadedStatusMessage: String) {
         setOCRImage(image)
         statusMessage = loadedStatusMessage
@@ -3422,6 +4757,10 @@ final class AppState: ObservableObject {
         models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
     }
 
+    var meetingCaptureSpeechModels: [ModelDescriptor] {
+        models.filter { $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+    }
+
     var selectedOCRModel: ModelDescriptor? {
         guard let modelID = preferences.ocr.modelID else {
             return nil
@@ -3441,6 +4780,22 @@ final class AppState: ObservableObject {
             return nil
         }
         return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }
+    }
+
+    var selectedLiveMeetingRealtimeASRModel: ModelDescriptor? {
+        guard let modelID = preferences.liveMeeting.realtimeASRModelID else { return nil }
+        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+    }
+
+    var selectedLiveMeetingFileASRModel: ModelDescriptor? {
+        guard let modelID = preferences.liveMeeting.fileASRModelID else { return nil }
+        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }
+    }
+
+    private var liveMeetingASRPreferences: MediaSubtitlePreferences {
+        var result = preferences.mediaSubtitles
+        result.sourceLanguageHint = preferences.liveMeeting.sourceLanguageHint
+        return result
     }
 
     private func preferredRealtimeSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {

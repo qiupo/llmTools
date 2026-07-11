@@ -278,6 +278,19 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
             && (speech?.supports(.fileOnly) == true || speech?.supports(.realtime) == true)
     }
 
+    public var supportsMeetingCaptureSpeech: Bool {
+        supportsRealtimeSpeech
+            || (supportsFileSpeech && speech?.canEmitSpeakerLabels == true)
+    }
+
+    public var meetingCaptureRuntimeMode: SpeechRuntimeMode? {
+        guard supportsMeetingCaptureSpeech else { return nil }
+        if speech?.canEmitSpeakerLabels == true {
+            return .fileOnly
+        }
+        return .realtime
+    }
+
     public static func textOnly(source: ModelCapabilitySource = .inferred, note: String? = nil) -> ModelCapabilities {
         ModelCapabilities(
             inputs: [.text],
@@ -1259,6 +1272,46 @@ public struct SpeakerDiarizationPreferences: Codable, Sendable, Hashable {
     }
 }
 
+public struct LiveMeetingPreferences: Codable, Sendable, Hashable {
+    public var realtimeASRModelID: UUID?
+    public var fileASRModelID: UUID?
+    public var notesModelID: UUID?
+    public var defaultAudioSource: LiveMeetingAudioSource
+    public var sourceLanguageHint: ASRSourceLanguageHint
+
+    public init(
+        realtimeASRModelID: UUID? = nil,
+        fileASRModelID: UUID? = nil,
+        notesModelID: UUID? = nil,
+        defaultAudioSource: LiveMeetingAudioSource = .microphone,
+        sourceLanguageHint: ASRSourceLanguageHint = .auto
+    ) {
+        self.realtimeASRModelID = realtimeASRModelID
+        self.fileASRModelID = fileASRModelID
+        self.notesModelID = notesModelID
+        self.defaultAudioSource = defaultAudioSource.isLiveCapture ? defaultAudioSource : .microphone
+        self.sourceLanguageHint = sourceLanguageHint
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case realtimeASRModelID
+        case fileASRModelID
+        case notesModelID
+        case defaultAudioSource
+        case sourceLanguageHint
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        realtimeASRModelID = try container.decodeIfPresent(UUID.self, forKey: .realtimeASRModelID)
+        fileASRModelID = try container.decodeIfPresent(UUID.self, forKey: .fileASRModelID)
+        notesModelID = try container.decodeIfPresent(UUID.self, forKey: .notesModelID)
+        let source = try container.decodeIfPresent(LiveMeetingAudioSource.self, forKey: .defaultAudioSource) ?? .microphone
+        defaultAudioSource = source.isLiveCapture ? source : .microphone
+        sourceLanguageHint = try container.decodeIfPresent(ASRSourceLanguageHint.self, forKey: .sourceLanguageHint) ?? .auto
+    }
+}
+
 public enum FastTranslationSurfaceEngine: String, Codable, Sendable, CaseIterable, Hashable {
     case auto
     case llm
@@ -1455,6 +1508,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var webPageTranslation: WebPageTranslationPreferences
     public var ocr: OCRPreferences
     public var mediaSubtitles: MediaSubtitlePreferences
+    public var liveMeeting: LiveMeetingPreferences
     public var languageRouting: LanguageRoutingPreferences
     public var speakerDiarization: SpeakerDiarizationPreferences
     public var fastTranslation: FastTranslationPreferences
@@ -1488,6 +1542,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         webPageTranslation: WebPageTranslationPreferences = WebPageTranslationPreferences(),
         ocr: OCRPreferences = OCRPreferences(),
         mediaSubtitles: MediaSubtitlePreferences = MediaSubtitlePreferences(),
+        liveMeeting: LiveMeetingPreferences = LiveMeetingPreferences(),
         languageRouting: LanguageRoutingPreferences = LanguageRoutingPreferences(),
         speakerDiarization: SpeakerDiarizationPreferences = SpeakerDiarizationPreferences(),
         fastTranslation: FastTranslationPreferences = FastTranslationPreferences(),
@@ -1518,6 +1573,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.webPageTranslation = webPageTranslation
         self.ocr = ocr
         self.mediaSubtitles = mediaSubtitles
+        self.liveMeeting = liveMeeting
         self.languageRouting = languageRouting
         self.speakerDiarization = speakerDiarization
         self.fastTranslation = fastTranslation
@@ -1551,6 +1607,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case webPageTranslation
         case ocr
         case mediaSubtitles
+        case liveMeeting
         case languageRouting
         case speakerDiarization
         case fastTranslation
@@ -1597,6 +1654,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         webPageTranslation = try container.decodeIfPresent(WebPageTranslationPreferences.self, forKey: .webPageTranslation) ?? WebPageTranslationPreferences()
         ocr = try container.decodeIfPresent(OCRPreferences.self, forKey: .ocr) ?? OCRPreferences()
         mediaSubtitles = try container.decodeIfPresent(MediaSubtitlePreferences.self, forKey: .mediaSubtitles) ?? MediaSubtitlePreferences()
+        liveMeeting = try container.decodeIfPresent(LiveMeetingPreferences.self, forKey: .liveMeeting) ?? LiveMeetingPreferences()
         languageRouting = try container.decodeIfPresent(LanguageRoutingPreferences.self, forKey: .languageRouting) ?? LanguageRoutingPreferences()
         speakerDiarization = try container.decodeIfPresent(SpeakerDiarizationPreferences.self, forKey: .speakerDiarization) ?? SpeakerDiarizationPreferences()
         fastTranslation = try container.decodeIfPresent(FastTranslationPreferences.self, forKey: .fastTranslation) ?? FastTranslationPreferences()
@@ -1630,6 +1688,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(webPageTranslation, forKey: .webPageTranslation)
         try container.encode(ocr, forKey: .ocr)
         try container.encode(mediaSubtitles, forKey: .mediaSubtitles)
+        try container.encode(liveMeeting, forKey: .liveMeeting)
         try container.encode(languageRouting, forKey: .languageRouting)
         try container.encode(speakerDiarization, forKey: .speakerDiarization)
         try container.encode(fastTranslation, forKey: .fastTranslation)

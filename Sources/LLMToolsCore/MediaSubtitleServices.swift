@@ -109,34 +109,49 @@ public struct ASRTranscriptionContext: Sendable, Hashable {
     public var mode: SpeechRuntimeMode
     public var sourceLanguageHint: ASRSourceLanguageHint
     public var isFinal: Bool
+    public var maximumTokens: Int?
+    public var chunkDurationSeconds: Int?
 
     public init(
         mode: SpeechRuntimeMode = .fileOnly,
         sourceLanguageHint: ASRSourceLanguageHint = .auto,
-        isFinal: Bool = true
+        isFinal: Bool = true,
+        maximumTokens: Int? = nil,
+        chunkDurationSeconds: Int? = nil
     ) {
         self.mode = mode
         self.sourceLanguageHint = sourceLanguageHint
         self.isFinal = isFinal
+        self.maximumTokens = maximumTokens.map { max(1, $0) }
+        self.chunkDurationSeconds = chunkDurationSeconds.map { max(1, $0) }
     }
 }
 
 public enum AudioExtractionService {
     public static func normalizeMediaFile(
         at url: URL,
-        temporaryDirectory: URL = FileManager.default.temporaryDirectory
+        temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        audioConverterPath: String = "/usr/bin/afconvert",
+        videoConverterPath: String = "/usr/bin/avconvert"
     ) async throws -> NormalizedAudioFile {
         try Task.checkCancellation()
         let descriptor = try MediaIntakeService.descriptor(for: url)
         let workingDirectory = temporaryDirectory
             .appendingPathComponent("llmtools-media-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workingDirectory, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: workingDirectory.path)
+        var transferredToCaller = false
+        defer {
+            if !transferredToCaller {
+                try? FileManager.default.removeItem(at: workingDirectory)
+            }
+        }
         let audioInputURL: URL
 
         if descriptor.mediaKind == "video" {
             let extracted = workingDirectory.appendingPathComponent("extracted.m4a")
             try await runProcess(
-                executablePath: "/usr/bin/avconvert",
+                executablePath: videoConverterPath,
                 arguments: [
                     "--source", url.path,
                     "--preset", "PresetAppleM4A",
@@ -144,6 +159,8 @@ public enum AudioExtractionService {
                     "--replace"
                 ]
             )
+            try Task.checkCancellation()
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: extracted.path)
             audioInputURL = extracted
         } else {
             audioInputURL = url
@@ -151,7 +168,7 @@ public enum AudioExtractionService {
 
         let wavURL = workingDirectory.appendingPathComponent("normalized-16k-mono.wav")
         try await runProcess(
-            executablePath: "/usr/bin/afconvert",
+            executablePath: audioConverterPath,
             arguments: [
                 audioInputURL.path,
                 wavURL.path,
@@ -160,13 +177,17 @@ public enum AudioExtractionService {
                 "-c", "1"
             ]
         )
+        try Task.checkCancellation()
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: wavURL.path)
         let duration = wavDuration(url: wavURL)
-        return NormalizedAudioFile(
+        let normalized = NormalizedAudioFile(
             url: wavURL,
             duration: duration,
             sampleRate: 16_000,
             channelCount: 1
         )
+        transferredToCaller = true
+        return normalized
     }
 
     private static func runProcess(executablePath: String, arguments: [String]) async throws {
@@ -179,18 +200,33 @@ public enum AudioExtractionService {
         process.arguments = arguments
         let errorPipe = Pipe()
         process.standardError = errorPipe
-        do {
-            try process.run()
+        let processHandle = CancellableProcessHandle(process: process)
+        try await withTaskCancellationHandler {
+            do {
+                try processHandle.run()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MediaSubtitleError.extractionFailed(error.localizedDescription)
+            }
+            async let errorData = readPipeToEnd(errorPipe)
             process.waitUntilExit()
-        } catch {
-            throw MediaSubtitleError.extractionFailed(error.localizedDescription)
+            let capturedError = await errorData
+            try Task.checkCancellation()
+            if process.terminationStatus != 0 {
+                let message = String(data: capturedError, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                throw MediaSubtitleError.extractionFailed(message?.isEmpty == false ? message! : "exit \(process.terminationStatus)")
+            }
+        } onCancel: {
+            processHandle.cancel()
         }
-        if process.terminationStatus != 0 {
-            let errorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
-            let message = String(data: errorData, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            throw MediaSubtitleError.extractionFailed(message?.isEmpty == false ? message! : "exit \(process.terminationStatus)")
-        }
+    }
+
+    private static func readPipeToEnd(_ pipe: Pipe) async -> Data {
+        await Task.detached(priority: .utility) {
+            pipe.fileHandleForReading.readDataToEndOfFile()
+        }.value
     }
 
     private static func wavDuration(url: URL) -> TimeInterval? {
@@ -367,20 +403,36 @@ public struct LocalASRProcessRunner: Sendable {
         let errorPipe = Pipe()
         process.standardOutput = outputPipe
         process.standardError = errorPipe
-        do {
-            try process.run()
+        let processHandle = CancellableProcessHandle(process: process)
+        return try await withTaskCancellationHandler {
+            do {
+                try processHandle.run()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw MediaSubtitleError.asrRuntimeFailed(error.localizedDescription)
+            }
+            async let output = Self.readPipeToEnd(outputPipe)
+            async let errorOutput = Self.readPipeToEnd(errorPipe)
             process.waitUntilExit()
-        } catch {
-            throw MediaSubtitleError.asrRuntimeFailed(error.localizedDescription)
+            let capturedOutput = await output
+            let capturedError = await errorOutput
+            try Task.checkCancellation()
+            if process.terminationStatus != 0 {
+                let message = String(data: capturedError, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                throw MediaSubtitleError.asrRuntimeFailed(message?.isEmpty == false ? message! : "exit \(process.terminationStatus)")
+            }
+            return try parseTranscript(data: capturedOutput, model: model, sessionID: sessionID, duration: duration)
+        } onCancel: {
+            processHandle.cancel()
         }
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        if process.terminationStatus != 0 {
-            let message = String(data: errorOutput, encoding: .utf8)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            throw MediaSubtitleError.asrRuntimeFailed(message?.isEmpty == false ? message! : "exit \(process.terminationStatus)")
-        }
-        return try parseTranscript(data: output, model: model, sessionID: sessionID, duration: duration)
+    }
+
+    private static func readPipeToEnd(_ pipe: Pipe) async -> Data {
+        await Task.detached(priority: .utility) {
+            pipe.fileHandleForReading.readDataToEndOfFile()
+        }.value
     }
 
     private struct ASRCommandResolution: Sendable {
@@ -460,14 +512,15 @@ public struct LocalASRProcessRunner: Sendable {
            let whisperTemplate = whisperCppCoreMLCommandTemplate(modelURL: modelURL) {
             return ASRCommandResolution(template: whisperTemplate, source: .whisperCppCoreMLRunner)
         }
+        if (family == .funASRNano || family == .funASRMLTNano || family == .senseVoiceSmall || family == .qwen3ASR06B || family == .vibeVoiceASR),
+           safetensorsModelFilesExist(at: modelURL),
+           (family != .vibeVoiceASR || vibeVoiceTokenizerFilesExist(for: modelURL)),
+           let mlxAudioTemplate = mlxAudioCommandTemplate(for: family) {
+            return ASRCommandResolution(template: mlxAudioTemplate, source: .mlxAudioRunner)
+        }
         if family == .vibeVoiceASR,
            let vibeVoiceTemplate = vibeVoiceASRCommandTemplate() {
             return ASRCommandResolution(template: vibeVoiceTemplate, source: .vibeVoiceASRRunner)
-        }
-        if (family == .funASRNano || family == .funASRMLTNano || family == .senseVoiceSmall || family == .qwen3ASR06B),
-           FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path),
-           let mlxAudioTemplate = mlxAudioCommandTemplate(for: family) {
-            return ASRCommandResolution(template: mlxAudioTemplate, source: .mlxAudioRunner)
         }
         if family == .senseVoiceSmall,
            FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.onnx").path),
@@ -703,7 +756,7 @@ public struct LocalASRProcessRunner: Sendable {
             return nil
         }
         let envName = mlxAudioVenvEnvironmentName(for: family)
-        return "\(envName)=\(shellEscape(venvPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
+        return "LLMTOOLS_ASR_MAX_TOKENS={max_tokens} LLMTOOLS_ASR_CHUNK_DURATION={chunk_duration} \(envName)=\(shellEscape(venvPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
     }
 
     private func mlxAudioRunnerPath() -> String? {
@@ -750,10 +803,8 @@ public struct LocalASRProcessRunner: Sendable {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "LLMTOOLS_ASR_VENV"
-        case .vibeVoiceASR:
-            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         case .customLocal:
@@ -769,10 +820,8 @@ public struct LocalASRProcessRunner: Sendable {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "venv"
-        case .vibeVoiceASR:
-            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         case .customLocal:
@@ -794,7 +843,7 @@ public struct LocalASRProcessRunner: Sendable {
         case .qwen3ASRSherpaOnnx:
             return false
         case .vibeVoiceASR:
-            return false
+            moduleName = "vibevoice_asr"
         case .whisperCppCoreML:
             return false
         case .customLocal:
@@ -853,7 +902,7 @@ public struct LocalASRProcessRunner: Sendable {
         } else if family == .funASRNano {
             parts.append("Fun-ASR-Nano is the preferred low-latency realtime family; safetensors/MLX directories can use the bundled mlx-audio runner, while automatic GGUF detection requires llama-funasr-cli plus Fun-ASR encoder, Qwen3 decoder, and optionally FSMN-VAD GGUF files.")
         }
-        if FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path) {
+        if safetensorsModelFilesExist(at: modelURL) {
             parts.append("This model directory uses safetensors/MLX weights; install the matching local MLX ASR runtime or configure an ASR command for \(family.rawValue).")
         }
         if family == .senseVoiceSmall {
@@ -866,12 +915,50 @@ public struct LocalASRProcessRunner: Sendable {
             parts.append("The sherpa-onnx Qwen3-ASR backend has been removed because MLX Qwen3-ASR is faster on Apple Silicon.")
         }
         if family == .vibeVoiceASR {
-            parts.append("VibeVoice-ASR is file-only in llmTools. Use scripts/install-phase4-vibevoice-asr-runtime.sh for the local Python runtime, or configure a command that returns rich JSON segments with text, start/end timestamps, and speaker labels.")
+            parts.append("VibeVoice-ASR is file-only in llmTools. The mlx-community converted model uses the bundled MLX ASR runner with the shared mlx-audio runtime and a local Qwen2.5 tokenizer sidecar; original PyTorch VibeVoice-ASR runtimes can still be configured with a custom command that returns rich JSON segments with text, start/end timestamps, and speaker labels.")
         }
         if family == .whisperCppCoreML {
             parts.append("whisper.cpp Core ML directories require scripts/install-phase4-whisper-coreml-runtime.sh, whisper-cli built with WHISPER_COREML=1, a ggml model file, and its adjacent compiled encoder .mlmodelc directory.")
         }
         return parts.joined(separator: " ")
+    }
+
+    private func safetensorsModelFilesExist(at modelURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path)
+            || fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors.index.json").path) {
+            return true
+        }
+        guard let contents = try? fileManager.contentsOfDirectory(at: modelURL, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else {
+            return false
+        }
+        return contents.contains { $0.pathExtension.lowercased() == "safetensors" }
+    }
+
+    private func vibeVoiceTokenizerFilesExist(for modelURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        let env = ProcessInfo.processInfo.environment
+        let homeURL = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            modelURL,
+            nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]).map(URL.init(fileURLWithPath:)),
+            homeURL
+                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
+                .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/lmstudio-community/Qwen2.5-0.5B-Instruct-MLX-4bit", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-4bit", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-bf16", isDirectory: true),
+            homeURL
+                .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-1.7B-bf16", isDirectory: true)
+        ].compactMap { $0 }
+        return candidates.contains { url in
+            fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer_config.json").path)
+                && (fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer.json").path)
+                    || fileManager.fileExists(atPath: url.appendingPathComponent("vocab.json").path))
+        }
     }
 
     private func fixtureTranscriptURL() -> URL? {
@@ -901,6 +988,8 @@ public struct LocalASRProcessRunner: Sendable {
             .replacingOccurrences(of: "{language}", with: shellEscape(context.sourceLanguageHint.rawValue))
             .replacingOccurrences(of: "{mode}", with: context.mode.rawValue)
             .replacingOccurrences(of: "{isFinal}", with: context.isFinal ? "true" : "false")
+            .replacingOccurrences(of: "{max_tokens}", with: String(context.maximumTokens ?? 512))
+            .replacingOccurrences(of: "{chunk_duration}", with: String(context.chunkDurationSeconds ?? 30))
     }
 
     private func shellEscape(_ value: String) -> String {

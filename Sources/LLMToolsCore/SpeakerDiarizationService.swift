@@ -112,7 +112,8 @@ public actor SpeakerDiarizationService {
 
     public func diarize(
         audioURL: URL,
-        preferences: SpeakerDiarizationPreferences = SpeakerDiarizationPreferences()
+        preferences: SpeakerDiarizationPreferences = SpeakerDiarizationPreferences(),
+        expectedSpeakerCount: Int? = nil
     ) async throws -> SpeakerDiarizationResult {
         guard preferences.enabledForFileSubtitles else {
             throw SpeakerDiarizationError.disabled
@@ -124,7 +125,8 @@ public actor SpeakerDiarizationService {
         return try await SpeakerDiarizationCommandRunner.run(
             audioURL: audioURL,
             resolution: resolution,
-            preferences: preferences
+            preferences: preferences,
+            expectedSpeakerCount: expectedSpeakerCount
         )
     }
 
@@ -321,7 +323,8 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
     public static func run(
         audioURL: URL,
         resolution: CommandResolution,
-        preferences: SpeakerDiarizationPreferences
+        preferences: SpeakerDiarizationPreferences,
+        expectedSpeakerCount: Int? = nil
     ) async throws -> SpeakerDiarizationResult {
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("llmtools-diarization-\(UUID().uuidString)")
@@ -329,17 +332,25 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         defer {
             try? FileManager.default.removeItem(at: outputURL)
         }
-        let command = renderCommand(
+        var command = renderCommand(
             resolution.command,
             audioURL: audioURL,
             outputURL: outputURL,
             preferences: preferences
         )
+        if resolution.source == .bundledPyannoteSidecar,
+           let expectedSpeakerCount,
+           expectedSpeakerCount > 0 {
+            command += " --speaker-count-hint \(shellEscape(String(expectedSpeakerCount)))"
+        }
         let started = Date()
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
         var environment = ProcessInfo.processInfo.environment
+        // File and meeting diarization execute only against already-local model files.
+        environment["HF_HUB_OFFLINE"] = "1"
+        environment["TRANSFORMERS_OFFLINE"] = "1"
         if environment["PYANNOTE_AUTH_TOKEN"] == nil, let token = token(preferences: preferences) {
             environment["PYANNOTE_AUTH_TOKEN"] = token
         }
@@ -352,32 +363,40 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         let stderr = Pipe()
         process.standardOutput = stdout
         process.standardError = stderr
-        do {
-            try process.run()
-        } catch {
-            throw SpeakerDiarizationError.runtimeFailed(userVisibleRuntimeFailure(error.localizedDescription))
+        let processHandle = CancellableProcessHandle(process: process)
+        return try await withTaskCancellationHandler {
+            do {
+                try processHandle.run()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                throw SpeakerDiarizationError.runtimeFailed(userVisibleRuntimeFailure(error.localizedDescription))
+            }
+            async let stdoutData = readPipeToEnd(stdout)
+            async let stderrData = readPipeToEnd(stderr)
+            process.waitUntilExit()
+            let capturedStdout = await stdoutData
+            let capturedStderr = await stderrData
+            try Task.checkCancellation()
+            let stderrText = String(data: capturedStderr, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard process.terminationStatus == 0 else {
+                throw SpeakerDiarizationError.runtimeFailed(
+                    userVisibleRuntimeFailure(stderrText.isEmpty ? "Speaker diarization command failed." : stderrText)
+                )
+            }
+            let data: Data
+            if FileManager.default.fileExists(atPath: outputURL.path) {
+                data = try Data(contentsOf: outputURL)
+            } else {
+                data = capturedStdout
+            }
+            var result = try parseResult(data: data, source: resolution.source)
+            result.latencyMilliseconds = Int(Date().timeIntervalSince(started) * 1000)
+            return result
+        } onCancel: {
+            processHandle.cancel()
         }
-        async let stdoutData = readPipeToEnd(stdout)
-        async let stderrData = readPipeToEnd(stderr)
-        process.waitUntilExit()
-        let capturedStdout = await stdoutData
-        let capturedStderr = await stderrData
-        let stderrText = String(data: capturedStderr, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard process.terminationStatus == 0 else {
-            throw SpeakerDiarizationError.runtimeFailed(
-                userVisibleRuntimeFailure(stderrText.isEmpty ? "Speaker diarization command failed." : stderrText)
-            )
-        }
-        let data: Data
-        if FileManager.default.fileExists(atPath: outputURL.path) {
-            data = try Data(contentsOf: outputURL)
-        } else {
-            data = capturedStdout
-        }
-        var result = try parseResult(data: data, source: resolution.source)
-        result.latencyMilliseconds = Int(Date().timeIntervalSince(started) * 1000)
-        return result
     }
 
     private static func readPipeToEnd(_ pipe: Pipe) async -> Data {

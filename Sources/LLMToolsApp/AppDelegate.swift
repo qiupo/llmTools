@@ -32,12 +32,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     )
     private let liveSubtitleImmersiveTwoLineHeight: CGFloat = 96
     private let liveSubtitleImmersiveBilingualHeight: CGFloat = 128
+    private let liveMeetingWindowContentSize = NSSize(width: 980, height: 700)
     private let statusMenuMessageLimit = 32
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
     private let selectionActionService = SelectionActionService()
     private let settingsNavigation = SettingsNavigationState()
+    private let quickActionPinState = WindowPinState()
+    private let selectionActionPinState = WindowPinState()
+    private let floatingWidgetPinState = WindowPinState()
+    private let liveSubtitlePinState = WindowPinState()
+    private let liveMeetingPinState = WindowPinState()
     private lazy var localAppBridgeServer = LocalAppBridgeServer(appState: appState)
     private var cancellables: Set<AnyCancellable> = []
     private var statusItem: NSStatusItem?
@@ -46,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var selectionActionWindowController: WindowController?
     private var floatingWindowController: WindowController?
     private var liveSubtitleWindowController: WindowController?
+    private var liveMeetingWindowController: WindowController?
     private var settingsWindowController: WindowController?
     private var liveSubtitleWindowResizeObserver: Any?
     private var selectionDismissMonitors: [Any] = []
@@ -68,6 +75,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         installLiveSubtitleEscapeMonitors()
         installLiveSubtitlePointerMonitors()
         observeAppState()
+        if ProcessInfo.processInfo.environment["LLMTOOLS_OPEN_MEETING_WINDOW"] == "1" {
+            openLiveMeeting()
+        }
         Task {
             await appState.bootstrap()
             localAppBridgeServer.start()
@@ -86,6 +96,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         hotKeyService.unregister()
         appState.cancelCurrentTask(unloadModel: true)
         appState.stopAppLiveSubtitlesForShutdown()
+        appState.prepareLiveMeetingForAbnormalTermination()
         if let liveSubtitleWindowResizeObserver {
             NotificationCenter.default.removeObserver(liveSubtitleWindowResizeObserver)
         }
@@ -113,6 +124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         menu.addItem(NSMenuItem(title: "打开快捷操作", action: #selector(openQuickAction), keyEquivalent: "o"))
         menu.addItem(NSMenuItem(title: "图片 OCR", action: #selector(openImageOCR), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "开始实时字幕", action: #selector(toggleAppLiveSubtitles), keyEquivalent: "l"))
+        menu.addItem(NSMenuItem(title: "会议转写与纪要", action: #selector(openLiveMeeting), keyEquivalent: "m"))
         menu.addItem(NSMenuItem(title: "打开悬浮组件", action: #selector(openFloatingWidget), keyEquivalent: "w"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "模型", action: #selector(openModelSettings), keyEquivalent: ","))
@@ -130,10 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         quickActionWindowController = WindowController(
             title: "快捷操作",
             frame: NSRect(x: 0, y: 0, width: 500, height: 400),
-            contentView: AnyView(QuickActionView(appState: appState) { [weak self] in
+            contentView: AnyView(QuickActionView(appState: appState, pinState: quickActionPinState) { [weak self] in
                 self?.quickActionWindowController?.close()
             }),
-            windowLevel: .floating
+            pinState: quickActionPinState
         )
         if let quickActionWindow = quickActionWindowController?.window as? FloatingWindow {
             quickActionWindow.onEscape = { [weak self] in
@@ -158,10 +170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionWindowController = WindowController(
             title: "选择操作",
             frame: NSRect(origin: .zero, size: selectionActionCompactSize),
-            contentView: AnyView(SelectionActionView(appState: appState) { [weak self] task in
+            contentView: AnyView(SelectionActionView(appState: appState, pinState: selectionActionPinState) { [weak self] task in
                 self?.performSelectionAction(task)
             }),
-            windowLevel: .floating,
+            pinState: selectionActionPinState,
             windowKind: .nonActivatingPanel
         )
         selectionActionWindowController?.window?.isOpaque = false
@@ -170,17 +182,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         floatingWindowController = WindowController(
             title: "悬浮组件",
             frame: NSRect(x: 0, y: 0, width: 360, height: 520),
-            contentView: AnyView(FloatingWidgetView(appState: appState)),
-            windowLevel: .floating,
+            contentView: AnyView(FloatingWidgetView(appState: appState, pinState: floatingWidgetPinState)),
+            pinState: floatingWidgetPinState,
             autoCollapseAtScreenEdge: appState.preferences.autoCollapseWidget
         )
         liveSubtitleWindowController = WindowController(
             title: "实时字幕",
             frame: NSRect(origin: .zero, size: liveSubtitleWindowInitialSize),
-            contentView: AnyView(LiveSubtitleFloatingView(appState: appState) { [weak self] in
+            contentView: AnyView(LiveSubtitleFloatingView(appState: appState, pinState: liveSubtitlePinState) { [weak self] in
                 self?.closeLiveSubtitlesFromWindow()
             }),
-            windowLevel: .floating,
+            pinState: liveSubtitlePinState,
             windowKind: .nonActivatingPanel,
             allowsResizing: true
         )
@@ -209,6 +221,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 }
             }
         }
+        liveMeetingWindowController = WindowController(
+            title: "会议转写与纪要",
+            frame: NSRect(origin: .zero, size: liveMeetingWindowContentSize),
+            contentView: AnyView(LiveMeetingView(appState: appState, pinState: liveMeetingPinState)),
+            pinState: liveMeetingPinState,
+            allowsResizing: true
+        )
+        if let liveMeetingWindow = liveMeetingWindowController?.window {
+            liveMeetingWindow.contentMinSize = NSSize(width: 760, height: 520)
+            liveMeetingWindow.minSize = NSSize(width: 760, height: 520)
+        }
         settingsWindowController = WindowController(
             title: "设置",
             frame: NSRect(origin: .zero, size: settingsWindowContentSize),
@@ -236,6 +259,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     @objc private func openFloatingWidget() {
         floatingWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openLiveMeeting() {
+        liveMeetingWindowController?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -664,7 +692,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 guard let self else {
                     return
                 }
-                if event.window !== self.selectionActionWindowController?.window {
+                if event.window !== self.selectionActionWindowController?.window,
+                   !self.selectionActionPinState.isPinned {
                     self.closeSelectionAction()
                 }
             }
@@ -679,6 +708,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                     return
                 }
                 guard !SelectedTextService.isSyntheticShortcutEvent(event),
+                      !self.selectionActionPinState.isPinned,
                       self.shouldDismissSelectionAction(for: event) else {
                     return
                 }
@@ -1245,6 +1275,7 @@ final class WindowController: NSWindowController {
         title: String,
         frame: NSRect,
         contentView: AnyView,
+        pinState: WindowPinState? = nil,
         windowLevel: NSWindow.Level = .normal,
         autoCollapseAtScreenEdge: Bool = false,
         windowKind: WindowKind = .regular,
@@ -1285,6 +1316,7 @@ final class WindowController: NSWindowController {
         window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .managed]
         window.isMovableByWindowBackground = true
         window.level = windowLevel
+        pinState?.attach(to: window)
         if allowsResizing {
             window.acceptsMouseMovedEvents = true
         }

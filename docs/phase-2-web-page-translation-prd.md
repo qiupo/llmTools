@@ -779,7 +779,7 @@ Every request:
   "requestID": "uuid",
   "type": "translateSegments",
   "browserID": "chrome",
-  "extensionVersion": "0.3.0",
+  "extensionVersion": "0.4.0",
   "tabID": 123,
   "pageSessionID": "uuid",
   "sentAt": "2026-06-30T12:00:00Z",

@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIGURATION="${CONFIGURATION:-release}"
 APP_NAME="llmTools"
 BUNDLE_ID="local.llmtools.app"
-APP_VERSION="${APP_VERSION:-0.3.0}"
+APP_VERSION="${APP_VERSION:-0.4.0}"
 APP_BUILD="${APP_BUILD:-1}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -127,7 +127,7 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>llmTools uses microphone audio only when you start live subtitles.</string>
+    <string>llmTools uses microphone audio only when you start live subtitles or a live meeting transcription session.</string>
 </dict>
 </plist>
 PLIST

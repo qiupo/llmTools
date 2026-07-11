@@ -1,6 +1,6 @@
 # llmTools Roadmap
 
-Last updated: 2026-07-06
+Last updated: 2026-07-11
 
 ## Product Direction
 
@@ -34,7 +34,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4 product direction is now media intake and live subtitles: local audio/video transcription, translated subtitles, and desktop live subtitles from system audio and/or microphone audio. The previous file/document intake plan is retained as supporting file-ingestion scope and later document-assistant work.
 - Phase 4.x language/speaker/fast-MT implementation is now in place: language-ID routing, file-scope speaker diarization, fast MT sidecar routing for subtitles/webpage translation, webpage cache v2 engine isolation, and dependency-free fixture checks.
 - Phase 4.x realtime speaker diarization is explicitly out of scope for the MVP. The live speaker toggle is hard-disabled until a later spike can prove that diarization never blocks ASR partial/final subtitle output.
-- Phase 4.y live meeting transcription is a proposed separate product surface that allows delayed transcript, delayed speaker labels, speaker correction, and meeting-note generation without changing the low-latency live subtitle contract.
+- Phase 4.y live meeting transcription has a separate local-only product surface with microphone, native system-audio, and local audio/video-file input. Recognition is capability-adaptive: native speaker-aware ASR (including VibeVoice) emits text/speakers/timestamps jointly; ordinary live ASR emits natural-pause transcript rows first and receives delayed local pyannote labels independently; transcript-only is the local failure fallback. Ordinary local files may still diarize first and transcribe stable speaker slices offline. This keeps live text responsive without changing the low-latency Live Subtitles contract, and includes editable grouped turns, speaker correction, recovery drafts, a 60-minute reminder, cancellable manual finalization, and after-stop chunked Chinese notes.
 
 ## Confirmed Decisions
 

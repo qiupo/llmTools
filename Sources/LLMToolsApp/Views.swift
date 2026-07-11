@@ -6,6 +6,7 @@ import LLMToolsCore
 
 struct SelectionActionView: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var pinState: WindowPinState
     var onSelect: (TaskKind) -> Void
 
     private let actionBarWidth: CGFloat = 244
@@ -63,7 +64,7 @@ struct SelectionActionView: View {
     }
 
     private var actionBar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             ForEach(TaskKind.interactiveCases) { task in
                 Button {
                     onSelect(task)
@@ -80,8 +81,14 @@ struct SelectionActionView: View {
                 .help(task.title(language: language))
                 .disabled(appState.isRunning)
             }
+
+            WindowPinButton(
+                pinState: pinState,
+                language: language,
+                appearance: .selectionAction
+            )
         }
-        .padding(.horizontal, 11)
+        .padding(.horizontal, 8)
         .frame(width: actionBarWidth, height: actionBarHeight)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.98), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(
@@ -174,6 +181,7 @@ struct SelectionActionView: View {
 
 struct QuickActionView: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var pinState: WindowPinState
     var onClose: () -> Void = {}
     @State private var showFileImporter = false
     @State private var showImageImporter = false
@@ -1167,6 +1175,7 @@ struct QuickActionView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
+            WindowPinButton(pinState: pinState, language: language)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
@@ -2395,6 +2404,7 @@ private extension NSTextField {
 
 struct FloatingWidgetView: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var pinState: WindowPinState
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -2413,6 +2423,8 @@ struct FloatingWidgetView: View {
                 Text(appState.statusMessage)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                WindowPinButton(pinState: pinState, language: language)
             }
 
             Picker(L10n.text("Task", language: language), selection: $appState.selectedTask) {
@@ -2531,8 +2543,507 @@ struct FloatingWidgetView: View {
     }
 }
 
+struct LiveMeetingView: View {
+    @ObservedObject var appState: AppState
+    @ObservedObject var pinState: WindowPinState
+    @State private var selectedMergeTargetBySpeaker: [String: String] = [:]
+    @State private var speakerNameDrafts: [String: String] = [:]
+    @State private var showFileImporter = false
+
+    private var session: LiveMeetingSession? { appState.liveMeetingSession }
+    private var isStopped: Bool {
+        guard let state = session?.state else { return false }
+        return state == .stopped || state == .restored || state == .failed
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            if appState.liveMeetingRecoveryDraft != nil && session == nil {
+                recoveryBanner
+                Divider()
+            }
+            HSplitView {
+                transcriptPanel
+                    .frame(minWidth: 470, maxWidth: .infinity, maxHeight: .infinity)
+                sidePanel
+                    .frame(minWidth: 310, idealWidth: 350, maxWidth: 420, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 760, minHeight: 520)
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.audio, .movie, .video],
+            allowsMultipleSelection: false
+        ) { result in
+            if case .success(let urls) = result, let url = urls.first {
+                appState.processLiveMeetingFile(url)
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("会议转写与纪要")
+                    .font(.system(size: 17, weight: .semibold))
+                Text(headerStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            Picker("讲话人数", selection: Binding(
+                get: { session?.speakerCountHint ?? appState.liveMeetingSpeakerCountHint },
+                set: { appState.updateLiveMeetingSpeakerCountHint($0) }
+            )) {
+                ForEach(LiveMeetingSpeakerCountHint.allCases) { hint in
+                    Text(hint.displayName).tag(hint)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            Picker("音频来源", selection: Binding(
+                get: { appState.liveMeetingAudioSource },
+                set: { appState.setLiveMeetingAudioSource($0) }
+            )) {
+                Text("麦克风").tag(LiveMeetingAudioSource.microphone)
+                Text("系统音频").tag(LiveMeetingAudioSource.systemAudio)
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(width: 118, alignment: .leading)
+            .disabled(appState.liveMeetingIsRunning)
+            Button {
+                showFileImporter = true
+            } label: {
+                Label("本地文件", systemImage: "folder")
+            }
+            .disabled(appState.liveMeetingIsRunning || appState.liveMeetingHasUnresolvedRecoveryDraft)
+            if session?.state == .stopping {
+                Button {
+                    appState.cancelLiveMeetingStop()
+                } label: {
+                    Label("结束收尾", systemImage: "xmark.circle.fill")
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .help("保留当前转写并结束剩余处理")
+            } else if appState.liveMeetingIsRunning {
+                Button {
+                    appState.stopLiveMeeting()
+                } label: {
+                    Label("停止", systemImage: "stop.fill")
+                }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            } else {
+                Button {
+                    appState.startLiveMeeting()
+                } label: {
+                    Label("开始转写", systemImage: "record.circle")
+                }
+                .disabled(appState.liveMeetingHasUnresolvedRecoveryDraft)
+            }
+            WindowPinButton(pinState: pinState, language: appState.preferences.appLanguage)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 13)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var recoveryBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "arrow.clockwise.circle.fill")
+                .foregroundStyle(.orange)
+            Text("检测到未正常结束的本地会议草稿。草稿不包含临时音频。")
+                .font(.caption)
+            Spacer()
+            Button("恢复草稿") { appState.restoreLiveMeetingRecoveryDraft() }
+            Button("删除草稿", role: .destructive) { appState.deleteLiveMeetingRecoveryDraft() }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.09))
+    }
+
+    private var transcriptPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("完整转写")
+                    .font(.headline)
+                Spacer()
+                if appState.liveMeetingASRInFlight {
+                    ProgressView().controlSize(.small)
+                    Text("正在本地处理").font(.caption).foregroundStyle(.secondary)
+                }
+                if let session, session.transcriptLagMilliseconds > 0 {
+                    Text(transcriptLagLabel(session))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 12)
+
+            if appState.liveMeetingLongSessionReminderVisible {
+                Label("会议已达到 60 分钟。建议停止后最终整理并导出，会议不会自动停止。", systemImage: "clock.badge.exclamationmark")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, 9)
+            }
+
+            if appState.liveMeetingSegments.isEmpty {
+                ContentUnavailableView(
+                    "等待转写",
+                    systemImage: "text.line.first.and.arrowtriangle.forward",
+                    description: Text(emptyTranscriptDescription)
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    ForEach(appState.liveMeetingSegments) { segment in
+                        meetingSegmentRow(segment)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14))
+                    }
+                }
+                .listStyle(.plain)
+            }
+        }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.32))
+    }
+
+    private func meetingSegmentRow(_ segment: LiveMeetingSegment) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(timestamp(segment.startTime))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 60, alignment: .leading)
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Text(segment.speakerLabel ?? "Unknown")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(segment.state == .lowConfidence ? Color.orange : Color.accentColor)
+                    if segment.state == .partial {
+                        Text("草稿").font(.caption2).foregroundStyle(.secondary)
+                    } else if segment.state == .lowConfidence {
+                        Text("低置信").font(.caption2).foregroundStyle(.orange)
+                    }
+                    if segment.userEditedText {
+                        Image(systemName: "pencil.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if segment.state == .partial {
+                    Text(segment.text)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField("", text: Binding(
+                        get: { segment.text },
+                        set: { appState.editLiveMeetingSegmentText(id: segment.id, text: $0) }
+                    ), axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(.body)
+                    .lineLimit(2...)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(5)
+                    .background(Color(nsColor: .controlBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
+                }
+            }
+        }
+    }
+
+    private var sidePanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                sessionCard
+                speakerCard
+                actionsCard
+                notesCard
+                diagnosticsCard
+            }
+            .padding(16)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private var sessionCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("会话")
+                .font(.headline)
+            labeledValue("来源", session?.source.displayName ?? "未选择")
+            labeledValue("ASR", session?.asrModelName ?? "未选择")
+            labeledValue("识别策略", meetingRecognitionStrategyName)
+            if let runtime = session?.diarizationRuntimeID {
+                labeledValue("Speaker Runtime", runtime)
+            }
+            if let message = appState.liveMeetingDiarizationMessage ?? appState.liveMeetingDiarizationHealth?.message {
+                Text(message).font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            Button("检查本地说话人分离") { appState.refreshLiveMeetingDiarizationHealth() }
+                .controlSize(.small)
+        }
+    }
+
+    private var speakerCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("讲话人")
+                .font(.headline)
+            if appState.liveMeetingSpeakers.isEmpty {
+                Text(emptySpeakerMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(appState.liveMeetingSpeakers.filter { $0.mergedIntoSpeakerID == nil }) { speaker in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            TextField(
+                                "讲话人名称",
+                                text: Binding(
+                                    get: { speakerNameDrafts[speaker.id] ?? speaker.renderedName },
+                                    set: { speakerNameDrafts[speaker.id] = $0 }
+                                )
+                            )
+                            .textFieldStyle(.roundedBorder)
+                            Button {
+                                appState.renameLiveMeetingSpeaker(id: speaker.id, name: speakerNameDrafts[speaker.id] ?? speaker.renderedName)
+                            } label: {
+                                Image(systemName: "checkmark")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("保存名称")
+                        }
+                        if appState.liveMeetingSpeakers.filter({ $0.id != speaker.id && $0.mergedIntoSpeakerID == nil }).isEmpty == false {
+                            HStack(spacing: 6) {
+                                Picker("合并到", selection: Binding(
+                                    get: { selectedMergeTargetBySpeaker[speaker.id] ?? "" },
+                                    set: { selectedMergeTargetBySpeaker[speaker.id] = $0 }
+                                )) {
+                                    Text("合并到...").tag("")
+                                    ForEach(appState.liveMeetingSpeakers.filter { $0.id != speaker.id && $0.mergedIntoSpeakerID == nil }) { target in
+                                        Text(target.renderedName).tag(target.id)
+                                    }
+                                }
+                                .labelsHidden()
+                                .pickerStyle(.menu)
+                                Button {
+                                    if let target = selectedMergeTargetBySpeaker[speaker.id], !target.isEmpty {
+                                        appState.mergeLiveMeetingSpeaker(sourceID: speaker.id, into: target)
+                                    }
+                                } label: {
+                                    Image(systemName: "arrow.triangle.merge")
+                                }
+                                .disabled((selectedMergeTargetBySpeaker[speaker.id] ?? "").isEmpty)
+                                .help("合并讲话人")
+                            }
+                        }
+                    }
+                    .padding(.bottom, 3)
+                }
+            }
+        }
+    }
+
+    private var actionsCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("停止后操作")
+                .font(.headline)
+            HStack(spacing: 8) {
+                Button {
+                    appState.liveMeetingFinalizeTaskIsRunning ? appState.cancelLiveMeetingFinalization() : appState.finalizeLiveMeeting()
+                } label: {
+                    Label(appState.liveMeetingFinalizeTaskIsRunning ? "取消整理" : "最终整理", systemImage: appState.liveMeetingFinalizeTaskIsRunning ? "xmark" : "wand.and.stars")
+                }
+                .disabled(!isStopped && !appState.liveMeetingFinalizeTaskIsRunning)
+                Button {
+                    appState.liveMeetingNotesTaskIsRunning ? appState.cancelLiveMeetingNotes() : appState.generateLiveMeetingNotes()
+                } label: {
+                    Label(appState.liveMeetingNotesTaskIsRunning ? "取消纪要" : "生成纪要", systemImage: appState.liveMeetingNotesTaskIsRunning ? "xmark" : "note.text.badge.plus")
+                }
+                .disabled((!appState.liveMeetingCanGenerateNotes && !appState.liveMeetingNotesTaskIsRunning) || (!isStopped && !appState.liveMeetingNotesTaskIsRunning))
+            }
+            if let disabled = appState.liveMeetingNotesDisabledMessage {
+                Text(disabled)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Menu {
+                Button("Markdown") { appState.exportLiveMeetingToDownloads(format: "markdown") }
+                Button("TXT") { appState.exportLiveMeetingToDownloads(format: "txt") }
+                Button("JSON") { appState.exportLiveMeetingToDownloads(format: "json") }
+            } label: {
+                Label("导出", systemImage: "square.and.arrow.up")
+            }
+            .disabled(!isStopped)
+        }
+    }
+
+    private var notesCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("中文会议纪要")
+                    .font(.headline)
+                Spacer()
+                if appState.liveMeetingNotes?.isStale == true {
+                    Text("需重新生成").font(.caption2).foregroundStyle(.orange)
+                }
+            }
+            if let notes = appState.liveMeetingNotes, notes.hasContent {
+                noteSection("摘要", notes.summary)
+                noteList("关键决策", notes.decisions)
+                noteList("待办事项", notes.actionItems)
+                noteList("开放问题", notes.openQuestions)
+                noteList("讨论主题", notes.topics)
+                Text("本地分块：\(notes.chunkCount) 段")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("停止后手动生成。不会使用远程文本 provider。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var diagnosticsCard: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text("状态")
+                .font(.headline)
+            Text(appState.liveMeetingStatusMessage ?? "就绪")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let diagnostics = appState.liveMeetingDiagnostics {
+                Text("\(diagnostics.transcriptSegmentCount) 段 · \(diagnostics.speakerCount) 位讲话人 · \(diagnostics.durationBucket)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func labeledValue(_ label: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(label).font(.caption).foregroundStyle(.secondary).frame(width: 74, alignment: .leading)
+            Text(value).font(.caption).lineLimit(1).truncationMode(.middle)
+        }
+    }
+
+    private var meetingRecognitionStrategyName: String {
+        switch session?.recognitionStrategy {
+        case .nativeSpeakerASR: return "原生转写 + 说话人"
+        case .delayedSpeakerLabels: return "先转写，后补说话人"
+        case .diarizationFirst: return "先分离说话人，再转写"
+        case .transcriptOnly: return "仅转写"
+        case nil: return "尚未开始"
+        }
+    }
+
+    private var emptySpeakerMessage: String {
+        switch session?.recognitionStrategy {
+        case .nativeSpeakerASR:
+            return "speaker 会在明显停顿、120 秒技术窗口或停止后随转写一起输出。"
+        case .delayedSpeakerLabels:
+            return "文字会在自然停顿后先输出；speaker 由本地 pyannote 在后台延迟回填。"
+        case .diarizationFirst:
+            return "本地文件会先按稳定 speaker turn 切分音频，再逐段转写。"
+        case .transcriptOnly:
+            return "当前为仅转写模式。仍可编辑文本、生成纪要、导出和恢复草稿。"
+        case nil:
+            return "开始会议或导入本地文件后，这里会显示识别出的讲话人。"
+        }
+    }
+
+    private var emptyTranscriptDescription: String {
+        switch session?.recognitionStrategy {
+        case .nativeSpeakerASR:
+            return "明显停顿后开始处理；连续讲话按 120 秒技术窗口分批推理，逻辑讲话仍按自然边界整理。"
+        case .delayedSpeakerLabels:
+            return "转写在自然停顿后先输出，连续讲话最迟约 30 秒提交；speaker 随后回填。"
+        case .diarizationFirst:
+            return "本地文件正在按 speaker turn 分段转写。"
+        case .transcriptOnly:
+            return "当前讲话会在自然停顿后整理，连续讲话最迟约 30 秒提交。"
+        case nil:
+            return "开始会议，或选择本地音频/视频文件。"
+        }
+    }
+
+    private func transcriptLagLabel(_ session: LiveMeetingSession) -> String {
+        let lag = timestamp(Double(session.transcriptLagMilliseconds) / 1_000)
+        switch session.recognitionStrategy ?? .transcriptOnly {
+        case .nativeSpeakerASR:
+            if session.transcriptLagMilliseconds >= LiveMeetingNativeBatchPolicy.preferredBatchMilliseconds {
+                return "已采集 \(lag)，等待下一次自然停顿"
+            }
+            return "已采集 \(lag)，等待明显停顿"
+        case .delayedSpeakerLabels:
+            if session.transcriptLagMilliseconds > 0 {
+                return "待转写 \(lag)"
+            }
+            if session.speakerLagMilliseconds > 0, !appState.liveMeetingSegments.isEmpty {
+                return "说话人待回填 \(timestamp(Double(session.speakerLagMilliseconds) / 1_000))"
+            }
+            return appState.liveMeetingSegments.isEmpty ? "等待讲话" : "转写已跟上"
+        case .diarizationFirst:
+            return "待稳定处理 \(lag)"
+        case .transcriptOnly:
+            return "当前讲话 \(lag)，等待停顿"
+        }
+    }
+
+    private func noteSection(_ title: String, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold))
+            Text(text).font(.caption).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func noteList(_ title: String, _ values: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.caption.weight(.semibold))
+            if values.isEmpty {
+                Text("暂无").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(Array(values.enumerated()), id: \.offset) { _, value in
+                    Text("- \(value)").font(.caption).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private var headerStatus: String {
+        guard let session else { return "本地 ASR、说话人分离与本地中文纪要" }
+        switch session.state {
+        case .starting: return "正在启动 \(session.source.displayName)"
+        case .running:
+            switch session.source {
+            case .microphone: return "正在转写麦克风，按停顿整理段落"
+            case .systemAudio: return "正在转写系统音频，按停顿整理段落"
+            case .localFile: return "正在处理 Local File"
+            }
+        case .stopping: return "采集已停止，正在处理剩余内容"
+        case .stopped: return "已停止，可手动最终整理、生成纪要或导出"
+        case .restored: return "已从本地草稿恢复"
+        case .failed: return "会话需要处理"
+        case .idle: return "就绪"
+        }
+    }
+
+    private func timestamp(_ value: TimeInterval) -> String {
+        let total = max(0, Int(value.rounded(.down)))
+        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+    }
+}
+
 struct LiveSubtitleFloatingView: View {
     @ObservedObject var appState: AppState
+    @ObservedObject var pinState: WindowPinState
     var onClose: () -> Void
 
     private var language: AppLanguage {
@@ -2629,6 +3140,11 @@ struct LiveSubtitleFloatingView: View {
             }
             .foregroundStyle(.white)
             .layoutPriority(2)
+            WindowPinButton(
+                pinState: pinState,
+                language: language,
+                appearance: .subtitle
+            )
             enterImmersiveButton
             liveSubtitleToggleButton
             closeButton
@@ -2843,6 +3359,11 @@ struct LiveSubtitleFloatingView: View {
 
     private var immersiveWindowButtons: some View {
         HStack(spacing: 6) {
+            WindowPinButton(
+                pinState: pinState,
+                language: language,
+                appearance: .immersiveSubtitle
+            )
             exitImmersiveButton
             immersiveCloseButton
         }
@@ -3324,6 +3845,7 @@ enum SettingsTab: CaseIterable, Identifiable {
     case defaults
     case ocr
     case media
+    case meeting
     case webPage
     case prompts
     case about
@@ -3342,6 +3864,8 @@ enum SettingsTab: CaseIterable, Identifiable {
             return "text.viewfinder"
         case .media:
             return "waveform.and.magnifyingglass"
+        case .meeting:
+            return "person.2.wave.2"
         case .webPage:
             return "safari"
         case .defaults:
@@ -3365,6 +3889,8 @@ enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("OCR", language: language)
         case .media:
             return L10n.text("Media", language: language)
+        case .meeting:
+            return L10n.text("Meeting", language: language)
         case .webPage:
             return L10n.text("Web Page Translation", language: language)
         case .defaults:
@@ -3384,6 +3910,8 @@ enum SettingsTab: CaseIterable, Identifiable {
             return L10n.text("Image", language: language)
         case .media:
             return L10n.text("Media", language: language)
+        case .meeting:
+            return L10n.text("Meeting", language: language)
         case .defaults:
             return L10n.text("Text", language: language)
         case .prompts:
@@ -3555,9 +4083,9 @@ private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
                 downloadURL: "https://huggingface.co/mlx-community/VibeVoice-ASR-4bit",
                 mirrorURL: "https://hf-mirror.com/mlx-community/VibeVoice-ASR-4bit",
                 copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/VibeVoice-ASR-4bit --local-dir ~/code/models/mlx-community/VibeVoice-ASR-4bit",
-                installerScript: "scripts/install-phase4-vibevoice-asr-runtime.sh",
-                chineseNote: "重型 file-only rich transcription 模型；可保留说话人和时间戳元数据。",
-                englishNote: "Heavy file-only rich transcription model that can preserve speaker and timestamp metadata."
+                installerScript: "scripts/install-phase4-mlx-asr-runtime.sh",
+                chineseNote: "重型 file-only MLX rich transcription 模型；可保留说话人和时间戳元数据。",
+                englishNote: "Heavy file-only MLX rich transcription model that can preserve speaker and timestamp metadata."
             ),
             SupportedModelDownloadEntry(
                 id: "whisper-coreml",
@@ -3841,6 +4369,8 @@ struct SettingsView: View {
             ocrSettingsPage
         case .media:
             mediaSubtitleSettingsPage
+        case .meeting:
+            liveMeetingSettingsPage
         case .webPage:
             webPageTranslationPage
         case .defaults:
@@ -5126,6 +5656,60 @@ struct SettingsView: View {
         .disabled(appState.realtimeSpeechModels.isEmpty)
     }
 
+    private var settingsLiveMeetingFileASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.liveMeeting.fileASRModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.liveMeeting.fileASRModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.fileSpeechModels) { model in
+                Text(settingsSpeechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 320, alignment: .leading)
+        .disabled(appState.fileSpeechModels.isEmpty)
+    }
+
+    private var settingsLiveMeetingRealtimeASRPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.liveMeeting.realtimeASRModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.liveMeeting.realtimeASRModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.meetingCaptureSpeechModels) { model in
+                Text(settingsMeetingSpeechModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 320, alignment: .leading)
+        .disabled(appState.meetingCaptureSpeechModels.isEmpty)
+    }
+
+    private var settingsLiveMeetingNotesModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.liveMeeting.notesModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.liveMeeting.notesModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
+            ForEach(appState.models.filter { $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx) }) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 320, alignment: .leading)
+        .disabled(appState.models.allSatisfy { !$0.enabled || !$0.capabilities.supportsText || $0.isRemoteProvider || ($0.format != .gguf && $0.format != .mlx) })
+    }
+
     private func settingsLiveASRPartialControl(for model: ModelDescriptor) -> some View {
         let effective = appState.effectiveLiveASRPartialMilliseconds(for: model)
         let defaultValue = appState.defaultLiveASRPartialMilliseconds(for: model)
@@ -5459,6 +6043,123 @@ struct SettingsView: View {
                 }
             }
 
+        }
+    }
+
+    private var liveMeetingSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: localizedSettingsText(chinese: "会议采集模型", english: "Meeting Capture Model")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsLiveMeetingRealtimeASRPicker
+                    Text(localizedSettingsText(
+                        chinese: "用于麦克风和系统音频。VibeVoice 等模型原生联合输出转写与说话人；普通 ASR 先在自然停顿处输出文字，再由本地 pyannote 延迟回填 speaker。该选择不影响实时字幕。",
+                        english: "Used for microphone and system audio. Speaker-aware models such as VibeVoice emit transcript and speakers jointly; ordinary ASR emits text at natural pauses and receives delayed local pyannote speaker labels. This does not affect Live Subtitles."
+                    ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        appState.checkLiveMeetingASRHealth(mode: .realtime)
+                    } label: {
+                        Label(localizedSettingsText(chinese: "健康检查", english: "Health Check"), systemImage: appState.liveMeetingASRHealthCheckMode == .realtime ? "clock" : "stethoscope")
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.liveMeetingASRHealthCheckMode != nil || appState.selectedLiveMeetingRealtimeASRModel == nil)
+                    if let report = appState.liveMeetingASRHealthReport,
+                       report.modelID == appState.selectedLiveMeetingRealtimeASRModel?.id {
+                        mediaASRHealthReportView(
+                            report,
+                            mode: appState.selectedLiveMeetingRealtimeASRModel?.capabilities.meetingCaptureRuntimeMode ?? .realtime
+                        )
+                    }
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "会议文件 ASR", english: "Meeting File ASR")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsLiveMeetingFileASRPicker
+                    Text(localizedSettingsText(
+                        chinese: "用于本地音频和视频文件的离线会议转写；视频仍通过现有媒体管线抽取音频。",
+                        english: "Used for offline meeting transcription from local audio and video files. Video audio is still extracted through the existing media pipeline."
+                    ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        appState.checkLiveMeetingASRHealth(mode: .fileOnly)
+                    } label: {
+                        Label(localizedSettingsText(chinese: "健康检查", english: "Health Check"), systemImage: appState.liveMeetingASRHealthCheckMode == .fileOnly ? "clock" : "stethoscope")
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.liveMeetingASRHealthCheckMode != nil || appState.selectedLiveMeetingFileASRModel == nil)
+                    if let report = appState.liveMeetingASRHealthReport,
+                       report.modelID == appState.selectedLiveMeetingFileASRModel?.id {
+                        mediaASRHealthReportView(report, mode: .fileOnly)
+                    }
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "会议纪要模型", english: "Meeting Notes Model")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    settingsLiveMeetingNotesModelPicker
+                    Text(localizedSettingsText(
+                        chinese: "只允许本地 GGUF 或 MLX 文本模型。会议纪要默认中文，绝不使用远程 provider。",
+                        english: "Only local GGUF or MLX text models are allowed. Notes default to Chinese and never use a remote provider."
+                    ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "默认会议输入", english: "Default Meeting Input")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Picker(localizedSettingsText(chinese: "音频来源", english: "Audio Source"), selection: Binding(
+                        get: { appState.preferences.liveMeeting.defaultAudioSource },
+                        set: { newValue in
+                            appState.setLiveMeetingAudioSource(newValue)
+                        }
+                    )) {
+                        Text(localizedSettingsText(chinese: "麦克风", english: "Microphone")).tag(LiveMeetingAudioSource.microphone)
+                        Text(localizedSettingsText(chinese: "系统音频", english: "System Audio")).tag(LiveMeetingAudioSource.systemAudio)
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220, alignment: .leading)
+                    .disabled(appState.liveMeetingIsRunning)
+
+                    Picker(localizedSettingsText(chinese: "源语言", english: "Source Language"), selection: Binding(
+                        get: { appState.preferences.liveMeeting.sourceLanguageHint },
+                        set: { newValue in
+                            appState.updatePreferences { $0.liveMeeting.sourceLanguageHint = newValue }
+                        }
+                    )) {
+                        ForEach(ASRSourceLanguageHint.allCases) { hint in
+                            Text(sourceLanguageHintName(hint)).tag(hint)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 220, alignment: .leading)
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "说话人分离", english: "Speaker Diarization")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(localizedSettingsText(
+                        chinese: "普通实时 ASR 复用模型设置中的本地 pyannote 运行时、模型缓存与健康检查，并在文字出现后延迟回填 speaker；普通本地文件仍可先按 speaker turn 切分再转写。原生说话人 ASR 不重复运行 pyannote；运行时不可用时仍保持仅转写。",
+                        english: "Ordinary live ASR reuses the local pyannote runtime, cache, and health check to backfill speakers after text appears; ordinary local files can still be split into speaker turns before ASR. Native speaker ASR skips pyannote. Transcript-only remains available when diarization is unavailable."
+                    ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        navigation.selectedTab = .models
+                        selectedModelSettingsPane = .settings
+                    } label: {
+                        Label(localizedSettingsText(chinese: "打开说话人分离设置", english: "Open Diarization Settings"), systemImage: "slider.horizontal.3")
+                    }
+                    .controlSize(.small)
+                }
+            }
         }
     }
 
@@ -6364,7 +7065,7 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.3.0"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.4.0"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
     }
@@ -8242,6 +8943,17 @@ struct SettingsView: View {
         let modeLabel = model.capabilities.supportsRealtimeSpeech
             ? L10n.text("Realtime", language: language)
             : L10n.text("File only", language: language)
+        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
+        return "\(model.name) · \(family) · \(modeLabel)"
+    }
+
+    private func settingsMeetingSpeechModelPickerTitle(_ model: ModelDescriptor) -> String {
+        let modeLabel: String
+        if model.capabilities.speech?.canEmitSpeakerLabels == true {
+            modeLabel = localizedSettingsText(chinese: "原生说话人", english: "Native speakers")
+        } else {
+            modeLabel = localizedSettingsText(chinese: "先分离后转写", english: "Diarization first")
+        }
         let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
         return "\(model.name) · \(family) · \(modeLabel)"
     }
