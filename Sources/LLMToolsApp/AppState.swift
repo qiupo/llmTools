@@ -2046,8 +2046,11 @@ final class AppState: ObservableObject {
         let fileManager = FileManager.default
         let env = ProcessInfo.processInfo.environment
         let homeURL = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
-            nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]).map(URL.init(fileURLWithPath:)),
+        var candidates: [URL] = []
+        if let configuredTokenizer = nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]) {
+            candidates.append(URL(fileURLWithPath: configuredTokenizer))
+        }
+        candidates.append(contentsOf: [
             homeURL
                 .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
                 .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
@@ -2059,7 +2062,7 @@ final class AppState: ObservableObject {
                 .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-bf16", isDirectory: true),
             homeURL
                 .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-1.7B-bf16", isDirectory: true)
-        ].compactMap { $0 }
+        ])
         return candidates.contains { url in
             fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer_config.json").path)
                 && (fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer.json").path)

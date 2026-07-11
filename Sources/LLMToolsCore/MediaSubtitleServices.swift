@@ -564,10 +564,13 @@ public struct LocalASRProcessRunner: Sendable {
            fileManager.isExecutableFile(atPath: envPython) {
             return envPython
         }
-        let candidates = [
-            nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_VENV"]).map {
-                URL(fileURLWithPath: $0).appendingPathComponent("bin/python").path
-            },
+        var candidates: [String] = []
+        if let configuredVenv = nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_VENV"]) {
+            candidates.append(
+                URL(fileURLWithPath: configuredVenv).appendingPathComponent("bin/python").path
+            )
+        }
+        candidates.append(contentsOf: [
             AppPaths.applicationSupportDirectory
                 .appendingPathComponent("asr-runtime", isDirectory: true)
                 .appendingPathComponent("vibevoice-venv", isDirectory: true)
@@ -576,7 +579,7 @@ public struct LocalASRProcessRunner: Sendable {
             URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
                 .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/vibevoice-venv/bin/python")
                 .path(percentEncoded: false)
-        ].compactMap { $0 }
+        ])
         return candidates.first {
             fileManager.isExecutableFile(atPath: $0)
                 && pythonModuleExists(in: URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().path, moduleName: "vibevoice")
@@ -939,9 +942,11 @@ public struct LocalASRProcessRunner: Sendable {
         let fileManager = FileManager.default
         let env = ProcessInfo.processInfo.environment
         let homeURL = FileManager.default.homeDirectoryForCurrentUser
-        let candidates = [
-            modelURL,
-            nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]).map(URL.init(fileURLWithPath:)),
+        var candidates = [modelURL]
+        if let configuredTokenizer = nonEmpty(env["LLMTOOLS_VIBEVOICE_TOKENIZER_DIR"]) {
+            candidates.append(URL(fileURLWithPath: configuredTokenizer))
+        }
+        candidates.append(contentsOf: [
             homeURL
                 .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
                 .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
@@ -953,7 +958,7 @@ public struct LocalASRProcessRunner: Sendable {
                 .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-0.6B-bf16", isDirectory: true),
             homeURL
                 .appendingPathComponent("code/models/mlx-community/Qwen3-ASR-1.7B-bf16", isDirectory: true)
-        ].compactMap { $0 }
+        ])
         return candidates.contains { url in
             fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer_config.json").path)
                 && (fileManager.fileExists(atPath: url.appendingPathComponent("tokenizer.json").path)
