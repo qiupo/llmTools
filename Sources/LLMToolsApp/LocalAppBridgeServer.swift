@@ -112,13 +112,16 @@ final class LocalAppBridgeServer {
                 if let data {
                     next.append(data)
                 }
-                if self.isCompleteHTTPRequest(next) {
-                    await self.respond(to: next, connection: connection)
-                } else if isComplete {
-                    self.sendResponse(connection: connection, statusCode: 400, payload: ["error": "Incomplete request"])
-                } else if next.count > 2 * 1024 * 1024 {
+                switch LocalBridgeHTTPFraming.readState(for: next) {
+                case .complete(let expectedByteCount):
+                    await self.respond(to: Data(next.prefix(expectedByteCount)), connection: connection)
+                case .tooLarge:
                     self.sendResponse(connection: connection, statusCode: 413, payload: ["error": "Request too large"])
-                } else {
+                case .invalid:
+                    self.sendResponse(connection: connection, statusCode: 400, payload: ["error": "Invalid request framing"])
+                case .incomplete where isComplete:
+                    self.sendResponse(connection: connection, statusCode: 400, payload: ["error": "Incomplete request"])
+                case .incomplete:
                     self.receiveRequest(connection: connection, accumulated: next)
                 }
             }
@@ -299,22 +302,6 @@ final class LocalAppBridgeServer {
     private func requestHeadersEnd(in data: Data) -> Data.Index? {
         let marker = Data([13, 10, 13, 10])
         return data.range(of: marker)?.lowerBound
-    }
-
-    private func isCompleteHTTPRequest(_ data: Data) -> Bool {
-        guard let headersEnd = requestHeadersEnd(in: data),
-              let headerText = String(data: data[..<headersEnd], encoding: .utf8) else {
-            return false
-        }
-        let contentLength = headerText
-            .components(separatedBy: "\r\n")
-            .first { $0.lowercased().hasPrefix("content-length:") }
-            .flatMap { line -> Int? in
-                let value = line.split(separator: ":", maxSplits: 1).dropFirst().first?
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return value.flatMap(Int.init)
-            } ?? 0
-        return data.count >= headersEnd + 4 + contentLength
     }
 
     private func sendResponse<Payload: Encodable>(

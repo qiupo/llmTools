@@ -9,7 +9,7 @@ Languages: English | [简体中文](README.zh-CN.md)
 
 llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, running model-vision OCR, creating local media subtitles, and transcribing meetings. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
 
-Latest release: [v0.4.0](https://github.com/qiupo/llmTools/releases/tag/v0.4.0)
+Latest release: [v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
 
 ## Highlights
 
@@ -29,9 +29,9 @@ Latest release: [v0.4.0](https://github.com/qiupo/llmTools/releases/tag/v0.4.0)
 
 ## Status
 
-llmTools is under active development. The current `v0.4.0` release includes the desktop Quick Action flow, local/remote model registry, capability-aware model settings, local model-vision OCR, Chromium webpage translation, media subtitles, native desktop live captions, local language/fast-MT routing, file speaker diarization, and local-only meeting transcription and notes.
+llmTools is under active development. The current `v0.4.1` release includes the desktop Quick Action flow, per-task text model defaults, hardened local/remote model configuration, local model-vision OCR, Chromium webpage translation, media subtitles, native desktop live captions, the official FunASR Nano + CAM++ offline speaker pipeline, local language/fast-MT routing, file speaker diarization, and local-only meeting transcription and notes.
 
-Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.4.0. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
+Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.4.1. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
 
 ## Features And Usage
 
@@ -133,6 +133,8 @@ Selected-text capture depends on macOS Accessibility permission and the behavior
 
 The Models settings page uses one shared registry for local and remote models. The default model picker, quick-action panel, and webpage translation model picker all read from that registry.
 
+Provider API keys remain in the local registry under `~/Library/Application Support/llmTools`. llmTools does not use macOS Keychain. The app hardens that directory to `0700` and registry/history/backup files to `0600`; users who need stronger separation should avoid shared macOS accounts and restrict filesystem backups accordingly.
+
 Supported model/provider families:
 
 - Local GGUF files.
@@ -182,13 +184,15 @@ When a real OpenAI-compatible provider API key is configured, `swift run LLMTool
 
 Phase 4 adds media-first subtitle workflows. The native app can register speech-capable local models, pick separate realtime and file ASR models, check local ASR runtime health, import local audio/video files, normalize audio through macOS media tools, transcribe into timestamped subtitle segments, translate those segments through the existing text translation engine, and export SRT, VTT, TXT, or Markdown.
 
-ASR is local-only. There is no remote ASR setting and no cloud fallback. On the current Apple Silicon test machine, Qwen3-ASR-0.6B bf16 through the MLX sidecar is the preferred mixed Chinese/English realtime candidate; in the packaged-app bridge benchmark with 100 ms realtime PCM transport chunks, the first partial appeared at about 1.59 s wall time and ASR-event responses measured about 157 ms median / 203 ms p90. Qwen3-ASR-0.6B 4bit remains the faster Qwen3 alternative when its quantized quality is acceptable. Fun-ASR-MLT-Nano, Fun-ASR-Nano, and SenseVoiceSmall remain supported realtime candidates with lower-latency or broader-language tradeoffs. Realtime partial subtitles use tested family-specific partial-window defaults: Qwen3 1350 ms, SenseVoice 1200 ms, Fun-ASR 1500 ms, and whisper.cpp Core ML 2000 ms. Settings -> Media -> Realtime ASR exposes a `Partial window` control for per-model manual tuning, while final subtitles still decode the complete buffered utterance. This control is not the model decoder's low-level audio-slice size; the bundled Qwen3, SenseVoice, Fun-ASR, and whisper realtime sidecars currently re-decode rolling windows instead of maintaining an incremental decoder state for every PCM slice.
+ASR is local-only. There is no remote ASR setting and no cloud fallback. On the current Apple Silicon test machine, Qwen3-ASR-0.6B bf16 through the MLX sidecar is the preferred mixed Chinese/English realtime candidate; in the packaged-app bridge benchmark with 100 ms realtime PCM transport chunks, the first partial appeared at about 1.59 s wall time and ASR-event responses measured about 157 ms median / 203 ms p90. Qwen3-ASR-0.6B 4bit remains the faster Qwen3 alternative when its quantized quality is acceptable. Fun-ASR-MLT-Nano, MLX/GGUF Fun-ASR-Nano, and SenseVoiceSmall remain supported realtime candidates with lower-latency or broader-language tradeoffs; official `model.pt` Nano remains available for realtime captions and file processing through its persistent Torch/MPS and Nano + VAD + CAM++ paths, but is excluded from realtime meeting capture because speaker separation quality was poor in testing. Realtime partial subtitles use tested family-specific partial-window defaults: Qwen3 1350 ms, SenseVoice 1200 ms, Fun-ASR 1500 ms, and whisper.cpp Core ML 2000 ms. Settings -> Media -> Realtime ASR exposes a `Partial window` control for per-model manual tuning, while final subtitles still decode the complete buffered utterance. This control is not the model decoder's low-level audio-slice size; the bundled Qwen3, SenseVoice, Fun-ASR, and whisper realtime sidecars currently re-decode rolling windows instead of maintaining an incremental decoder state for every PCM slice.
 
 VibeVoice-ASR is supported as a heavy file-only rich transcription model. It is intentionally excluded from realtime/live-caption pickers. When its runtime returns speaker-attributed segments, llmTools uses the native speaker and timestamp metadata directly and skips external pyannote diarization. Other ASR commands can also return speaker metadata; any JSON segment with `speaker`, `speakerID`, or `speakerLabel` is treated as model/runtime-native speaker labeling. If no speaker metadata is returned and the selected model is not VibeVoice-ASR, the existing file-scope pyannote diarization path can still add speaker labels when enabled.
 
+Official Fun-ASR-Nano speaker diarization is a composite FunASR pipeline: Nano performs ASR, FSMN-VAD identifies speech regions, CAM++ provides speaker embeddings/clustering, CT-Punc provides the punctuation component, and speaker IDs are read from `sentence_info[].spk`. llmTools now uses this pipeline for file subtitles and offline meetings with inference forced offline; if it produces no usable speaker labels, the existing pyannote/transcript fallback remains available. Fun-ASR-Nano / Fun-ASR-MLT-Nano MLX and GGUF routes remain ASR-only and are not misrepresented as native-speaker Nano weights. See [Speech Recognition Architecture and FunASR Integration](docs/speech-recognition-architecture.md) for the current three-layer architecture and runtime matrix.
+
 The current Mac realtime ASR benchmark notes are kept in [Phase 4 ASR realtime latency report](docs/phase-4-asr-realtime-latency-report.md). That report separates live first-subtitle latency from offline file throughput and records the tested MLX, whisper.cpp Core ML, Apple SpeechAnalyzer, FluidAudio/Parakeet, and removed sherpa-onnx Qwen3-ASR paths.
 
-Official Fun-ASR acceleration paths split by hardware. The vLLM path targets CUDA/NVIDIA servers and provides the highest throughput/streaming service. The llama.cpp/GGUF path targets CPU/edge/on-device use with a single `llama-funasr-cli` binary and built-in FSMN-VAD when compatible GGUF files are present. The checked Fun-ASR GitHub docs do not document Apple MPS/Metal as a supported acceleration path, so llmTools does not assume `device="mps"` for Fun-ASR runtimes.
+Official Fun-ASR acceleration paths split by hardware. vLLM targets CUDA/NVIDIA servers and the highest throughput, while llama.cpp/GGUF targets CPU/edge. Nano's official Torch `demo2.py` selects `mps` on Apple Silicon; llmTools reuses that MPS path in its persistent original-Nano sidecar and has completed a real partial/final smoke on M5 Pro. This does not imply NVIDIA vLLM RTFx throughput on Apple hardware.
 
 Local ASR runtime integration is command-based so the app can work with installed local sidecars without sending audio off-device. Configure command templates in Settings -> Media -> Local ASR runtime. Command templates can use `{model}`, `{audio}`, `{language}`, `{mode}`, `{isFinal}`, `{max_tokens}`, and `{chunk_duration}`. Environment variables are still supported as a launch-time fallback:
 
@@ -200,14 +204,14 @@ LLMTOOLS_VIBEVOICE_ASR_COMMAND='your-vibevoice-asr-command --model {model} --aud
 LLMTOOLS_ASR_COMMAND='your-generic-local-asr-command --model {model} --audio {audio}'
 ```
 
-The command must print either plain transcript text or JSON subtitle segments such as `{"segments":[{"start":0,"end":2.5,"speakerID":"0","speakerLabel":"Speaker 1","text":"Hello"}]}`. `{audio}` is the normalized 16 kHz mono WAV path and `{model}` is the selected local model folder. Settings commands take priority over environment variables. Fun-ASR GGUF folders can be detected automatically when `llama-funasr-cli` is in `PATH` and the selected model folder contains compatible Fun-ASR encoder and Qwen3 decoder GGUF files. SenseVoiceSmall can also use `sherpa-onnx-offline` from `PATH` when the selected model folder contains `model.onnx` and `tokens.txt`. safetensors/MLX ASR folders use the bundled `llmtools-mlx-asr-runner.sh` with family-specific isolated runtimes: pinned `mlx-audio` for Qwen3 and mlx-community VibeVoice-ASR, patched `mlx-audio` for SenseVoiceSmall and Fun-ASR-Nano, and `mlx-audio-plus` for Fun-ASR-MLT-Nano. mlx-community VibeVoice-ASR also needs a local Qwen2.5 tokenizer sidecar, installed by `install-phase4-mlx-asr-runtime.sh` under `~/Library/Application Support/llmTools/asr-runtime/qwen2.5-tokenizer` or overridden with `LLMTOOLS_VIBEVOICE_TOKENIZER_DIR`. Original PyTorch VibeVoice-ASR runtimes can still use `scripts/llmtools-vibevoice-asr-runner.py` or a custom command to preserve rich transcription speaker/timestamp fields.
+The command must print either plain transcript text or JSON subtitle segments such as `{"segments":[{"start":0,"end":2.5,"speakerID":"0","speakerLabel":"Speaker 1","text":"Hello"}]}`. `{audio}` is the normalized 16 kHz mono WAV path and `{model}` is the selected local model folder. Settings commands take priority over environment variables. Official Fun-ASR-Nano `model.pt` folders automatically use the isolated persistent Torch/MPS sidecar in realtime mode and Nano + FSMN-VAD + CAM++ + CT-Punc in file mode; Fun-ASR GGUF folders can use `llama-funasr-cli` when available. SenseVoiceSmall can also use a compatible sherpa-onnx runtime. safetensors/MLX ASR folders use the bundled `llmtools-mlx-asr-runner.sh` with family-specific isolated runtimes: Qwen3 and mlx-community VibeVoice-ASR share pinned `mlx-audio`, while SenseVoiceSmall, Fun-ASR-Nano, and Fun-ASR-MLT-Nano keep their dedicated environments. VibeVoice automatic discovery now follows the MLX runtime actually used by the registered model; an original PyTorch runtime can still be connected through an explicit custom command.
 
 ```sh
 ./scripts/install-phase4-mlx-asr-runtime.sh
 ./scripts/install-phase4-funasr-mlx-runtime.sh
 ./scripts/install-phase4-funasr-nano-mlx-runtime.sh
+./scripts/install-phase4-funasr-pipeline-runtime.sh
 ./scripts/install-phase4-sensevoice-mlx-runtime.sh
-./scripts/install-phase4-vibevoice-asr-runtime.sh # legacy/original PyTorch VibeVoice-ASR
 ```
 
 Health checks show the runtime source: Settings command, environment variable, fixture transcript, local MLX runner, automatic sherpa-onnx, or unavailable. The Settings health check can offer a repair button for supported safetensors/MLX model folders when the matching local runtime is missing.
@@ -233,7 +237,7 @@ Use the meeting workflow as follows:
 5. Stop capture. Use `Finalize` when transcript cleanup is wanted, `Generate Notes` to create local Chinese meeting notes, and `Export` to write Markdown, TXT, or JSON to Downloads. These are separate, cancellable actions.
 6. If the app exits abnormally during an active session, restore or delete the local recovery draft at the next launch. Recovery drafts keep transcript/speaker edits but do not retain temporary audio by default.
 
-Meeting capture intentionally does not mix microphone and system audio in v0.4.0. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
+Meeting capture intentionally does not mix microphone and system audio in v0.4.1. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
 
 Privacy defaults stay restrictive: raw audio, full transcripts, translated subtitles, page titles, full URLs, and full media paths are not written to diagnostics or history by default. Meeting workspaces are owner-only, unused per-callback PCM chunks are not persisted, and temporary normalized audio is deleted after ASR processing.
 
@@ -251,7 +255,7 @@ Privacy defaults stay restrictive: raw audio, full transcripts, translated subti
 | Install Phase 4 Fun-ASR-MLT MLX runtime | `./scripts/install-phase4-funasr-mlx-runtime.sh` |
 | Install Phase 4 Fun-ASR-Nano MLX runtime | `./scripts/install-phase4-funasr-nano-mlx-runtime.sh` |
 | Install Phase 4 SenseVoice MLX runtime | `./scripts/install-phase4-sensevoice-mlx-runtime.sh` |
-| Install legacy/original PyTorch VibeVoice-ASR runtime | `./scripts/install-phase4-vibevoice-asr-runtime.sh` |
+| Install official FunASR Nano + CAM++ offline pipeline | `./scripts/install-phase4-funasr-pipeline-runtime.sh` |
 | Phase 4 real media pipeline smoke | `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke` |
 | Phase 4.y meeting file smoke | `swift run LLMToolsMeetingSmoke --input /absolute/path/to/audio-or-video --output-dir dist/meeting-smoke` |
 | Package app | `./scripts/package-app.sh` |
@@ -297,11 +301,11 @@ GitHub Actions release packaging lives in `.github/workflows/release.yml`.
 Trigger a release by pushing a version tag:
 
 ```sh
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.4.1
+git push origin v0.4.1
 ```
 
-The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.4.0`.
+The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.4.1`.
 
 The workflow:
 
@@ -341,6 +345,7 @@ Resources/              app icon assets
 - [Phase 3 native task and OCR PRD](docs/phase-3-native-task-and-ocr-prd.md)
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
+- [v0.4.1 release notes and usage](docs/releases/v0.4.1.md)
 - [v0.4.0 release notes and usage](docs/releases/v0.4.0.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)
 - [Phase 4 ASR realtime latency report](docs/phase-4-asr-realtime-latency-report.md)

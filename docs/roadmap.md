@@ -1,6 +1,6 @@
 # llmTools Roadmap
 
-Last updated: 2026-07-11
+Last updated: 2026-07-13
 
 ## Product Direction
 
@@ -18,6 +18,8 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 The app should default to local processing. Remote provider entries can exist in the shared model registry, but browser page translation must remain local/private by default unless the user explicitly chooses a remote provider.
 
 ## Current Status
+
+- A repository-wide code/security/runtime review and the next five optimization phases are tracked in `docs/code-audit-and-five-phase-optimization-plan.md`. Quick Action has a separate workstream and acceptance matrix in that document.
 
 - Phase 1 native MVP is complete as of 2026-07-03.
 - Phase 1 should now be treated as the stable baseline for regression checks: selected-text processing, quick action, model registry, GGUF/MLX runners, task templates, floating widget, local packaging, and recent history.
@@ -43,6 +45,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Minimum platform target: macOS 14 or newer, with development and verification on the current newer macOS environment.
 - Model source: users can reuse already downloaded local models by selecting model files or model folders.
 - Model management: the app manages model registration, status, routing, and runner lifecycle.
+- Provider API keys remain in the existing local model registry. llmTools does not use macOS Keychain; the legacy Keychain account field is decode-only compatibility data and is never queried.
 - Text replacement: copying results is required; replacing original selected text is optional and controlled by a setting.
 - Floating window: a desktop widget is required; it appears on all Spaces by default and can auto-collapse at the screen edge.
 - Phase 1 model support: multiple model registrations are supported from the beginning.
@@ -66,7 +69,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Local text-only GGUF and MLX models should remain unavailable for OCR until a real multimodal local runner exists.
 - Phase 4 changes the main line from generic file/document intake to media intake and subtitles. TXT/Markdown/image drag-and-drop can remain as supporting workflow, but PDF/DOCX and reusable document understanding stay later-phase work.
 - Phase 4 does not consider remote ASR. Speech recognition must run locally by default and should not include a cloud fallback path in MVP requirements.
-- Phase 4 realtime subtitles prefer Fun-ASR-MLT-Nano when a local Fun-ASR streaming runtime is configured, with Fun-ASR-Nano as the lower-latency Chinese/English/Japanese option. SenseVoiceSmall remains supported as a short-window low-latency runtime. Qwen3-ASR-0.6B is selectable as an experimental realtime ASR through a local vLLM/streaming runtime and remains available for audio/video file transcription.
+- Phase 4 keeps ASR model, local runtime, and speaker processing as separate layers. Fun-ASR-MLT-Nano remains the broad-language initial realtime preference, Fun-ASR-Nano is the Chinese/English/Japanese option, and the currently benchmarked Qwen3-ASR-0.6B bf16 MLX route remains the preferred mixed Chinese/English candidate on Apple Silicon. The UI exposes actual family/mode/speaker capability instead of presenting one universal best model.
 - Phase 4 translated subtitles reuse llmTools' existing text translation engine after ASR; ASR models should produce transcripts, not final Chinese translations.
 - Phase 4.x file subtitle diarization is file-scope only. Cross-file speaker identity and speaker embedding persistence are rejected for the MVP.
 - Phase 4.x fast MT has a global killswitch (`fastTranslation.forceLLM`) and must fall back to LLM when configured to do so. Webpage translation cache keys must include source language, target language, engine id, engine model id, domain, and text hash so LLM and fast MT outputs do not mix.
@@ -342,9 +345,11 @@ Implementation status as of 2026-07-06:
 
 - Implemented in the native app: speech-capable model metadata, media subtitle preferences, realtime/file ASR pickers, local ASR health checks, file media intake, macOS audio extraction/normalization, subtitle segment model, subtitle translation coordinator, SRT/VTT/TXT/Markdown export, media quick-action mode, and redacted diagnostics.
 - Implemented for local ASR runtime integration: Fun-ASR-Nano and Fun-ASR-MLT-Nano realtime/file capability detection, SenseVoiceSmall realtime/file capability detection, Qwen3-ASR-0.6B file/realtime capability detection, Settings-configurable command templates for local sidecars, runtime-source health labels, ASR source-language hints, launch-time environment variable fallback through `LLMTOOLS_FUN_ASR_COMMAND`, `LLMTOOLS_SENSEVOICE_COMMAND`, `LLMTOOLS_QWEN3_ASR_COMMAND`, or `LLMTOOLS_ASR_COMMAND`, automatic `llama-funasr-cli` GGUF detection for compatible Fun-ASR folders, automatic bundled MLX runner use for supported safetensors/MLX ASR folders when the matching isolated venv is installed, plus automatic `sherpa-onnx-offline` use for SenseVoiceSmall ONNX folders where available.
+- Implemented for ASR organization: Settings and Quick Action use stable model-family names and show mode/speaker capability; Settings exposes the three-layer speech pipeline and registered-model overview; custom ASR command templates remain available in one advanced disclosure. The Fun-ASR MLX/GGUF routes remain ASR-only.
+- Implemented for official FunASR: the original Fun-ASR-Nano `model.pt` uses a persistent Torch/MPS sidecar for realtime subtitles, while file transcription composes Nano, FSMN-VAD, CAM++, and CT-Punc and maps `sentence_info[].spk` into existing contracts. Based on realtime meeting tests, the original Nano is excluded from meeting capture; meeting speaker quality takes priority over adding another model option.
 - Implemented in the native app for desktop live subtitles: ScreenCaptureKit system-audio capture, microphone capture, mixed audio source selection, floating subtitle window, configurable global shortcut, VAD gating, partial/final/translated event plumbing, and local ASR command execution over temporary live-audio WAV windows.
 - Implemented checks: `swift run LLMToolsChecks`, `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke`, `node scripts/check-phase4-media-subtitles.mjs`, `node scripts/check-phase4-local-asr-runtime.mjs`, extension JavaScript syntax checks, and the existing browser DOM regression suite with browser live-subtitle permissions removed.
-- Runtime dependency: real file transcription and real desktop live subtitles require a local Fun-ASR, SenseVoiceSmall, or Qwen3-ASR runtime/model on the user's Mac. Fun-ASR can use a configured local streaming command or compatible GGUF files with `llama-funasr-cli`; supported safetensors/MLX ASR folders can use the bundled `llmtools-mlx-asr-runner.sh` after the matching isolated runtime is installed. Qwen3 uses `scripts/install-phase4-mlx-asr-runtime.sh`; Fun-ASR-MLT-Nano uses `scripts/install-phase4-funasr-mlx-runtime.sh`; Fun-ASR-Nano uses `scripts/install-phase4-funasr-nano-mlx-runtime.sh`; SenseVoiceSmall uses `scripts/install-phase4-sensevoice-mlx-runtime.sh`. The app reports missing local runtime/model state explicitly and does not fall back to remote ASR.
+- Runtime dependency: real file transcription and real desktop live subtitles require a local Fun-ASR, SenseVoiceSmall, Qwen3-ASR, Whisper, or VibeVoice runtime/model on the user's Mac. Supported safetensors/MLX folders use the bundled `llmtools-mlx-asr-runner.sh`; original Fun-ASR-Nano realtime and file transcription share the isolated runtime installed by `scripts/install-phase4-funasr-pipeline-runtime.sh`; whisper.cpp keeps its own root. No path falls back to remote ASR.
 
 Core capabilities:
 

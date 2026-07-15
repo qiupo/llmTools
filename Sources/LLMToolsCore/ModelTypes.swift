@@ -544,6 +544,17 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var supportsImageInput: Bool {
         enabled && capabilities.supportsImage
     }
+
+    public var supportsMeetingCaptureSpeech: Bool {
+        guard capabilities.supportsMeetingCaptureSpeech else { return false }
+        // 原版 Nano 保留实时字幕和文件转写，但实测 speaker 回填质量不足，不进入会议采集。
+        return !ModelDetection.isOfficialFunASRNanoModel(at: resolvedPath ?? sourcePath)
+    }
+
+    public var meetingCaptureRuntimeMode: SpeechRuntimeMode? {
+        guard supportsMeetingCaptureSpeech else { return nil }
+        return capabilities.meetingCaptureRuntimeMode
+    }
 }
 
 public enum OCRMode: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
@@ -587,8 +598,8 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
         self.defaultMode = defaultMode
         self.persistHistory = persistHistory
         self.useModelRecognitionByDefault = useModelRecognitionByDefault
-        self.maximumImageBytes = maximumImageBytes
-        self.maximumPixelCount = maximumPixelCount
+        self.maximumImageBytes = min(max(maximumImageBytes, 128_000), 16_000_000)
+        self.maximumPixelCount = min(max(maximumPixelCount, 1_000_000), 100_000_000)
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -608,8 +619,14 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
         defaultMode = try container.decodeIfPresent(OCRMode.self, forKey: .defaultMode) ?? .plainText
         persistHistory = try container.decodeIfPresent(Bool.self, forKey: .persistHistory) ?? false
         useModelRecognitionByDefault = try container.decodeIfPresent(Bool.self, forKey: .useModelRecognitionByDefault) ?? false
-        maximumImageBytes = max(try container.decodeIfPresent(Int.self, forKey: .maximumImageBytes) ?? 8_000_000, 128_000)
-        maximumPixelCount = max(try container.decodeIfPresent(Int.self, forKey: .maximumPixelCount) ?? 16_000_000, 1_000_000)
+        maximumImageBytes = min(
+            max(try container.decodeIfPresent(Int.self, forKey: .maximumImageBytes) ?? 8_000_000, 128_000),
+            16_000_000
+        )
+        maximumPixelCount = min(
+            max(try container.decodeIfPresent(Int.self, forKey: .maximumPixelCount) ?? 16_000_000, 1_000_000),
+            100_000_000
+        )
     }
 }
 
@@ -1488,6 +1505,7 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
 
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
+    public var textTaskModelIDs: [TaskKind: UUID]
     public var autoCollapseWidget: Bool
     public var widgetVisibleOnAllSpaces: Bool
     public var launchAtLogin: Bool
@@ -1520,6 +1538,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
 
     public init(
         defaultModelID: UUID? = nil,
+        textTaskModelIDs: [TaskKind: UUID] = [:],
         autoCollapseWidget: Bool = true,
         widgetVisibleOnAllSpaces: Bool = true,
         launchAtLogin: Bool = false,
@@ -1553,6 +1572,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         quickActionPopupShortcuts: QuickActionPopupShortcuts = QuickActionPopupShortcuts()
     ) {
         self.defaultModelID = defaultModelID
+        self.textTaskModelIDs = textTaskModelIDs
         self.autoCollapseWidget = autoCollapseWidget
         self.widgetVisibleOnAllSpaces = widgetVisibleOnAllSpaces
         self.launchAtLogin = launchAtLogin
@@ -1586,6 +1606,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case defaultModelID
+        case textTaskModelIDs
         case autoCollapseWidget
         case widgetVisibleOnAllSpaces
         case launchAtLogin
@@ -1621,6 +1642,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         defaultModelID = try container.decodeIfPresent(UUID.self, forKey: .defaultModelID)
+        textTaskModelIDs = try container.decodeIfPresent([TaskKind: UUID].self, forKey: .textTaskModelIDs) ?? [:]
         autoCollapseWidget = try container.decodeIfPresent(Bool.self, forKey: .autoCollapseWidget) ?? true
         widgetVisibleOnAllSpaces = try container.decodeIfPresent(Bool.self, forKey: .widgetVisibleOnAllSpaces) ?? true
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
@@ -1668,6 +1690,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(defaultModelID, forKey: .defaultModelID)
+        try container.encode(textTaskModelIDs, forKey: .textTaskModelIDs)
         try container.encode(autoCollapseWidget, forKey: .autoCollapseWidget)
         try container.encode(widgetVisibleOnAllSpaces, forKey: .widgetVisibleOnAllSpaces)
         try container.encode(launchAtLogin, forKey: .launchAtLogin)
@@ -1698,6 +1721,18 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(liveSubtitleShortcut, forKey: .liveSubtitleShortcut)
         try container.encode(quickActionPopupShortcuts, forKey: .quickActionPopupShortcuts)
     }
+
+    /// 润色、总结、解释和待办可覆盖通用默认模型；未设置时保持旧版的通用默认行为。
+    public func preferredTextModelID(for task: TaskKind) -> UUID? {
+        TaskKind.perTaskModelCases.contains(task) ? textTaskModelIDs[task] ?? defaultModelID : defaultModelID
+    }
+
+    public mutating func setTextModelID(_ modelID: UUID?, for task: TaskKind) {
+        guard TaskKind.perTaskModelCases.contains(task) else {
+            return
+        }
+        textTaskModelIDs[task] = modelID
+    }
 }
 
 public struct HistoryItem: Codable, Identifiable, Hashable, Sendable {
@@ -1725,7 +1760,7 @@ public struct HistoryItem: Codable, Identifiable, Hashable, Sendable {
     }
 }
 
-public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
+public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
     case translate
     case webPageTranslate
     case polish
@@ -1738,6 +1773,10 @@ public enum TaskKind: String, Codable, Sendable, CaseIterable, Identifiable {
 
     public static var interactiveCases: [TaskKind] {
         [.translate, .polish, .summarize, .explain, .extractTodos]
+    }
+
+    public static var perTaskModelCases: [TaskKind] {
+        [.polish, .summarize, .explain, .extractTodos]
     }
 
     public var title: String {

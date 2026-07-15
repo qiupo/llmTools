@@ -31,8 +31,11 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
               providerConfiguration.apiStyle == .openAICompatible else {
             throw RunnerError.unsupportedConfiguration("OpenAI-compatible provider configuration is missing.")
         }
-        guard providerConfiguration.baseURL != nil else {
+        guard let baseURL = providerConfiguration.baseURL else {
             throw RunnerError.unsupportedConfiguration("Provider base URL is missing.")
+        }
+        guard ProviderEndpointPolicy.allows(baseURL) else {
+            throw RunnerError.unsupportedConfiguration(ProviderEndpointPolicy.secureTransportMessage)
         }
         guard !providerConfiguration.modelID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw RunnerError.unsupportedConfiguration("Provider model ID is missing.")
@@ -195,7 +198,7 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
         request.httpBody = try JSONEncoder().encode(body)
 
         try Task.checkCancellation()
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderHTTPSession.data(for: request)
         try Task.checkCancellation()
         guard let httpResponse = response as? HTTPURLResponse else {
             throw RunnerError.unsupportedConfiguration("Provider did not return an HTTP response.")

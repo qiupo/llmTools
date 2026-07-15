@@ -51,6 +51,7 @@ public enum LiveMeetingSegmentState: String, Codable, Sendable, Hashable {
 
 public enum LiveMeetingRecognitionStrategy: String, Codable, Sendable, Hashable {
     case nativeSpeakerASR
+    case compositeSpeakerASR
     case delayedSpeakerLabels
     case diarizationFirst
     case transcriptOnly
@@ -58,6 +59,7 @@ public enum LiveMeetingRecognitionStrategy: String, Codable, Sendable, Hashable 
     public var displayName: String {
         switch self {
         case .nativeSpeakerASR: return "Native speaker ASR"
+        case .compositeSpeakerASR: return "Composite ASR and speaker pipeline"
         case .delayedSpeakerLabels: return "Transcript first, delayed speaker labels"
         case .diarizationFirst: return "Diarization first"
         case .transcriptOnly: return "Transcript only"

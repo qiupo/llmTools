@@ -31,8 +31,11 @@ public actor AnthropicMessagesRunner: ModelRunner {
               providerConfiguration.apiStyle == .anthropicMessages else {
             throw RunnerError.unsupportedConfiguration("Anthropic provider configuration is missing.")
         }
-        guard providerConfiguration.baseURL != nil else {
+        guard let baseURL = providerConfiguration.baseURL else {
             throw RunnerError.unsupportedConfiguration("Anthropic base URL is missing.")
+        }
+        guard ProviderEndpointPolicy.allows(baseURL) else {
+            throw RunnerError.unsupportedConfiguration(ProviderEndpointPolicy.secureTransportMessage)
         }
         var loadedConfiguration = providerConfiguration
         loadedConfiguration.apiKey = try ProviderCredentialStore.resolvedAPIKey(for: providerConfiguration)
@@ -121,7 +124,7 @@ public actor AnthropicMessagesRunner: ModelRunner {
         request.httpBody = try JSONEncoder().encode(body)
 
         try Task.checkCancellation()
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderHTTPSession.data(for: request)
         try Task.checkCancellation()
         guard let httpResponse = response as? HTTPURLResponse else {
             throw RunnerError.unsupportedConfiguration("Anthropic did not return an HTTP response.")

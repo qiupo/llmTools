@@ -351,6 +351,119 @@ public enum LiveMeetingTranscriptReducer {
         return collapsed
     }
 
+    /// Split one ASR row by diarization boundaries when the row spans multiple
+    /// confirmed speakers. This is a fallback for transcript-first live capture:
+    /// exact word timing is unavailable, so text is divided proportionally by time.
+    public static func splitSegmentsBySpeakerTurns(
+        _ segments: [LiveMeetingSegment],
+        turns: [SpeakerTurn],
+        speakers: inout [LiveMeetingSpeaker],
+        confidenceThreshold: Double = 0.55,
+        through: TimeInterval? = nil
+    ) -> [LiveMeetingSegment] {
+        var result: [LiveMeetingSegment] = []
+        for segment in segments {
+            result.append(contentsOf: splitSegmentBySpeakerTurns(
+                segment,
+                turns: turns,
+                speakers: &speakers,
+                confidenceThreshold: confidenceThreshold,
+                through: through
+            ))
+        }
+        for index in result.indices { result[index].index = index }
+        return result
+    }
+
+    public static func splitSegmentBySpeakerTurns(
+        _ segment: LiveMeetingSegment,
+        turns: [SpeakerTurn],
+        speakers: inout [LiveMeetingSpeaker],
+        confidenceThreshold: Double = 0.55,
+        through: TimeInterval? = nil
+    ) -> [LiveMeetingSegment] {
+        guard !segment.userEditedText,
+              segment.speakerID == nil,
+              let segmentEnd = segment.endTime,
+              segmentEnd > segment.startTime else {
+            return [segment]
+        }
+        let splitEnd = min(segmentEnd, through ?? segmentEnd)
+        guard splitEnd > segment.startTime else { return [segment] }
+        let plannerSlices = LiveMeetingSpeakerTurnPlanner.plan(
+            turns: turns,
+            processedThrough: segment.startTime,
+            stableThrough: splitEnd,
+            maximumTurnDuration: max(segmentEnd - segment.startTime, LiveMeetingSpeakerTurnPlanner.minimumTurnDuration)
+        )
+        let slices = plannerSlices.filter { $0.endTime > $0.startTime }
+        let confirmedSpeakerIDs = Set(slices.compactMap { slice -> String? in
+            guard let speakerID = slice.speakerID,
+                  slice.confidence.map({ $0 >= confidenceThreshold }) ?? true,
+                  !slice.isLowConfidence else { return nil }
+            return speakerID
+        })
+        guard confirmedSpeakerIDs.count >= 2 else {
+            return [segment]
+        }
+        let wholeDuration = segmentEnd - segment.startTime
+        guard wholeDuration > 0 else { return [segment] }
+        var pieces: [LiveMeetingSegment] = []
+        for slice in slices {
+            let startRatio = (slice.startTime - segment.startTime) / wholeDuration
+            let endRatio = (slice.endTime - segment.startTime) / wholeDuration
+            let text = proportionalText(
+                segment.text,
+                startRatio: startRatio,
+                endRatio: endRatio,
+                isLastPiece: slice.endTime >= splitEnd && splitEnd >= segmentEnd
+            )
+            guard !text.isEmpty else { continue }
+            var piece = segment
+            piece.id = UUID()
+            piece.startTime = slice.startTime
+            piece.endTime = slice.endTime
+            piece.text = text
+            piece.originalText = text
+            if let speakerID = slice.speakerID {
+                let speaker = ensureSpeaker(
+                    id: speakerID,
+                    suggestedLabel: slice.speakerLabel,
+                    speakers: &speakers
+                )
+                piece.speakerID = speaker.id
+                piece.speakerLabel = speaker.renderedName
+            } else {
+                piece.speakerID = nil
+                piece.speakerLabel = "Unknown"
+            }
+            piece.confidence = slice.confidence
+            let hasLowConfidence = slice.isLowConfidence
+                || slice.speakerID == nil
+                || slice.confidence.map { $0 < confidenceThreshold } == true
+            piece.state = hasLowConfidence ? .lowConfidence : .final
+            pieces.append(piece)
+        }
+        if segmentEnd > splitEnd {
+            let text = proportionalText(
+                segment.text,
+                startRatio: (splitEnd - segment.startTime) / wholeDuration,
+                endRatio: 1,
+                isLastPiece: true
+            )
+            if !text.isEmpty {
+                var trailing = segment
+                trailing.id = UUID()
+                trailing.startTime = splitEnd
+                trailing.endTime = segmentEnd
+                trailing.text = text
+                trailing.originalText = text
+                pieces.append(trailing)
+            }
+        }
+        return pieces.isEmpty ? [segment] : pieces
+    }
+
     public static func editText(
         id: UUID,
         text: String,
@@ -534,6 +647,24 @@ public enum LiveMeetingTranscriptReducer {
             current = speakers.first(where: { $0.id == targetID }) ?? current
         }
         return current
+    }
+
+    private static func proportionalText(
+        _ text: String,
+        startRatio: Double,
+        endRatio: Double,
+        isLastPiece: Bool
+    ) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        let characters = Array(trimmed)
+        let count = characters.count
+        let start = min(count, max(0, Int((Double(count) * startRatio).rounded(.down))))
+        let end = isLastPiece
+            ? count
+            : min(count, max(start, Int((Double(count) * endRatio).rounded(.toNearestOrAwayFromZero))))
+        guard start < end else { return "" }
+        return String(characters[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func canMerge(_ lhs: LiveMeetingSegment, _ rhs: LiveMeetingSegment) -> Bool {

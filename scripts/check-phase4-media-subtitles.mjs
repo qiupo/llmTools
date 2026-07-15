@@ -64,6 +64,7 @@ async function run() {
 				    "scripts/check-phase4x-fast-mt.mjs",
 				    "scripts/llmtools-mlx-asr-runner.sh",
 				    "scripts/llmtools-streaming-asr-sidecar.py",
+				    "scripts/llmtools-funasr-pipeline.py",
 				    "scripts/llmtools-lid-sidecar.py",
 				    "scripts/llmtools-fastmt-sidecar.py",
 				    "scripts/llmtools-pyannote-diarization-sidecar.py",
@@ -71,6 +72,7 @@ async function run() {
 				    "scripts/install-phase4-mlx-asr-runtime.sh",
 		    "scripts/install-phase4-funasr-mlx-runtime.sh",
 		    "scripts/install-phase4-funasr-nano-mlx-runtime.sh",
+		    "scripts/install-phase4-funasr-pipeline-runtime.sh",
 		    "scripts/install-phase4-sensevoice-mlx-runtime.sh",
 		    "scripts/install-phase4-whisper-coreml-runtime.sh",
 		    "scripts/install-phase4x-fasttext-lid.sh",
@@ -102,6 +104,8 @@ async function run() {
   const languageNormalizer = await read("Sources/LLMToolsCore/LanguageCodeNormalizer.swift");
   const mediaTypes = await read("Sources/LLMToolsCore/MediaSubtitleTypes.swift");
   const mediaServices = await read("Sources/LLMToolsCore/MediaSubtitleServices.swift");
+  const processLifecycle = await read("Sources/LLMToolsCore/CancellableProcessHandle.swift");
+  const taskEngine = await read("Sources/LLMToolsCore/TaskEngine.swift");
   const settingsView = await read("Sources/LLMToolsApp/Views.swift");
   const localASRRuntimeCheck = await read("scripts/check-phase4-local-asr-runtime.mjs");
 
@@ -177,14 +181,17 @@ async function run() {
     "startAppLiveSubtitles",
     "stopAppLiveSubtitles",
     "appLiveSubtitleStatusPayload",
+    "clearAppLiveSubtitleHistory",
     "repairMediaSubtitleASRRuntime",
-    "buildMLXASRCommandTemplateForRepair",
+	    "installFunASRPipeline",
 	    "LiveSubtitleCaptureService",
 	    "createLiveSubtitleSession",
 	    "appendLiveAudioChunk",
 	    "stopLiveSubtitleSession",
-		    "StreamingASRProcessSession",
-		    "LocalASRProcessRunner",
+			    "StreamingASRProcessSession",
+			    "stopLiveMeetingStreamingASR",
+			    "beginExternalModelUse()",
+			    "LocalASRProcessRunner",
 		    "mode: .realtime",
 		    "translateSubtitleSegments"
 	  ]) {
@@ -278,7 +285,10 @@ async function run() {
     "translationEngineID",
     "liveAudioSource",
     "liveWindowOpacity",
-    "ASRRuntimeSource",
+    "liveTextColorHex",
+	    "ASRRuntimeSource",
+	    "funASRTorchStreaming",
+	    "funASRCompositePipeline",
     "commandTemplate(for family"
   ]) {
     assertIncludes(mediaTypes, needle, "media subtitle preferences");
@@ -295,21 +305,36 @@ async function run() {
 	    "LLMTOOLS_ASR_COMMAND",
 		    "funASRGGUFCommandTemplate",
 		    "funASRGGUFAuto",
+		    "funASRCompositeCommandTemplate",
+		    "llmtools-funasr-pipeline.py",
 			    "whisperCppCoreMLCommandTemplate",
 			    "mlxAudioCommandTemplate",
 	    "mlxAudioRunner",
-	    "StreamingASRProcessSession",
-	    "llmtools-streaming-asr-sidecar.py",
+			    "StreamingASRProcessSession",
+			    "PersistentProcessLifecycle",
+			    "funASRTorchStreaming",
+		    "llmtools-streaming-asr-sidecar.py",
 	    "model.onnx",
     "tokens.txt",
     "runtimeSource"
-  ]) {
-    assertIncludes(mediaServices, needle, "local ASR command resolution");
-  }
+	  ]) {
+	    assertIncludes(mediaServices, needle, "local ASR command resolution");
+	  }
+	  for (const needle of [
+	    "try? inputHandle.close()",
+	    "process.terminate()",
+	    "Darwin.kill(process.processIdentifier, SIGKILL)"
+	  ]) {
+	    assertIncludes(processLifecycle, needle, "persistent sidecar lifecycle");
+	  }
+	  for (const needle of ["languageDetectionService.stop()", "fastTranslationService.stop()"]) {
+	    assertIncludes(taskEngine, needle, "global model unload");
+	  }
   for (const needle of [
     "Local ASR runtime",
     "Runtime source",
     "Repair Runtime",
+	    "安装 FunASR Nano + CAM++",
     "funASRCommandTemplate",
     "senseVoiceCommandTemplate",
 	    "qwen3ASRCommandTemplate",
@@ -318,6 +343,9 @@ async function run() {
     "Audio source",
     "Source language",
     "Window opacity",
+    "Subtitle text color",
+    "ColorPicker",
+    "Clear subtitle history",
     "LiveSubtitleFloatingView",
     "Use {model}, {audio}, {language}, {mode}, and {isFinal}"
   ]) {
@@ -331,6 +359,8 @@ async function run() {
     "No remote ASR fallback",
 	    "llama-funasr-cli",
 	    "funASRGGUFAuto",
+	    "funASRCompositePipeline",
+	    "install-phase4-funasr-pipeline-runtime.sh",
 	    "Fun-ASR-MLT-Nano",
 		    "mlxAudioRunner",
 		    "LLMTOOLS_FUN_ASR_VENV",
@@ -352,6 +382,8 @@ async function run() {
 				  const mlxInstaller = await read("scripts/install-phase4-mlx-asr-runtime.sh");
 			  const funASRMLXInstaller = await read("scripts/install-phase4-funasr-mlx-runtime.sh");
 			  const funASRNanoMLXInstaller = await read("scripts/install-phase4-funasr-nano-mlx-runtime.sh");
+			  const funASRPipeline = await read("scripts/llmtools-funasr-pipeline.py");
+			  const funASRPipelineInstaller = await read("scripts/install-phase4-funasr-pipeline-runtime.sh");
 			  const senseVoiceMLXInstaller = await read("scripts/install-phase4-sensevoice-mlx-runtime.sh");
 			  const whisperCoreMLInstaller = await read("scripts/install-phase4-whisper-coreml-runtime.sh");
 			  for (const needle of [
@@ -377,8 +409,9 @@ async function run() {
 			    "senseVoiceSmall",
 			    "pcm16Base64",
 			    "\"backend\": self.backend",
-			    "\"type\": \"ready\"",
-			    "\"mode\": \"streaming-window\""
+				    "\"type\": \"ready\"",
+				    "signal.signal(signal.SIGTERM, terminate_from_signal)",
+				    "\"mode\": \"streaming-window\""
 			  ]) {
 		    assertIncludes(streamingASRSidecar, needle, "llmTools streaming ASR sidecar");
 		  }
@@ -406,6 +439,40 @@ async function run() {
 		    "avoid eager optional model imports"
 		  ]) {
 		    assertIncludes(funASRNanoMLXInstaller, needle, "llmTools Fun-ASR-Nano mlx-audio installer");
+		  }
+		  for (const needle of [
+		    "FunASRNano",
+		    "funasr-torch",
+		    "prev_text",
+		    "LLMTOOLS_FUNASR_DEVICE",
+		    "回滚末尾 5 个 token",
+		    "MODELSCOPE_OFFLINE",
+		    "device",
+		    "streaming-window"
+		  ]) {
+		    assertIncludes(streamingASRSidecar, needle, "llmTools official FunASR streaming sidecar");
+		  }
+		  for (const needle of [
+		    "AutoModel",
+		    "fsmn-vad",
+		    "campp",
+		    "ct-punc",
+		    "sentence_info",
+		    "speakerID",
+		    "HF_HUB_OFFLINE",
+		    "llmtools.asr/v1"
+		  ]) {
+		    assertIncludes(funASRPipeline, needle, "llmTools official FunASR composite sidecar");
+		  }
+		  for (const needle of [
+		    "funasr==",
+		    "modelscope==",
+		    "torch==",
+		    "runtime-manifest.json",
+		    "campplus_cn_common.bin",
+		    "LLMTOOLS_FUNASR_PIPELINE_ROOT"
+		  ]) {
+		    assertIncludes(funASRPipelineInstaller, needle, "llmTools official FunASR composite installer");
 		  }
 		  for (const needle of [
 		    "uv venv",
@@ -440,6 +507,7 @@ async function run() {
 		  assertIncludes(packageScript, "browser-extension", "packaged app resources");
 				  assertIncludes(packageScript, "llmtools-mlx-asr-runner.sh", "packaged app ASR resources");
 				  assertIncludes(packageScript, "llmtools-streaming-asr-sidecar.py", "packaged app streaming ASR resources");
+				  assertIncludes(packageScript, "llmtools-funasr-pipeline.py", "packaged app official FunASR resources");
 				  assertIncludes(packageScript, "llmtools-lid-sidecar.py", "packaged app LID resources");
 				  assertIncludes(packageScript, "llmtools-fastmt-sidecar.py", "packaged app fast MT resources");
 				  assertIncludes(packageScript, "llmtools-pyannote-diarization-sidecar.py", "packaged app diarization resources");
@@ -447,6 +515,7 @@ async function run() {
 			  assertIncludes(packageScript, "install-phase4-mlx-asr-runtime.sh", "packaged app ASR installer resources");
 			  assertIncludes(packageScript, "install-phase4-funasr-mlx-runtime.sh", "packaged app Fun-ASR ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-funasr-nano-mlx-runtime.sh", "packaged app Fun-ASR-Nano ASR installer resources");
+				  assertIncludes(packageScript, "install-phase4-funasr-pipeline-runtime.sh", "packaged app official FunASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-sensevoice-mlx-runtime.sh", "packaged app SenseVoice ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4-whisper-coreml-runtime.sh", "packaged app whisper CoreML ASR installer resources");
 				  assertIncludes(packageScript, "install-phase4x-fasttext-lid.sh", "packaged app LID installer resources");
@@ -454,6 +523,7 @@ async function run() {
 				  assertIncludes(packageScript, "install-phase4x-nllb-200-distilled-600m.sh", "packaged app NLLB fast MT installer resources");
 				  assertIncludes(packageScript, "install-phase4x-argos.sh", "packaged app Argos fast MT installer resources");
 				  assertIncludes(packageScript, "install-phase4x-pyannote-diarization.sh", "packaged app diarization installer resources");
+				  assertExcludes(packageScript, ["llmtools-vibevoice-asr-runner.py", "install-phase4-vibevoice-asr-runtime.sh"], "packaged app ASR resources");
 	  assertIncludes(packageScript, "chmod +x", "packaged app ASR script executability");
   assertIncludes(packageManifest, "LLMToolsMediaSmoke", "Phase 4 media smoke executable");
 

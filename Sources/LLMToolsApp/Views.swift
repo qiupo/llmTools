@@ -4,6 +4,71 @@ import SwiftUI
 import UniformTypeIdentifiers
 import LLMToolsCore
 
+private func liveSubtitleColor(from hex: String) -> Color {
+    let normalized = MediaSubtitlePreferences.normalizedLiveTextColorHex(hex)
+    let rgb = UInt32(String(normalized.dropFirst()), radix: 16) ?? 0xFFFFFF
+    return Color(
+        red: Double((rgb >> 16) & 0xFF) / 255,
+        green: Double((rgb >> 8) & 0xFF) / 255,
+        blue: Double(rgb & 0xFF) / 255
+    )
+}
+
+private func liveSubtitleColorHex(from color: Color) -> String {
+    guard let rgb = NSColor(color).usingColorSpace(.sRGB) else {
+        return MediaSubtitlePreferences.defaultLiveTextColorHex
+    }
+    // 使用固定 RGB 字符串持久化，避免把 AppKit/SwiftUI 类型带入 Core 配置。
+    let red = Int((min(max(rgb.redComponent, 0), 1) * 255).rounded())
+    let green = Int((min(max(rgb.greenComponent, 0), 1) * 255).rounded())
+    let blue = Int((min(max(rgb.blueComponent, 0), 1) * 255).rounded())
+    return String(format: "#%02X%02X%02X", red, green, blue)
+}
+
+private func speechFamilyTitle(_ model: ModelDescriptor) -> String {
+    model.capabilities.speech?.family.displayName ?? model.sizeClass
+}
+
+private func speechUsageTitle(_ model: ModelDescriptor, language: AppLanguage) -> String {
+    let supportsRealtime = model.capabilities.supportsRealtimeSpeech
+    let supportsFile = model.capabilities.supportsFileSpeech
+    switch (language, supportsRealtime, supportsFile) {
+    case (.chinese, true, true): return "实时 + 文件"
+    case (.chinese, true, false): return "仅实时"
+    case (.chinese, false, true): return "仅文件"
+    case (.chinese, false, false): return "不可用"
+    case (.english, true, true): return "Realtime + File"
+    case (.english, true, false): return "Realtime only"
+    case (.english, false, true): return "File only"
+    case (.english, false, false): return "Unavailable"
+    }
+}
+
+private func speechSpeakerTitle(_ model: ModelDescriptor, language: AppLanguage) -> String {
+    if model.capabilities.speech?.canEmitSpeakerLabels == true {
+        return language == .chinese ? "原生说话人" : "Native speakers"
+    }
+    return language == .chinese ? "独立说话人处理" : "Separate speaker processing"
+}
+
+private func speechRuntimeTitle(_ model: ModelDescriptor, language: AppLanguage) -> String {
+    let chinese = language == .chinese
+    switch model.capabilities.speech?.family {
+    case .funASRNano:
+        return "MLX / GGUF sidecar"
+    case .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
+        return "MLX sidecar"
+    case .vibeVoiceASR:
+        return chinese ? "MLX 文件运行时" : "MLX file runtime"
+    case .whisperCppCoreML:
+        return "whisper.cpp Core ML"
+    case .qwen3ASRSherpaOnnx:
+        return chinese ? "已停用" : "Deprecated"
+    case .customLocal, .none:
+        return chinese ? "本地命令" : "Local command"
+    }
+}
+
 struct SelectionActionView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pinState: WindowPinState
@@ -352,7 +417,10 @@ struct QuickActionView: View {
     }
 
     private var quickActionModePicker: some View {
-        Picker("", selection: $appState.quickActionMode) {
+        Picker("", selection: Binding(
+            get: { appState.quickActionMode },
+            set: { _ = appState.switchQuickActionMode(to: $0) }
+        )) {
             Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
             Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
             Text(L10n.text("Media mode", language: language)).tag(AppState.QuickActionMode.media)
@@ -1336,14 +1404,7 @@ struct QuickActionView: View {
     }
 
     private func speechModelPickerTitle(_ model: ModelDescriptor) -> String {
-        let modeLabel: String
-        if model.capabilities.supportsRealtimeSpeech {
-            modeLabel = L10n.text("Realtime", language: language)
-        } else {
-            modeLabel = L10n.text("File only", language: language)
-        }
-        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
-        return "\(model.name) · \(family) · \(modeLabel)"
+        "\(model.name) · \(speechFamilyTitle(model)) · \(speechUsageTitle(model, language: language)) · \(speechSpeakerTitle(model, language: language))"
     }
 
     private func subtitleModeName(_ mode: SubtitleDisplayMode) -> String {
@@ -2937,6 +2998,7 @@ struct LiveMeetingView: View {
     private var meetingRecognitionStrategyName: String {
         switch session?.recognitionStrategy {
         case .nativeSpeakerASR: return "原生转写 + 说话人"
+        case .compositeSpeakerASR: return "FunASR 组合转写 + 说话人"
         case .delayedSpeakerLabels: return "先转写，后补说话人"
         case .diarizationFirst: return "先分离说话人，再转写"
         case .transcriptOnly: return "仅转写"
@@ -2948,6 +3010,8 @@ struct LiveMeetingView: View {
         switch session?.recognitionStrategy {
         case .nativeSpeakerASR:
             return "speaker 会在明显停顿、120 秒技术窗口或停止后随转写一起输出。"
+        case .compositeSpeakerASR:
+            return "Fun-ASR-Nano、VAD 和 CAM++ 会在本地文件处理中联合输出 speaker。"
         case .delayedSpeakerLabels:
             return "文字会在自然停顿后先输出；speaker 由本地 pyannote 在后台延迟回填。"
         case .diarizationFirst:
@@ -2963,6 +3027,8 @@ struct LiveMeetingView: View {
         switch session?.recognitionStrategy {
         case .nativeSpeakerASR:
             return "明显停顿后开始处理；连续讲话按 120 秒技术窗口分批推理，逻辑讲话仍按自然边界整理。"
+        case .compositeSpeakerASR:
+            return "本地文件正在通过 FunASR 组合管线一次完成转写和说话人处理。"
         case .delayedSpeakerLabels:
             return "转写在自然停顿后先输出，连续讲话最迟约 30 秒提交；speaker 随后回填。"
         case .diarizationFirst:
@@ -2982,6 +3048,8 @@ struct LiveMeetingView: View {
                 return "已采集 \(lag)，等待下一次自然停顿"
             }
             return "已采集 \(lag)，等待明显停顿"
+        case .compositeSpeakerASR:
+            return "FunASR 本地文件处理中"
         case .delayedSpeakerLabels:
             if session.transcriptLagMilliseconds > 0 {
                 return "待转写 \(lag)"
@@ -3052,6 +3120,10 @@ struct LiveSubtitleFloatingView: View {
 
     private var backgroundOpacity: Double {
         appState.preferences.mediaSubtitles.liveWindowOpacity
+    }
+
+    private var subtitleTextColor: Color {
+        liveSubtitleColor(from: appState.preferences.mediaSubtitles.liveTextColorHex)
     }
 
     private var targetLanguageIsActive: Bool {
@@ -3146,6 +3218,7 @@ struct LiveSubtitleFloatingView: View {
                 appearance: .subtitle
             )
             enterImmersiveButton
+            clearLiveSubtitleHistoryButton
             liveSubtitleToggleButton
             closeButton
         }
@@ -3335,6 +3408,19 @@ struct LiveSubtitleFloatingView: View {
         .help(L10n.text("Enter immersive subtitles", language: language))
     }
 
+    private var clearLiveSubtitleHistoryButton: some View {
+        Button {
+            appState.clearAppLiveSubtitleHistory()
+        } label: {
+            Image(systemName: "trash")
+                .font(.system(size: 11, weight: .semibold))
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.white.opacity(0.82))
+        .disabled(!hasClearableLiveSubtitleHistory)
+        .help(L10n.text("Clear subtitle history", language: language))
+    }
+
     private var exitImmersiveButton: some View {
         Button {
             appState.setLiveSubtitleImmersive(false)
@@ -3419,7 +3505,7 @@ struct LiveSubtitleFloatingView: View {
     ) -> some View {
         Text(text.isEmpty ? " " : text)
             .font(.system(size: size, weight: weight))
-            .foregroundStyle(.white.opacity(text.isEmpty ? 0 : opacity))
+            .foregroundStyle(subtitleTextColor.opacity(text.isEmpty ? 0 : opacity))
             .lineLimit(1)
             .minimumScaleFactor(0.72)
             .truncationMode(.tail)
@@ -3524,7 +3610,7 @@ struct LiveSubtitleFloatingView: View {
         VStack(alignment: .center, spacing: 4) {
             Text(primary)
                 .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white.opacity(isDraft ? 0.78 : 1))
+                .foregroundStyle(subtitleTextColor.opacity(isDraft ? 0.78 : 1))
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity)
@@ -3532,7 +3618,7 @@ struct LiveSubtitleFloatingView: View {
             if let secondary {
                 Text(secondary)
                     .font(.system(size: 14, weight: .medium))
-                    .foregroundStyle(.white.opacity(isDraft ? 0.58 : 0.74))
+                    .foregroundStyle(subtitleTextColor.opacity(isDraft ? 0.58 : 0.74))
                     .multilineTextAlignment(.center)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity)
@@ -3547,6 +3633,17 @@ struct LiveSubtitleFloatingView: View {
                 proxy.scrollTo(scrollBottomID, anchor: .bottom)
             }
         }
+    }
+
+    private var hasClearableLiveSubtitleHistory: Bool {
+        if !appState.appLiveSubtitleHistory.isEmpty {
+            return true
+        }
+        guard !appState.appLiveSubtitleIsPartial else {
+            return false
+        }
+        return !trimmed(appState.appLiveSubtitleOriginalText).isEmpty
+            || !trimmed(appState.appLiveSubtitleTranslatedText).isEmpty
     }
 
     private var primarySubtitleText: String {
@@ -5299,7 +5396,7 @@ struct SettingsView: View {
                     ),
                     placeholder: "{python} {sidecar} --model {diarization_model} --audio {audio_wav_16k_mono} --output {output_json}"
                 )
-                Text(L10n.text("Use {audio_wav_16k_mono}, {output_json}, {diarization_model}, {hf_cache}, and {hf_token}. Empty field uses the bundled pyannote sidecar when the local runtime is installed.", language: language))
+                Text(L10n.text("Use {audio_wav_16k_mono}, {output_json}, {diarization_model}, and {hf_cache}. The token is provided through PYANNOTE_AUTH_TOKEN and cannot be inserted into the command template. Empty field uses the bundled pyannote sidecar when the local runtime is installed.", language: language))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -5408,7 +5505,7 @@ struct SettingsView: View {
                         appState.updatePreferences { $0.fastTranslation.textEngine = newValue }
                     }
                 ))
-                Text(L10n.text("Only Translate can use fast MT. Polish, summary, explanation, and TODO always use the default LLM model.", language: language))
+                Text(L10n.text("Only Translate can use fast MT. Polish, summary, explanation, and TODO use their configured LLM models.", language: language))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -5634,7 +5731,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 320, alignment: .leading)
+        .frame(width: 440, alignment: .leading)
         .disabled(appState.fileSpeechModels.isEmpty)
     }
 
@@ -5652,7 +5749,7 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .pickerStyle(.menu)
-        .frame(width: 320, alignment: .leading)
+        .frame(width: 440, alignment: .leading)
         .disabled(appState.realtimeSpeechModels.isEmpty)
     }
 
@@ -5759,6 +5856,139 @@ struct SettingsView: View {
         }
     }
 
+    private var speechRecognitionOverview: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                statusBadge(
+                    localizedSettingsText(chinese: "转写模型", english: "ASR model"),
+                    systemImage: "waveform"
+                )
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                statusBadge(
+                    localizedSettingsText(chinese: "本地运行时", english: "Local runtime"),
+                    systemImage: "cpu"
+                )
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                statusBadge(
+                    localizedSettingsText(chinese: "可选说话人处理", english: "Optional speakers"),
+                    systemImage: "person.wave.2"
+                )
+            }
+
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(appState.speechCapableModels) { model in
+                        speechModelOverviewRow(model)
+                        Divider()
+                    }
+                }
+                .padding(.top, 5)
+            } label: {
+                Text(localizedSettingsText(
+                    chinese: "已注册语音模型（\(appState.speechCapableModels.count)）",
+                    english: "Registered speech models (\(appState.speechCapableModels.count))"
+                ))
+                .font(.subheadline)
+            }
+        }
+    }
+
+    private func speechModelOverviewRow(_ model: ModelDescriptor) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Text(model.name)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                Text(speechUsageTitle(model, language: language))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            HStack(spacing: 5) {
+                Text(speechFamilyTitle(model))
+                Text("·")
+                Text(speechRuntimeTitle(model, language: language))
+                Text("·")
+                Label(
+                    speechSpeakerTitle(model, language: language),
+                    systemImage: model.capabilities.speech?.canEmitSpeakerLabels == true ? "person.2.fill" : "person.wave.2"
+                )
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+        }
+        .padding(.vertical, 7)
+    }
+
+    private var selectedFileSpeakerPipelineSummary: String {
+        guard let model = appState.selectedFileASRModel else {
+            return localizedSettingsText(chinese: "请选择文件转写模型。", english: "Select a file transcription model.")
+        }
+        if isOfficialFunASRNanoModel(model) {
+            return localizedSettingsText(
+                chinese: "原版 Nano 会通过本地 VAD + CAM++ + 标点组合管线返回说话人标签；没有有效标签时再回退到 pyannote。",
+                english: "Official Nano uses the local VAD + CAM++ + punctuation pipeline for speaker labels, then falls back to pyannote when no usable labels are returned."
+            )
+        }
+        if model.capabilities.speech?.canEmitSpeakerLabels == true {
+            return localizedSettingsText(
+                chinese: "当前模型可返回原生说话人标签；有原生标签时不会再运行外部 pyannote。",
+                english: "This model can return native speaker labels; external pyannote is skipped when those labels are present."
+            )
+        }
+        if model.capabilities.speech?.family == .funASRNano {
+            return localizedSettingsText(
+                chinese: "当前 llmTools 的 Fun-ASR-Nano MLX/GGUF 路径只负责转写；说话人标签仍走独立后处理。",
+                english: "The current llmTools Fun-ASR-Nano MLX/GGUF routes handle transcription only; speaker labels still use separate post-processing."
+            )
+        }
+        return localizedSettingsText(
+            chinese: "当前模型只负责转写；启用后会由独立 pyannote 管线补充说话人标签。",
+            english: "This model handles transcription only; the separate pyannote pipeline adds speaker labels when enabled."
+        )
+    }
+
+    private var funASRSpeakerPipelineSummary: String {
+        // 官方示例中的 speaker 来自 Nano 与 CAM++ 的组合管线，并非 Nano 权重单独输出。
+        localizedSettingsText(
+            chinese: "原版 FunASR Nano 已接入文件字幕和离线会议：VAD + Nano + CAM++ + 标点生成带 speaker 的片段；实时会议已按 speaker 效果排除。MLX/GGUF Nano 仍只负责转写，继续使用独立 pyannote。",
+            english: "Official FunASR Nano is integrated for file subtitles and offline meetings: VAD + Nano + CAM++ + punctuation emits speaker-labeled segments. It is excluded from realtime meetings after speaker-quality testing; MLX/GGUF Nano remains transcription-only and continues to use separate pyannote."
+        )
+    }
+
+    private func isOfficialFunASRNanoModel(_ model: ModelDescriptor) -> Bool {
+        guard model.capabilities.speech?.family == .funASRNano else { return false }
+        let directory = model.resolvedPath ?? model.sourcePath
+        return FileManager.default.fileExists(atPath: directory.appendingPathComponent("model.pt").path)
+            && FileManager.default.fileExists(atPath: directory.appendingPathComponent("config.yaml").path)
+    }
+
+    private var funASRPipelineActionTitle: String {
+        if appState.funASRPipelineInstallInProgress {
+            return localizedSettingsText(chinese: "正在安装 FunASR 组合管线", english: "Installing FunASR pipeline")
+        }
+        guard let installed = appState.models.first(where: isOfficialFunASRNanoModel) else {
+            return localizedSettingsText(chinese: "安装 FunASR Nano + CAM++", english: "Install FunASR Nano + CAM++")
+        }
+        if appState.selectedFileASRModel?.id == installed.id {
+            return localizedSettingsText(chinese: "验证/修复 FunASR 组合管线", english: "Verify or repair FunASR pipeline")
+        }
+        return localizedSettingsText(chinese: "使用 FunASR Nano + CAM++", english: "Use FunASR Nano + CAM++")
+    }
+
+    private var funASRPipelineActionIcon: String {
+        if appState.funASRPipelineInstallInProgress { return "clock" }
+        return appState.models.contains(where: isOfficialFunASRNanoModel)
+            ? "checkmark.circle"
+            : "arrow.down.circle"
+    }
+
     private var mediaSubtitleSettingsPage: some View {
         settingsForm(maxWidth: 620) {
             settingRow(title: L10n.text("Feature", language: language)) {
@@ -5779,6 +6009,10 @@ struct SettingsView: View {
                 }
             }
 
+            settingRow(title: localizedSettingsText(chinese: "语音管线", english: "Speech pipeline")) {
+                speechRecognitionOverview
+            }
+
             settingRow(title: L10n.text("Default realtime model", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     settingsMediaRealtimeASRPicker
@@ -5793,7 +6027,10 @@ struct SettingsView: View {
                         }
                         .controlSize(.small)
                         .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedRealtimeASRModel == nil)
-                        Text(L10n.text("Fun-ASR-MLT-Nano remains the broad-language default; MLX Qwen3-ASR and whisper.cpp Core ML also run realtime through persistent local sidecars.", language: language))
+                        Text(localizedSettingsText(
+                            chinese: "选择器已按模型族、用途和说话人能力标注；健康检查验证当前模型的实际本地运行时。",
+                            english: "The picker labels model family, usage, and speaker capability; Health Check verifies the selected local runtime."
+                        ))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -5815,7 +6052,7 @@ struct SettingsView: View {
                         }
                         .controlSize(.small)
                         .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedFileASRModel == nil)
-                        Text(L10n.text("VibeVoice-ASR is a heavy file-only rich transcription model; native speaker/timestamp output is used before external diarization.", language: language))
+                        Text(selectedFileSpeakerPipelineSummary)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -5828,74 +6065,103 @@ struct SettingsView: View {
 
             settingRow(title: L10n.text("Local ASR runtime", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
-                    mediaASRCommandField(
-                        title: L10n.text("Fun-ASR command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.funASRCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.funASRCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "fun-asr-stream --model {model} --audio {audio} --language {language}"
+                    Label(
+                        localizedSettingsText(chinese: "默认自动使用已安装的模型专用本地 sidecar", english: "Installed model-specific local sidecars are used automatically"),
+                        systemImage: "externaldrive.connected.to.line.below"
                     )
-                    mediaASRCommandField(
-                        title: L10n.text("SenseVoice command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.senseVoiceCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.senseVoiceCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "sensevoice --model {model} --audio {audio} --language {language}"
-                    )
-                    mediaASRCommandField(
-                        title: L10n.text("Qwen3-ASR command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.qwen3ASRCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.qwen3ASRCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "qwen3-asr --model {model} --audio {audio} --language {language}"
-                    )
-                    mediaASRCommandField(
-                        title: L10n.text("VibeVoice-ASR command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.vibeVoiceASRCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.vibeVoiceASRCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "vibevoice-asr --model {model} --audio {audio}"
-                    )
-                    mediaASRCommandField(
-                        title: L10n.text("Whisper command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.whisperCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.whisperCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "whisper-cli -m {model} -f {audio} -l {language}"
-                    )
-                    mediaASRCommandField(
-                        title: L10n.text("Generic ASR command", language: language),
-                        text: Binding(
-                            get: { appState.preferences.mediaSubtitles.genericASRCommandTemplate },
-                            set: { newValue in
-                                appState.updatePreferences { $0.mediaSubtitles.genericASRCommandTemplate = newValue }
-                            }
-                        ),
-                        placeholder: "local-asr --model {model} --audio {audio} --language {language}"
-                    )
-                    Text(L10n.text("Use {model}, {audio}, {language}, {mode}, and {isFinal}. Empty fields fall back to environment variables or detected local runtimes.", language: language))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    Button {
+                        appState.installFunASRPipeline()
+                    } label: {
+                        Label(
+                            funASRPipelineActionTitle,
+                            systemImage: funASRPipelineActionIcon
+                        )
+                    }
+                    .controlSize(.small)
+                    .disabled(appState.funASRPipelineInstallInProgress || appState.mediaSubtitleASRRepairMode != nil)
+
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            mediaASRCommandField(
+                                title: L10n.text("Fun-ASR command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.funASRCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.funASRCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "fun-asr-stream --model {model} --audio {audio} --language {language}"
+                            )
+                            mediaASRCommandField(
+                                title: L10n.text("SenseVoice command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.senseVoiceCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.senseVoiceCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "sensevoice --model {model} --audio {audio} --language {language}"
+                            )
+                            mediaASRCommandField(
+                                title: L10n.text("Qwen3-ASR command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.qwen3ASRCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.qwen3ASRCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "qwen3-asr --model {model} --audio {audio} --language {language}"
+                            )
+                            mediaASRCommandField(
+                                title: L10n.text("VibeVoice-ASR command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.vibeVoiceASRCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.vibeVoiceASRCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "vibevoice-asr --model {model} --audio {audio}"
+                            )
+                            mediaASRCommandField(
+                                title: L10n.text("Whisper command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.whisperCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.whisperCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "whisper-cli -m {model} -f {audio} -l {language}"
+                            )
+                            mediaASRCommandField(
+                                title: L10n.text("Generic ASR command", language: language),
+                                text: Binding(
+                                    get: { appState.preferences.mediaSubtitles.genericASRCommandTemplate },
+                                    set: { newValue in
+                                        appState.updatePreferences { $0.mediaSubtitles.genericASRCommandTemplate = newValue }
+                                    }
+                                ),
+                                placeholder: "local-asr --model {model} --audio {audio} --language {language}"
+                            )
+                            Text(L10n.text("Use {model}, {audio}, {language}, {mode}, and {isFinal}. Empty fields fall back to environment variables or detected local runtimes.", language: language))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.top, 6)
+                    } label: {
+                        Label(
+                            localizedSettingsText(chinese: "自定义命令模板（高级）", english: "Custom command templates (Advanced)"),
+                            systemImage: "terminal"
+                        )
+                    }
                 }
             }
 
-            settingRow(title: L10n.text("Speaker Diarization", language: language)) {
+            settingRow(title: localizedSettingsText(chinese: "说话人处理", english: "Speaker processing")) {
                 VStack(alignment: .leading, spacing: 8) {
                     checkboxLine(
                         title: L10n.text("Enable for file subtitles", language: language),
@@ -5906,6 +6172,10 @@ struct SettingsView: View {
                             }
                         )
                     )
+                    Text(funASRSpeakerPipelineSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(L10n.text("pyannote model, token, cache, command, and runtime are managed under Models > Model Settings.", language: language))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -6013,6 +6283,21 @@ struct SettingsView: View {
                             .frame(width: 44, alignment: .trailing)
                     }
                     .frame(width: 320, alignment: .leading)
+
+                    HStack(spacing: 10) {
+                        Label(L10n.text("Subtitle text color", language: language), systemImage: "textformat")
+                            .frame(width: 150, alignment: .leading)
+                        ColorPicker(
+                            "",
+                            selection: Binding(
+                                get: { liveSubtitleColor(from: appState.preferences.mediaSubtitles.liveTextColorHex) },
+                                set: { appState.setLiveSubtitleTextColorHex(liveSubtitleColorHex(from: $0)) }
+                            ),
+                            supportsOpacity: false
+                        )
+                        .labelsHidden()
+                    }
+                    .frame(width: 320, alignment: .leading)
                 }
             }
 
@@ -6069,7 +6354,7 @@ struct SettingsView: View {
                        report.modelID == appState.selectedLiveMeetingRealtimeASRModel?.id {
                         mediaASRHealthReportView(
                             report,
-                            mode: appState.selectedLiveMeetingRealtimeASRModel?.capabilities.meetingCaptureRuntimeMode ?? .realtime
+                            mode: appState.selectedLiveMeetingRealtimeASRModel?.meetingCaptureRuntimeMode ?? .realtime
                         )
                     }
                 }
@@ -6393,10 +6678,23 @@ struct SettingsView: View {
             settingRow(title: L10n.text("Default LLM model", language: language)) {
                 VStack(alignment: .leading, spacing: 4) {
                     defaultModelPicker
-                    Text(L10n.text("Used by text-mode LLM actions. Webpage translation can choose its own model on the Webpage tab.", language: language))
+                    Text(L10n.text("Used as the fallback for text-mode LLM actions. Webpage translation can choose its own model on the Webpage tab.", language: language))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            settingRow(title: L10n.text("Task default models", language: language)) {
+                VStack(alignment: .leading, spacing: 7) {
+                    ForEach(TaskKind.perTaskModelCases) { task in
+                        HStack(spacing: 8) {
+                            Text(task.title(language: language))
+                                .font(.subheadline)
+                                .frame(width: 88, alignment: .leading)
+                            textTaskModelPicker(for: task)
+                        }
+                    }
                 }
             }
 
@@ -6852,6 +7150,24 @@ struct SettingsView: View {
         .disabled(appState.textCapableModels.isEmpty)
     }
 
+    private func textTaskModelPicker(for task: TaskKind) -> some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.textTaskModelIDs[task] },
+            set: { newValue in
+                appState.updatePreferences { $0.setTextModelID(newValue, for: task) }
+            }
+        )) {
+            Text(L10n.text("Use text default model", language: language)).tag(UUID?.none)
+            ForEach(appState.textCapableModels) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 230, alignment: .leading)
+        .disabled(appState.textCapableModels.isEmpty)
+    }
+
     private var webPageTranslationModelPicker: some View {
         Picker("", selection: Binding<UUID?>(
             get: { appState.preferences.webPageTranslation.modelID },
@@ -7065,7 +7381,7 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.4.0"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.4.1"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
     }
@@ -8127,7 +8443,7 @@ struct SettingsView: View {
                     .lineLimit(2)
             }
             if let speech = capabilities.speech {
-                Text("\(speech.family.rawValue) · \(speech.modes.map { $0.rawValue }.joined(separator: ", "))")
+                Text("\(speech.family.displayName) · \(speech.modes.map { $0.rawValue }.joined(separator: ", "))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -8912,6 +9228,10 @@ struct SettingsView: View {
             return "whisper.cpp CoreML"
         case (.chinese, .funASRGGUFAuto):
             return "自动 FunASR GGUF"
+        case (.chinese, .funASRTorchStreaming):
+            return "FunASR Torch/MPS 实时"
+        case (.chinese, .funASRCompositePipeline):
+            return "FunASR Nano + CAM++"
         case (.chinese, .vibeVoiceASRRunner):
             return "VibeVoice-ASR"
         case (.chinese, .unavailable):
@@ -8932,6 +9252,10 @@ struct SettingsView: View {
             return "whisper.cpp Core ML"
         case (.english, .funASRGGUFAuto):
             return "Auto FunASR GGUF"
+        case (.english, .funASRTorchStreaming):
+            return "FunASR Torch/MPS realtime"
+        case (.english, .funASRCompositePipeline):
+            return "FunASR Nano + CAM++"
         case (.english, .vibeVoiceASRRunner):
             return "VibeVoice-ASR"
         case (.english, .unavailable):
@@ -8940,11 +9264,7 @@ struct SettingsView: View {
     }
 
     private func settingsSpeechModelPickerTitle(_ model: ModelDescriptor) -> String {
-        let modeLabel = model.capabilities.supportsRealtimeSpeech
-            ? L10n.text("Realtime", language: language)
-            : L10n.text("File only", language: language)
-        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
-        return "\(model.name) · \(family) · \(modeLabel)"
+        "\(model.name) · \(speechFamilyTitle(model)) · \(speechUsageTitle(model, language: language)) · \(speechSpeakerTitle(model, language: language))"
     }
 
     private func settingsMeetingSpeechModelPickerTitle(_ model: ModelDescriptor) -> String {
@@ -8952,10 +9272,9 @@ struct SettingsView: View {
         if model.capabilities.speech?.canEmitSpeakerLabels == true {
             modeLabel = localizedSettingsText(chinese: "原生说话人", english: "Native speakers")
         } else {
-            modeLabel = localizedSettingsText(chinese: "先分离后转写", english: "Diarization first")
+            modeLabel = localizedSettingsText(chinese: "先转写后回填说话人", english: "Transcript first, delayed speakers")
         }
-        let family = model.capabilities.speech?.family.rawValue ?? model.sizeClass
-        return "\(model.name) · \(family) · \(modeLabel)"
+        return "\(model.name) · \(speechFamilyTitle(model)) · \(modeLabel)"
     }
 
     private func subtitleModeName(_ mode: SubtitleDisplayMode) -> String {

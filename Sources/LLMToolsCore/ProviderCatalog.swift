@@ -133,6 +133,29 @@ public struct ProviderConfiguration: Codable, Hashable, Sendable {
     }
 }
 
+public enum ProviderEndpointPolicy {
+    public static let secureTransportMessage = "Provider base URL must use HTTPS unless it points to localhost."
+
+    public static func allows(_ url: URL) -> Bool {
+        guard url.user == nil, url.password == nil,
+              let scheme = url.scheme?.lowercased(),
+              let host = url.host?.lowercased() else {
+            return false
+        }
+        if scheme == "https" {
+            return true
+        }
+        guard scheme == "http" else {
+            return false
+        }
+        // Ollama、LM Studio 等本机服务允许 HTTP；远程文本和密钥必须走 HTTPS。
+        let normalizedHost = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]."))
+        return normalizedHost == "localhost"
+            || normalizedHost == "127.0.0.1"
+            || normalizedHost == "::1"
+    }
+}
+
 public enum ProviderRequestOptions {
     public static func enableThinking(for configuration: ProviderConfiguration) -> Bool? {
         guard configuration.providerID == .siliconFlow,

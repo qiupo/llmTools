@@ -34,6 +34,7 @@ public struct ProviderTestResult: Sendable, Hashable {
 public enum ProviderConnectivityError: Error, LocalizedError, Sendable {
     case notRemoteProvider
     case missingBaseURL
+    case insecureBaseURL
     case missingModelID
     case missingAPIKey(String)
     case requestFailed(Int, String)
@@ -46,6 +47,8 @@ public enum ProviderConnectivityError: Error, LocalizedError, Sendable {
             return "This model is local and does not use a network provider."
         case .missingBaseURL:
             return "Provider base URL is missing."
+        case .insecureBaseURL:
+            return ProviderEndpointPolicy.secureTransportMessage
         case .missingModelID:
             return "Provider model ID is missing."
         case .missingAPIKey(let providerName):
@@ -68,6 +71,9 @@ public enum ProviderConnectivity {
         let providerName = ModelProviderCatalog.displayName(for: configuration.providerID)
         guard let baseURL = configuration.baseURL else {
             throw ProviderConnectivityError.missingBaseURL
+        }
+        guard ProviderEndpointPolicy.allows(baseURL) else {
+            throw ProviderConnectivityError.insecureBaseURL
         }
         let modelID = configuration.modelID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !modelID.isEmpty else {
@@ -266,7 +272,7 @@ public enum ProviderConnectivity {
 
     private static func data(for request: URLRequest) async throws -> Data {
         try Task.checkCancellation()
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await ProviderHTTPSession.data(for: request)
         try Task.checkCancellation()
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ProviderConnectivityError.requestFailed(0, "No HTTP response.")

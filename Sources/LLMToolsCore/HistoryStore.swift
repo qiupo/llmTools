@@ -16,6 +16,7 @@ public actor HistoryStore {
 
     public func load() throws -> [HistoryItem] {
         let fm = FileManager.default
+        try AppPaths.preparePrivateFileStorage(at: fileURL)
         guard fm.fileExists(atPath: fileURL.path) else {
             return []
         }
@@ -24,9 +25,9 @@ public actor HistoryStore {
     }
 
     public func save(_ items: [HistoryItem]) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try AppPaths.preparePrivateFileStorage(at: fileURL)
         let data = try encoder.encode(items)
         try data.write(to: fileURL, options: [.atomic])
+        try AppPaths.hardenPrivateFile(at: fileURL)
     }
 }

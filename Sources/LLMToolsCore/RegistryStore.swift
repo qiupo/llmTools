@@ -26,6 +26,7 @@ public actor RegistryStore {
 
     public func load() throws -> RegistrySnapshot {
         let fm = FileManager.default
+        try AppPaths.preparePrivateFileStorage(at: fileURL)
         guard fm.fileExists(atPath: fileURL.path) else {
             return .init()
         }
@@ -34,9 +35,9 @@ public actor RegistryStore {
     }
 
     public func save(_ snapshot: RegistrySnapshot) throws {
-        let fm = FileManager.default
-        try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try AppPaths.preparePrivateFileStorage(at: fileURL)
         let data = try encoder.encode(snapshot)
         try data.write(to: fileURL, options: [.atomic])
+        try AppPaths.hardenPrivateFile(at: fileURL)
     }
 }

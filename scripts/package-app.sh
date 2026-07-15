@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIGURATION="${CONFIGURATION:-release}"
 APP_NAME="llmTools"
 BUNDLE_ID="local.llmtools.app"
-APP_VERSION="${APP_VERSION:-0.4.0}"
+APP_VERSION="${APP_VERSION:-0.4.1}"
 APP_BUILD="${APP_BUILD:-1}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
@@ -40,25 +40,25 @@ fi
 mkdir -p "$RESOURCES_DIR/asr"
 cp "$ROOT_DIR/scripts/llmtools-mlx-asr-runner.sh" "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh"
 cp "$ROOT_DIR/scripts/llmtools-streaming-asr-sidecar.py" "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py"
+cp "$ROOT_DIR/scripts/llmtools-funasr-pipeline.py" "$RESOURCES_DIR/asr/llmtools-funasr-pipeline.py"
 cp "$ROOT_DIR/scripts/llmtools-whisper-coreml-runner.sh" "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh"
-cp "$ROOT_DIR/scripts/llmtools-vibevoice-asr-runner.py" "$RESOURCES_DIR/asr/llmtools-vibevoice-asr-runner.py"
 cp "$ROOT_DIR/scripts/install-phase4-mlx-asr-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-funasr-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-funasr-nano-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh"
+cp "$ROOT_DIR/scripts/install-phase4-funasr-pipeline-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-funasr-pipeline-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-sensevoice-mlx-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh"
 cp "$ROOT_DIR/scripts/install-phase4-whisper-coreml-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
-cp "$ROOT_DIR/scripts/install-phase4-vibevoice-asr-runtime.sh" "$RESOURCES_DIR/asr/install-phase4-vibevoice-asr-runtime.sh"
 chmod +x \
     "$RESOURCES_DIR/asr/llmtools-mlx-asr-runner.sh" \
     "$RESOURCES_DIR/asr/llmtools-streaming-asr-sidecar.py" \
+    "$RESOURCES_DIR/asr/llmtools-funasr-pipeline.py" \
     "$RESOURCES_DIR/asr/llmtools-whisper-coreml-runner.sh" \
-    "$RESOURCES_DIR/asr/llmtools-vibevoice-asr-runner.py" \
     "$RESOURCES_DIR/asr/install-phase4-mlx-asr-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-funasr-mlx-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-funasr-nano-mlx-runtime.sh" \
+    "$RESOURCES_DIR/asr/install-phase4-funasr-pipeline-runtime.sh" \
     "$RESOURCES_DIR/asr/install-phase4-sensevoice-mlx-runtime.sh" \
-    "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh" \
-    "$RESOURCES_DIR/asr/install-phase4-vibevoice-asr-runtime.sh"
+    "$RESOURCES_DIR/asr/install-phase4-whisper-coreml-runtime.sh"
 mkdir -p "$RESOURCES_DIR/lid"
 cp "$ROOT_DIR/scripts/llmtools-lid-sidecar.py" "$RESOURCES_DIR/lid/llmtools-lid-sidecar.py"
 cp "$ROOT_DIR/scripts/install-phase4x-fasttext-lid.sh" "$RESOURCES_DIR/lid/install-phase4x-fasttext-lid.sh"

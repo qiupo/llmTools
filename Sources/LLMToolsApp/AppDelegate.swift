@@ -5,6 +5,21 @@ import LLMToolsCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate, SelectionActionServiceDelegate, NSMenuDelegate {
+    private struct RegisteredHotKeys: Equatable {
+        let quickAction: KeyboardShortcutPreference
+        let quickActionWithoutSelection: KeyboardShortcutPreference
+        let liveSubtitles: KeyboardShortcutPreference
+
+        static var defaults: RegisteredHotKeys {
+            let preferences = AppPreferences()
+            return RegisteredHotKeys(
+                quickAction: preferences.quickActionShortcut,
+                quickActionWithoutSelection: preferences.quickActionWithoutSelectionShortcut,
+                liveSubtitles: preferences.liveSubtitleShortcut
+            )
+        }
+    }
+
     private enum LiveSubtitleResizeCursorKind {
         case horizontal
         case vertical
@@ -57,6 +72,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var liveSubtitleWindowResizeObserver: Any?
     private var selectionDismissMonitors: [Any] = []
     private var quickActionKeyboardMonitor: Any?
+    private var quickActionSelectionCaptureTask: Task<Void, Never>?
+    private var quickActionSelectionCaptureRevision = 0
+    private var selectionActionCaptureTask: Task<Void, Never>?
+    private var selectionCaptureRevision = 0
+    private var lastRegisteredHotKeys: RegisteredHotKeys?
+    private var hotKeyRegistrationError: String?
+    private var hotKeyPreferencesBeingRestored: RegisteredHotKeys?
     private var liveSubtitleEscapeMonitors: [Any] = []
     private var liveSubtitlePointerMonitors: [Any] = []
     private var liveSubtitleResizeCursorKind: LiveSubtitleResizeCursorKind?
@@ -71,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionService.delegate = self
         configureStatusItem()
         configureWindows()
+        SelectedTextService.startMonitoringPasteboardOwnershipEvents()
         installQuickActionKeyboardMonitor()
         installLiveSubtitleEscapeMonitors()
         installLiveSubtitlePointerMonitors()
@@ -94,6 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         hotKeyService.unregister()
+        SelectedTextService.stopMonitoringPasteboardOwnershipEvents()
         appState.cancelCurrentTask(unloadModel: true)
         appState.stopAppLiveSubtitlesForShutdown()
         appState.prepareLiveMeetingForAbnormalTermination()
@@ -150,6 +174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         if let quickActionWindow = quickActionWindowController?.window as? FloatingWindow {
             quickActionWindow.onEscape = { [weak self] in
                 self?.quickActionWindowController?.close()
+            }
+            quickActionWindow.onClose = { [weak self] in
+                self?.cancelPendingQuickActionSelectionCapture()
+                self?.appState.cancelQuickActionWork()
             }
             quickActionWindow.onKeyboardShortcut = { [weak self] shortcut in
                 self?.handleQuickActionShortcut(shortcut) ?? false
@@ -248,12 +276,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     @objc private func openQuickAction() {
-        appState.quickActionMode = .text
+        _ = appState.switchQuickActionMode(to: .text)
         openQuickActionWindow(nearSelection: false)
     }
 
     @objc private func openImageOCR() {
-        appState.quickActionMode = .image
+        _ = appState.switchQuickActionMode(to: .image)
         openQuickActionWindow(nearSelection: false)
     }
 
@@ -338,13 +366,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     func hotKeyService(_ service: HotKeyService, didTriggerQuickActionCapturingSelection shouldCaptureSelection: Bool) {
+        appState.cancelQuickActionWork()
         if shouldCaptureSelection {
             populateSelectedTextIfAvailable()
         } else {
+            cancelPendingQuickActionSelectionCapture()
             appState.setInputText("", origin: .manual)
             appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
+            openQuickAction()
         }
-        openQuickAction()
     }
 
     func hotKeyServiceDidTriggerLiveSubtitles(_ service: HotKeyService) {
@@ -363,18 +393,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             return
         }
 
-        Task { @MainActor [weak self] in
+        selectionCaptureRevision += 1
+        let revision = selectionCaptureRevision
+        selectionActionCaptureTask?.cancel()
+        selectionActionCaptureTask = Task { @MainActor [weak self] in
             guard let self else {
                 return
             }
-            await self.handleSelectionActionTrigger(at: screenPoint, source: source, gesture: gesture)
+            await self.handleSelectionActionTrigger(
+                at: screenPoint,
+                source: source,
+                gesture: gesture,
+                revision: revision
+            )
         }
     }
 
     private func handleSelectionActionTrigger(
         at screenPoint: NSPoint,
         source: SelectionActionTriggerSource,
-        gesture: SelectionActionGesture?
+        gesture: SelectionActionGesture?,
+        revision: Int
     ) async {
         guard isSelectionActionEnabled else {
             return
@@ -383,12 +422,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             return
         }
 
-        guard let selectedText = await captureSelectedTextForSelectionAction(source: source, at: screenPoint) else {
+        guard let selectedText = await captureSelectedTextForSelectionAction(
+            source: source,
+            at: screenPoint,
+            revision: revision
+        ) else {
+            guard !Task.isCancelled, revision == selectionCaptureRevision else {
+                return
+            }
             if !SelectedTextService.isAccessibilityTrusted {
                 appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
             } else {
                 appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
             }
+            return
+        }
+        guard !Task.isCancelled, revision == selectionCaptureRevision else {
             return
         }
 
@@ -404,16 +453,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         appState.statusMessage = L10n.text("Captured selected text", language: appState.preferences.appLanguage)
         lastSelectionScreenPoint = screenPoint
         showSelectionAction(at: screenPoint)
+        guard !appState.selectedTextModelIsRemote else {
+            appState.statusMessage = L10n.text(
+                "Selected text is ready. Choose an action to send it to the remote provider.",
+                language: appState.preferences.appLanguage
+            )
+            return
+        }
         appState.runCurrentTask()
     }
 
-    private func captureSelectedTextForSelectionAction(source: SelectionActionTriggerSource, at screenPoint: NSPoint) async -> String? {
+    private func captureSelectedTextForSelectionAction(
+        source: SelectionActionTriggerSource,
+        at screenPoint: NSPoint,
+        revision: Int
+    ) async -> String? {
         let retryDelays: [UInt64] = [0, 180_000_000, 320_000_000]
         for delay in retryDelays {
             if delay > 0 {
                 try? await Task.sleep(nanoseconds: delay)
             }
-            guard isSelectionActionEnabled else {
+            guard !Task.isCancelled,
+                  revision == selectionCaptureRevision,
+                  isSelectionActionEnabled else {
                 return nil
             }
             if let selectedText = await SelectedTextService.captureSelectedText(
@@ -443,22 +505,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func populateSelectedTextIfAvailable() {
-        Task { @MainActor [weak self] in
+        selectionCaptureRevision += 1
+        selectionActionCaptureTask?.cancel()
+        selectionActionCaptureTask = nil
+        cancelPendingQuickActionSelectionCapture()
+        quickActionSelectionCaptureRevision += 1
+        let revision = quickActionSelectionCaptureRevision
+        quickActionSelectionCaptureTask = Task { @MainActor [weak self] in
             guard let self else {
                 return
             }
 
             if let selectedText = await SelectedTextService.captureSelectedText() {
+                guard !Task.isCancelled, revision == quickActionSelectionCaptureRevision else {
+                    return
+                }
                 appState.setInputText(selectedText, origin: .selection)
                 appState.statusMessage = L10n.text("Captured selected text", language: appState.preferences.appLanguage)
             } else if !SelectedTextService.isAccessibilityTrusted {
+                guard !Task.isCancelled, revision == quickActionSelectionCaptureRevision else {
+                    return
+                }
                 SelectedTextService.clearCapturedSelectionSource()
                 appState.statusMessage = L10n.text("Enable Accessibility permission or paste text", language: appState.preferences.appLanguage)
             } else if appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                guard !Task.isCancelled, revision == quickActionSelectionCaptureRevision else {
+                    return
+                }
                 appState.setInputText("", origin: .manual)
                 appState.statusMessage = L10n.text("Paste or type text", language: appState.preferences.appLanguage)
             }
+            guard !Task.isCancelled, revision == quickActionSelectionCaptureRevision else {
+                return
+            }
+            quickActionSelectionCaptureTask = nil
+            openQuickAction()
         }
+    }
+
+    private func cancelPendingQuickActionSelectionCapture() {
+        quickActionSelectionCaptureTask?.cancel()
+        quickActionSelectionCaptureTask = nil
+        quickActionSelectionCaptureRevision += 1
+        selectionCaptureRevision += 1
+        selectionActionCaptureTask?.cancel()
+        selectionActionCaptureTask = nil
     }
 
     private func showSelectionAction(at screenPoint: NSPoint) {
@@ -981,11 +1072,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
 
     private func applyHotKeyPreferences(_ preferences: AppPreferences? = nil) {
         let preferences = preferences ?? appState.preferences
-        hotKeyService.registerHotKeys(
-            quickActionShortcut: preferences.quickActionShortcut,
-            quickActionWithoutSelectionShortcut: preferences.quickActionWithoutSelectionShortcut,
-            liveSubtitleShortcut: preferences.liveSubtitleShortcut
+        let requested = RegisteredHotKeys(
+            quickAction: preferences.quickActionShortcut,
+            quickActionWithoutSelection: preferences.quickActionWithoutSelectionShortcut,
+            liveSubtitles: preferences.liveSubtitleShortcut
         )
+        if hotKeyPreferencesBeingRestored == requested {
+            hotKeyPreferencesBeingRestored = nil
+            return
+        }
+        guard requested != lastRegisteredHotKeys else {
+            return
+        }
+        let previous = lastRegisteredHotKeys
+        let failures = hotKeyService.registerHotKeys(
+            quickActionShortcut: requested.quickAction,
+            quickActionWithoutSelectionShortcut: requested.quickActionWithoutSelection,
+            liveSubtitleShortcut: requested.liveSubtitles
+        )
+        if let failure = failures.first {
+            var rollbackMessage = ""
+            let fallback = previous ?? (requested == .defaults ? nil : .defaults)
+            if let fallback {
+                // registerHotKeys 会先注销当前集合，即使配置未变化，失败后也必须重新注册旧集合。
+                let rollbackFailures = hotKeyService.registerHotKeys(
+                    quickActionShortcut: fallback.quickAction,
+                    quickActionWithoutSelectionShortcut: fallback.quickActionWithoutSelection,
+                    liveSubtitleShortcut: fallback.liveSubtitles
+                )
+                if let rollbackFailure = rollbackFailures.first {
+                    lastRegisteredHotKeys = nil
+                    rollbackMessage = " " + L10n.text(
+                        "The previous shortcut set could not be restored.",
+                        language: appState.preferences.appLanguage
+                    ) + " [\(rollbackFailure.name): \(rollbackFailure.status)]"
+                } else {
+                    lastRegisteredHotKeys = fallback
+                }
+            } else {
+                lastRegisteredHotKeys = nil
+            }
+            let message = L10n.text(
+                "A global shortcut could not be registered. Choose a different shortcut.",
+                language: appState.preferences.appLanguage
+            ) + " [\(failure.name): \(failure.status)]" + rollbackMessage
+            hotKeyRegistrationError = message
+            appState.validationError = message
+            if let fallback, fallback != requested {
+                // 注册失败的组合不能留在磁盘，否则重启后没有可回滚集合，三组快捷键都会失效。
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        return
+                    }
+                    self.hotKeyPreferencesBeingRestored = fallback
+                    self.appState.restoreGlobalShortcutPreferences(
+                        quickAction: fallback.quickAction,
+                        quickActionWithoutSelection: fallback.quickActionWithoutSelection,
+                        liveSubtitles: fallback.liveSubtitles,
+                        errorMessage: message
+                    )
+                }
+            }
+            return
+        }
+
+        lastRegisteredHotKeys = requested
+        if appState.validationError == hotKeyRegistrationError {
+            appState.validationError = nil
+        }
+        hotKeyRegistrationError = nil
     }
 
     private func selectionActionTriggerSources(for preferences: AppPreferences) -> Set<SelectionActionTriggerSource> {
@@ -1090,17 +1245,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         let shortcuts = appState.preferences.quickActionPopupShortcuts
 
         if shortcut == shortcuts.textMode {
-            appState.quickActionMode = .text
+            _ = appState.switchQuickActionMode(to: .text)
             refreshQuickActionWindowTitle()
             return true
         }
         if shortcut == shortcuts.imageMode {
-            appState.quickActionMode = .image
+            _ = appState.switchQuickActionMode(to: .image)
             refreshQuickActionWindowTitle()
             return true
         }
         if shortcut == shortcuts.mediaMode {
-            appState.quickActionMode = .media
+            _ = appState.switchQuickActionMode(to: .media)
             refreshQuickActionWindowTitle()
             return true
         }
@@ -1429,6 +1584,7 @@ final class SelectionActionWindow: NSPanel {
 class FloatingWindow: NSWindow {
     var autoCollapseAtScreenEdge = false
     var onEscape: (() -> Void)?
+    var onClose: (() -> Void)?
     var onKeyboardShortcut: ((KeyboardShortcutPreference) -> Bool)?
     var onCommandPaste: (() -> Bool)?
     var onCommandCopy: (() -> Bool)?
@@ -1436,9 +1592,21 @@ class FloatingWindow: NSWindow {
     private let collapsedWidth: CGFloat = 42
     private let edgeTolerance: CGFloat = 24
 
+    override func close() {
+        onClose?()
+        super.close()
+    }
+
     override func sendEvent(_ event: NSEvent) {
         if event.type == .keyDown {
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            if event.keyCode == 53,
+               modifiers.isEmpty,
+               let textView = firstResponder as? NSTextView,
+               textView.hasMarkedText() {
+                super.sendEvent(event)
+                return
+            }
             if event.keyCode == 53, modifiers.isEmpty, let onEscape {
                 onEscape()
                 return

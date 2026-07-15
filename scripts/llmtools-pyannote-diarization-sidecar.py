@@ -103,6 +103,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="pyannote/speaker-diarization-3.1")
     parser.add_argument("--hf-token", default=os.environ.get("PYANNOTE_AUTH_TOKEN") or os.environ.get("HF_TOKEN") or "")
     parser.add_argument("--speaker-count-hint", default="auto", help="auto or an expected positive speaker count")
+    parser.add_argument(
+        "--minimum-speakers",
+        type=int,
+        default=None,
+        help="Minimum speaker count for automatic clustering. Ignored when an exact count is provided.",
+    )
+    parser.add_argument(
+        "--maximum-speakers",
+        type=int,
+        default=None,
+        help="Maximum speaker count for automatic clustering. Ignored when an exact count is provided.",
+    )
     return parser.parse_args()
 
 
@@ -145,6 +157,21 @@ def main() -> int:
         if speaker_count <= 0:
             raise RuntimeError("speaker-count-hint must be auto or a positive integer")
         inference_kwargs["num_speakers"] = speaker_count
+    else:
+        if args.minimum_speakers is not None:
+            if args.minimum_speakers <= 0:
+                raise RuntimeError("minimum-speakers must be a positive integer")
+            inference_kwargs["min_speakers"] = args.minimum_speakers
+        if args.maximum_speakers is not None:
+            if args.maximum_speakers <= 0:
+                raise RuntimeError("maximum-speakers must be a positive integer")
+            inference_kwargs["max_speakers"] = args.maximum_speakers
+        if (
+            args.minimum_speakers is not None
+            and args.maximum_speakers is not None
+            and args.minimum_speakers > args.maximum_speakers
+        ):
+            raise RuntimeError("minimum-speakers must not exceed maximum-speakers")
     diarization = pipeline(str(audio_path), **inference_kwargs)
     speaker_labels: dict[str, str] = {}
     turns: list[dict[str, Any]] = []

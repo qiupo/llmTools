@@ -18,6 +18,27 @@ public enum SpeechModelFamily: String, Codable, Sendable, CaseIterable, Identifi
     case customLocal
 
     public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .funASRNano:
+            return "Fun-ASR-Nano"
+        case .funASRMLTNano:
+            return "Fun-ASR-MLT-Nano"
+        case .senseVoiceSmall:
+            return "SenseVoiceSmall"
+        case .qwen3ASR06B:
+            return "Qwen3-ASR"
+        case .qwen3ASRSherpaOnnx:
+            return "Qwen3-ASR (sherpa-onnx)"
+        case .vibeVoiceASR:
+            return "VibeVoice-ASR"
+        case .whisperCppCoreML:
+            return "whisper.cpp Core ML"
+        case .customLocal:
+            return "Custom local ASR"
+        }
+    }
 }
 
 public enum ASRSourceLanguageHint: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
@@ -152,7 +173,7 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
     public static func funASRNano(
         source: ModelCapabilitySource = .inferred,
         confidence: Double = 0.86,
-        note: String? = "Fun-ASR-Nano local ASR model. Preferred realtime family when a local streaming or GGUF sidecar runtime is configured."
+        note: String? = "Fun-ASR-Nano local ASR model. The current llmTools MLX/GGUF routes provide ASR only; the official FunASR pipeline can compose Nano with a separate CAM++ speaker model."
     ) -> SpeechModelCapabilities {
         SpeechModelCapabilities(
             family: .funASRNano,
@@ -168,7 +189,7 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
     public static func funASRMLTNano(
         source: ModelCapabilitySource = .inferred,
         confidence: Double = 0.84,
-        note: String? = "Fun-ASR-MLT-Nano local multilingual ASR model. Preferred realtime family for broad language coverage when a local streaming sidecar is configured."
+        note: String? = "Fun-ASR-MLT-Nano local multilingual ASR model. The current llmTools MLX route provides ASR only and requires separate speaker processing."
     ) -> SpeechModelCapabilities {
         SpeechModelCapabilities(
             family: .funASRMLTNano,
@@ -317,6 +338,8 @@ public enum ASRRuntimeSource: String, Codable, Sendable, Hashable {
     case sherpaOnnxQwen3Runner
     case whisperCppCoreMLRunner
     case funASRGGUFAuto
+    case funASRTorchStreaming
+    case funASRCompositePipeline
     case vibeVoiceASRRunner
     case unavailable
 }
@@ -324,6 +347,7 @@ public enum ASRRuntimeSource: String, Codable, Sendable, Hashable {
 public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     public static let defaultLiveWindowWidth: Double = 980
     public static let defaultLiveWindowHeight: Double = 220
+    public static let defaultLiveTextColorHex = "#FFFFFF"
     public static let minimumLiveWindowWidth: Double = 860
     public static let minimumLiveWindowHeight: Double = 180
     public static let minimumLiveASRPartialMilliseconds = 500
@@ -346,6 +370,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
     public var genericASRCommandTemplate: String
     public var liveAudioSource: LiveSubtitleAudioSource
     public var liveWindowOpacity: Double
+    public var liveTextColorHex: String
     public var liveWindowWidth: Double
     public var liveWindowHeight: Double
     public var liveASRPartialMillisecondsByModelID: [String: Int]
@@ -368,6 +393,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         genericASRCommandTemplate: String = "",
         liveAudioSource: LiveSubtitleAudioSource = .systemAndMicrophone,
         liveWindowOpacity: Double = 0.82,
+        liveTextColorHex: String = Self.defaultLiveTextColorHex,
         liveWindowWidth: Double = Self.defaultLiveWindowWidth,
         liveWindowHeight: Double = Self.defaultLiveWindowHeight,
         liveASRPartialMillisecondsByModelID: [String: Int] = [:],
@@ -389,6 +415,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         self.genericASRCommandTemplate = Self.normalizedCommandTemplate(genericASRCommandTemplate)
         self.liveAudioSource = liveAudioSource
         self.liveWindowOpacity = Self.normalizedOpacity(liveWindowOpacity)
+        self.liveTextColorHex = Self.normalizedLiveTextColorHex(liveTextColorHex)
         self.liveWindowWidth = Self.normalizedLiveWindowWidth(liveWindowWidth)
         self.liveWindowHeight = Self.normalizedLiveWindowHeight(liveWindowHeight)
         self.liveASRPartialMillisecondsByModelID = Self.normalizedLiveASRPartialMillisecondsByModelID(liveASRPartialMillisecondsByModelID)
@@ -412,6 +439,7 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         case genericASRCommandTemplate
         case liveAudioSource
         case liveWindowOpacity
+        case liveTextColorHex
         case liveWindowWidth
         case liveWindowHeight
         case liveASRPartialMillisecondsByModelID
@@ -450,6 +478,9 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
         liveAudioSource = try container.decodeIfPresent(LiveSubtitleAudioSource.self, forKey: .liveAudioSource) ?? defaults.liveAudioSource
         liveWindowOpacity = Self.normalizedOpacity(
             try container.decodeIfPresent(Double.self, forKey: .liveWindowOpacity) ?? defaults.liveWindowOpacity
+        )
+        liveTextColorHex = Self.normalizedLiveTextColorHex(
+            try container.decodeIfPresent(String.self, forKey: .liveTextColorHex) ?? defaults.liveTextColorHex
         )
         liveWindowWidth = Self.normalizedLiveWindowWidth(
             try container.decodeIfPresent(Double.self, forKey: .liveWindowWidth) ?? defaults.liveWindowWidth
@@ -545,6 +576,15 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
 
     public static func normalizedOpacity(_ value: Double) -> Double {
         min(max(value, 0.0), 1.0)
+    }
+
+    public static func normalizedLiveTextColorHex(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hex = trimmed.hasPrefix("#") ? String(trimmed.dropFirst()) : trimmed
+        guard hex.count == 6, hex.allSatisfy(\.isHexDigit) else {
+            return defaultLiveTextColorHex
+        }
+        return "#\(hex.uppercased())"
     }
 
     private static func nonEmpty(_ value: String) -> String? {

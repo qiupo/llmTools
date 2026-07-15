@@ -113,7 +113,9 @@ public actor SpeakerDiarizationService {
     public func diarize(
         audioURL: URL,
         preferences: SpeakerDiarizationPreferences = SpeakerDiarizationPreferences(),
-        expectedSpeakerCount: Int? = nil
+        expectedSpeakerCount: Int? = nil,
+        minimumSpeakerCount: Int? = nil,
+        maximumSpeakerCount: Int? = nil
     ) async throws -> SpeakerDiarizationResult {
         guard preferences.enabledForFileSubtitles else {
             throw SpeakerDiarizationError.disabled
@@ -126,7 +128,9 @@ public actor SpeakerDiarizationService {
             audioURL: audioURL,
             resolution: resolution,
             preferences: preferences,
-            expectedSpeakerCount: expectedSpeakerCount
+            expectedSpeakerCount: expectedSpeakerCount,
+            minimumSpeakerCount: minimumSpeakerCount,
+            maximumSpeakerCount: maximumSpeakerCount
         )
     }
 
@@ -303,6 +307,12 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
 
     public static func commandResolution(preferences: SpeakerDiarizationPreferences) throws -> CommandResolution {
         if hasCustomCommand(preferences: preferences) {
+            guard !preferences.commandTemplate.contains("{hf_token}") else {
+                // Token 仅通过环境变量传递，避免出现在 shell 命令行和进程参数中。
+                throw SpeakerDiarizationError.runtimeMissing(
+                    "{hf_token} is not allowed in the command template. Read PYANNOTE_AUTH_TOKEN from the environment instead."
+                )
+            }
             return CommandResolution(command: preferences.commandTemplate, source: .settingsCommand)
         }
         if modelReferenceLooksLocal(preferences.modelIdentifier), !modelReferenceIsLocal(preferences.modelIdentifier) {
@@ -324,7 +334,9 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
         audioURL: URL,
         resolution: CommandResolution,
         preferences: SpeakerDiarizationPreferences,
-        expectedSpeakerCount: Int? = nil
+        expectedSpeakerCount: Int? = nil,
+        minimumSpeakerCount: Int? = nil,
+        maximumSpeakerCount: Int? = nil
     ) async throws -> SpeakerDiarizationResult {
         let outputURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("llmtools-diarization-\(UUID().uuidString)")
@@ -338,10 +350,17 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
             outputURL: outputURL,
             preferences: preferences
         )
-        if resolution.source == .bundledPyannoteSidecar,
-           let expectedSpeakerCount,
-           expectedSpeakerCount > 0 {
-            command += " --speaker-count-hint \(shellEscape(String(expectedSpeakerCount)))"
+        if resolution.source == .bundledPyannoteSidecar {
+            if let expectedSpeakerCount, expectedSpeakerCount > 0 {
+                command += " --speaker-count-hint \(shellEscape(String(expectedSpeakerCount)))"
+            } else {
+                if let minimumSpeakerCount, minimumSpeakerCount > 0 {
+                    command += " --minimum-speakers \(shellEscape(String(minimumSpeakerCount)))"
+                }
+                if let maximumSpeakerCount, maximumSpeakerCount > 0 {
+                    command += " --maximum-speakers \(shellEscape(String(maximumSpeakerCount)))"
+                }
+            }
         }
         let started = Date()
         let process = Process()
@@ -432,7 +451,6 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
             .replacingOccurrences(of: "{hf_cache}", with: shellEscape(cacheDirectory(preferences: preferences) ?? ""))
             .replacingOccurrences(of: "{audio_wav_16k_mono}", with: shellEscape(audioURL.path))
             .replacingOccurrences(of: "{output_json}", with: shellEscape(outputURL.path))
-            .replacingOccurrences(of: "{hf_token}", with: shellEscape(token(preferences: preferences) ?? ""))
     }
 
     private static func token(preferences: SpeakerDiarizationPreferences) -> String? {
@@ -473,12 +491,10 @@ public struct SpeakerDiarizationCommandRunner: Sendable {
     private static func pythonPath() -> String? {
         firstExecutablePath([
             environmentValue("LLMTOOLS_DIARIZATION_PYTHON"),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("diarization-runtime", isDirectory: true)
+            AppPaths.diarizationRuntimeDirectory
                 .appendingPathComponent("venv/bin/python3")
                 .path,
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("diarization-runtime", isDirectory: true)
+            AppPaths.diarizationRuntimeDirectory
                 .appendingPathComponent("venv/bin/python")
                 .path,
             "/usr/bin/python3"

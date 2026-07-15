@@ -86,10 +86,12 @@ public struct LiveMeetingDiarizationService: Sendable {
                 "会议不使用自定义说话人分离命令。请使用已配置的本地 pyannote runtime。"
             )
         }
+        let automaticMinimumSpeakerCount = speakerCountHint == .automatic ? 2 : nil
         return try await sharedService.diarize(
             audioURL: audioURL,
             preferences: localMeetingPreferences(from: preferences),
-            expectedSpeakerCount: speakerCountHint.expectedSpeakerCount
+            expectedSpeakerCount: speakerCountHint.expectedSpeakerCount,
+            minimumSpeakerCount: automaticMinimumSpeakerCount
         )
     }
 

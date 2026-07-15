@@ -1,5 +1,6 @@
 import CoreGraphics
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import UniformTypeIdentifiers
@@ -143,13 +144,323 @@ public struct VisionCapabilityProbeResult: Sendable, Hashable {
     }
 }
 
+public enum RemoteImageURLPolicy {
+    public static func validatedURL(_ value: String) throws -> URL {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              url.scheme?.lowercased() == "https",
+              url.user == nil,
+              url.password == nil,
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              host != "localhost",
+              !host.hasSuffix(".localhost"),
+              !host.hasSuffix(".local") else {
+            throw OCRTaskError.remoteImageURLUnsupported(value)
+        }
+
+        if isIPAddress(host) {
+            guard isPublicIPAddress(host) else {
+                throw OCRTaskError.remoteImageURLUnsupported(value)
+            }
+            return url
+        }
+
+        let resolvedAddresses = resolveAddresses(for: host)
+        guard !resolvedAddresses.isEmpty,
+              resolvedAddresses.allSatisfy(isPublicIPAddress) else {
+            throw OCRTaskError.remoteImageURLUnsupported(value)
+        }
+        return url
+    }
+
+    public static func isPublicIPAddress(_ value: String) -> Bool {
+        var ipv4 = in_addr()
+        if inet_pton(AF_INET, value, &ipv4) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv4) { Array($0) }
+            guard bytes.count == 4 else {
+                return false
+            }
+            let first = bytes[0]
+            let second = bytes[1]
+            return first != 0
+                && first != 10
+                && first != 127
+                && !(first == 100 && (64...127).contains(second))
+                && !(first == 169 && second == 254)
+                && !(first == 172 && (16...31).contains(second))
+                && !(first == 192 && second == 0)
+                && !(first == 192 && second == 2)
+                && !(first == 192 && second == 168)
+                && !(first == 198 && (18...19).contains(second))
+                && !(first == 198 && second == 51)
+                && !(first == 203 && second == 0)
+                && first < 224
+        }
+
+        var ipv6 = in6_addr()
+        if inet_pton(AF_INET6, value, &ipv6) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv6) { Array($0) }
+            guard bytes.count == 16 else {
+                return false
+            }
+            let isUnspecified = bytes.allSatisfy { $0 == 0 }
+            let isLoopback = bytes.dropLast().allSatisfy { $0 == 0 } && bytes.last == 1
+            let isUniqueLocal = (bytes[0] & 0xFE) == 0xFC
+            let isLinkLocal = bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80
+            let isSiteLocal = bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0xC0
+            let isMulticast = bytes[0] == 0xFF
+            let isDocumentation = bytes[0] == 0x20
+                && bytes[1] == 0x01
+                && bytes[2] == 0x0D
+                && bytes[3] == 0xB8
+            let isIPv4Mapped = bytes.prefix(10).allSatisfy { $0 == 0 }
+                && bytes[10] == 0xFF
+                && bytes[11] == 0xFF
+            if isIPv4Mapped {
+                return isPublicIPAddress(bytes[12...15].map(String.init).joined(separator: "."))
+            }
+            return !isUnspecified
+                && !isLoopback
+                && !isUniqueLocal
+                && !isLinkLocal
+                && !isSiteLocal
+                && !isMulticast
+                && !isDocumentation
+        }
+        return false
+    }
+
+    private static func isIPAddress(_ host: String) -> Bool {
+        var ipv4 = in_addr()
+        var ipv6 = in6_addr()
+        return inet_pton(AF_INET, host, &ipv4) == 1 || inet_pton(AF_INET6, host, &ipv6) == 1
+    }
+
+    private static func resolveAddresses(for host: String) -> [String] {
+        var hints = addrinfo()
+        hints.ai_flags = AI_ADDRCONFIG
+        hints.ai_family = AF_UNSPEC
+        var result: UnsafeMutablePointer<addrinfo>?
+        guard getaddrinfo(host, nil, &hints, &result) == 0, let result else {
+            return []
+        }
+        defer { freeaddrinfo(result) }
+
+        var addresses: [String] = []
+        var current: UnsafeMutablePointer<addrinfo>? = result
+        while let info = current?.pointee {
+            if let address = info.ai_addr {
+                var buffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                if getnameinfo(
+                    address,
+                    info.ai_addrlen,
+                    &buffer,
+                    socklen_t(buffer.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                ) == 0 {
+                    let terminator = buffer.firstIndex(of: 0) ?? buffer.endIndex
+                    addresses.append(String(decoding: buffer[..<terminator].map(UInt8.init(bitPattern:)), as: UTF8.self))
+                }
+            }
+            current = info.ai_next
+        }
+        return Array(Set(addresses))
+    }
+}
+
+private struct RemoteImageDownloadResult: Sendable {
+    let data: Data
+    let response: HTTPURLResponse
+}
+
+private final class RemoteImageDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let url: URL
+    private let maximumBytes: Int
+    private let lock = NSLock()
+    private var session: URLSession?
+    private var task: URLSessionDataTask?
+    private var continuation: CheckedContinuation<RemoteImageDownloadResult, Error>?
+    private var response: HTTPURLResponse?
+    private var data = Data()
+    private var isFinished = false
+    private var isCancelled = false
+
+    init(url: URL, maximumBytes: Int) {
+        self.url = url
+        self.maximumBytes = maximumBytes
+    }
+
+    func download() async throws -> RemoteImageDownloadResult {
+        try Task.checkCancellation()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        configuration.waitsForConnectivity = false
+        let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.dataTask(with: url)
+                let shouldStart = lock.withLock {
+                    self.continuation = continuation
+                    self.session = session
+                    self.task = task
+                    return !isCancelled
+                }
+                if shouldStart {
+                    task.resume()
+                } else {
+                    finish(.failure(CancellationError()))
+                }
+            }
+        } onCancel: {
+            self.cancel()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let value = request.url?.absoluteString,
+              (try? RemoteImageURLPolicy.validatedURL(value)) != nil else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode) else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            completionHandler(.cancel)
+            finish(.failure(OCRTaskError.remoteImageDownloadFailed(
+                HTTPURLResponse.localizedString(forStatusCode: statusCode)
+            )))
+            return
+        }
+        guard let finalURLValue = httpResponse.url?.absoluteString,
+              (try? RemoteImageURLPolicy.validatedURL(finalURLValue)) != nil,
+              httpResponse.mimeType?.lowercased().hasPrefix("image/") == true else {
+            completionHandler(.cancel)
+            finish(.failure(OCRTaskError.remoteImageDownloadFailed(
+                "The response is not a permitted public image."
+            )))
+            return
+        }
+        if httpResponse.expectedContentLength > Int64(maximumBytes) {
+            completionHandler(.cancel)
+            finish(.failure(OCRTaskError.imageTooLarge(
+                current: Int(clamping: httpResponse.expectedContentLength),
+                limit: maximumBytes
+            )))
+            return
+        }
+        lock.withLock {
+            self.response = httpResponse
+            if httpResponse.expectedContentLength > 0 {
+                data.reserveCapacity(min(Int(httpResponse.expectedContentLength), maximumBytes))
+            }
+        }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive chunk: Data) {
+        let exceededLimit = lock.withLock { () -> Bool in
+            guard chunk.count <= maximumBytes - data.count else {
+                return true
+            }
+            data.append(chunk)
+            return false
+        }
+        if exceededLimit {
+            dataTask.cancel()
+            finish(.failure(OCRTaskError.imageTooLarge(
+                current: maximumBytes + 1,
+                limit: maximumBytes
+            )))
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            let cancellation = lock.withLock { isCancelled }
+            finish(.failure(cancellation ? CancellationError() : error))
+            return
+        }
+        let result = lock.withLock { () -> RemoteImageDownloadResult? in
+            guard let response else {
+                return nil
+            }
+            return RemoteImageDownloadResult(data: data, response: response)
+        }
+        guard let result else {
+            finish(.failure(OCRTaskError.remoteImageDownloadFailed("No HTTP response.")))
+            return
+        }
+        finish(.success(result))
+    }
+
+    private func cancel() {
+        let task = lock.withLock { () -> URLSessionDataTask? in
+            isCancelled = true
+            return self.task
+        }
+        task?.cancel()
+    }
+
+    private func finish(_ result: Result<RemoteImageDownloadResult, Error>) {
+        let state = lock.withLock { () -> (CheckedContinuation<RemoteImageDownloadResult, Error>?, URLSession?) in
+            guard !isFinished else {
+                return (nil, nil)
+            }
+            isFinished = true
+            let continuation = self.continuation
+            self.continuation = nil
+            let session = self.session
+            self.session = nil
+            self.task = nil
+            return (continuation, session)
+        }
+        guard let continuation = state.0 else {
+            return
+        }
+        state.1?.invalidateAndCancel()
+        continuation.resume(with: result)
+    }
+}
+
 public enum OCRImagePreprocessor {
     public static func normalizeImageFile(
         at url: URL,
         preferences: OCRPreferences,
         sourceDescription: String? = nil
     ) throws -> OCRImageInput {
-        let data = try Data(contentsOf: url)
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
+        let sourceByteLimit = sourceImageByteLimit(preferences: preferences)
+        guard fileSize <= sourceByteLimit else {
+            throw OCRTaskError.imageTooLarge(current: fileSize, limit: sourceByteLimit)
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let data = try handle.read(upToCount: sourceByteLimit + 1) ?? Data()
+        guard data.count <= sourceByteLimit else {
+            throw OCRTaskError.imageTooLarge(current: data.count, limit: sourceByteLimit)
+        }
         return try normalizeImageData(
             data,
             preferences: preferences,
@@ -164,8 +475,9 @@ public enum OCRImagePreprocessor {
         fileName: String? = nil,
         sourceDescription: String = "Image"
     ) throws -> OCRImageInput {
-        guard data.count <= max(preferences.maximumImageBytes * 4, preferences.maximumImageBytes) else {
-            throw OCRTaskError.imageTooLarge(current: data.count, limit: preferences.maximumImageBytes)
+        let sourceByteLimit = sourceImageByteLimit(preferences: preferences)
+        guard data.count <= sourceByteLimit else {
+            throw OCRTaskError.imageTooLarge(current: data.count, limit: sourceByteLimit)
         }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw OCRTaskError.unsupportedImageFormat
@@ -179,8 +491,11 @@ public enum OCRImagePreprocessor {
             throw OCRTaskError.unsupportedImageFormat
         }
 
-        let pixelCount = width * height
-        let maxPixels = max(preferences.maximumPixelCount, 1)
+        let (pixelCount, pixelCountOverflowed) = width.multipliedReportingOverflow(by: height)
+        let maxPixels = min(max(preferences.maximumPixelCount, 1), 100_000_000)
+        guard !pixelCountOverflowed else {
+            throw OCRTaskError.pixelCountTooLarge(current: Int.max, limit: maxPixels)
+        }
         let maxDimension: Int
         if pixelCount > maxPixels {
             let scale = sqrt(Double(maxPixels) / Double(pixelCount))
@@ -197,14 +512,17 @@ public enum OCRImagePreprocessor {
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
             throw OCRTaskError.unsupportedImageFormat
         }
-        let normalizedPixelCount = image.width * image.height
-        guard normalizedPixelCount <= maxPixels else {
-            throw OCRTaskError.pixelCountTooLarge(current: normalizedPixelCount, limit: maxPixels)
+        let (normalizedPixelCount, normalizedPixelCountOverflowed) = image.width.multipliedReportingOverflow(by: image.height)
+        guard !normalizedPixelCountOverflowed, normalizedPixelCount <= maxPixels else {
+            throw OCRTaskError.pixelCountTooLarge(
+                current: normalizedPixelCountOverflowed ? Int.max : normalizedPixelCount,
+                limit: maxPixels
+            )
         }
 
         let encoded = try encodeProviderImage(
             image,
-            maximumImageBytes: preferences.maximumImageBytes
+            maximumImageBytes: encodedImageByteLimit(preferences: preferences)
         )
         let hash = SHA256.hash(data: encoded.data)
             .map { String(format: "%02x", $0) }
@@ -225,41 +543,36 @@ public enum OCRImagePreprocessor {
         from value: String,
         preferences: OCRPreferences
     ) async throws -> OCRImageInput {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: trimmed),
-              let scheme = url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme) else {
-            throw OCRTaskError.remoteImageURLUnsupported(value)
-        }
+        let url = try RemoteImageURLPolicy.validatedURL(value)
+        let maximumDownloadBytes = sourceImageByteLimit(preferences: preferences)
 
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            if let httpResponse = response as? HTTPURLResponse,
-               !(200..<300).contains(httpResponse.statusCode) {
-                throw OCRTaskError.remoteImageDownloadFailed(
-                    HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
-                )
-            }
-            let tempDirectory = FileManager.default.temporaryDirectory
-                .appendingPathComponent("llmTools-ocr", isDirectory: true)
-            try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
-            let tempURL = tempDirectory
-                .appendingPathComponent(UUID().uuidString)
-                .appendingPathExtension(url.pathExtension.isEmpty ? "img" : url.pathExtension)
-            try data.write(to: tempURL, options: [.atomic])
-            defer {
-                try? FileManager.default.removeItem(at: tempURL)
-            }
-            return try normalizeImageFile(
-                at: tempURL,
+            // URLSessionDataDelegate 按数据块累计，达到硬上限立即取消连接。
+            let result = try await RemoteImageDownloader(
+                url: url,
+                maximumBytes: maximumDownloadBytes
+            ).download()
+            return try normalizeImageData(
+                result.data,
                 preferences: preferences,
+                fileName: result.response.url?.lastPathComponent,
                 sourceDescription: "Remote image"
             )
         } catch let error as OCRTaskError {
             throw error
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             throw OCRTaskError.remoteImageDownloadFailed(error.localizedDescription)
         }
+    }
+
+    private static func sourceImageByteLimit(preferences: OCRPreferences) -> Int {
+        min(encodedImageByteLimit(preferences: preferences), 8_000_000) * 4
+    }
+
+    private static func encodedImageByteLimit(preferences: OCRPreferences) -> Int {
+        min(max(preferences.maximumImageBytes, 128_000), 16_000_000)
     }
 
     public static var probeImage: OCRImageInput {

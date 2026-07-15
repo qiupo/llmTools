@@ -158,7 +158,14 @@ final class AppState: ObservableObject {
             switchQuickActionOutputState(from: oldValue, to: quickActionMode)
         }
     }
-    @Published var selectedTask: TaskKind = .translate
+    @Published var selectedTask: TaskKind = .translate {
+        didSet {
+            guard oldValue != selectedTask else {
+                return
+            }
+            selectedModelID = resolvedTextModelID(for: selectedTask)
+        }
+    }
     @Published var inputText: String = ""
     @Published var inputOrigin: InputOrigin = .manual
     @Published var outputText: String = ""
@@ -183,6 +190,7 @@ final class AppState: ObservableObject {
     @Published var mediaSubtitleHealthReport: ASRHealthReport?
     @Published var mediaSubtitleHealthCheckMode: SpeechRuntimeMode?
     @Published var mediaSubtitleASRRepairMode: SpeechRuntimeMode?
+    @Published var funASRPipelineInstallInProgress = false
     @Published var languageDetectionHealthReport: LanguageDetectionHealth?
     @Published var languageDetectionHealthCheckInProgress = false
     @Published var languageDetectionRuntimeRepairInProgress = false
@@ -231,6 +239,8 @@ final class AppState: ObservableObject {
     private var preferenceSaveRevision = 0
     private var currentRunTask: Task<Void, Never>?
     private var runRevision = 0
+    private var ocrPreparationTask: Task<Void, Never>?
+    private var ocrPreparationRevision = 0
     private var activeExternalModelUseCount = 0
     private var scheduledModelUnloadTask: Task<Void, Never>?
     private var textOutputState = QuickActionOutputState()
@@ -239,6 +249,7 @@ final class AppState: ObservableObject {
     private var liveSubtitleSessions: [String: LiveSubtitleRuntimeSession] = [:]
     private var appLiveSubtitleSequence = -1
     private var liveMeetingCaptureService: LiveSubtitleCaptureService?
+    private var liveMeetingStreamingASR: StreamingASRProcessSession?
     private var liveMeetingAudioBuffer = Data()
     private var liveMeetingAllAudioBuffer = Data()
     private var liveMeetingAudioCapturedMilliseconds = 0
@@ -273,6 +284,7 @@ final class AppState: ObservableObject {
 
     func bootstrap() async {
         await engine.bootstrap()
+        await registerInstalledFunASRPipelineModelIfNeeded()
         let snapshot = await engine.registry()
         var preferences = snapshot.preferences
         clearMissingWebPageModelPreference(&preferences, models: snapshot.models)
@@ -290,13 +302,35 @@ final class AppState: ObservableObject {
         self.appLiveSubtitleTargetLanguage = preferences.mediaSubtitles.defaultTargetLanguage
         self.appLiveSubtitleDisplayMode = preferences.mediaSubtitles.defaultSubtitleMode
         self.liveMeetingAudioSource = preferences.liveMeeting.defaultAudioSource
-        self.selectedModelID = preferences.defaultModelID ?? snapshot.models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+        self.selectedModelID = resolvedTextModelID(for: selectedTask)
         self.history = await engine.recentHistory()
         liveMeetingRecoveryDraft = try? liveMeetingRecoveryStore.loadDiscardingTemporaryAudio()
         liveMeetingDiarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
         self.statusMessage = snapshot.models.isEmpty
             ? t("No model configured")
             : t("Ready")
+    }
+
+    private func registerInstalledFunASRPipelineModelIfNeeded() async {
+        let modelURL = AppPaths.funASRPipelineRuntimeDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("funasr-nano", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.pt").path),
+              FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("config.yaml").path) else {
+            return
+        }
+        let normalizedModelURL = modelURL.standardizedFileURL.resolvingSymlinksInPath()
+        let snapshot = await engine.registry()
+        if let existing = snapshot.models.first(where: {
+            ($0.resolvedPath ?? $0.sourcePath).standardizedFileURL.resolvingSymlinksInPath() == normalizedModelURL
+        }) {
+            if existing.capabilities.speech?.supports(.realtime) != true {
+                _ = try? await engine.resetModelCapabilities(id: existing.id)
+            }
+            return
+        }
+        // 手动运行官方安装器后自动发现模型，但保留用户现有的实时/文件模型选择。
+        _ = try? await engine.addModel(from: modelURL)
     }
 
     func launchAtLoginStatusText() -> String {
@@ -345,7 +379,7 @@ final class AppState: ObservableObject {
         if let currentModelID, snapshot.models.contains(where: { $0.id == currentModelID }) {
             selectedModelID = currentModelID
         } else {
-            selectedModelID = preferences.defaultModelID ?? snapshot.models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+            selectedModelID = resolvedTextModelID(for: selectedTask)
         }
         history = await engine.recentHistory()
     }
@@ -568,6 +602,7 @@ final class AppState: ObservableObject {
     }
 
     func loadMediaSubtitleFile(from url: URL) {
+        beginQuickActionInputChange()
         do {
             let resourceAccess = url.startAccessingSecurityScopedResource()
             defer {
@@ -594,6 +629,7 @@ final class AppState: ObservableObject {
     }
 
     func loadOCRImageFile(from url: URL) {
+        beginQuickActionInputChange()
         do {
             let resourceAccess = url.startAccessingSecurityScopedResource()
             defer {
@@ -614,6 +650,7 @@ final class AppState: ObservableObject {
     }
 
     func loadOCRImageData(_ data: Data, fileName: String? = nil, sourceDescription: String = "Image") {
+        beginQuickActionInputChange()
         do {
             let image = try OCRImagePreprocessor.normalizeImageData(
                 data,
@@ -670,25 +707,41 @@ final class AppState: ObservableObject {
             validationError = t("Enter an image URL first.")
             return
         }
+        beginQuickActionInputChange()
+        ocrPreparationRevision += 1
+        let revision = ocrPreparationRevision
+        let ocrPreferences = preferences.ocr
         isPreparingOCRImage = true
         validationError = nil
         statusMessage = t("Downloading image")
-        Task {
+        ocrPreparationTask = Task {
             do {
                 let image = try await OCRImagePreprocessor.downloadAndNormalizeRemoteImage(
                     from: value,
-                    preferences: preferences.ocr
+                    preferences: ocrPreferences
                 )
-                await MainActor.run {
-                    isPreparingOCRImage = false
-                    finishLoadingOCRImage(image, statusMessage: t("Loaded image"))
+                try Task.checkCancellation()
+                guard revision == ocrPreparationRevision else {
+                    return
                 }
+                isPreparingOCRImage = false
+                ocrPreparationTask = nil
+                finishLoadingOCRImage(image, statusMessage: t("Loaded image"))
+            } catch is CancellationError {
+                guard revision == ocrPreparationRevision else {
+                    return
+                }
+                isPreparingOCRImage = false
+                ocrPreparationTask = nil
+                statusMessage = t("Cancelled")
             } catch {
-                await MainActor.run {
-                    isPreparingOCRImage = false
-                    validationError = error.localizedDescription
-                    statusMessage = t("Failed to load image")
+                guard revision == ocrPreparationRevision else {
+                    return
                 }
+                isPreparingOCRImage = false
+                ocrPreparationTask = nil
+                validationError = error.localizedDescription
+                statusMessage = t("Failed to load image")
             }
         }
     }
@@ -716,8 +769,8 @@ final class AppState: ObservableObject {
         }
 
         preferences = updated
-        if updated.defaultModelID != previous.defaultModelID {
-            selectedModelID = updated.defaultModelID
+        if updated.preferredTextModelID(for: selectedTask) != previous.preferredTextModelID(for: selectedTask) {
+            selectedModelID = resolvedTextModelID(for: selectedTask)
         }
         validationError = nil
         preferenceSaveRevision += 1
@@ -725,6 +778,9 @@ final class AppState: ObservableObject {
 
         Task {
             do {
+                guard revision == preferenceSaveRevision else {
+                    return
+                }
                 try await engine.setPreferences(updated)
             } catch {
                 if revision == preferenceSaveRevision {
@@ -736,15 +792,45 @@ final class AppState: ObservableObject {
         }
     }
 
+    func restoreGlobalShortcutPreferences(
+        quickAction: KeyboardShortcutPreference,
+        quickActionWithoutSelection: KeyboardShortcutPreference,
+        liveSubtitles: KeyboardShortcutPreference,
+        errorMessage: String
+    ) {
+        var restored = preferences
+        restored.quickActionShortcut = quickAction
+        restored.quickActionWithoutSelectionShortcut = quickActionWithoutSelection
+        restored.liveSubtitleShortcut = liveSubtitles
+        preferenceSaveRevision += 1
+        let revision = preferenceSaveRevision
+        preferences = restored
+        validationError = errorMessage
+
+        Task {
+            do {
+                guard revision == preferenceSaveRevision else {
+                    return
+                }
+                try await engine.setPreferences(restored)
+            } catch {
+                guard revision == preferenceSaveRevision else {
+                    return
+                }
+                validationError = "\(errorMessage) \(error.localizedDescription)"
+            }
+        }
+    }
+
     func setDefaultModel(id: UUID) {
         guard models.contains(where: { $0.id == id && $0.enabled && $0.capabilities.supportsText }) else {
             return
         }
-        selectedModelID = id
         updatePreferences { $0.defaultModelID = id }
     }
 
     func setInputText(_ text: String, origin: InputOrigin) {
+        beginQuickActionInputChange()
         quickActionMode = .text
         inputText = text
         inputOrigin = origin
@@ -758,12 +844,22 @@ final class AppState: ObservableObject {
         }
     }
 
+    @discardableResult
+    func switchQuickActionMode(to mode: QuickActionMode) -> Bool {
+        guard !isRunning, !isPreparingOCRImage else {
+            return mode == quickActionMode
+        }
+        quickActionMode = mode
+        return true
+    }
+
     func setOCRMode(_ mode: OCRMode) {
         ocrMode = mode
         updatePreferences { $0.ocr.defaultMode = mode }
     }
 
     func clearOCRImage() {
+        beginQuickActionInputChange()
         ocrImageInput = nil
         ocrPreviewImage = nil
         outputText = ""
@@ -774,6 +870,7 @@ final class AppState: ObservableObject {
     }
 
     func clearMediaSubtitleFile() {
+        beginQuickActionInputChange()
         mediaSubtitleFileURL = nil
         mediaSubtitleDescriptor = nil
         mediaSubtitleSegments = []
@@ -888,6 +985,11 @@ final class AppState: ObservableObject {
         updatePreferences { $0.mediaSubtitles.liveWindowOpacity = normalized }
     }
 
+    func setLiveSubtitleTextColorHex(_ colorHex: String) {
+        let normalized = MediaSubtitlePreferences.normalizedLiveTextColorHex(colorHex)
+        updatePreferences { $0.mediaSubtitles.liveTextColorHex = normalized }
+    }
+
     func setLiveSubtitleWindowSize(width: Double, height: Double) {
         let normalizedWidth = MediaSubtitlePreferences.normalizedLiveWindowWidth(width)
         let normalizedHeight = MediaSubtitlePreferences.normalizedLiveWindowHeight(height)
@@ -899,6 +1001,16 @@ final class AppState: ObservableObject {
 
     func setLiveSubtitleImmersive(_ isImmersive: Bool) {
         appLiveSubtitleIsImmersive = isImmersive
+    }
+
+    /// 清空已完成的字幕历史，但保留仍在识别中的当前草稿和 ASR 会话。
+    func clearAppLiveSubtitleHistory() {
+        appLiveSubtitleHistory = []
+        guard !appLiveSubtitleIsPartial else {
+            return
+        }
+        appLiveSubtitleOriginalText = ""
+        appLiveSubtitleTranslatedText = ""
     }
 
     private func updateActiveLiveSubtitleSession(_ transform: (inout LiveSubtitleRuntimeSession) -> Void) {
@@ -986,6 +1098,7 @@ final class AppState: ObservableObject {
         guard !text.isEmpty, TaskKind.interactiveCases.contains(task) else {
             return
         }
+        beginQuickActionInputChange()
         quickActionMode = .text
         selectedTask = task
         inputText = text
@@ -998,6 +1111,7 @@ final class AppState: ObservableObject {
     }
 
     func prepareAutomaticSelectionText(_ text: String) -> Bool {
+        beginQuickActionInputChange()
         quickActionMode = .text
         let characterCount = text.count
         let limit = automaticSelectionCharacterLimit
@@ -1092,6 +1206,9 @@ final class AppState: ObservableObject {
             todoExtractionMode: preferences.defaultTodoExtractionMode
         )
         let modelID = selectedModelID
+        let selectionCaptureID = inputOrigin == .selection
+            ? SelectedTextService.currentCapturedSelectionID
+            : nil
         isRunning = true
         validationError = nil
         statusMessage = "\(t("Running")) \(selectedTask.title(language: preferences.appLanguage))..."
@@ -1114,7 +1231,10 @@ final class AppState: ObservableObject {
                     currentRunTask = nil
                     scheduleModelUnloadIfIdle()
                 }
-                await replaceOriginalTextIfNeeded(result.text)
+                guard revision == runRevision, !Task.isCancelled else {
+                    return
+                }
+                replaceOriginalTextIfNeeded(result.text, selectionCaptureID: selectionCaptureID)
                 await reloadSnapshot()
             } catch is CancellationError {
                 await MainActor.run {
@@ -1535,7 +1655,7 @@ final class AppState: ObservableObject {
             do {
                 try await Task.detached {
                     let installerPath = try Self.languageDetectionInstallerPath()
-                    try Self.runLanguageDetectionInstaller(at: installerPath)
+                    try await Self.runLanguageDetectionInstaller(at: installerPath)
                 }.value
                 await MainActor.run {
                     languageDetectionRuntimeRepairInProgress = false
@@ -1624,7 +1744,7 @@ final class AppState: ObservableObject {
             do {
                 try await Task.detached {
                     let installerPath = try Self.speakerDiarizationInstallerPath()
-                    try Self.runSpeakerDiarizationInstaller(at: installerPath)
+                    try await Self.runSpeakerDiarizationInstaller(at: installerPath)
                 }.value
                 await MainActor.run {
                     speakerDiarizationRuntimeRepairInProgress = false
@@ -1697,7 +1817,7 @@ final class AppState: ObservableObject {
             do {
                 try await Task.detached { [modelVariant] in
                     let installerPath = try Self.fastTranslationInstallerPath(for: modelVariant)
-                    try Self.runFastTranslationInstaller(at: installerPath)
+                    try await Self.runFastTranslationInstaller(at: installerPath)
                 }.value
                 await MainActor.run {
                     fastTranslationRuntimeRepairInProgress = false
@@ -1729,26 +1849,11 @@ final class AppState: ObservableObject {
         statusMessage = t("Repairing ASR runtime")
         Task {
             do {
-                let commandTemplate = try await Task.detached {
-                    try Self.buildASRCommandTemplateForRepair(model: model, family: family)
+                try await Task.detached {
+                    try await Self.repairASRRuntime(model: model, family: family)
                 }.value
                 var updated = preferences
-                switch family {
-                case .funASRNano, .funASRMLTNano:
-                    updated.mediaSubtitles.funASRCommandTemplate = commandTemplate
-                case .senseVoiceSmall:
-                    updated.mediaSubtitles.senseVoiceCommandTemplate = commandTemplate
-                case .qwen3ASR06B:
-                    updated.mediaSubtitles.qwen3ASRCommandTemplate = commandTemplate
-                case .qwen3ASRSherpaOnnx:
-                    updated.mediaSubtitles.genericASRCommandTemplate = commandTemplate
-                case .vibeVoiceASR:
-                    updated.mediaSubtitles.vibeVoiceASRCommandTemplate = commandTemplate
-                case .whisperCppCoreML:
-                    updated.mediaSubtitles.whisperCommandTemplate = commandTemplate
-                case .customLocal:
-                    updated.mediaSubtitles.genericASRCommandTemplate = commandTemplate
-                }
+                Self.clearManagedASRCommand(for: family, preferences: &updated.mediaSubtitles)
                 try await engine.setPreferences(updated)
                 await reloadSnapshot()
                 mediaSubtitleASRRepairMode = nil
@@ -1761,6 +1866,50 @@ final class AppState: ObservableObject {
                 statusMessage = t("ASR runtime repair failed")
             }
         }
+    }
+
+    func installFunASRPipeline() {
+        guard !funASRPipelineInstallInProgress else { return }
+        funASRPipelineInstallInProgress = true
+        validationError = nil
+        statusMessage = localizedSettingsStatus(chinese: "正在安装 FunASR 组合管线", english: "Installing FunASR composite pipeline")
+        Task {
+            do {
+                let modelURL = try await Task.detached {
+                    let installerPath = try Self.funASRPipelineInstallerPath()
+                    try await Self.runMLXASRInstaller(at: installerPath)
+                    return AppPaths.funASRPipelineRuntimeDirectory
+                        .appendingPathComponent("models", isDirectory: true)
+                        .appendingPathComponent("funasr-nano", isDirectory: true)
+                }.value
+                // 安装器可重复执行；相同模型目录只复用已有注册项，避免设置页每次修复都新增副本。
+                let normalizedModelURL = modelURL.standardizedFileURL.resolvingSymlinksInPath()
+                let model: ModelDescriptor
+                if let existing = models.first(where: {
+                    ($0.resolvedPath ?? $0.sourcePath).standardizedFileURL.resolvingSymlinksInPath() == normalizedModelURL
+                }) {
+                    model = try await engine.resetModelCapabilities(id: existing.id)
+                } else {
+                    model = try await engine.addModel(from: modelURL)
+                }
+                var updated = preferences
+                updated.mediaSubtitles.fileASRModelID = model.id
+                updated.mediaSubtitles.funASRCommandTemplate = ""
+                try await engine.setPreferences(updated)
+                await reloadSnapshot()
+                funASRPipelineInstallInProgress = false
+                statusMessage = localizedSettingsStatus(chinese: "FunASR 组合管线已安装", english: "FunASR composite pipeline installed")
+                checkMediaSubtitleASRHealth(mode: .fileOnly)
+            } catch {
+                funASRPipelineInstallInProgress = false
+                validationError = error.localizedDescription
+                statusMessage = localizedSettingsStatus(chinese: "FunASR 安装失败", english: "FunASR installation failed")
+            }
+        }
+    }
+
+    private func localizedSettingsStatus(chinese: String, english: String) -> String {
+        preferences.appLanguage == .chinese ? chinese : english
     }
 
     private func mediaSubtitleASRModel(for mode: SpeechRuntimeMode) -> ModelDescriptor? {
@@ -1790,22 +1939,29 @@ final class AppState: ObservableObject {
         }
     }
 
-    private nonisolated static func buildASRCommandTemplateForRepair(
+    private nonisolated static func repairASRRuntime(
         model: ModelDescriptor,
         family: SpeechModelFamily
-    ) throws -> String {
+    ) async throws {
         switch family {
-        case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
-            return try buildMLXASRCommandTemplateForRepair(model: model, family: family)
+        case .funASRNano:
+            let modelURL = model.resolvedPath ?? model.sourcePath
+            if FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.pt").path) {
+                try await runMLXASRInstaller(at: try funASRPipelineInstallerPath())
+            } else {
+                try await repairMLXASRRuntime(model: model, family: family)
+            }
+        case .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
+            try await repairMLXASRRuntime(model: model, family: family)
         case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is not available for this ASR family.")
         }
     }
 
-    private nonisolated static func buildMLXASRCommandTemplateForRepair(
+    private nonisolated static func repairMLXASRRuntime(
         model: ModelDescriptor,
         family: SpeechModelFamily
-    ) throws -> String {
+    ) async throws {
         guard supportsMLXASRRepair(family) else {
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is only available for supported safetensors/MLX ASR models.")
         }
@@ -1813,110 +1969,35 @@ final class AppState: ObservableObject {
         guard safetensorsModelFilesExist(at: modelURL) else {
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair expects a safetensors/MLX ASR model directory.")
         }
-        let runnerPath = try mlxASRRunnerPath()
         let venvPath = mlxASRVenvPath(for: family)
         if !mlxASRVenvIsReady(venvPath, family: family) {
             let installerPath = try mlxASRInstallerPath(for: family)
-            try runMLXASRInstaller(at: installerPath)
+            try await runMLXASRInstaller(at: installerPath)
         }
         guard mlxASRVenvIsReady(venvPath, family: family) else {
             throw MediaSubtitleError.asrRuntimeFailed("Matching MLX ASR runtime was not found after installation.")
         }
-        let envName = mlxASRVenvEnvironmentName(for: family)
-        return "\(envName)=\(shellEscape(venvPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
     }
 
-    private nonisolated static func mlxASRRunnerPath() throws -> String {
-        let fileManager = FileManager.default
-        let candidates = [
-            Bundle.main.resourceURL?
-                .appendingPathComponent("asr", isDirectory: true)
-                .appendingPathComponent("llmtools-mlx-asr-runner.sh")
-                .path,
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("scripts", isDirectory: true)
-                .appendingPathComponent("llmtools-mlx-asr-runner.sh")
-                .path
-        ].compactMap { $0 }
-        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
-            return path
+    private nonisolated static func clearManagedASRCommand(
+        for family: SpeechModelFamily,
+        preferences: inout MediaSubtitlePreferences
+    ) {
+        func cleared(_ value: String) -> String {
+            value.contains("llmtools-mlx-asr-runner.sh") ? "" : value
         }
-        throw MediaSubtitleError.asrRuntimeMissing("Bundled llmTools MLX ASR runner was not found.")
-    }
-
-    private nonisolated static func buildVibeVoiceASRCommandTemplateForRepair(
-        model: ModelDescriptor
-    ) throws -> String {
-        let modelURL = model.resolvedPath ?? model.sourcePath
-        guard FileManager.default.fileExists(atPath: modelURL.path) else {
-            throw MediaSubtitleError.asrModelMissing("VibeVoice-ASR model path is missing.")
+        switch family {
+        case .funASRNano, .funASRMLTNano:
+            preferences.funASRCommandTemplate = cleared(preferences.funASRCommandTemplate)
+        case .senseVoiceSmall:
+            preferences.senseVoiceCommandTemplate = cleared(preferences.senseVoiceCommandTemplate)
+        case .qwen3ASR06B:
+            preferences.qwen3ASRCommandTemplate = cleared(preferences.qwen3ASRCommandTemplate)
+        case .vibeVoiceASR:
+            preferences.vibeVoiceASRCommandTemplate = cleared(preferences.vibeVoiceASRCommandTemplate)
+        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+            break
         }
-        let runnerPath = try vibeVoiceASRRunnerPath()
-        let venvPath = vibeVoiceASRVenvPath()
-        if !vibeVoiceASRVenvIsReady(venvPath) {
-            let installerPath = try vibeVoiceASRInstallerPath()
-            try runMLXASRInstaller(at: installerPath)
-        }
-        guard vibeVoiceASRVenvIsReady(venvPath) else {
-            throw MediaSubtitleError.asrRuntimeFailed("VibeVoice-ASR runtime was not found after installation.")
-        }
-        let pythonPath = URL(fileURLWithPath: venvPath).appendingPathComponent("bin/python").path
-        return "\(shellEscape(pythonPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
-    }
-
-    private nonisolated static func vibeVoiceASRRunnerPath() throws -> String {
-        let fileManager = FileManager.default
-        let candidates = [
-            Bundle.main.resourceURL?
-                .appendingPathComponent("asr", isDirectory: true)
-                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
-                .path,
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("scripts", isDirectory: true)
-                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
-                .path
-        ].compactMap { $0 }
-        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
-            return path
-        }
-        throw MediaSubtitleError.asrRuntimeMissing("Bundled VibeVoice-ASR runner was not found.")
-    }
-
-    private nonisolated static func vibeVoiceASRInstallerPath() throws -> String {
-        let fileManager = FileManager.default
-        let scriptName = "install-phase4-vibevoice-asr-runtime.sh"
-        let candidates = [
-            Bundle.main.resourceURL?
-                .appendingPathComponent("asr", isDirectory: true)
-                .appendingPathComponent(scriptName)
-                .path,
-            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent("scripts", isDirectory: true)
-                .appendingPathComponent(scriptName)
-                .path
-        ].compactMap { $0 }
-        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
-            return path
-        }
-        throw MediaSubtitleError.asrRuntimeMissing("Bundled VibeVoice-ASR installer was not found.")
-    }
-
-    private nonisolated static func vibeVoiceASRVenvPath() -> String {
-        if let envPath = ProcessInfo.processInfo.environment["LLMTOOLS_VIBEVOICE_ASR_VENV"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !envPath.isEmpty {
-            return envPath
-        }
-        return AppPaths.applicationSupportDirectory
-            .appendingPathComponent("asr-runtime", isDirectory: true)
-            .appendingPathComponent("vibevoice-venv", isDirectory: true)
-            .path(percentEncoded: false)
-    }
-
-    private nonisolated static func vibeVoiceASRVenvIsReady(_ venvPath: String) -> Bool {
-        let pythonPath = URL(fileURLWithPath: venvPath).appendingPathComponent("bin/python").path
-        return FileManager.default.isExecutableFile(atPath: pythonPath)
-            && pythonModuleExists(in: venvPath, moduleName: "vibevoice")
     }
 
     private nonisolated static func mlxASRInstallerPath(for family: SpeechModelFamily) throws -> String {
@@ -1938,6 +2019,25 @@ final class AppState: ObservableObject {
         throw MediaSubtitleError.asrRuntimeMissing("Bundled llmTools MLX ASR installer was not found.")
     }
 
+    private nonisolated static func funASRPipelineInstallerPath() throws -> String {
+        let fileManager = FileManager.default
+        let scriptName = "install-phase4-funasr-pipeline-runtime.sh"
+        let candidates = [
+            Bundle.main.resourceURL?
+                .appendingPathComponent("asr", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path,
+            URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("scripts", isDirectory: true)
+                .appendingPathComponent(scriptName)
+                .path
+        ].compactMap { $0 }
+        if let path = candidates.first(where: { fileManager.isExecutableFile(atPath: $0) }) {
+            return path
+        }
+        throw MediaSubtitleError.asrRuntimeMissing("Bundled official FunASR pipeline installer was not found.")
+    }
+
     private nonisolated static func mlxASRVenvPath(for family: SpeechModelFamily) -> String {
         let envKey = mlxASRVenvEnvironmentName(for: family)
         let directoryName = mlxASRVenvDirectoryName(for: family)
@@ -1946,8 +2046,7 @@ final class AppState: ObservableObject {
            !envPath.isEmpty {
             return envPath
         }
-        return AppPaths.applicationSupportDirectory
-            .appendingPathComponent("asr-runtime", isDirectory: true)
+        return AppPaths.asrRuntimeDirectory
             .appendingPathComponent(directoryName, isDirectory: true)
             .path(percentEncoded: false)
     }
@@ -2004,28 +2103,6 @@ final class AppState: ObservableObject {
         return false
     }
 
-    private nonisolated static func pythonModuleExists(in venvPath: String, moduleName: String) -> Bool {
-        let fileManager = FileManager.default
-        let libURL = URL(fileURLWithPath: venvPath).appendingPathComponent("lib", isDirectory: true)
-        guard let enumerator = fileManager.enumerator(
-            at: libURL,
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return false
-        }
-        let suffix = "/site-packages/\(moduleName)"
-        while let element = enumerator.nextObject() {
-            guard let url = element as? URL else {
-                continue
-            }
-            if url.path.hasSuffix(suffix) {
-                return true
-            }
-        }
-        return false
-    }
-
     private nonisolated static func safetensorsModelFilesExist(at modelURL: URL) -> Bool {
         let fileManager = FileManager.default
         if fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path)
@@ -2051,8 +2128,7 @@ final class AppState: ObservableObject {
             candidates.append(URL(fileURLWithPath: configuredTokenizer))
         }
         candidates.append(contentsOf: [
-            homeURL
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
             homeURL
                 .appendingPathComponent("code/models/lmstudio-community/Qwen2.5-0.5B-Instruct-MLX-4bit", isDirectory: true),
@@ -2131,37 +2207,16 @@ final class AppState: ObservableObject {
         }
     }
 
-    private nonisolated static func runMLXASRInstaller(at installerPath: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: installerPath)
-        var environment = ProcessInfo.processInfo.environment
-        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
-            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
-        } else {
-            environment["PATH"] = defaultPATH
-        }
-        process.environment = environment
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+    private nonisolated static func runMLXASRInstaller(at installerPath: String) async throws {
         do {
-            try process.run()
-            process.waitUntilExit()
+            let result = try await runInstaller(at: installerPath)
+            guard result.terminationStatus == 0 else {
+                throw MediaSubtitleError.asrRuntimeFailed(installerFailureMessage(result))
+            }
+        } catch let error as MediaSubtitleError {
+            throw error
         } catch {
             throw MediaSubtitleError.asrRuntimeFailed(error.localizedDescription)
-        }
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = [
-                String(data: errorOutput, encoding: .utf8),
-                String(data: output, encoding: .utf8)
-            ]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
-            throw MediaSubtitleError.asrRuntimeFailed(message)
         }
     }
 
@@ -2190,38 +2245,16 @@ final class AppState: ObservableObject {
         throw FastTranslationError.runtimeMissing("Bundled fast translation installer was not found.")
     }
 
-    private nonisolated static func runFastTranslationInstaller(at installerPath: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: installerPath)
-        process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
-        var environment = ProcessInfo.processInfo.environment
-        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
-            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
-        } else {
-            environment["PATH"] = defaultPATH
-        }
-        process.environment = environment
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+    private nonisolated static func runFastTranslationInstaller(at installerPath: String) async throws {
         do {
-            try process.run()
-            process.waitUntilExit()
+            let result = try await runInstaller(at: installerPath)
+            guard result.terminationStatus == 0 else {
+                throw FastTranslationError.runtimeFailed(installerFailureMessage(result))
+            }
+        } catch let error as FastTranslationError {
+            throw error
         } catch {
             throw FastTranslationError.runtimeFailed(error.localizedDescription)
-        }
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = [
-                String(data: errorOutput, encoding: .utf8),
-                String(data: output, encoding: .utf8)
-            ]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
-            throw FastTranslationError.runtimeFailed(message)
         }
     }
 
@@ -2244,38 +2277,16 @@ final class AppState: ObservableObject {
         throw SpeakerDiarizationError.runtimeMissing("Bundled speaker diarization installer was not found.")
     }
 
-    private nonisolated static func runSpeakerDiarizationInstaller(at installerPath: String) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: installerPath)
-        process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
-        var environment = ProcessInfo.processInfo.environment
-        let defaultPATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        if let currentPATH = environment["PATH"], !currentPATH.isEmpty {
-            environment["PATH"] = "\(defaultPATH):\(currentPATH)"
-        } else {
-            environment["PATH"] = defaultPATH
-        }
-        process.environment = environment
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
+    private nonisolated static func runSpeakerDiarizationInstaller(at installerPath: String) async throws {
         do {
-            try process.run()
-            process.waitUntilExit()
+            let result = try await runInstaller(at: installerPath)
+            guard result.terminationStatus == 0 else {
+                throw SpeakerDiarizationError.runtimeFailed(installerFailureMessage(result))
+            }
+        } catch let error as SpeakerDiarizationError {
+            throw error
         } catch {
             throw SpeakerDiarizationError.runtimeFailed(error.localizedDescription)
-        }
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = [
-                String(data: errorOutput, encoding: .utf8),
-                String(data: output, encoding: .utf8)
-            ]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
-            throw SpeakerDiarizationError.runtimeFailed(message)
         }
     }
 
@@ -2298,7 +2309,20 @@ final class AppState: ObservableObject {
         throw LanguageDetectionError.runtimeMissing("Bundled language routing installer was not found.")
     }
 
-    private nonisolated static func runLanguageDetectionInstaller(at installerPath: String) throws {
+    private nonisolated static func runLanguageDetectionInstaller(at installerPath: String) async throws {
+        do {
+            let result = try await runInstaller(at: installerPath)
+            guard result.terminationStatus == 0 else {
+                throw LanguageDetectionError.runtimeFailed(installerFailureMessage(result))
+            }
+        } catch let error as LanguageDetectionError {
+            throw error
+        } catch {
+            throw LanguageDetectionError.runtimeFailed(error.localizedDescription)
+        }
+    }
+
+    private nonisolated static func runInstaller(at installerPath: String) async throws -> ProcessOutput {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: installerPath)
         process.currentDirectoryURL = URL(fileURLWithPath: installerPath).deletingLastPathComponent()
@@ -2310,27 +2334,16 @@ final class AppState: ObservableObject {
             environment["PATH"] = defaultPATH
         }
         process.environment = environment
-        let outputPipe = Pipe()
-        let errorPipe = Pipe()
-        process.standardOutput = outputPipe
-        process.standardError = errorPipe
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            throw LanguageDetectionError.runtimeFailed(error.localizedDescription)
-        }
-        let output = outputPipe.fileHandleForReading.readDataToEndOfFile()
-        let errorOutput = errorPipe.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0 else {
-            let message = [
-                String(data: errorOutput, encoding: .utf8),
-                String(data: output, encoding: .utf8)
-            ]
-                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .first(where: { !$0.isEmpty }) ?? "exit \(process.terminationStatus)"
-            throw LanguageDetectionError.runtimeFailed(message)
-        }
+        return try await ProcessOutputCollector.run(process)
+    }
+
+    private nonisolated static func installerFailureMessage(_ result: ProcessOutput) -> String {
+        [
+            String(data: result.standardError, encoding: .utf8),
+            String(data: result.standardOutput, encoding: .utf8)
+        ]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first(where: { !$0.isEmpty }) ?? "exit \(result.terminationStatus)"
     }
 
     private nonisolated static func shellEscape(_ value: String) -> String {
@@ -2479,7 +2492,7 @@ final class AppState: ObservableObject {
             ? preferences.liveMeeting.realtimeASRModelID
             : preferences.liveMeeting.fileASRModelID
         let runtimeMode = mode == .realtime
-            ? (selectedLiveMeetingRealtimeASRModel?.capabilities.meetingCaptureRuntimeMode ?? .realtime)
+            ? (selectedLiveMeetingRealtimeASRModel?.meetingCaptureRuntimeMode ?? .realtime)
             : .fileOnly
         liveMeetingASRHealthCheckMode = mode
         Task {
@@ -2540,7 +2553,7 @@ final class AppState: ObservableObject {
             liveMeetingStatusMessage = "请先在设置 > 会议中选择已就绪的本地会议转写模型。"
             return
         }
-        let runtimeMode = model.capabilities.meetingCaptureRuntimeMode ?? .realtime
+        let runtimeMode = model.meetingCaptureRuntimeMode ?? .realtime
         let health = LocalASRProcessRunner().health(
             for: model,
             preferences: liveMeetingASRPreferences,
@@ -2548,6 +2561,19 @@ final class AppState: ObservableObject {
         )
         guard health.status == .ready else {
             liveMeetingStatusMessage = health.message
+            return
+        }
+        let streamingASR: StreamingASRProcessSession?
+        do {
+            liveMeetingStatusMessage = runtimeMode == .realtime ? "正在加载本地实时 ASR 模型..." : "正在准备本地会议模型..."
+            streamingASR = runtimeMode == .realtime
+                ? try await createStreamingASRSessionIfNeeded(
+                    for: model,
+                    sourceLanguageHint: preferences.liveMeeting.sourceLanguageHint
+                )
+                : nil
+        } catch {
+            liveMeetingStatusMessage = "本地实时 ASR 启动失败：\(error.localizedDescription)"
             return
         }
         let recognitionStrategy: LiveMeetingRecognitionStrategy
@@ -2584,6 +2610,8 @@ final class AppState: ObservableObject {
             liveMeetingSpeakers = []
             liveMeetingNotes = nil
             liveMeetingDiagnostics = nil
+            liveMeetingStreamingASR?.stop()
+            liveMeetingStreamingASR = streamingASR
             liveMeetingAudioBuffer = Data()
             liveMeetingAllAudioBuffer = Data()
             liveMeetingAudioCapturedMilliseconds = 0
@@ -2615,7 +2643,7 @@ final class AppState: ObservableObject {
                     self.liveMeetingSession = current
                     let sourceName = source == .microphone ? "麦克风" : "系统音频"
                     switch recognitionStrategy {
-                    case .nativeSpeakerASR:
+                    case .nativeSpeakerASR, .compositeSpeakerASR:
                         self.liveMeetingStatusMessage = "\(sourceName)会议正在采集；优先在明显停顿后处理，连续讲话每约 120 秒封装技术推理窗口。"
                     case .delayedSpeakerLabels:
                         self.liveMeetingStatusMessage = "\(sourceName)会议正在转写；自然停顿后先出文字，连续讲话最迟约 30 秒提交；speaker 稍后回填。"
@@ -2627,6 +2655,8 @@ final class AppState: ObservableObject {
                     self.saveLiveMeetingRecoveryDraft()
                 } catch {
                     self.liveMeetingCaptureService = nil
+                    self.liveMeetingStreamingASR?.stop()
+                    self.liveMeetingStreamingASR = nil
                     guard var current = self.liveMeetingSession, current.id == sessionID else { return }
                     current.state = .failed
                     self.liveMeetingSession = current
@@ -2639,6 +2669,7 @@ final class AppState: ObservableObject {
                 }
             }
         } catch {
+            streamingASR?.stop()
             liveMeetingStatusMessage = error.localizedDescription
         }
     }
@@ -2687,10 +2718,12 @@ final class AppState: ObservableObject {
                 return
             }
             switch session.recognitionStrategy ?? .transcriptOnly {
-            case .nativeSpeakerASR:
+            case .nativeSpeakerASR, .compositeSpeakerASR:
                 await self.flushLiveMeetingASR(final: true)
+                self.stopLiveMeetingStreamingASR()
             case .delayedSpeakerLabels, .diarizationFirst:
                 await self.flushLiveMeetingASR(final: true)
+                self.stopLiveMeetingStreamingASR()
                 if !self.liveMeetingStopCancellationRequested {
                     await self.waitForLiveMeetingDiarizationToFinish()
                 }
@@ -2699,6 +2732,7 @@ final class AppState: ObservableObject {
                 }
             case .transcriptOnly:
                 await self.flushLiveMeetingASR(final: true)
+                self.stopLiveMeetingStreamingASR()
             }
             if self.liveMeetingStopCancellationRequested {
                 await self.finishCancelledLiveMeetingWork(sessionID: sessionID)
@@ -2718,6 +2752,7 @@ final class AppState: ObservableObject {
         guard liveMeetingSession?.state == .stopping else { return }
         liveMeetingStopCancellationRequested = true
         liveMeetingStatusMessage = status
+        stopLiveMeetingStreamingASR()
         liveMeetingASRTask?.cancel()
         liveMeetingDiarizationTask?.cancel()
     }
@@ -2744,6 +2779,7 @@ final class AppState: ObservableObject {
         liveMeetingAudioLevel = 0
         liveMeetingASRInFlight = false
         liveMeetingDiarizationInFlight = false
+        stopLiveMeetingStreamingASR()
         liveMeetingPendingASRBatches.removeAll(keepingCapacity: false)
         liveMeetingAudioBuffer.removeAll(keepingCapacity: false)
         liveMeetingAllAudioBuffer.removeAll(keepingCapacity: false)
@@ -2835,6 +2871,8 @@ final class AppState: ObservableObject {
                 switch result.recognitionStrategy {
                 case .nativeSpeakerASR:
                     self.liveMeetingDiarizationMessage = "本地文件由 \(model.name) 原生联合输出转写与 speaker。"
+                case .compositeSpeakerASR:
+                    self.liveMeetingDiarizationMessage = "本地文件由 Fun-ASR-Nano + CAM++ 组合管线一次输出转写与 speaker。"
                 case .delayedSpeakerLabels:
                     self.liveMeetingDiarizationMessage = "本地文件转写已完成，speaker 已延迟回填。"
                 case .diarizationFirst:
@@ -2965,6 +3003,9 @@ final class AppState: ObservableObject {
         let sessionID = session.id
         liveMeetingNotesTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            // 会议纪要与翻译共用同一套空闲卸载计数，避免本地文本模型在纪要完成后常驻。
+            self.beginExternalModelUse()
+            defer { self.endExternalModelUse() }
             do {
                 let notes = try await self.engine.generateLocalMeetingNotes(
                     segments: segments,
@@ -3073,6 +3114,7 @@ final class AppState: ObservableObject {
         liveMeetingStopWatchdogTask?.cancel()
         liveMeetingASRTask?.cancel()
         liveMeetingDiarizationTask?.cancel()
+        stopLiveMeetingStreamingASR()
         liveMeetingFinalizeTask?.cancel()
         liveMeetingNotesTask?.cancel()
         if let sessionID {
@@ -3094,7 +3136,7 @@ final class AppState: ObservableObject {
         liveMeetingAudioCapturedMilliseconds += milliseconds
 
         switch strategy {
-        case .nativeSpeakerASR:
+        case .nativeSpeakerASR, .compositeSpeakerASR:
             if speechDetected || !liveMeetingAudioBuffer.isEmpty {
                 if liveMeetingAudioBuffer.isEmpty {
                     liveMeetingTurnStartMilliseconds = chunkStartMilliseconds
@@ -3128,7 +3170,7 @@ final class AppState: ObservableObject {
                 0,
                 liveMeetingAudioCapturedMilliseconds - liveMeetingSpeakerProcessedMilliseconds
             )
-        case .nativeSpeakerASR, .transcriptOnly:
+        case .nativeSpeakerASR, .compositeSpeakerASR, .transcriptOnly:
             session.transcriptLagMilliseconds = liveMeetingTranscriptBacklogMilliseconds()
         }
         if session.longSessionReminderShownAt == nil,
@@ -3139,7 +3181,7 @@ final class AppState: ObservableObject {
         liveMeetingSession = session
         saveLiveMeetingRecoveryDraft()
         switch strategy {
-        case .nativeSpeakerASR:
+        case .nativeSpeakerASR, .compositeSpeakerASR:
             let batchDurationMilliseconds = liveMeetingPCM16DurationMilliseconds(liveMeetingAudioBuffer)
             let reachedNaturalBoundary = LiveMeetingNativeBatchPolicy.shouldFlush(
                 speechMilliseconds: liveMeetingSpeechMilliseconds,
@@ -3321,15 +3363,32 @@ final class AppState: ObservableObject {
                 .appendingPathComponent("asr-\(liveMeetingLastASRMilliseconds).wav")
             try LiveMeetingAudioStorage.writePCM16WAV(data: audio, to: audioURL)
             defer { try? FileManager.default.removeItem(at: audioURL) }
-            let transcript = try await self.transcribeLiveMeetingPCM(
+            var transcript = try await self.transcribeLiveMeetingPCM(
                 audioURL: audioURL,
+                pcm16Data: audio,
                 modelID: modelID,
                 startMilliseconds: start,
                 durationMilliseconds: durationMilliseconds,
                 isFinal: true
             )
             guard liveMeetingSession?.id == sessionID else { return false }
+            if strategy == .delayedSpeakerLabels || strategy == .diarizationFirst {
+                transcript = LiveMeetingTranscriptReducer.splitSegmentsBySpeakerTurns(
+                    transcript,
+                    turns: liveMeetingSpeakerTurns(),
+                    speakers: &liveMeetingSpeakers,
+                    through: Double(liveMeetingSpeakerProcessedMilliseconds) / 1_000
+                )
+            }
             liveMeetingSegments = LiveMeetingTranscriptReducer.append(transcript, to: liveMeetingSegments)
+            if strategy == .delayedSpeakerLabels || strategy == .diarizationFirst {
+                seedLiveMeetingSpeakersFromSegments()
+                liveMeetingSegments = LiveMeetingTranscriptReducer.collapseAdjacentSpeakerSegments(
+                    liveMeetingSegments,
+                    speakers: liveMeetingSpeakers,
+                    collapseThrough: Double(liveMeetingSpeakerProcessedMilliseconds) / 1_000
+                )
+            }
             liveMeetingProcessedAudioMilliseconds = max(
                 liveMeetingProcessedAudioMilliseconds,
                 start + durationMilliseconds
@@ -3415,8 +3474,24 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func liveMeetingSpeakerTurns() -> [SpeakerTurn] {
+        liveMeetingSegments.compactMap { segment -> SpeakerTurn? in
+            guard let speakerID = segment.speakerID,
+                  let segmentEnd = segment.endTime,
+                  segmentEnd > segment.startTime else { return nil }
+            return SpeakerTurn(
+                startTime: segment.startTime,
+                endTime: segmentEnd,
+                speakerID: speakerID,
+                speakerLabel: segment.speakerLabel,
+                confidence: segment.confidence
+            )
+        }
+    }
+
     private func transcribeLiveMeetingPCM(
         audioURL: URL,
+        pcm16Data: Data,
         modelID: UUID,
         startMilliseconds: Int,
         durationMilliseconds: Int,
@@ -3428,21 +3503,33 @@ final class AppState: ObservableObject {
         let maximumTokens = nativeSpeakerASR
             ? min(32_768, max(8_192, Int(duration * 10)))
             : Self.liveMeetingASRMaximumTokens
-        let runtimeMode = model.capabilities.meetingCaptureRuntimeMode ?? .realtime
-        let subtitles = try await LocalASRProcessRunner().transcribe(
-            audioURL: audioURL,
-            model: model,
-            sessionID: UUID(),
-            duration: duration,
-            preferences: liveMeetingASRPreferences,
-            context: ASRTranscriptionContext(
-                mode: runtimeMode,
+        let runtimeMode = model.meetingCaptureRuntimeMode ?? .realtime
+        let subtitles: [SubtitleSegment]
+        if runtimeMode == .realtime, let streamingASR = liveMeetingStreamingASR {
+            subtitles = try await streamingASR.transcribe(
+                pcm16Data: pcm16Data,
+                sampleRate: 16_000,
+                sessionID: liveMeetingSession?.id ?? UUID(),
+                duration: duration,
                 sourceLanguageHint: preferences.liveMeeting.sourceLanguageHint,
-                isFinal: isFinal,
-                maximumTokens: maximumTokens,
-                chunkDurationSeconds: nativeSpeakerASR ? nil : Self.liveMeetingASRChunkDurationSeconds
+                isFinal: isFinal
             )
-        )
+        } else {
+            subtitles = try await LocalASRProcessRunner().transcribe(
+                audioURL: audioURL,
+                model: model,
+                sessionID: UUID(),
+                duration: duration,
+                preferences: liveMeetingASRPreferences,
+                context: ASRTranscriptionContext(
+                    mode: runtimeMode,
+                    sourceLanguageHint: preferences.liveMeeting.sourceLanguageHint,
+                    isFinal: isFinal,
+                    maximumTokens: maximumTokens,
+                    chunkDurationSeconds: nativeSpeakerASR ? nil : Self.liveMeetingASRChunkDurationSeconds
+                )
+            )
+        }
         return subtitles.enumerated().map { offset, segment in
             LiveMeetingSegment(
                 id: segment.id,
@@ -3514,6 +3601,12 @@ final class AppState: ObservableObject {
                 return stableTurn.endTime - stableTurn.startTime >= 0.01 ? stableTurn : nil
             }
             let previousSegments = liveMeetingSegments
+            liveMeetingSegments = LiveMeetingTranscriptReducer.splitSegmentsBySpeakerTurns(
+                liveMeetingSegments,
+                turns: stableTurns,
+                speakers: &liveMeetingSpeakers,
+                through: stableThrough
+            )
             LiveMeetingTranscriptReducer.applySpeakerTurns(
                 stableTurns,
                 to: &liveMeetingSegments,
@@ -3770,6 +3863,11 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func stopLiveMeetingStreamingASR() {
+        liveMeetingStreamingASR?.stop()
+        liveMeetingStreamingASR = nil
+    }
+
     private func setAppLiveSubtitleASRInFlight(_ inFlight: Bool, sessionID: String) {
         guard appLiveSubtitleSessionID == sessionID else {
             return
@@ -3792,6 +3890,18 @@ final class AppState: ObservableObject {
             }
         } else {
             scheduleModelUnloadIfIdle()
+        }
+    }
+
+    func cancelQuickActionWork() {
+        let wasPreparingOCRImage = isPreparingOCRImage
+        ocrPreparationTask?.cancel()
+        ocrPreparationTask = nil
+        ocrPreparationRevision += 1
+        isPreparingOCRImage = false
+        cancelCurrentTask()
+        if wasPreparingOCRImage {
+            statusMessage = t("Cancelled")
         }
     }
 
@@ -4472,7 +4582,7 @@ final class AppState: ObservableObject {
     }
 
     @MainActor
-    private func replaceOriginalTextIfNeeded(_ text: String) async {
+    private func replaceOriginalTextIfNeeded(_ text: String, selectionCaptureID: UUID?) {
         guard preferences.replaceOriginalText else {
             return
         }
@@ -4481,18 +4591,35 @@ final class AppState: ObservableObject {
         }
         guard SelectedTextService.isAccessibilityTrusted else {
             SelectedTextService.requestAccessibilityPermission()
+            copyTextToPasteboard(text)
             validationError = t("Replace original text requires Accessibility permission.")
             statusMessage = t("Result copied; replacement unavailable")
             return
         }
 
-        let replaced = await SelectedTextService.replaceSelectedText(with: text)
+        guard let selectionCaptureID else {
+            copyTextToPasteboard(text)
+            validationError = t("Could not replace the original text from the current selection.")
+            statusMessage = t("Result copied")
+            return
+        }
+        let replaced = SelectedTextService.replaceSelectedText(
+            with: text,
+            expectedCaptureID: selectionCaptureID
+        )
         if replaced {
             statusMessage = t("Result pasted back")
         } else {
+            copyTextToPasteboard(text)
             validationError = t("Could not replace the original text from the current selection.")
             statusMessage = t("Result copied")
         }
+    }
+
+    private func copyTextToPasteboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     private func t(_ key: String) -> String {
@@ -4581,6 +4708,19 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func beginQuickActionInputChange() {
+        // 新输入代表新的用户意图；旧推理或旧图片下载不能在稍后覆盖当前面板。
+        if isRunning {
+            cancelCurrentTask()
+        }
+        if isPreparingOCRImage {
+            ocrPreparationTask?.cancel()
+            ocrPreparationTask = nil
+            ocrPreparationRevision += 1
+            isPreparingOCRImage = false
+        }
+    }
+
     private func clearMissingMediaSubtitlePreferences(
         _ preferences: inout AppPreferences,
         models: [ModelDescriptor]
@@ -4605,7 +4745,7 @@ final class AppState: ObservableObject {
         _ preferences: inout AppPreferences,
         models: [ModelDescriptor]
     ) {
-        let realtimeModels = models.filter { $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+        let realtimeModels = models.filter { $0.enabled && $0.supportsMeetingCaptureSpeech }
         let fileModels = models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
         let notesModels = models.filter {
             $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
@@ -4623,7 +4763,9 @@ final class AppState: ObservableObject {
             preferences.liveMeeting.notesModelID = nil
         }
         if preferences.liveMeeting.realtimeASRModelID == nil {
-            preferences.liveMeeting.realtimeASRModelID = preferences.mediaSubtitles.realtimeASRModelID ?? preferredRealtimeSpeechModel(in: models)?.id
+            preferences.liveMeeting.realtimeASRModelID = preferences.mediaSubtitles.realtimeASRModelID.flatMap { candidate in
+                realtimeModels.first(where: { $0.id == candidate })?.id
+            } ?? preferredRealtimeSpeechModel(in: realtimeModels)?.id ?? realtimeModels.first?.id
         }
         if preferences.liveMeeting.fileASRModelID == nil {
             preferences.liveMeeting.fileASRModelID = preferences.mediaSubtitles.fileASRModelID ?? fileModels.first?.id
@@ -4666,6 +4808,14 @@ final class AppState: ObservableObject {
         return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.contextLength
     }
 
+    private func resolvedTextModelID(for task: TaskKind) -> UUID? {
+        if let preferredModelID = preferences.preferredTextModelID(for: task),
+           models.contains(where: { $0.id == preferredModelID && $0.enabled && $0.capabilities.supportsText }) {
+            return preferredModelID
+        }
+        return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+    }
+
     private var inputCharacterLimit: Int {
         InputSizePolicy.maximumInputCharacters(forContextLength: selectedModelContextLength)
     }
@@ -4704,6 +4854,18 @@ final class AppState: ObservableObject {
 
     var webPageTranslationModelIsRemote: Bool {
         webPageTranslationModel?.isRemoteProvider ?? false
+    }
+
+    var selectedTextModelIsRemote: Bool {
+        if let selectedModelID,
+           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.enabled && $0.capabilities.supportsText }) {
+            return selectedModel.isRemoteProvider
+        }
+        if let defaultModelID = preferences.defaultModelID,
+           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.enabled && $0.capabilities.supportsText }) {
+            return defaultModel.isRemoteProvider
+        }
+        return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.isRemoteProvider ?? false
     }
 
     var webPageTranslationConcurrencyLimit: Int {
@@ -4761,7 +4923,7 @@ final class AppState: ObservableObject {
     }
 
     var meetingCaptureSpeechModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+        models.filter { $0.enabled && $0.supportsMeetingCaptureSpeech }
     }
 
     var selectedOCRModel: ModelDescriptor? {
@@ -4787,7 +4949,7 @@ final class AppState: ObservableObject {
 
     var selectedLiveMeetingRealtimeASRModel: ModelDescriptor? {
         guard let modelID = preferences.liveMeeting.realtimeASRModelID else { return nil }
-        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }
+        return models.first { $0.id == modelID && $0.enabled && $0.supportsMeetingCaptureSpeech }
     }
 
     var selectedLiveMeetingFileASRModel: ModelDescriptor? {

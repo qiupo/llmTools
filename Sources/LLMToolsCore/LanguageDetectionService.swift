@@ -204,15 +204,13 @@ public struct FastTextLIDCommandRunner: Sendable {
     }
 
     public static var defaultFTZModelPath: String {
-        AppPaths.applicationSupportDirectory
-            .appendingPathComponent("lid-runtime", isDirectory: true)
+        AppPaths.languageDetectionRuntimeDirectory
             .appendingPathComponent("lid.176.ftz")
             .path
     }
 
     public static var defaultBINModelPath: String {
-        AppPaths.applicationSupportDirectory
-            .appendingPathComponent("lid-runtime", isDirectory: true)
+        AppPaths.languageDetectionRuntimeDirectory
             .appendingPathComponent("lid.176.bin")
             .path
     }
@@ -344,12 +342,10 @@ public struct FastTextLIDCommandRunner: Sendable {
     private static func pythonPath() -> String? {
         firstExecutablePath([
             environmentValue("LLMTOOLS_LID_PYTHON"),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("lid-runtime", isDirectory: true)
+            AppPaths.languageDetectionRuntimeDirectory
                 .appendingPathComponent("venv/bin/python3")
                 .path,
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("lid-runtime", isDirectory: true)
+            AppPaths.languageDetectionRuntimeDirectory
                 .appendingPathComponent("venv/bin/python")
                 .path,
             "/usr/bin/python3"
@@ -416,19 +412,19 @@ private final class LanguageDetectionProcessSession: @unchecked Sendable {
     private let outputHandle: FileHandle
     private let errorHandle: FileHandle
     private let requestLock = NSLock()
+    private let processLifecycle = PersistentProcessLifecycle()
     private let stderrLock = NSLock()
     private var stderrData = Data()
-    private var stopped = false
 
     var isRunning: Bool {
-        process.isRunning && !stopped
+        process.isRunning && !processLifecycle.isStopped
     }
 
     init(resolution: FastTextLIDCommandRunner.CommandResolution) throws {
         self.resolution = resolution
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-lc", resolution.command]
+        process.arguments = ["-lc", "exec \(resolution.command)"]
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
@@ -490,7 +486,7 @@ private final class LanguageDetectionProcessSession: @unchecked Sendable {
         defer {
             requestLock.unlock()
         }
-        guard !stopped, process.isRunning else {
+        guard !processLifecycle.isStopped, process.isRunning else {
             throw LanguageDetectionError.runtimeFailed("Language detection sidecar is not running.")
         }
         let requestID = UUID().uuidString
@@ -510,24 +506,11 @@ private final class LanguageDetectionProcessSession: @unchecked Sendable {
     }
 
     func stop() {
-        requestLock.lock()
-        guard !stopped else {
-            requestLock.unlock()
-            return
-        }
-        stopped = true
-        if process.isRunning {
-            let command = LanguageDetectionStopCommand(command: "stop", requestID: UUID().uuidString)
-            if let data = try? JSONEncoder().encode(command) {
-                var line = data
-                line.append(0x0A)
-                try? inputHandle.write(contentsOf: line)
-            }
-            try? inputHandle.close()
-            process.terminate()
-        }
-        errorHandle.readabilityHandler = nil
-        requestLock.unlock()
+        processLifecycle.stop(
+            process: process,
+            inputHandle: inputHandle,
+            errorHandle: errorHandle
+        )
     }
 
     private func writeJSONLine<T: Encodable>(_ value: T) throws {
@@ -595,18 +578,6 @@ private struct LanguageDetectionCommand: Encodable {
         case command
         case requestID
         case text
-    }
-}
-
-private struct LanguageDetectionStopCommand: Encodable {
-    var protocolName = "llmtools.lid/v1"
-    var command: String
-    var requestID: String
-
-    enum CodingKeys: String, CodingKey {
-        case protocolName = "protocol"
-        case command
-        case requestID
     }
 }
 

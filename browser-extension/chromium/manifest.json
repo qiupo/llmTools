@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "llmTools",
   "description": "Translate the current webpage with the local llmTools app.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA3AmaIpk1giQIyBpz0sSE1yB8RMlKgqlvPVNL2MKbwTn3uBmRn09ZpYqQ3oYt3OtLAIM/CnjNcOI1VfOL/G4mJvS5wQIooCcWhf3nM3NF6tZUrLnw1HjqvLBBfdQxVM8n9fh73WGoICzkJg60vQtqk+h7dXDqoCzsbDNwd6EcNLRM4pRhGprd/BqSeP8f/HjN+V/Z+H3iZCRtUK29rOH5adXI3BPDWCaA1Wq5ucsUQATHNajX+zGerE59VzuVqxv1hmAX4mb9nMB6HSNdUxJ8oiqevow+Gru6XsCUbxMBlWVttwo/auIo5ics4d0T2cYTkvM/3Oh2AwJiVWSZO2HrrwIDAQAB",
   "permissions": [
     "activeTab",

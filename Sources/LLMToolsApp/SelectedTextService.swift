@@ -4,7 +4,26 @@ import Carbon.HIToolbox
 
 @MainActor
 enum SelectedTextService {
-    private static var lastCapturedSourceProcessIdentifier: pid_t?
+    private struct CapturedAccessibilitySelection {
+        let id: UUID
+        let processIdentifier: pid_t
+        let element: AXUIElement
+        let range: CFRange
+        let text: String
+    }
+
+    private struct AccessibilitySelection {
+        let processIdentifier: pid_t
+        let element: AXUIElement
+        let range: CFRange
+        let text: String
+    }
+
+    private static var lastCapturedAccessibilitySelection: CapturedAccessibilitySelection?
+    private static var captureRevision = 0
+    private static var clipboardCaptureOwner: UUID?
+    private static var pasteboardOwnershipEventMonitor: Any?
+    private static var lastUserInteractionDate = Date.distantPast
     private static var lastUserCopyShortcutDate = Date.distantPast
     private static let syntheticShortcutEventMarker: Int64 = 0x4C4C_4D54
     private static let nonTextPayloadTypeFragments = [
@@ -52,6 +71,7 @@ enum SelectedTextService {
                 pasteboard.writeObjects(restoredItems)
             }
         }
+
     }
 
     static var isAccessibilityTrusted: Bool {
@@ -63,6 +83,40 @@ enum SelectedTextService {
         AXIsProcessTrustedWithOptions(options)
     }
 
+    static func startMonitoringPasteboardOwnershipEvents() {
+        guard pasteboardOwnershipEventMonitor == nil else {
+            return
+        }
+        let mask: NSEvent.EventTypeMask = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        // 此监听独立于划词功能生命周期，菜单复制、右键和快捷键都会让内部捕获失去剪贴板所有权。
+        pasteboardOwnershipEventMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { event in
+            let observedAt = Date()
+            Task { @MainActor in
+                guard !isSyntheticShortcutEvent(event) else {
+                    return
+                }
+                lastUserInteractionDate = observedAt
+                guard event.type == .keyDown,
+                      event.charactersIgnoringModifiers?.lowercased() == "c" else {
+                    return
+                }
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                guard flags.contains(.command),
+                      flags.intersection([.control, .option, .shift]).isEmpty else {
+                    return
+                }
+                noteUserCopyShortcut()
+            }
+        }
+    }
+
+    static func stopMonitoringPasteboardOwnershipEvents() {
+        if let pasteboardOwnershipEventMonitor {
+            NSEvent.removeMonitor(pasteboardOwnershipEventMonitor)
+            self.pasteboardOwnershipEventMonitor = nil
+        }
+    }
+
     static func captureSelectedText(
         near screenPoint: NSPoint? = nil,
         preserveNonTextClipboardPayloads: Bool = true
@@ -72,10 +126,33 @@ enum SelectedTextService {
             return nil
         }
 
-        let sourceProcessIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        if let accessibilityText = captureSelectedTextFromAccessibility(near: screenPoint) {
-            lastCapturedSourceProcessIdentifier = sourceProcessIdentifier
-            return accessibilityText
+        captureRevision += 1
+        let revision = captureRevision
+        lastCapturedAccessibilitySelection = nil
+        if let selection = captureSelectedTextFromAccessibility(near: screenPoint) {
+            lastCapturedAccessibilitySelection = CapturedAccessibilitySelection(
+                id: UUID(),
+                processIdentifier: selection.processIdentifier,
+                element: selection.element,
+                range: selection.range,
+                text: selection.text
+            )
+            return selection.text
+        }
+
+        // Cmd+C 回退是进程级剪贴板操作，必须串行；后来的捕获等待当前 owner 完成恢复。
+        while clipboardCaptureOwner != nil {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            guard !Task.isCancelled, revision == captureRevision else {
+                return nil
+            }
+        }
+        let owner = UUID()
+        clipboardCaptureOwner = owner
+        defer {
+            if clipboardCaptureOwner == owner {
+                clipboardCaptureOwner = nil
+            }
         }
 
         let pasteboard = NSPasteboard.general
@@ -85,27 +162,55 @@ enum SelectedTextService {
 
         pasteboard.clearContents()
         pasteboard.setString(marker, forType: .string)
+        let markerChangeCount = pasteboard.changeCount
         sendCopyShortcut()
-        try? await Task.sleep(nanoseconds: 120_000_000)
+        await waitForSyntheticCopy()
 
+        // changeCount 记录合成复制完成后的所有权；恢复前若再次变化，说明用户或其他程序已写入新内容。
+        let capturedChangeCount = pasteboard.changeCount
         let hasNonTextPayload = preserveNonTextClipboardPayloads && pasteboardContainsNonTextPayload(pasteboard)
         let copied = hasNonTextPayload ? nil : pasteboard.string(forType: .string)
-        if lastUserCopyShortcutDate < captureStartedAt {
-            if !hasNonTextPayload {
-                originalSnapshot.restore(to: pasteboard)
-            }
+        let userCopiedDuringCapture = lastUserCopyShortcutDate >= captureStartedAt
+        let userInteractedDuringCapture = lastUserInteractionDate >= captureStartedAt
+        let changeCountDelta = capturedChangeCount >= markerChangeCount
+            ? capturedChangeCount - markerChangeCount
+            : Int.max
+        let markerStillOwned = changeCountDelta == 0 && copied == marker
+        let syntheticCopyStillOwned = changeCountDelta == 1 && copied != marker
+        await yieldPasteboardOwnershipCheck()
+        let pasteboardStillOwned = pasteboard.changeCount == capturedChangeCount
+            && (markerStillOwned || syntheticCopyStillOwned)
+        if !userCopiedDuringCapture,
+           !userInteractedDuringCapture,
+           pasteboardStillOwned,
+           !hasNonTextPayload {
+            originalSnapshot.restore(to: pasteboard)
+        }
+        // 等待期间用户主动复制的内容属于用户，不得被当成本次选区捕获结果继续处理。
+        guard !userCopiedDuringCapture,
+              !userInteractedDuringCapture,
+              pasteboardStillOwned,
+              !Task.isCancelled,
+              revision == captureRevision else {
+            return nil
         }
 
         let trimmed = copied?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmed, !trimmed.isEmpty, trimmed != marker else {
             return nil
         }
-        lastCapturedSourceProcessIdentifier = sourceProcessIdentifier
+        // Cmd+C 回退只能读取文本，无法可靠标识原选区，因此禁止后续自动替换原文。
+        lastCapturedAccessibilitySelection = nil
         return copied
     }
 
     static func clearCapturedSelectionSource() {
-        lastCapturedSourceProcessIdentifier = nil
+        captureRevision += 1
+        lastCapturedAccessibilitySelection = nil
+    }
+
+    static var currentCapturedSelectionID: UUID? {
+        lastCapturedAccessibilitySelection?.id
     }
 
     static func isSyntheticShortcutEvent(_ event: NSEvent) -> Bool {
@@ -116,7 +221,7 @@ enum SelectedTextService {
         lastUserCopyShortcutDate = Date()
     }
 
-    private static func captureSelectedTextFromAccessibility(near screenPoint: NSPoint?) -> String? {
+    private static func captureSelectedTextFromAccessibility(near screenPoint: NSPoint?) -> AccessibilitySelection? {
         selectedText(in: accessibilityCandidateElements(near: screenPoint))
     }
 
@@ -183,17 +288,33 @@ enum SelectedTextService {
         return text
     }
 
-    private static func selectedText(in candidates: [AXUIElement]) -> String? {
+    private static func selectedText(in candidates: [AXUIElement]) -> AccessibilitySelection? {
         for element in candidates {
-            if let selectedText = selectedText(from: element) {
-                return selectedText
+            guard let selectedText = selectedText(from: element),
+                  let selectedRange = selectedRange(from: element) else {
+                continue
             }
+            var processIdentifier: pid_t = 0
+            guard AXUIElementGetPid(element, &processIdentifier) == .success,
+                  processIdentifier > 0 else {
+                continue
+            }
+            return AccessibilitySelection(
+                processIdentifier: processIdentifier,
+                element: element,
+                range: selectedRange,
+                text: selectedText
+            )
         }
         return nil
     }
 
     private static func attributeElement(_ attribute: String, from element: AXUIElement) -> AXUIElement? {
-        attributeValue(attribute, from: element) as! AXUIElement?
+        guard let value = attributeValue(attribute, from: element),
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeDowncast(value, to: AXUIElement.self)
     }
 
     private static func attributeValue(_ attribute: String, from element: AXUIElement) -> AnyObject? {
@@ -205,6 +326,22 @@ enum SelectedTextService {
         return value
     }
 
+    private static func selectedRange(from element: AXUIElement) -> CFRange? {
+        guard let value = attributeValue(kAXSelectedTextRangeAttribute, from: element),
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        let axValue = unsafeDowncast(value, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cfRange else {
+            return nil
+        }
+        var range = CFRange()
+        guard AXValueGetValue(axValue, .cfRange, &range), range.location >= 0, range.length > 0 else {
+            return nil
+        }
+        return range
+    }
+
     private static func pasteboardContainsNonTextPayload(_ pasteboard: NSPasteboard) -> Bool {
         let types = pasteboard.pasteboardItems?.flatMap(\.types) ?? pasteboard.types ?? []
         return types.contains { type in
@@ -213,38 +350,58 @@ enum SelectedTextService {
         }
     }
 
-    static func replaceSelectedText(with text: String) async -> Bool {
+    private static func waitForSyntheticCopy() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                continuation.resume()
+            }
+        }
+    }
+
+    private static func yieldPasteboardOwnershipCheck() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    static func replaceSelectedText(with text: String, expectedCaptureID: UUID) -> Bool {
         guard isAccessibilityTrusted else {
             return false
         }
 
-        guard let sourceProcessIdentifier = lastCapturedSourceProcessIdentifier,
-              let sourceApplication = NSWorkspace.shared.runningApplications.first(where: { $0.processIdentifier == sourceProcessIdentifier }) else {
+        guard let captured = lastCapturedAccessibilitySelection,
+              captured.id == expectedCaptureID,
+              NSWorkspace.shared.runningApplications.contains(where: { $0.processIdentifier == captured.processIdentifier }),
+              let currentText = selectedText(from: captured.element),
+              let currentRange = selectedRange(from: captured.element),
+              currentText == captured.text,
+              currentRange.location == captured.range.location,
+              currentRange.length == captured.range.length else {
             return false
         }
 
-        let pasteboard = NSPasteboard.general
-        let originalString = pasteboard.string(forType: .string)
-
-        NSApp.yieldActivation(to: sourceApplication)
-        sourceApplication.activate(from: .current, options: [])
-        try? await Task.sleep(nanoseconds: 120_000_000)
-
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        sendPasteShortcut()
-        try? await Task.sleep(nanoseconds: 120_000_000)
-
-        if let originalString {
-            pasteboard.clearContents()
-            pasteboard.setString(originalString, forType: .string)
-        } else {
-            pasteboard.clearContents()
+        var isSettable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            captured.element,
+            kAXSelectedTextAttribute as CFString,
+            &isSettable
+        ) == .success,
+        isSettable.boolValue else {
+            return false
         }
-
-        clearCapturedSelectionSource()
-
-        return true
+        // 直接写回原 AX 选区，避免激活窗口和临时覆盖系统剪贴板造成 TOCTOU 误替换。
+        let result = AXUIElementSetAttributeValue(
+            captured.element,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        )
+        if result == .success {
+            clearCapturedSelectionSource()
+            return true
+        }
+        return false
     }
 
     private static func sendCopyShortcut() {
@@ -259,15 +416,4 @@ enum SelectedTextService {
         keyUp?.post(tap: .cghidEventTap)
     }
 
-    private static func sendPasteShortcut() {
-        let source = CGEventSource(stateID: .combinedSessionState)
-        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: UInt16(kVK_ANSI_V), keyDown: true)
-        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: UInt16(kVK_ANSI_V), keyDown: false)
-        keyDown?.flags = .maskCommand
-        keyUp?.flags = .maskCommand
-        keyDown?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
-        keyUp?.setIntegerValueField(.eventSourceUserData, value: syntheticShortcutEventMarker)
-        keyDown?.post(tap: .cghidEventTap)
-        keyUp?.post(tap: .cghidEventTap)
-    }
 }

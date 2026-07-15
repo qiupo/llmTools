@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { accessSync, constants, copyFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, copyFileSync, existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -40,17 +40,17 @@ The script verifies:
 - registered speech-capable models and their local files
 - Media Subtitle command templates
 - llmTools ASR environment variables
+- official FunASR Nano + VAD + CAM++ + punctuation compatibility
 - automatic Fun-ASR GGUF compatibility
 - automatic Fun-ASR MLT mlx-audio-plus compatibility
 - automatic sherpa-onnx SenseVoice compatibility
 - automatic whisper.cpp CoreML compatibility
-- automatic VibeVoice-ASR rich transcription runtime compatibility
+- automatic VibeVoice-ASR MLX runtime compatibility
 - macOS media conversion tools needed by file intake
 
-Use --repair to install or reuse the matching isolated local ASR runtime and write the
-matching Media Subtitle command template for the currently selected realtime/file
-ASR models into the llmTools model registry.
-Use --strict to exit non-zero when no registered speech model is runnable.`);
+Use --repair to install or reuse the matching isolated local ASR runtime. Managed
+absolute command templates left by older builds are removed from the registry.
+Use --strict to exit non-zero when a selected realtime/file ASR model is not runnable.`);
 }
 
 function loadJSON(filePath) {
@@ -59,6 +59,16 @@ function loadJSON(filePath) {
 
 function repoRoot() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+}
+
+function asrRuntimeRoot() {
+  return nonEmpty(process.env.LLMTOOLS_ASR_RUNTIME_ROOT)
+    || path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime");
+}
+
+function funASRPipelineRoot() {
+  return nonEmpty(process.env.LLMTOOLS_FUNASR_PIPELINE_ROOT)
+    || path.join(asrRuntimeRoot(), "funasr-pipeline");
 }
 
 function sourcePathToFilePath(sourcePath) {
@@ -136,6 +146,7 @@ function accessSyncExecutable(filePath) {
 function modelFiles(modelPath) {
   const names = [
     "config.json",
+    "config.yaml",
     "model.safetensors",
     "model.safetensors.index.json",
     "model.pt",
@@ -199,7 +210,7 @@ function configModelType(modelPath) {
 function resolveRuntime(model, preferences) {
   const speech = model.capabilities?.speech;
   const family = speech?.family;
-  const modelPath = sourcePathToFilePath(model.sourcePath);
+  const modelPath = sourcePathToFilePath(model.resolvedPath || model.sourcePath);
   const files = modelPath ? modelFiles(modelPath) : {};
 
   if (family === "qwen3ASRSherpaOnnx") {
@@ -233,6 +244,22 @@ function resolveRuntime(model, preferences) {
       ready: true,
       source: env.source,
       reason: "A llmTools ASR environment variable is configured."
+    };
+  }
+
+  if (family === "funASRNano" && isOfficialFunASRNanoModel(modelPath, files)) {
+    const pipeline = funASRCompositeRuntime(modelPath);
+    if (pipeline.ready) {
+      return {
+        ready: true,
+        source: "funASRCompositePipeline",
+        reason: `Official FunASR Torch/MPS realtime and offline Nano + CAM++ pipelines are ready at ${pipeline.root}.`
+      };
+    }
+    return {
+      ready: false,
+      source: "unavailable",
+      reason: `Official FunASR Nano model.pt needs the isolated Torch/MPS + VAD + CAM++ runtime. ${pipeline.reason}`
     };
   }
 
@@ -284,18 +311,10 @@ function resolveRuntime(model, preferences) {
   }
 
   if (family === "vibeVoiceASR") {
-    const vibeVoice = vibeVoiceRuntime();
-    if (vibeVoice.ready) {
-      return {
-        ready: true,
-        source: "vibeVoiceASRRunner",
-        reason: `Bundled VibeVoice-ASR PyTorch runner is available with ${vibeVoice.venv}.`
-      };
-    }
     return {
       ready: false,
       source: "unavailable",
-      reason: "VibeVoice-ASR is file-only in llmTools. The mlx-community converted model needs the bundled MLX ASR runner with the shared mlx-audio runtime; original PyTorch VibeVoice-ASR runtimes can still be configured with LLMTOOLS_VIBEVOICE_ASR_COMMAND / the VibeVoice-ASR command template."
+      reason: "VibeVoice-ASR is file-only in llmTools. The registered mlx-community model needs the shared MLX ASR runtime and local Qwen2.5 tokenizer. Original PyTorch runtimes remain available only through an explicit custom command."
     };
   }
 
@@ -303,7 +322,7 @@ function resolveRuntime(model, preferences) {
     return {
       ready: false,
       source: "unavailable",
-      reason: `${family === "funASRMLTNano" ? "Fun-ASR-MLT-Nano" : "Fun-ASR-Nano"} needs a configured local command, the matching bundled MLX runner for safetensors/MLX weights, or llama-funasr-cli with compatible GGUF files. Official Fun-ASR docs describe CUDA/vLLM and CPU/GGUF routes; they do not document Apple MPS as a supported acceleration path.`
+      reason: `${family === "funASRMLTNano" ? "Fun-ASR-MLT-Nano" : "Fun-ASR-Nano"} needs a configured local command, the matching bundled MLX runner for safetensors/MLX weights, llama-funasr-cli with compatible GGUF files, or the isolated official Nano Torch runtime. The official Nano demo selects Apple MPS when available.`
     };
   }
 
@@ -372,19 +391,18 @@ function printToolStatus() {
   const whisper = whisperCppRuntime("");
   const vibeVoiceMLX = mlxAudioRuntime("vibeVoiceASR");
   const vibeVoiceTokenizer = vibeVoiceTokenizerRuntime();
-  const vibeVoice = vibeVoiceRuntime();
+  const funASRComposite = funASRCompositeRuntime();
   console.log(`- llmTools mlx-audio runner: ${mlxAudio.runner || funASRMLX.runner || funASRNanoMLX.runner || senseVoiceMLX.runner || "missing"}`);
   console.log(`- mlx-audio venv: ${mlxAudio.venv || "missing"}`);
   console.log(`- Fun-ASR mlx-audio-plus venv: ${funASRMLX.venv || "missing"}`);
   console.log(`- Fun-ASR-Nano mlx-audio venv: ${funASRNanoMLX.venv || "missing"}`);
+  console.log(`- FunASR Nano + CAM++ pipeline: ${funASRComposite.ready ? funASRComposite.root : `missing (${funASRComposite.reason})`}`);
   console.log(`- SenseVoice mlx-audio venv: ${senseVoiceMLX.venv || "missing"}`);
   console.log(`- whisper.cpp CoreML runner: ${whisper.runner || "missing"}`);
   console.log(`- whisper.cpp CoreML root: ${whisper.root || "missing"}`);
   console.log(`- VibeVoice-ASR MLX venv: ${vibeVoiceMLX.venv || "missing"}`);
   console.log(`- VibeVoice-ASR MLX tokenizer: ${vibeVoiceTokenizer.path || "missing"}`);
-  console.log(`- VibeVoice-ASR PyTorch runner: ${vibeVoice.runner || "missing"}`);
-  console.log(`- VibeVoice-ASR PyTorch venv: ${vibeVoice.venv || "missing"}`);
-  console.log("- Apple MPS: not an official Fun-ASR acceleration path in the checked GitHub docs");
+  console.log("- Apple MPS: official Nano Torch demo selects MPS when available; llmTools verifies it through the persistent sidecar");
 }
 
 function funASRGGUFReady(modelPath, files) {
@@ -404,7 +422,7 @@ function whisperCppRuntime(modelPath) {
   ];
   const runtimeCandidates = [
     process.env.LLMTOOLS_WHISPER_CPP_ROOT,
-    path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime", "whisper-cpp")
+    path.join(asrRuntimeRoot(), "whisper-cpp")
   ].filter(Boolean);
   const runner = runnerCandidates.find((candidate) => {
     try {
@@ -458,39 +476,6 @@ function whisperCppModelBin(modelPath) {
     .map((name) => path.join(modelPath, name))[0] ?? null;
 }
 
-function vibeVoiceRuntime() {
-  const root = repoRoot();
-  const runnerCandidates = [
-    path.join(root, "dist", "llmTools.app", "Contents", "Resources", "asr", "llmtools-vibevoice-asr-runner.py"),
-    path.join(root, "scripts", "llmtools-vibevoice-asr-runner.py")
-  ];
-  const venvCandidates = [
-    process.env.LLMTOOLS_VIBEVOICE_ASR_VENV,
-    path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime", "vibevoice-venv")
-  ].filter(Boolean);
-  const runner = runnerCandidates.find((candidate) => {
-    try {
-      accessSyncExecutable(candidate);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  const venv = venvCandidates.find((candidate) => {
-    try {
-      accessSyncExecutable(path.join(candidate, "bin", "python"));
-      return pythonModuleExists(candidate, "vibevoice");
-    } catch {
-      return false;
-    }
-  });
-  return {
-    ready: Boolean(runner && venv),
-    runner,
-    venv
-  };
-}
-
 function pythonModuleExists(venv, moduleName) {
   const libDir = path.join(venv, "lib");
   if (!existsSync(libDir)) {
@@ -505,6 +490,56 @@ function pythonModuleExists(venv, moduleName) {
     }
   }
   return false;
+}
+
+function isOfficialFunASRNanoModel(modelPath, files = {}) {
+  return Boolean(modelPath && files["model.pt"] && files["config.yaml"]);
+}
+
+function funASRCompositeRuntime(modelPath = null) {
+  const root = funASRPipelineRoot();
+  const runnerCandidates = [
+    path.join(repoRoot(), "dist", "llmTools.app", "Contents", "Resources", "asr", "llmtools-funasr-pipeline.py"),
+    path.join(repoRoot(), "scripts", "llmtools-funasr-pipeline.py")
+  ];
+  const runner = runnerCandidates.find((candidate) => {
+    try {
+      accessSyncExecutable(candidate);
+      return true;
+    } catch {
+      return false;
+    }
+  }) ?? null;
+  const venv = path.join(root, "venv");
+  const python = path.join(venv, "bin", "python");
+  const models = path.join(root, "models");
+  const nano = modelPath || path.join(models, "funasr-nano");
+  const requiredModels = [
+    { directory: nano, checkpoint: "model.pt" },
+    { directory: path.join(models, "fsmn-vad"), checkpoint: "model.pt" },
+    { directory: path.join(models, "campp"), checkpoint: "campplus_cn_common.bin" },
+    { directory: path.join(models, "ct-punc"), checkpoint: "model.pt" }
+  ];
+  const missing = [];
+  if (!runner) missing.push("pipeline runner");
+  try {
+    accessSyncExecutable(python);
+  } catch {
+    missing.push("pipeline python");
+  }
+  if (!pythonModuleExists(venv, "funasr")) missing.push("funasr module");
+  for (const model of requiredModels) {
+    if (!existsSync(path.join(model.directory, "config.yaml")) || !existsSync(path.join(model.directory, model.checkpoint))) {
+      missing.push(path.basename(model.directory));
+    }
+  }
+  return {
+    ready: missing.length === 0,
+    root,
+    runner,
+    venv,
+    reason: missing.length === 0 ? "all local components are present" : `missing ${missing.join(", ")}`
+  };
 }
 
 function readdirOrNull(modelPath) {
@@ -525,7 +560,7 @@ function mlxAudioRuntime(family = "qwen3ASR06B") {
   const envKey = mlxAudioVenvEnvironmentName(family);
   const venvCandidates = [
     process.env[envKey],
-    path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime", venvDirName)
+    path.join(asrRuntimeRoot(), venvDirName)
   ].filter(Boolean);
   const runner = runnerCandidates.find((candidate) => {
     try {
@@ -554,7 +589,7 @@ function vibeVoiceTokenizerRuntime(modelPath = null) {
   const candidates = [
     modelPath,
     process.env.LLMTOOLS_VIBEVOICE_TOKENIZER_DIR,
-    path.join(os.homedir(), "Library", "Application Support", "llmTools", "asr-runtime", "qwen2.5-tokenizer"),
+    path.join(asrRuntimeRoot(), "qwen2.5-tokenizer"),
     path.join(os.homedir(), "code", "models", "lmstudio-community", "Qwen2.5-0.5B-Instruct-MLX-4bit"),
     path.join(os.homedir(), "code", "models", "mlx-community", "Qwen3-ASR-0.6B-4bit"),
     path.join(os.homedir(), "code", "models", "mlx-community", "Qwen3-ASR-0.6B-bf16"),
@@ -619,12 +654,24 @@ function mlxAudioInstaller(family) {
   }) ?? null;
 }
 
-function supportsMLXASRRepair(family) {
-  return family === "funASRNano" || family === "funASRMLTNano" || family === "senseVoiceSmall" || family === "qwen3ASR06B" || family === "vibeVoiceASR";
+function funASRPipelineInstaller() {
+  const scriptName = "install-phase4-funasr-pipeline-runtime.sh";
+  const candidates = [
+    path.join(repoRoot(), "dist", "llmTools.app", "Contents", "Resources", "asr", scriptName),
+    path.join(repoRoot(), "scripts", scriptName)
+  ];
+  return candidates.find((candidate) => {
+    try {
+      accessSyncExecutable(candidate);
+      return true;
+    } catch {
+      return false;
+    }
+  }) ?? null;
 }
 
-function supportsASRRepair(family) {
-  return supportsMLXASRRepair(family);
+function supportsMLXASRRepair(family) {
+  return family === "funASRNano" || family === "funASRMLTNano" || family === "senseVoiceSmall" || family === "qwen3ASR06B" || family === "vibeVoiceASR";
 }
 
 function commandFieldForFamily(family) {
@@ -644,36 +691,6 @@ function commandFieldForFamily(family) {
     return "whisperCommandTemplate";
   }
   return null;
-}
-
-function shellEscape(value) {
-  return `'${String(value).replaceAll("'", "'\\''")}'`;
-}
-
-function buildMLXAudioCommandTemplate(runtime, family) {
-  const envKey = mlxAudioVenvEnvironmentName(family);
-  return `${envKey}=${shellEscape(runtime.venv)} ${shellEscape(runtime.runner)} --model {model} --audio {audio} --language {language}`;
-}
-
-function buildVibeVoiceCommandTemplate(runtime) {
-  return `${shellEscape(path.join(runtime.venv, "bin", "python"))} ${shellEscape(runtime.runner)} --model {model} --audio {audio} --language {language}`;
-}
-
-function vibeVoiceInstaller() {
-  const root = repoRoot();
-  const scriptName = "install-phase4-vibevoice-asr-runtime.sh";
-  const candidates = [
-    path.join(root, "dist", "llmTools.app", "Contents", "Resources", "asr", scriptName),
-    path.join(root, "scripts", scriptName)
-  ];
-  return candidates.find((candidate) => {
-    try {
-      accessSyncExecutable(candidate);
-      return true;
-    } catch {
-      return false;
-    }
-  }) ?? null;
 }
 
 function mlxAudioInstallerScriptName(family) {
@@ -726,9 +743,10 @@ function repairRegistry(registry, registryPath, speechModels) {
     : speechModels;
   const repairable = candidates.filter((model) => {
     const family = model.capabilities?.speech?.family;
-    const modelPath = sourcePathToFilePath(model.sourcePath);
+    const modelPath = sourcePathToFilePath(model.resolvedPath || model.sourcePath);
     const files = modelPath ? modelFiles(modelPath) : {};
-    return supportsMLXASRRepair(family) && safetensorsModelFilesExist(modelPath, files);
+    return (family === "funASRNano" && isOfficialFunASRNanoModel(modelPath, files))
+      || (supportsMLXASRRepair(family) && safetensorsModelFilesExist(modelPath, files));
   });
   if (repairable.length === 0) {
     console.log("Repair: no speech model is eligible for automatic ASR runtime repair.");
@@ -738,48 +756,67 @@ function repairRegistry(registry, registryPath, speechModels) {
   registry.preferences ??= {};
   registry.preferences.mediaSubtitles ??= {};
 
-  const updatedFields = new Set();
+  const clearedFields = new Set();
   const repairedModelNames = new Set();
   for (const model of repairable) {
     const family = model.capabilities?.speech?.family;
-    const field = commandFieldForFamily(family);
-    if (!field) {
-      continue;
-    }
-    let commandTemplate = "";
-    let runtime = mlxAudioRuntime(family);
-    if (!runtime.ready) {
-      const installer = mlxAudioInstaller(family);
-      if (!installer) {
-        throw new Error(`Repair: bundled mlx-audio installer was not found for ${family}.`);
+    const modelPath = sourcePathToFilePath(model.resolvedPath || model.sourcePath);
+    const files = modelPath ? modelFiles(modelPath) : {};
+    if (family === "funASRNano" && isOfficialFunASRNanoModel(modelPath, files)) {
+      let runtime = funASRCompositeRuntime(modelPath);
+      if (!runtime.ready) {
+        const installer = funASRPipelineInstaller();
+        if (!installer) {
+          throw new Error("Repair: bundled official FunASR pipeline installer was not found.");
+        }
+        console.log(`Repair: installing official FunASR pipeline with ${installer}`);
+        runInstaller(installer);
+        runtime = funASRCompositeRuntime(modelPath);
       }
-      console.log(`Repair: installing ${family} runtime with ${installer}`);
-      runInstaller(installer);
-      runtime = mlxAudioRuntime(family);
+      if (!runtime.ready) {
+        throw new Error(`Repair: official FunASR pipeline is still unavailable after installation: ${runtime.reason}.`);
+      }
+    } else {
+      let runtime = mlxAudioRuntime(family);
+      if (!runtime.ready) {
+        const installer = mlxAudioInstaller(family);
+        if (!installer) {
+          throw new Error(`Repair: bundled mlx-audio installer was not found for ${family}.`);
+        }
+        console.log(`Repair: installing ${family} runtime with ${installer}`);
+        runInstaller(installer);
+        runtime = mlxAudioRuntime(family);
+      }
+      if (!runtime.ready) {
+        throw new Error(`Repair: mlx-audio runtime is still unavailable for ${family} after installation.`);
+      }
     }
-    if (!runtime.ready) {
-      throw new Error(`Repair: mlx-audio runtime is still unavailable for ${family} after installation.`);
+
+    const field = commandFieldForFamily(family);
+    const oldCommand = field ? String(registry.preferences.mediaSubtitles[field] ?? "") : "";
+    if (field && (oldCommand.includes("llmtools-mlx-asr-runner.sh") || oldCommand.includes("llmtools-vibevoice-asr-runner.py"))) {
+      registry.preferences.mediaSubtitles[field] = "";
+      clearedFields.add(field);
     }
-    commandTemplate = buildMLXAudioCommandTemplate(runtime, family);
-    registry.preferences.mediaSubtitles[field] = commandTemplate;
-    updatedFields.add(field);
     markSpeechModelReady(model);
     repairedModelNames.add(model.name);
   }
 
-  if (updatedFields.size === 0) {
-    console.log("Repair: no Media Subtitle command template field was updated.");
+  if (repairedModelNames.size === 0) {
+    console.log("Repair: no runtime was repaired.");
     return false;
   }
 
   const timestamp = new Date().toISOString().replaceAll(":", "-").replace(/\.\d{3}Z$/, "Z");
   const backupPath = `${registryPath}.bak-${timestamp}`;
   copyFileSync(registryPath, backupPath);
+  chmodSync(backupPath, 0o600);
   writeFileSync(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
-  console.log(`Repair: wrote ${Array.from(updatedFields).join(", ")}.`);
-  if (repairedModelNames.size > 0) {
-    console.log(`Repair: marked ready ${Array.from(repairedModelNames).join(", ")}.`);
+  chmodSync(registryPath, 0o600);
+  if (clearedFields.size > 0) {
+    console.log(`Repair: cleared stale managed command templates: ${Array.from(clearedFields).join(", ")}.`);
   }
+  console.log(`Repair: verified ${Array.from(repairedModelNames).join(", ")}.`);
   console.log(`Repair: registry backup saved to ${backupPath}.`);
   return true;
 }
@@ -832,11 +869,13 @@ async function run() {
   }
 
   let readyCount = 0;
+  const runtimeByModelID = new Map();
   for (const model of speechModels) {
     const speech = model.capabilities.speech;
-    const modelPath = sourcePathToFilePath(model.sourcePath);
+    const modelPath = sourcePathToFilePath(model.resolvedPath || model.sourcePath);
     const files = modelPath && existsSync(modelPath) ? modelFiles(modelPath) : {};
     const runtime = resolveRuntime(model, registry.preferences);
+    runtimeByModelID.set(model.id, runtime);
     if (runtime.ready) {
       readyCount += 1;
     }
@@ -859,8 +898,34 @@ async function run() {
   }
 
   console.log(`Ready speech runtimes: ${readyCount}/${speechModels.length}`);
-  if (args.strict && readyCount === 0) {
-    process.exit(1);
+  if (args.strict) {
+    const selected = [
+      { label: "realtime", mode: "realtime", id: registry.preferences?.mediaSubtitles?.realtimeASRModelID },
+      { label: "file", mode: "fileOnly", id: registry.preferences?.mediaSubtitles?.fileASRModelID }
+    ].filter((item) => item.id);
+    const failures = [];
+    for (const item of selected) {
+      const model = speechModels.find((candidate) => candidate.id === item.id);
+      if (!model) {
+        failures.push(`${item.label}: selected model is missing or no longer selectable`);
+        continue;
+      }
+      if (!(model.capabilities?.speech?.modes ?? []).includes(item.mode)) {
+        failures.push(`${item.label}: ${model.name} does not support ${item.mode}`);
+        continue;
+      }
+      const runtime = runtimeByModelID.get(model.id);
+      if (!runtime?.ready) {
+        failures.push(`${item.label}: ${model.name} runtime is unavailable (${runtime?.reason || "unknown reason"})`);
+      }
+    }
+    if (selected.length === 0 && readyCount === 0) {
+      failures.push("no selected or runnable speech model");
+    }
+    if (failures.length > 0) {
+      console.error(`Strict check failed:\n- ${failures.join("\n- ")}`);
+      process.exit(1);
+    }
   }
 }
 

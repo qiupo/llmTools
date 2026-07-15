@@ -17,6 +17,7 @@ import http.client
 import json
 import os
 import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -34,6 +35,11 @@ import numpy as np
 
 PROTOCOL_STDOUT = sys.stdout
 
+# 原版 Fun-ASR-Nano 必须只使用已经下载到本机的模型，实时会话中禁止隐式联网补文件。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+os.environ.setdefault("MODELSCOPE_OFFLINE", "1")
+
 
 def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, ensure_ascii=False), file=PROTOCOL_STDOUT, flush=True)
@@ -41,6 +47,11 @@ def emit(payload: dict[str, Any]) -> None:
 
 def log(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+def terminate_from_signal(signum: int, _frame: Any) -> None:
+    # 让 SIGTERM 穿过 main 的 finally，确保 whisper 子服务和临时目录一并清理。
+    raise SystemExit(128 + signum)
 
 
 def parse_args() -> argparse.Namespace:
@@ -115,6 +126,19 @@ def fun_language(value: str | None, family: str) -> str | None:
     return code
 
 
+def official_fun_language(value: str | None) -> str | None:
+    code = language_code(value).lower()
+    if code in {"", "auto"}:
+        return None
+    return {
+        "zh": "中文",
+        "yue": "粤语",
+        "en": "English",
+        "ja": "日本語",
+        "ko": "한국어",
+    }.get(code, value)
+
+
 def clean_text(text: str) -> str:
     value = text or ""
     value = re.sub(r"<think>.*?</think>", "", value, flags=re.DOTALL)
@@ -164,11 +188,16 @@ class StreamingASRSidecar:
         self._whisper_process: subprocess.Popen[str] | None = None
         self._whisper_port: int | None = None
         self._whisper_tmpdir: tempfile.TemporaryDirectory[str] | None = None
+        self._official_fun_kwargs: dict[str, Any] | None = None
+        self._official_fun_prev_text = ""
+        self._official_fun_device: str | None = None
         self.model: Any | None = None
         self.backend = self._backend_for_family()
         start = time.perf_counter()
         if self.backend == "whisper-cpp-coreml":
             self._start_whisper_server()
+        elif self.backend == "funasr-torch":
+            self._load_official_fun_model()
         else:
             self._load_mlx_audio_model()
         self.load_ms = int((time.perf_counter() - start) * 1000)
@@ -178,7 +207,31 @@ class StreamingASRSidecar:
             raise RuntimeError("sherpa-onnx Qwen3-ASR backend has been removed; use the MLX Qwen3-ASR backend on Apple Silicon.")
         if self.family == "whisperCppCoreML":
             return "whisper-cpp-coreml"
+        if self.family == "funASRNano" and (self.model_path / "model.pt").is_file() and (self.model_path / "config.yaml").is_file():
+            return "funasr-torch"
         return "mlx-audio"
+
+    def _load_official_fun_model(self) -> None:
+        with contextlib.redirect_stdout(sys.stderr):
+            import torch
+            from funasr.models.fun_asr_nano.model import FunASRNano
+
+            requested_device = os.environ.get("LLMTOOLS_FUNASR_DEVICE", "").strip()
+            if requested_device:
+                device = requested_device
+            elif torch.cuda.is_available():
+                device = "cuda:0"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+            self.model, self._official_fun_kwargs = FunASRNano.from_pretrained(
+                model=str(self.model_path),
+                device=device,
+                disable_update=True,
+            )
+        self.model.eval()
+        self._official_fun_device = device
 
     def _load_mlx_audio_model(self) -> None:
         self._loaded_model_path = self._model_path_for_loading(self.model_path)
@@ -308,6 +361,7 @@ class StreamingASRSidecar:
                     "type": "ready",
                     "family": self.family,
                     "backend": self.backend,
+                    "device": self._official_fun_device,
                     "model": str(self.model_path),
                     "loadMilliseconds": self.load_ms,
                 }
@@ -398,6 +452,8 @@ class StreamingASRSidecar:
             return self.decode_whisper_cpp_coreml(raw_pcm16, language, sample_rate)
         if self.family == "qwen3ASR06B":
             return self.decode_qwen(audio, language)
+        if self.backend == "funasr-torch":
+            return self.decode_official_fun(audio, language, is_final)
         if self.family in {"funASRMLTNano", "funASRNano"}:
             return self.decode_fun(audio, language)
         if self.family == "senseVoiceSmall":
@@ -547,6 +603,37 @@ class StreamingASRSidecar:
         text = self.model._tokenizer.decode(token_ids, skip_special_tokens=True)
         return text, lang or "auto"
 
+    def decode_official_fun(
+        self,
+        audio: np.ndarray,
+        language: str | None,
+        is_final: bool,
+    ) -> tuple[str, str | None]:
+        import torch
+
+        assert self._official_fun_kwargs is not None
+        kwargs = dict(self._official_fun_kwargs)
+        kwargs.update(
+            prev_text=self._official_fun_prev_text,
+            language=official_fun_language(language),
+            max_length=self.max_tokens,
+        )
+        result = self.model.inference(
+            [torch.from_numpy(np.ascontiguousarray(audio))],
+            **kwargs,
+        )[0][0]
+        text = str(result.get("text", "") or "")
+        if is_final:
+            self._official_fun_prev_text = ""
+        else:
+            # 官方 demo2 会回滚末尾 5 个 token，下一轮用累积音频重新确认不稳定尾部。
+            tokenizer = kwargs["tokenizer"]
+            token_ids = tokenizer.encode(text)
+            stable_ids = token_ids[:-5] if len(token_ids) > 5 else []
+            self._official_fun_prev_text = tokenizer.decode(stable_ids).replace("�", "")
+        detected_language = language_code(language)
+        return text, None if detected_language == "auto" else detected_language
+
     def decode_sensevoice(
         self,
         audio: np.ndarray,
@@ -578,6 +665,8 @@ class StreamingASRSidecar:
 
 
 def main() -> int:
+    signal.signal(signal.SIGTERM, terminate_from_signal)
+    signal.signal(signal.SIGINT, terminate_from_signal)
     args = parse_args()
     sidecar: StreamingASRSidecar | None = None
     try:

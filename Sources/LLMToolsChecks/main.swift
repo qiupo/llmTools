@@ -12,9 +12,15 @@ struct LLMToolsChecks {
         try await checkModelDisplayName()
         try await checkProviderModelRegistration()
         try await checkProviderModelUpdate()
+        try await checkPrivateStorePermissions()
+        try checkProviderCredentialStoragePolicy()
+        try await checkProviderEndpointPolicy()
+        try checkProviderRedirectPolicy()
+        try checkLocalBridgeHTTPFraming()
         try checkProviderRequestOptions()
         try await checkHistoryLimit()
         try await checkPhase1InteractiveNativeTasks()
+        try await checkPerTaskDefaultModelRouting()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
         try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
         try checkPhase4XFoundationTypesAndPreferences()
@@ -25,6 +31,8 @@ struct LLMToolsChecks {
         try await checkSpeakerDiarizationFailureMessageSanitization()
         try await checkSpeakerDiarizationCommandDrainsLargeStderr()
         try await checkSpeakerDiarizationCommandCancellation()
+        try checkSpeakerDiarizationRejectsTokenInCommand()
+        try await checkProcessOutputCollectorDrainsLargePipes()
         try checkSubtitleExportWithSpeakers()
         try await checkSpeakerDiarizationFilePipeline()
         try await checkFastMTFixtureRoundTrip()
@@ -32,6 +40,7 @@ struct LLMToolsChecks {
         try checkFastMTPreferencesMigration()
         try checkTranslationRoutingDecisionTable()
         try await checkTextTranslateFastMTPipeline()
+        try await checkPersistentSidecarStopInterruptsBlockedRequest()
         try await checkSubtitleFastMTPipeline()
         try await checkWebPageFastMTRouting()
         try checkTextTaskModePreferencesAndPrompts()
@@ -40,6 +49,7 @@ struct LLMToolsChecks {
         try checkOCRPrompts()
         try checkLocalGenerationTokenLimits()
         try checkOCRImagePreprocessor()
+        try checkRemoteImageURLPolicy()
         try await checkOCRModelPreferenceClearsTextOnlyModel()
         try await checkManualVisionOverrideForLocalModel()
         try await checkTextOnlyModelRejectsOCRBeforeRunnerCall()
@@ -264,6 +274,129 @@ struct LLMToolsChecks {
         }
     }
 
+    private static func checkPrivateStorePermissions() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let privateDirectory = root.appendingPathComponent("Application Support/llmTools", isDirectory: true)
+        try FileManager.default.createDirectory(at: privateDirectory, withIntermediateDirectories: true)
+        let registryURL = privateDirectory.appendingPathComponent("model-registry.json")
+        let historyURL = privateDirectory.appendingPathComponent("history.json")
+        let registryBackupURL = privateDirectory.appendingPathComponent("model-registry.json.bak-test")
+        try Data("{\"models\":[],\"preferences\":{}}".utf8).write(to: registryURL)
+        try Data("[]".utf8).write(to: historyURL)
+        try Data("backup".utf8).write(to: registryBackupURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: privateDirectory.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: registryURL.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: historyURL.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: registryBackupURL.path)
+
+        let registryStore = RegistryStore(fileURL: registryURL)
+        let historyStore = HistoryStore(fileURL: historyURL)
+        _ = try await registryStore.load()
+        _ = try await historyStore.load()
+        let migratedDirectoryPermissions = try posixPermissions(at: privateDirectory)
+        let migratedRegistryPermissions = try posixPermissions(at: registryURL)
+        let migratedHistoryPermissions = try posixPermissions(at: historyURL)
+        let migratedBackupPermissions = try posixPermissions(at: registryBackupURL)
+        try require(migratedDirectoryPermissions == 0o700, "Expected local data directory permissions to migrate to 0700.")
+        try require(migratedRegistryPermissions == 0o600, "Expected existing registry permissions to migrate to 0600.")
+        try require(migratedHistoryPermissions == 0o600, "Expected existing history permissions to migrate to 0600.")
+        try require(migratedBackupPermissions == 0o600, "Expected existing registry backup permissions to migrate to 0600.")
+
+        try await registryStore.save(.init())
+        try await historyStore.save([])
+        let savedRegistryPermissions = try posixPermissions(at: registryURL)
+        let savedHistoryPermissions = try posixPermissions(at: historyURL)
+        try require(savedRegistryPermissions == 0o600, "Expected saved registry permissions to remain 0600.")
+        try require(savedHistoryPermissions == 0o600, "Expected saved history permissions to remain 0600.")
+    }
+
+    private static func checkProviderCredentialStoragePolicy() throws {
+        let inline = ProviderConfiguration(
+            providerID: .siliconFlow,
+            apiStyle: .openAICompatible,
+            apiKey: " local-key ",
+            apiKeyKeychainAccount: "legacy-account"
+        )
+        let resolvedInline = try ProviderCredentialStore.resolvedAPIKey(for: inline)
+        try require(
+            resolvedInline == "local-key",
+            "Expected provider credentials to resolve only from the local registry value."
+        )
+        var legacyOnly = inline
+        legacyOnly.apiKey = ""
+        let resolvedLegacy = try ProviderCredentialStore.resolvedAPIKey(for: legacyOnly)
+        try require(
+            resolvedLegacy.isEmpty,
+            "Expected legacy Keychain references to be ignored without accessing macOS Keychain."
+        )
+    }
+
+    private static func checkProviderEndpointPolicy() async throws {
+        try require(ProviderEndpointPolicy.allows(URL(string: "https://api.example.com/v1")!), "Expected remote HTTPS provider URL to be allowed.")
+        try require(ProviderEndpointPolicy.allows(URL(string: "http://localhost:11434/v1")!), "Expected localhost HTTP provider URL to be allowed.")
+        try require(ProviderEndpointPolicy.allows(URL(string: "http://127.0.0.1:1234/v1")!), "Expected loopback HTTP provider URL to be allowed.")
+        try require(!ProviderEndpointPolicy.allows(URL(string: "http://api.example.com/v1")!), "Expected remote HTTP provider URL to be rejected.")
+        try require(!ProviderEndpointPolicy.allows(URL(string: "https://user:secret@api.example.com/v1")!), "Expected provider URL credentials to be rejected.")
+
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        )
+        do {
+            _ = try await engine.addProviderModel(
+                providerID: .customOpenAICompatible,
+                modelID: "remote-model",
+                apiKey: "secret",
+                baseURL: "http://api.example.com/v1"
+            )
+            throw CheckError("Expected remote HTTP provider registration to fail.")
+        } catch let error as RunnerError {
+            try require(error.localizedDescription == ProviderEndpointPolicy.secureTransportMessage, "Expected clear HTTPS validation error.")
+        }
+    }
+
+    private static func checkLocalBridgeHTTPFraming() throws {
+        let complete = Data("POST /translate HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}".utf8)
+        try require(
+            LocalBridgeHTTPFraming.readState(for: complete) == .complete(expectedByteCount: complete.count),
+            "Expected a complete local bridge request."
+        )
+        let incomplete = Data("POST /translate HTTP/1.1\r\nContent-Length: 4\r\n\r\n{}".utf8)
+        try require(LocalBridgeHTTPFraming.readState(for: incomplete) == .incomplete, "Expected an incomplete request body.")
+        let duplicate = Data("POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\na".utf8)
+        try require(LocalBridgeHTTPFraming.readState(for: duplicate) == .invalid, "Expected duplicate Content-Length to be rejected.")
+        let negative = Data("POST / HTTP/1.1\r\nContent-Length: -1\r\n\r\n".utf8)
+        try require(LocalBridgeHTTPFraming.readState(for: negative) == .invalid, "Expected negative Content-Length to be rejected.")
+        let oversized = Data("POST / HTTP/1.1\r\nContent-Length: 999999999999999999999999\r\n\r\n".utf8)
+        try require(LocalBridgeHTTPFraming.readState(for: oversized) == .invalid, "Expected overflowing Content-Length to be rejected.")
+        let tooLarge = Data("POST / HTTP/1.1\r\nContent-Length: \(LocalBridgeHTTPFraming.maximumRequestBytes)\r\n\r\n".utf8)
+        try require(LocalBridgeHTTPFraming.readState(for: tooLarge) == .tooLarge, "Expected an oversized request to be rejected.")
+    }
+
+    private static func checkProviderRedirectPolicy() throws {
+        let source = URL(string: "https://api.example.com/v1/chat")!
+        try require(
+            ProviderRedirectPolicy.allowsRedirect(from: source, to: URL(string: "https://api.example.com/v2/chat")!),
+            "Expected a same-origin provider redirect to be allowed."
+        )
+        try require(
+            !ProviderRedirectPolicy.allowsRedirect(from: source, to: URL(string: "https://other.example.com/v1/chat")!),
+            "Expected a cross-host provider redirect to be rejected."
+        )
+        try require(
+            !ProviderRedirectPolicy.allowsRedirect(from: source, to: URL(string: "http://api.example.com/v1/chat")!),
+            "Expected a provider HTTPS downgrade redirect to be rejected."
+        )
+        let local = URL(string: "http://127.0.0.1:11434/v1/chat")!
+        try require(
+            !ProviderRedirectPolicy.allowsRedirect(from: local, to: URL(string: "http://127.0.0.1:11435/v1/chat")!),
+            "Expected a provider redirect to another local port to be rejected."
+        )
+    }
+
     private static func checkProviderRequestOptions() throws {
         let qwen3Text = ProviderConfiguration(
             providerID: .siliconFlow,
@@ -394,6 +527,62 @@ struct LLMToolsChecks {
         try require(clearedHistory.isEmpty, "Expected Phase 1 clear-history flow to empty recent history.")
     }
 
+    private static func checkPerTaskDefaultModelRouting() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let defaultRunner = StubRunner(output: "default summary", format: .mlx)
+        let polishRunner = StubRunner(output: "task polish", format: .gguf)
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: defaultRunner, .gguf: polishRunner]
+        )
+        let defaultModel = ModelDescriptor(
+            name: "Default Text Fixture",
+            sourcePath: root.appendingPathComponent("default-model"),
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 4_096,
+            capabilities: .textOnly(source: .manual)
+        )
+        let taskModel = ModelDescriptor(
+            name: "Polish Fixture",
+            sourcePath: root.appendingPathComponent("polish-model"),
+            format: .gguf,
+            sizeClass: "fixture",
+            role: .quality,
+            contextLength: 4_096,
+            capabilities: .textOnly(source: .manual)
+        )
+        try await engine.addModelDescriptorForTesting(defaultModel)
+        try await engine.addModelDescriptorForTesting(taskModel)
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = defaultModel.id
+            preferences.setTextModelID(taskModel.id, for: .polish)
+        }
+
+        let configured = await engine.registry().preferences
+        let roundTripped = try JSONDecoder().decode(
+            AppPreferences.self,
+            from: JSONEncoder().encode(configured)
+        )
+        try require(roundTripped.preferredTextModelID(for: .polish) == taskModel.id, "Expected the polish model override to persist.")
+        for task in [TaskKind.summarize, .explain, .extractTodos] {
+            try require(roundTripped.preferredTextModelID(for: task) == defaultModel.id, "Expected an unset task model to fall back to the default model.")
+        }
+
+        let polished = try await engine.run(request: TaskRequest(task: .polish, inputText: "Polish this."))
+        let summarized = try await engine.run(request: TaskRequest(task: .summarize, inputText: "Summarize this."))
+        try require(polished.text == "task polish", "Expected polish to use its configured task model.")
+        try require(summarized.text == "default summary", "Expected summary to use the shared default model when no override is configured.")
+        let loadedPolishModelID = await polishRunner.loadedModelID()
+        let loadedDefaultModelID = await defaultRunner.loadedModelID()
+        try require(loadedPolishModelID == taskModel.id, "Expected the polish runner to load the task-specific model.")
+        try require(loadedDefaultModelID == defaultModel.id, "Expected the default runner to load the fallback model.")
+    }
+
     private static func checkPreferenceDefaultsDecodeFromOlderRegistry() throws {
         let json = """
         {
@@ -440,6 +629,7 @@ struct LLMToolsChecks {
         try require(preferences.defaultSummaryMode == .keyPoints, "Expected older registries to default summaries to key points.")
         try require(preferences.defaultExplanationMode == .plain, "Expected older registries to default explanations to plain mode.")
         try require(preferences.defaultTodoExtractionMode == .actionItems, "Expected older registries to default TODO extraction to action items.")
+        try require(preferences.textTaskModelIDs.isEmpty, "Expected older registries to keep per-task model overrides empty.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
 
         let legacySelectionLimitJSON = """
@@ -502,6 +692,7 @@ struct LLMToolsChecks {
         try require(preferences.mediaSubtitles.genericASRCommandTemplate.isEmpty, "Generic ASR command should default empty.")
         try require(preferences.mediaSubtitles.liveWindowWidth == MediaSubtitlePreferences.defaultLiveWindowWidth, "Expected live subtitle window width to use the default.")
         try require(preferences.mediaSubtitles.liveWindowHeight == MediaSubtitlePreferences.defaultLiveWindowHeight, "Expected live subtitle window height to use the default.")
+        try require(preferences.mediaSubtitles.liveTextColorHex == MediaSubtitlePreferences.defaultLiveTextColorHex, "Expected live subtitle text color to default to white.")
         try require(preferences.mediaSubtitles.liveASRPartialMillisecondsByModelID.isEmpty, "Expected live ASR partial-window overrides to default empty.")
         try require(preferences.liveMeeting.defaultAudioSource == .microphone, "Expected live meeting input to default to microphone.")
         try require(preferences.liveMeeting.sourceLanguageHint == .auto, "Expected live meeting source language to default to auto.")
@@ -511,6 +702,8 @@ struct LLMToolsChecks {
         let tinyWindowPreferences = MediaSubtitlePreferences(liveWindowWidth: 10, liveWindowHeight: 10)
         try require(tinyWindowPreferences.liveWindowWidth == MediaSubtitlePreferences.minimumLiveWindowWidth, "Expected live subtitle window width to clamp to the minimum.")
         try require(tinyWindowPreferences.liveWindowHeight == MediaSubtitlePreferences.minimumLiveWindowHeight, "Expected live subtitle window height to clamp to the minimum.")
+        try require(MediaSubtitlePreferences(liveTextColorHex: "12abEF").liveTextColorHex == "#12ABEF", "Expected live subtitle text color to normalize RGB hex values.")
+        try require(MediaSubtitlePreferences(liveTextColorHex: "invalid").liveTextColorHex == MediaSubtitlePreferences.defaultLiveTextColorHex, "Expected invalid live subtitle text colors to fall back to white.")
         let asrModelID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
         var partialWindowPreferences = MediaSubtitlePreferences(
             liveASRPartialMillisecondsByModelID: [
@@ -902,6 +1095,7 @@ struct LLMToolsChecks {
             delayedStrategy.requiresFullSessionAudioBuffer
                 && LiveMeetingRecognitionStrategy.diarizationFirst.requiresFullSessionAudioBuffer
                 && !LiveMeetingRecognitionStrategy.nativeSpeakerASR.requiresFullSessionAudioBuffer
+                && !LiveMeetingRecognitionStrategy.compositeSpeakerASR.requiresFullSessionAudioBuffer
                 && !LiveMeetingRecognitionStrategy.transcriptOnly.requiresFullSessionAudioBuffer,
             "Only delayed diarization strategies may retain a full-session in-memory audio buffer."
         )
@@ -1112,6 +1306,38 @@ struct LLMToolsChecks {
             speakers: &sequentialTurnSpeakers
         )
         try require(sequentialTurnSegments[0].speakerID == "A" && sequentialTurnSegments[0].state == .final, "Sequential diarization turns must choose the dominant speaker instead of becoming Unknown.")
+
+        var alternatingSpeakerSplitSpeakers: [LiveMeetingSpeaker] = []
+        let alternatingSpeakerSplit = LiveMeetingTranscriptReducer.splitSegmentBySpeakerTurns(
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 8, text: "甲方提问乙方回答", state: .final),
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 3.8, speakerID: "A", speakerLabel: "Speaker 1", confidence: 0.92),
+                SpeakerTurn(startTime: 3.8, endTime: 8, speakerID: "B", speakerLabel: "Speaker 2", confidence: 0.91)
+            ],
+            speakers: &alternatingSpeakerSplitSpeakers,
+            through: 8
+        )
+        try require(
+            alternatingSpeakerSplit.count == 2
+                && alternatingSpeakerSplit.map(\.speakerID) == ["A", "B"]
+                && alternatingSpeakerSplitSpeakers.map(\.id) == ["A", "B"],
+            "A transcript-first row spanning two alternating speakers must be split at diarization boundaries instead of assigning one dominant speaker."
+        )
+
+        var dominantSpeakerSplitSpeakers: [LiveMeetingSpeaker] = []
+        let dominantSpeakerSplit = LiveMeetingTranscriptReducer.splitSegmentBySpeakerTurns(
+            LiveMeetingSegment(index: 0, startTime: 0, endTime: 8, text: "主讲人持续发言", state: .final),
+            turns: [
+                SpeakerTurn(startTime: 0, endTime: 7, speakerID: "A", speakerLabel: "Speaker 1", confidence: 0.92),
+                SpeakerTurn(startTime: 7, endTime: 8, speakerID: "A", speakerLabel: "Speaker 1", confidence: 0.91)
+            ],
+            speakers: &dominantSpeakerSplitSpeakers,
+            through: 8
+        )
+        try require(
+            dominantSpeakerSplit.count == 1 && dominantSpeakerSplit[0].speakerID == nil,
+            "A row containing only one confirmed speaker must stay intact for normal overlap assignment."
+        )
 
         var dominantOverlapSegments = [
             LiveMeetingSegment(index: 0, startTime: 0, endTime: 8, text: "主讲人内容", state: .lowConfidence)
@@ -1853,6 +2079,45 @@ struct LLMToolsChecks {
         )
     }
 
+    private static func checkSpeakerDiarizationRejectsTokenInCommand() throws {
+        let secret = "hf-secret-must-not-reach-argv"
+        let previousToken = ProcessInfo.processInfo.environment["PYANNOTE_AUTH_TOKEN"]
+        setenv("PYANNOTE_AUTH_TOKEN", secret, 1)
+        defer {
+            if let previousToken {
+                setenv("PYANNOTE_AUTH_TOKEN", previousToken, 1)
+            } else {
+                unsetenv("PYANNOTE_AUTH_TOKEN")
+            }
+        }
+        let preferences = SpeakerDiarizationPreferences(
+            enabledForFileSubtitles: true,
+            commandTemplate: "/bin/echo {hf_token}"
+        )
+        do {
+            _ = try SpeakerDiarizationCommandRunner.commandResolution(preferences: preferences)
+            throw CheckError("Expected diarization token placeholder to be rejected.")
+        } catch let error as SpeakerDiarizationError {
+            try require(error.localizedDescription.contains("PYANNOTE_AUTH_TOKEN"), "Expected command error to direct callers to the environment variable.")
+            try require(!error.localizedDescription.contains(secret), "Diarization command error must not reveal the saved token.")
+        }
+    }
+
+    private static func checkProcessOutputCollectorDrainsLargePipes() async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [
+            "-c",
+            "import sys; sys.stdout.write('o' * 200000); sys.stdout.flush(); sys.stderr.write('e' * 200000); sys.stderr.flush()"
+        ]
+        let result = try await ProcessOutputCollector.run(process, maximumCapturedBytes: 64 * 1_024)
+        try require(result.terminationStatus == 0, "Expected large-output fixture process to exit successfully.")
+        try require(result.standardOutput.count == 64 * 1_024, "Expected stdout capture to retain only the bounded tail.")
+        try require(result.standardError.count == 64 * 1_024, "Expected stderr capture to retain only the bounded tail.")
+        try require(result.standardOutput.allSatisfy { $0 == 0x6f }, "Expected stdout tail contents.")
+        try require(result.standardError.allSatisfy { $0 == 0x65 }, "Expected stderr tail contents.")
+    }
+
     private static func checkSpeakerDiarizationFilePipeline() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -2205,6 +2470,77 @@ struct LLMToolsChecks {
         try require(polished.text == "LLM polished", "Expected polish to keep using LLM runner.")
         let polishedRequestCount = await runner.generatedRequestCount()
         try require(polishedRequestCount == 1, "Expected only non-translation text task to use LLM runner.")
+    }
+
+    private static func checkPersistentSidecarStopInterruptsBlockedRequest() async throws {
+        let root = try makeTemporaryDirectory(name: "persistent-sidecar-stop")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let scriptURL = root.appendingPathComponent("blocking-sidecar.zsh")
+        let pidURL = root.appendingPathComponent("pid")
+        let requestURL = root.appendingPathComponent("request-started")
+        let blockFIFOURL = root.appendingPathComponent("block.fifo")
+        guard mkfifo(blockFIFOURL.path, 0o600) == 0 else {
+            throw CheckError("Could not create persistent sidecar blocking FIFO.")
+        }
+        try """
+        #!/bin/zsh
+        print -r -- $$ > "$1"
+        print -r -- '{"protocol":"llmtools.fastmt/v1","type":"ready","engine":"customCommand","model":"lifecycle-fixture","available":true,"supportedPairs":[{"source":"en","target":"zh-Hans"}]}'
+        while IFS= read -r request; do
+            print -r -- started > "$2"
+            IFS= read -r blocked < "$3"
+        done
+        """.write(to: scriptURL, atomically: true, encoding: .utf8)
+
+        let escaped = [scriptURL, pidURL, requestURL, blockFIFOURL].map {
+            "'" + $0.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        let runner = FastTranslationCommandRunner()
+        let preferences = FastTranslationPreferences(
+            commandTemplates: FastTranslationCommandTemplates(
+                ctranslate2: "",
+                argos: "",
+                generic: "/bin/zsh \(escaped.joined(separator: " "))"
+            )
+        )
+        let task = Task {
+            try await runner.translate(
+                batch: [FastTranslationSegment(id: "blocked", text: "blocked request")],
+                pair: LanguagePair(source: "en", target: "zh-Hans"),
+                preferences: preferences
+            )
+        }
+        let requestDeadline = Date(timeIntervalSinceNow: 2)
+        while !FileManager.default.fileExists(atPath: requestURL.path), Date() < requestDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard FileManager.default.fileExists(atPath: requestURL.path) else {
+            await runner.stop()
+            throw CheckError("Expected the persistent sidecar request to block.")
+        }
+
+        let stopStarted = Date()
+        await runner.stop()
+        try require(
+            Date().timeIntervalSince(stopStarted) < 0.5,
+            "Persistent sidecar stop must not wait for the request lock."
+        )
+        let pidText = try String(contentsOf: pidURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let processIdentifier = Int32(pidText) else {
+            throw CheckError("Persistent sidecar fixture did not record a valid PID.")
+        }
+        let exitDeadline = Date(timeIntervalSinceNow: 4)
+        while Darwin.kill(processIdentifier, 0) == 0, Date() < exitDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        try require(
+            Darwin.kill(processIdentifier, 0) != 0,
+            "Persistent sidecar must exit after graceful close or forced termination."
+        )
+        guard case .failure = await task.result else {
+            throw CheckError("Blocked sidecar request must fail after the process stops.")
+        }
     }
 
     private static func checkSubtitleFastMTPipeline() async throws {
@@ -2576,6 +2912,40 @@ struct LLMToolsChecks {
         try require(image.pixelWidth == 64 && image.pixelHeight == 64, "Expected fixture image dimensions to survive normalization.")
         try require(image.dataURL.hasPrefix("data:\(image.mimeType);base64,"), "Expected image data URL to use normalized local bytes.")
         try require(!image.dataURL.contains("http://") && !image.dataURL.contains("https://"), "Image data URL must not pass through a remote URL.")
+    }
+
+    private static func checkRemoteImageURLPolicy() throws {
+        try require(RemoteImageURLPolicy.isPublicIPAddress("8.8.8.8"), "Expected a public IPv4 address to be allowed.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("127.0.0.1"), "Expected IPv4 loopback to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("10.0.0.1"), "Expected private IPv4 to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("169.254.169.254"), "Expected link-local metadata IPv4 to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("192.0.2.1"), "Expected documentation IPv4 to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("198.18.0.1"), "Expected benchmark IPv4 to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("::1"), "Expected IPv6 loopback to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("fd00::1"), "Expected private IPv6 to be rejected.")
+        try require(!RemoteImageURLPolicy.isPublicIPAddress("2001:db8::1"), "Expected documentation IPv6 to be rejected.")
+        do {
+            _ = try RemoteImageURLPolicy.validatedURL("http://8.8.8.8/image.png")
+            throw CheckError("Expected an insecure remote image URL to be rejected.")
+        } catch let error as OCRTaskError {
+            guard case .remoteImageURLUnsupported = error else {
+                throw error
+            }
+        }
+        do {
+            _ = try RemoteImageURLPolicy.validatedURL("https://127.0.0.1/image.png")
+            throw CheckError("Expected a loopback remote image URL to be rejected.")
+        } catch let error as OCRTaskError {
+            guard case .remoteImageURLUnsupported = error else {
+                throw error
+            }
+        }
+        let hostilePreferences = try JSONDecoder().decode(
+            OCRPreferences.self,
+            from: Data("{\"maximumImageBytes\":9223372036854775807,\"maximumPixelCount\":9223372036854775807}".utf8)
+        )
+        try require(hostilePreferences.maximumImageBytes == 16_000_000, "Expected OCR byte preferences to have a hard upper bound.")
+        try require(hostilePreferences.maximumPixelCount == 100_000_000, "Expected OCR pixel preferences to have a hard upper bound.")
     }
 
     private static func checkOCRModelPreferenceClearsTextOnlyModel() async throws {
@@ -3051,6 +3421,11 @@ struct LLMToolsChecks {
         FileManager.default.createFile(atPath: funMLTDirectory.appendingPathComponent("model.pt").path, contents: Data())
         FileManager.default.createFile(atPath: funMLTDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
 
+        let officialFunNanoDirectory = root.appendingPathComponent("Fun-ASR-Nano-2512", isDirectory: true)
+        try FileManager.default.createDirectory(at: officialFunNanoDirectory, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: officialFunNanoDirectory.appendingPathComponent("model.pt").path, contents: Data())
+        FileManager.default.createFile(atPath: officialFunNanoDirectory.appendingPathComponent("config.yaml").path, contents: Data("model: FunASRNano\n".utf8))
+
         let qwenDirectory = root.appendingPathComponent("Qwen3-ASR-0.6B", isDirectory: true)
         try FileManager.default.createDirectory(at: qwenDirectory, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: qwenDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
@@ -3096,6 +3471,35 @@ struct LLMToolsChecks {
         try require(detectedFunMLT.family == .funASRMLTNano, "Expected Fun-ASR-MLT-Nano family detection.")
         try require(detectedFunMLT.supports(.realtime), "Fun-ASR-MLT-Nano must be realtime-capable through a local streaming runtime.")
         try require(detectedFunMLT.supports(.fileOnly), "Fun-ASR-MLT-Nano must also support file transcription.")
+        // FunASR 工具箱可组合 CAM++，但不能因此把 Nano/MLT 的 ASR 权重标成原生说话人模型。
+        try require(!detectedFunMLT.canEmitSpeakerLabels, "Fun-ASR-MLT-Nano must keep speaker diarization as a separate pipeline capability.")
+        try require(!SpeechModelCapabilities.funASRNano().canEmitSpeakerLabels, "Fun-ASR-Nano must not claim native speaker labels without the separate CAM++ pipeline.")
+        try require(SpeechModelFamily.funASRNano.displayName == "Fun-ASR-Nano", "Speech model families must expose stable product names instead of raw enum values.")
+
+        let detectedOfficialFunNano = try requireNonNil(
+            ModelDetection.detectSpeechModel(at: officialFunNanoDirectory),
+            "Expected official Fun-ASR-Nano speech detection."
+        )
+        try require(detectedOfficialFunNano.family == .funASRNano, "Expected the official Fun-ASR-Nano family.")
+        try require(detectedOfficialFunNano.supports(.fileOnly), "The official FunASR composite pipeline must support file transcription.")
+        try require(detectedOfficialFunNano.supports(.realtime), "The official Fun-ASR-Nano model must expose its persistent Torch/MPS realtime path.")
+        try require(!detectedOfficialFunNano.canEmitSpeakerLabels, "CAM++ output is a runtime capability, not a native Nano model claim.")
+        let officialFunNanoDescriptor = ModelDescriptor(
+            name: "Fun-ASR-Nano-2512",
+            sourcePath: officialFunNanoDirectory,
+            format: .speech,
+            sizeClass: "large",
+            role: .default,
+            contextLength: 2_048,
+            capabilities: ModelCapabilities.speech(detectedOfficialFunNano)
+        )
+        try require(
+            !officialFunNanoDescriptor.supportsMeetingCaptureSpeech
+                && officialFunNanoDescriptor.capabilities.speech?.supports(.realtime) == true
+                && officialFunNanoDescriptor.capabilities.speech?.supports(.fileOnly) == true
+                && officialFunNanoDescriptor.meetingCaptureRuntimeMode == nil,
+            "The official Nano model.pt must stay available for realtime subtitles/files but be excluded from realtime meeting capture."
+        )
 
         let detectedQwen = try requireNonNil(ModelDetection.detectSpeechModel(at: qwenDirectory), "Expected Qwen3-ASR speech detection.")
         try require(detectedQwen.family == .qwen3ASR06B, "Expected Qwen3-ASR-0.6B family detection.")

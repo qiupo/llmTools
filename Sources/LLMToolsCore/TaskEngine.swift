@@ -176,6 +176,9 @@ public actor TaskEngine {
         guard let resolvedBaseURL = URL(string: baseURLString), resolvedBaseURL.scheme != nil, resolvedBaseURL.host != nil else {
             throw RunnerError.unsupportedConfiguration("Provider base URL is invalid.")
         }
+        guard ProviderEndpointPolicy.allows(resolvedBaseURL) else {
+            throw RunnerError.unsupportedConfiguration(ProviderEndpointPolicy.secureTransportMessage)
+        }
 
         let configuration = ProviderConfiguration(
             providerID: providerID,
@@ -258,6 +261,9 @@ public actor TaskEngine {
         let baseURLString = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let resolvedBaseURL = URL(string: baseURLString), resolvedBaseURL.scheme != nil, resolvedBaseURL.host != nil else {
             throw RunnerError.unsupportedConfiguration("Provider base URL is invalid.")
+        }
+        guard ProviderEndpointPolicy.allows(resolvedBaseURL) else {
+            throw RunnerError.unsupportedConfiguration(ProviderEndpointPolicy.secureTransportMessage)
         }
 
         let displayName = name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -527,7 +533,8 @@ public actor TaskEngine {
     }
 
     public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
-        let model = try resolveModel(for: modelID)
+        let preferredModelID = modelID ?? snapshot.preferences.preferredTextModelID(for: request.task)
+        let model = try resolveModel(for: preferredModelID)
         let routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
         if let fastResult = try await translateTextWithFastMTIfSelected(routedRequest) {
             if persistHistory {
@@ -828,7 +835,9 @@ public actor TaskEngine {
         var diarizationErrorMessage: String?
         if snapshot.preferences.speakerDiarization.enabledForFileSubtitles {
             if SpeakerTurnMapper.speakerCount(in: segments) > 0 {
-                diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
+                diarizationModelID = health.runtimeSource == .funASRCompositePipeline
+                    ? "funasr-nano+cam++"
+                    : "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
             } else if model.capabilities.speech?.canEmitSpeakerLabels == true {
                 diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
                 diarizationErrorCode = "native_speaker_labels_missing"
@@ -911,12 +920,14 @@ public actor TaskEngine {
             try? FileManager.default.removeItem(at: normalizedAudio.url.deletingLastPathComponent())
         }
         descriptor.duration = normalizedAudio.duration
-        let canEmitNativeSpeakers = model.capabilities.speech?.canEmitSpeakerLabels == true
+        let usesFunASRCompositePipeline = health.runtimeSource == .funASRCompositePipeline
+        let canEmitCombinedSpeakers = model.capabilities.speech?.canEmitSpeakerLabels == true
+            || usesFunASRCompositePipeline
         var recognitionStrategy: LiveMeetingRecognitionStrategy = .transcriptOnly
         var diarizationModelID: String?
         var segments: [LiveMeetingSegment]
 
-        if canEmitNativeSpeakers {
+        if canEmitCombinedSpeakers {
             let nativeSubtitles = try await transcribeMeetingAudio(
                 audioURL: normalizedAudio.url,
                 model: model,
@@ -926,8 +937,10 @@ public actor TaskEngine {
             )
             let nativeSegments = liveMeetingSegments(from: nativeSubtitles)
             if nativeSegments.contains(where: { $0.speakerID != nil }) {
-                recognitionStrategy = .nativeSpeakerASR
-                diarizationModelID = "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
+                recognitionStrategy = usesFunASRCompositePipeline ? .compositeSpeakerASR : .nativeSpeakerASR
+                diarizationModelID = usesFunASRCompositePipeline
+                    ? "funasr-nano+cam++"
+                    : "\(model.capabilities.speech?.family.rawValue ?? "asr")-native"
                 segments = nativeSegments
             } else if let speakerAware = try? await transcribeMeetingBySpeakerTurns(
                 normalizedAudioURL: normalizedAudio.url,
@@ -1631,6 +1644,9 @@ public actor TaskEngine {
             await runner.unload()
         }
         runners.removeAll()
+        // 全局空闲卸载也要覆盖进程型模型，不能只清理进程内的 GGUF/MLX runner。
+        await languageDetectionService.stop()
+        await fastTranslationService.stop()
     }
 
     private func unloadModel(id: UUID) async {
@@ -2475,6 +2491,10 @@ public actor TaskEngine {
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
             preferences.defaultModelID = models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
         }
+        preferences.textTaskModelIDs = preferences.textTaskModelIDs.filter { entry in
+            TaskKind.perTaskModelCases.contains(entry.key)
+                && models.contains(where: { $0.id == entry.value && $0.enabled && $0.capabilities.supportsText })
+        }
         if let modelID = preferences.webPageTranslation.modelID,
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
             preferences.webPageTranslation.modelID = nil
@@ -2498,7 +2518,7 @@ public actor TaskEngine {
             preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
         }
         if let modelID = preferences.liveMeeting.realtimeASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsMeetingCaptureSpeech }) {
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.supportsMeetingCaptureSpeech }) {
             preferences.liveMeeting.realtimeASRModelID = nil
         }
         if let modelID = preferences.liveMeeting.fileASRModelID,

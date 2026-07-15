@@ -125,7 +125,7 @@ public enum ModelDetection {
             return .funASRMLTNano(
                 source: .detected,
                 confidence: 0.87,
-                note: "Detected Fun-ASR-MLT-Nano-style local ASR files. Preferred multilingual realtime family when a local streaming sidecar is configured."
+                note: "Detected Fun-ASR-MLT-Nano-style local ASR files. The current llmTools MLX route provides multilingual ASR only and uses separate speaker processing."
             )
         }
         if searchable.contains("fun-asr-nano")
@@ -134,11 +134,17 @@ public enum ModelDetection {
             || searchable.contains("llama-funasr")
             || searchable.contains("funasr-encoder")
             || searchable.contains("fsmn-vad") {
-            return .funASRNano(
+            var capabilities = SpeechModelCapabilities.funASRNano(
                 source: .detected,
                 confidence: 0.88,
-                note: "Detected Fun-ASR-Nano-style local ASR files. Preferred realtime family when a local streaming or GGUF sidecar runtime is configured."
+                note: "Detected Fun-ASR-Nano-style local ASR files. The current llmTools MLX/GGUF routes provide ASR only; CAM++ speaker diarization belongs to the separate official FunASR pipeline."
             )
+            if isOfficialFunASRNanoModel(at: url) {
+                // 同一份原版权重按运行模式分流：实时走常驻 Torch/MPS，文件转写走 VAD + CAM++ 复合管线。
+                capabilities.modes = [.realtime, .fileOnly]
+                capabilities.note = "Detected the official Fun-ASR-Nano model.pt runtime. Realtime transcription uses the persistent Torch/MPS runner; file transcription can compose Nano with local VAD, CAM++, and punctuation models."
+            }
+            return capabilities
         }
         if searchable.contains("sensevoice") || searchable.contains("sense-voice") {
             return .senseVoiceSmall(
@@ -189,6 +195,13 @@ public enum ModelDetection {
         return fm.fileExists(atPath: tokenizer.appendingPathComponent("vocab.json").path)
             && fm.fileExists(atPath: tokenizer.appendingPathComponent("merges.txt").path)
             && fm.fileExists(atPath: tokenizer.appendingPathComponent("tokenizer_config.json").path)
+    }
+
+    public static func isOfficialFunASRNanoModel(at url: URL) -> Bool {
+        guard let directory = localModelDirectory(for: url) else { return false }
+        let fm = FileManager.default
+        return fm.fileExists(atPath: directory.appendingPathComponent("model.pt").path)
+            && fm.fileExists(atPath: directory.appendingPathComponent("config.yaml").path)
     }
 
     private static func sherpaQwen3ModelPairExists(in directory: URL) -> Bool {

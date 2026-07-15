@@ -253,15 +253,13 @@ public actor FastTranslationCommandRunner: FastTranslationService {
     }
 
     public static var defaultOPUSCT2ModelPath: String {
-        AppPaths.applicationSupportDirectory
-            .appendingPathComponent("fastmt-runtime", isDirectory: true)
+        AppPaths.fastTranslationRuntimeDirectory
             .appendingPathComponent("opus-mt-en-zh-ct2", isDirectory: true)
             .path
     }
 
     public static var defaultNLLB600MCT2ModelPath: String {
-        AppPaths.applicationSupportDirectory
-            .appendingPathComponent("fastmt-runtime", isDirectory: true)
+        AppPaths.fastTranslationRuntimeDirectory
             .appendingPathComponent("nllb-200-distilled-600m-ct2-int8", isDirectory: true)
             .path
     }
@@ -552,12 +550,10 @@ public actor FastTranslationCommandRunner: FastTranslationService {
     private static func pythonPath() -> String? {
         firstExecutablePath([
             environmentValue("LLMTOOLS_FASTMT_PYTHON"),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("fastmt-runtime", isDirectory: true)
+            AppPaths.fastTranslationRuntimeDirectory
                 .appendingPathComponent("venv/bin/python3")
                 .path,
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("fastmt-runtime", isDirectory: true)
+            AppPaths.fastTranslationRuntimeDirectory
                 .appendingPathComponent("venv/bin/python")
                 .path,
             "/usr/bin/python3"
@@ -768,21 +764,21 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
     private let outputHandle: FileHandle
     private let errorHandle: FileHandle
     private let requestLock = NSLock()
+    private let processLifecycle = PersistentProcessLifecycle()
     private let stderrLock = NSLock()
     private var stderrData = Data()
-    private var stopped = false
 
     var readyEvent: FastTranslationSidecarEvent?
 
     var isRunning: Bool {
-        process.isRunning && !stopped
+        process.isRunning && !processLifecycle.isStopped
     }
 
     init(resolution: FastTranslationCommandRunner.CommandResolution) throws {
         self.resolution = resolution
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-lc", resolution.command]
+        process.arguments = ["-lc", "exec \(resolution.command)"]
         var environment = ProcessInfo.processInfo.environment
         environment["PYTHONUNBUFFERED"] = "1"
         process.environment = environment
@@ -857,26 +853,18 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
     func cancel(requestID: String) {
         requestLock.lock()
         defer { requestLock.unlock() }
-        guard !stopped, process.isRunning else {
+        guard !processLifecycle.isStopped, process.isRunning else {
             return
         }
         try? writeJSONLine(FastTranslationCancelCommand(command: "cancel", requestID: requestID))
     }
 
     func stop() {
-        requestLock.lock()
-        guard !stopped else {
-            requestLock.unlock()
-            return
-        }
-        stopped = true
-        if process.isRunning {
-            try? writeJSONLine(FastTranslationCancelCommand(command: "stop", requestID: UUID().uuidString))
-            try? inputHandle.close()
-            process.terminate()
-        }
-        errorHandle.readabilityHandler = nil
-        requestLock.unlock()
+        processLifecycle.stop(
+            process: process,
+            inputHandle: inputHandle,
+            errorHandle: errorHandle
+        )
     }
 
     private func translateSync(
@@ -886,7 +874,7 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
     ) throws -> [FastTranslatedSegment] {
         requestLock.lock()
         defer { requestLock.unlock() }
-        guard !stopped, process.isRunning else {
+        guard !processLifecycle.isStopped, process.isRunning else {
             throw FastTranslationError.runtimeFailed("Fast translation sidecar is not running.")
         }
         let requestID = UUID().uuidString

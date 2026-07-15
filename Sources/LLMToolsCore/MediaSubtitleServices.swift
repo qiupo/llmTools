@@ -343,7 +343,12 @@ public struct LocalASRProcessRunner: Sendable {
                 message: "Local streaming ASR sidecar is not available for \(model.name). \(runtimeMissingMessage(for: model, family: speech.family))"
             )
         }
-        guard let resolution = commandResolution(for: model, family: speech.family, preferences: preferences) else {
+        guard let resolution = commandResolution(
+            for: model,
+            family: speech.family,
+            preferences: preferences,
+            mode: mode
+        ) else {
             return ASRHealthReport(
                 modelID: model.id,
                 modelName: model.name,
@@ -386,7 +391,12 @@ public struct LocalASRProcessRunner: Sendable {
         if let fixtureURL = fixtureTranscriptURL() {
             return try parseTranscript(data: Data(contentsOf: fixtureURL), model: model, sessionID: sessionID, duration: duration)
         }
-        guard let resolution = commandResolution(for: model, family: speech.family, preferences: preferences) else {
+        guard let resolution = commandResolution(
+            for: model,
+            family: speech.family,
+            preferences: preferences,
+            mode: effectiveContext.mode
+        ) else {
             throw MediaSubtitleError.asrRuntimeMissing("No local ASR command is configured for \(model.name).")
         }
         let command = renderCommandTemplate(
@@ -457,6 +467,10 @@ public struct LocalASRProcessRunner: Sendable {
                 return "Local whisper.cpp Core ML runtime is available."
             case .funASRGGUFAuto:
                 return "Local Fun-ASR llama.cpp/GGUF runtime is available."
+            case .funASRTorchStreaming:
+                return "Official local Fun-ASR-Nano Torch/MPS streaming runtime is available."
+            case .funASRCompositePipeline:
+                return "Official local FunASR Nano + VAD + CAM++ pipeline is available for file transcription."
             case .vibeVoiceASRRunner:
                 return "Local VibeVoice-ASR rich transcription runtime is available."
             case .unavailable:
@@ -468,7 +482,8 @@ public struct LocalASRProcessRunner: Sendable {
     private func commandResolution(
         for model: ModelDescriptor,
         family: SpeechModelFamily,
-        preferences: MediaSubtitlePreferences
+        preferences: MediaSubtitlePreferences,
+        mode: SpeechRuntimeMode
     ) -> ASRCommandResolution? {
         if let command = preferences.commandTemplate(for: family) {
             return ASRCommandResolution(template: command, source: .settingsCommand)
@@ -504,6 +519,11 @@ public struct LocalASRProcessRunner: Sendable {
             return ASRCommandResolution(template: value, source: .environmentCommand)
         }
         let modelURL = model.resolvedPath ?? model.sourcePath
+        if mode == .fileOnly,
+           family == .funASRNano,
+           let pipelineTemplate = funASRCompositeCommandTemplate(modelURL: modelURL) {
+            return ASRCommandResolution(template: pipelineTemplate, source: .funASRCompositePipeline)
+        }
         if (family == .funASRNano || family == .funASRMLTNano),
            let funASRTemplate = funASRGGUFCommandTemplate(modelURL: modelURL) {
             return ASRCommandResolution(template: funASRTemplate, source: .funASRGGUFAuto)
@@ -518,10 +538,6 @@ public struct LocalASRProcessRunner: Sendable {
            let mlxAudioTemplate = mlxAudioCommandTemplate(for: family) {
             return ASRCommandResolution(template: mlxAudioTemplate, source: .mlxAudioRunner)
         }
-        if family == .vibeVoiceASR,
-           let vibeVoiceTemplate = vibeVoiceASRCommandTemplate() {
-            return ASRCommandResolution(template: vibeVoiceTemplate, source: .vibeVoiceASRRunner)
-        }
         if family == .senseVoiceSmall,
            FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.onnx").path),
            FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("tokens.txt").path),
@@ -534,56 +550,48 @@ public struct LocalASRProcessRunner: Sendable {
         return nil
     }
 
-    private func vibeVoiceASRCommandTemplate() -> String? {
-        guard let runnerPath = vibeVoiceASRRunnerPath(),
-              let pythonPath = vibeVoiceASRPythonPath() else {
+    private func funASRCompositeCommandTemplate(modelURL: URL) -> String? {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.pt").path),
+              fileManager.fileExists(atPath: modelURL.appendingPathComponent("config.yaml").path) else {
             return nil
         }
-        return "\(shellEscape(pythonPath)) \(shellEscape(runnerPath)) --model {model} --audio {audio} --language {language}"
+        let root = AppPaths.funASRPipelineRuntimeDirectory
+        let venvPath = root.appendingPathComponent("venv", isDirectory: true).path
+        let pythonPath = URL(fileURLWithPath: venvPath).appendingPathComponent("bin/python").path
+        let requiredModels = [
+            (directory: "fsmn-vad", checkpoint: "model.pt"),
+            (directory: "campp", checkpoint: "campplus_cn_common.bin"),
+            (directory: "ct-punc", checkpoint: "model.pt")
+        ]
+        guard fileManager.isExecutableFile(atPath: pythonPath),
+              pythonModuleExists(in: venvPath, moduleName: "funasr"),
+              requiredModels.allSatisfy({ model in
+                  let directory = root
+                      .appendingPathComponent("models", isDirectory: true)
+                      .appendingPathComponent(model.directory, isDirectory: true)
+                  return fileManager.fileExists(atPath: directory.appendingPathComponent("config.yaml").path)
+                      && fileManager.fileExists(atPath: directory.appendingPathComponent(model.checkpoint).path)
+              }),
+              let sidecarPath = funASRCompositeSidecarPath() else {
+            return nil
+        }
+        return "LLMTOOLS_FUNASR_PIPELINE_ROOT=\(shellEscape(root.path)) \(shellEscape(pythonPath)) \(shellEscape(sidecarPath)) --model {model} --audio {audio} --language {language}"
     }
 
-    private func vibeVoiceASRRunnerPath() -> String? {
+    private func funASRCompositeSidecarPath() -> String? {
         let fileManager = FileManager.default
         let candidates = [
             Bundle.main.resourceURL?
                 .appendingPathComponent("asr", isDirectory: true)
-                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .appendingPathComponent("llmtools-funasr-pipeline.py")
                 .path,
             URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
                 .appendingPathComponent("scripts", isDirectory: true)
-                .appendingPathComponent("llmtools-vibevoice-asr-runner.py")
+                .appendingPathComponent("llmtools-funasr-pipeline.py")
                 .path
         ].compactMap { $0 }
-        return candidates.first { fileManager.isExecutableFile(atPath: $0) }
-    }
-
-    private func vibeVoiceASRPythonPath() -> String? {
-        let fileManager = FileManager.default
-        let env = ProcessInfo.processInfo.environment
-        if let envPython = nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_PYTHON"]),
-           fileManager.isExecutableFile(atPath: envPython) {
-            return envPython
-        }
-        var candidates: [String] = []
-        if let configuredVenv = nonEmpty(env["LLMTOOLS_VIBEVOICE_ASR_VENV"]) {
-            candidates.append(
-                URL(fileURLWithPath: configuredVenv).appendingPathComponent("bin/python").path
-            )
-        }
-        candidates.append(contentsOf: [
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("asr-runtime", isDirectory: true)
-                .appendingPathComponent("vibevoice-venv", isDirectory: true)
-                .appendingPathComponent("bin/python")
-                .path(percentEncoded: false),
-            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/vibevoice-venv/bin/python")
-                .path(percentEncoded: false)
-        ])
-        return candidates.first {
-            fileManager.isExecutableFile(atPath: $0)
-                && pythonModuleExists(in: URL(fileURLWithPath: $0).deletingLastPathComponent().deletingLastPathComponent().path, moduleName: "vibevoice")
-        }
+        return candidates.first { fileManager.fileExists(atPath: $0) }
     }
 
     private func whisperCppCoreMLCommandTemplate(modelURL: URL) -> String? {
@@ -614,12 +622,8 @@ public struct LocalASRProcessRunner: Sendable {
     private func whisperCppRuntimeRootPath() -> String? {
         let candidates = [
             nonEmpty(ProcessInfo.processInfo.environment["LLMTOOLS_WHISPER_CPP_ROOT"]),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent("whisper-cpp", isDirectory: true)
-                .path(percentEncoded: false),
-            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/whisper-cpp", isDirectory: true)
                 .path(percentEncoded: false)
         ].compactMap { $0 }
         return candidates.first
@@ -784,12 +788,8 @@ public struct LocalASRProcessRunner: Sendable {
         let directoryName = mlxAudioVenvDirectoryName(for: family)
         let candidates = [
             nonEmpty(env[envKey]),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent(directoryName, isDirectory: true)
-                .path(percentEncoded: false),
-            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/\(directoryName)", isDirectory: true)
                 .path(percentEncoded: false)
         ].compactMap { $0 }
         return candidates.first {
@@ -901,12 +901,12 @@ public struct LocalASRProcessRunner: Sendable {
             "Configure a local ASR command in Media Subtitle settings, or set LLMTOOLS_FUN_ASR_COMMAND, LLMTOOLS_SENSEVOICE_COMMAND, LLMTOOLS_QWEN3_ASR_COMMAND, LLMTOOLS_VIBEVOICE_ASR_COMMAND, LLMTOOLS_WHISPER_CPP_COMMAND, or LLMTOOLS_ASR_COMMAND."
         ]
         if family == .funASRMLTNano {
-            parts.append("Fun-ASR-MLT-Nano is the preferred broad-language realtime family; safetensors/MLX directories require the bundled runner plus the isolated Fun-ASR mlx-audio-plus runtime, while official Fun-ASR realtime routes still require CUDA/vLLM or compatible GGUF/llama-funasr-cli files.")
+            parts.append("Fun-ASR-MLT-Nano covers broad-language realtime transcription; safetensors/MLX directories require the bundled runner plus the isolated Fun-ASR mlx-audio-plus runtime. This route performs ASR only and uses a separate speaker-processing pipeline.")
         } else if family == .funASRNano {
-            parts.append("Fun-ASR-Nano is the preferred low-latency realtime family; safetensors/MLX directories can use the bundled mlx-audio runner, while automatic GGUF detection requires llama-funasr-cli plus Fun-ASR encoder, Qwen3 decoder, and optionally FSMN-VAD GGUF files.")
+            parts.append("Fun-ASR-Nano covers low-latency Chinese/English/Japanese transcription; safetensors/MLX directories can use the bundled mlx-audio runner, while automatic GGUF detection requires llama-funasr-cli plus Fun-ASR encoder, Qwen3 decoder, and optionally FSMN-VAD GGUF files. Official FunASR speaker diarization additionally composes a CAM++ speaker model and is not enabled by these ASR-only routes.")
         }
         if safetensorsModelFilesExist(at: modelURL) {
-            parts.append("This model directory uses safetensors/MLX weights; install the matching local MLX ASR runtime or configure an ASR command for \(family.rawValue).")
+            parts.append("This model directory uses safetensors/MLX weights; install the matching local MLX ASR runtime or configure an ASR command for \(family.displayName).")
         }
         if family == .senseVoiceSmall {
             parts.append("SenseVoiceSmall safetensors/MLX directories can use the bundled runner with the isolated SenseVoice mlx-audio runtime. Automatic sherpa-onnx detection requires model.onnx, tokens.txt, and sherpa-onnx-offline in PATH.")
@@ -947,8 +947,7 @@ public struct LocalASRProcessRunner: Sendable {
             candidates.append(URL(fileURLWithPath: configuredTokenizer))
         }
         candidates.append(contentsOf: [
-            homeURL
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent("qwen2.5-tokenizer", isDirectory: true),
             homeURL
                 .appendingPathComponent("code/models/lmstudio-community/Qwen2.5-0.5B-Instruct-MLX-4bit", isDirectory: true),
@@ -1245,9 +1244,9 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
     private let outputHandle: FileHandle
     private let errorHandle: FileHandle
     private let requestLock = NSLock()
+    private let processLifecycle = PersistentProcessLifecycle()
     private let stderrLock = NSLock()
     private var stderrData = Data()
-    private var stopped = false
 
     private init(
         model: ModelDescriptor,
@@ -1333,6 +1332,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return nil
         }
         switch family {
+        case .funASRNano where ModelDetection.isOfficialFunASRNanoModel(at: model.resolvedPath ?? model.sourcePath):
+            return (.funASRTorchStreaming, "Official persistent Fun-ASR-Nano Torch/MPS streaming sidecar is available.")
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
             return (.mlxAudioRunner, "Local persistent MLX ASR streaming sidecar is available.")
         case .qwen3ASRSherpaOnnx:
@@ -1381,7 +1382,7 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
         defer {
             requestLock.unlock()
         }
-        guard !stopped, process.isRunning else {
+        guard !processLifecycle.isStopped, process.isRunning else {
             throw MediaSubtitleError.asrRuntimeFailed("Streaming ASR sidecar is not running.")
         }
 
@@ -1420,24 +1421,11 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
     }
 
     public func stop() {
-        requestLock.lock()
-        guard !stopped else {
-            requestLock.unlock()
-            return
-        }
-        stopped = true
-        if process.isRunning {
-            let command = StreamingASRStopCommand(command: "stop", requestID: UUID().uuidString)
-            if let data = try? JSONEncoder().encode(command) {
-                var line = data
-                line.append(0x0A)
-                try? inputHandle.write(contentsOf: line)
-            }
-            inputHandle.closeFile()
-            process.terminate()
-        }
-        errorHandle.readabilityHandler = nil
-        requestLock.unlock()
+        processLifecycle.stop(
+            process: process,
+            inputHandle: inputHandle,
+            errorHandle: errorHandle
+        )
     }
 
     private func waitUntilReady() async throws {
@@ -1566,6 +1554,13 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return nil
         }
         switch family {
+        case .funASRNano where ModelDetection.isOfficialFunASRNanoModel(at: modelURL):
+            guard let runtimeRoot = officialFunASRRuntimeRoot(),
+                  let pythonPath = pythonExecutable(in: runtimeRoot.appendingPathComponent("venv", isDirectory: true).path),
+                  pythonPackageExists(in: runtimeRoot.appendingPathComponent("venv", isDirectory: true).path, moduleName: "funasr") else {
+                return nil
+            }
+            return SidecarResolution(pythonPath: pythonPath, sidecarPath: sidecarPath)
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
             guard FileManager.default.fileExists(atPath: modelURL.appendingPathComponent("model.safetensors").path),
                   let venvPath = mlxAudioVenvPath(for: family),
@@ -1593,12 +1588,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
     private static func streamingWhisperCppRuntimeRootPath() -> String? {
         let candidates = [
             nonEmpty(ProcessInfo.processInfo.environment["LLMTOOLS_WHISPER_CPP_ROOT"]),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent("whisper-cpp", isDirectory: true)
-                .path(percentEncoded: false),
-            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/whisper-cpp", isDirectory: true)
                 .path(percentEncoded: false)
         ].compactMap { $0 }
         return candidates.first { FileManager.default.fileExists(atPath: $0) }
@@ -1678,6 +1669,17 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
         return candidates.first { fileManager.isReadableFile(atPath: $0) }
     }
 
+    private static func officialFunASRRuntimeRoot() -> URL? {
+        let candidates = [
+            nonEmpty(ProcessInfo.processInfo.environment["LLMTOOLS_FUNASR_PIPELINE_ROOT"])
+                .map { URL(fileURLWithPath: $0, isDirectory: true) },
+            AppPaths.funASRPipelineRuntimeDirectory
+        ].compactMap { $0 }
+        return candidates.first { root in
+            FileManager.default.fileExists(atPath: root.appendingPathComponent("venv", isDirectory: true).path)
+        }
+    }
+
     private static func pythonExecutable(in venvPath: String) -> String? {
         let fileManager = FileManager.default
         let root = URL(fileURLWithPath: venvPath)
@@ -1694,12 +1696,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
         let directoryName = mlxAudioVenvDirectoryName(for: family)
         let candidates = [
             nonEmpty(env[envKey]),
-            AppPaths.applicationSupportDirectory
-                .appendingPathComponent("asr-runtime", isDirectory: true)
+            AppPaths.asrRuntimeDirectory
                 .appendingPathComponent(directoryName, isDirectory: true)
-                .path(percentEncoded: false),
-            URL(fileURLWithPath: FileManager.default.homeDirectoryForCurrentUser.path(percentEncoded: false))
-                .appendingPathComponent("Library/Application Support/llmTools/asr-runtime/\(directoryName)", isDirectory: true)
                 .path(percentEncoded: false)
         ].compactMap { $0 }
         return candidates.first {
@@ -1715,10 +1713,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .customLocal:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
             return "LLMTOOLS_ASR_VENV"
-        case .vibeVoiceASR:
-            return "LLMTOOLS_VIBEVOICE_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
         }
@@ -1732,10 +1728,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .customLocal:
+        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
             return "venv"
-        case .vibeVoiceASR:
-            return "vibevoice-venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
         }
@@ -1817,11 +1811,6 @@ private struct StreamingASRCommand: Encodable {
     var language: String
     var isFinal: Bool
     var pcm16Base64: String
-}
-
-private struct StreamingASRStopCommand: Encodable {
-    var command: String
-    var requestID: String
 }
 
 private struct StreamingASREvent: Decodable {
