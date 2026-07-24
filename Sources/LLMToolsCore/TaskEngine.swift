@@ -75,7 +75,8 @@ public actor TaskEngine {
         let detection = try ModelDetection.detect(from: url)
         let displayName = name ?? inferDisplayName(from: url)
         let inferredRole: ModelRole = role ?? inferRole(format: detection.format, sizeClass: detection.sizeClass)
-        let inferredContext = inferContextLength(format: detection.format, sizeClass: detection.sizeClass)
+        let inferredContext = ModelDetection.contextLength(at: detection.resolvedPath)
+            ?? inferContextLength(format: detection.format, sizeClass: detection.sizeClass)
         let descriptor = ModelDescriptor(
             name: displayName,
             sourcePath: url,
@@ -123,11 +124,18 @@ public actor TaskEngine {
         guard let speech = speech ?? ModelDetection.detectSpeechModel(at: url) else {
             throw ModelDetectionError.unsupported(url)
         }
+        let resolvedPath: URL
+        if speech.family == .nemotron35ASRStreaming06B,
+           let variant = ModelDetection.nemotronStreamingCoreMLVariantDirectory(at: url) {
+            resolvedPath = variant
+        } else {
+            resolvedPath = url
+        }
         let displayName = name ?? inferDisplayName(from: url)
         let descriptor = ModelDescriptor(
             name: displayName,
             sourcePath: url,
-            resolvedPath: url,
+            resolvedPath: resolvedPath,
             format: .speech,
             sizeClass: speech.family.rawValue,
             role: .default,
@@ -445,6 +453,45 @@ public actor TaskEngine {
         )
     }
 
+    public func setModelThinkingModeEnabled(id: UUID, enabled: Bool) async throws -> ModelDescriptor {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        guard snapshot.models[index].supportsThinkingModeControl else {
+            throw RunnerError.unsupportedConfiguration("This model does not support thinking mode control.")
+        }
+        guard snapshot.models[index].thinkingModeEnabled != enabled else {
+            return snapshot.models[index]
+        }
+
+        // runner 在 load 时读取该开关，先卸载才能保证下一次请求立即使用新模式。
+        await unloadModel(id: id)
+        snapshot.models[index].thinkingModeEnabled = enabled
+        try await registryStore.save(snapshot)
+        return snapshot.models[index]
+    }
+
+    public func setModelContextLength(id: UUID, contextLength: Int) async throws -> ModelDescriptor {
+        guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
+            throw RunnerError.unsupportedConfiguration("Model not found.")
+        }
+        guard !snapshot.models[index].capabilities.supportsSpeech else {
+            throw RunnerError.unsupportedConfiguration("Speech models do not use the LLM context setting.")
+        }
+        guard (1_024...1_048_576).contains(contextLength) else {
+            throw RunnerError.unsupportedConfiguration("Context length must be between 1024 and 1048576 tokens.")
+        }
+        guard snapshot.models[index].contextLength != contextLength else {
+            return snapshot.models[index]
+        }
+
+        // GGUF 会在 load 时按上下文创建资源，统一卸载可确保所有后端从下一次请求生效。
+        await unloadModel(id: id)
+        snapshot.models[index].contextLength = contextLength
+        try await registryStore.save(snapshot)
+        return snapshot.models[index]
+    }
+
     public func testVisionCapability(id: UUID) async throws -> VisionCapabilityProbeResult {
         guard let index = snapshot.models.firstIndex(where: { $0.id == id }) else {
             throw RunnerError.unsupportedConfiguration("Model not found.")
@@ -550,6 +597,13 @@ public actor TaskEngine {
         }
         var result = try await runner.generate(request: routedRequest, preferences: snapshot.preferences)
         result.sourceLanguage = routedRequest.sourceLanguage
+        if routedRequest.task == .translate,
+           routedRequest.translationOutputMode == .detailed,
+           let study = TranslationStudyResult.parse(modelText: result.text) {
+            // 复制、历史和原文回填继续使用纯译文；结构化内容只交给支持它的结果视图。
+            result.text = study.translation
+            result.translationStudy = study
+        }
         if persistHistory {
             appendHistory(model: model, result: result, request: routedRequest)
         }
@@ -557,7 +611,7 @@ public actor TaskEngine {
     }
 
     private func translateTextWithFastMTIfSelected(_ request: TaskRequest) async throws -> TaskResult? {
-        guard request.task == .translate else {
+        guard request.task == .translate, request.translationOutputMode == .plain else {
             return nil
         }
         let preferences = snapshot.preferences.fastTranslation
@@ -625,10 +679,15 @@ public actor TaskEngine {
             try await runner.load(model: model)
         }
 
+        let dedicatedOCR = ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
+        if dedicatedOCR, mode == .explainImage {
+            throw OCRTaskError.unsupportedMode(modelName: model.name, mode: mode)
+        }
         let prompt = PromptTemplates.ocrPrompt(
             mode: mode,
             targetLanguage: snapshot.preferences.defaultTranslationTarget,
-            preferences: snapshot.preferences
+            preferences: snapshot.preferences,
+            dedicatedOCR: dedicatedOCR
         )
         let ocrResult = try await visionRunner.generateOCR(
             request: OCRTaskRequest(image: image, mode: mode, prompt: prompt),
@@ -1143,6 +1202,102 @@ public actor TaskEngine {
         )
     }
 
+    public func analyzeTTSScript(
+        source: String,
+        modelID: UUID? = nil,
+        availableVoices: [TTSVoiceProfile] = []
+    ) async throws -> TTSScriptAnalysis {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { throw TTSError.invalidScript("请输入需要配音的文案。") }
+        if availableVoices.isEmpty, let explicit = TTSScriptParser.explicitAnalysis(source) {
+            return explicit
+        }
+
+        let model = try resolveLocalMeetingNotesModel(for: modelID)
+        let contextLimit = InputSizePolicy.maximumInputCharacters(forContextLength: model.contextLength)
+        let units = TTSScriptParser.sourceUnits(source)
+        guard !units.isEmpty else { throw TTSError.invalidScript("无法安全切分原文，请改用显式角色格式。") }
+        let chunks = TTSScriptParser.sourceUnitChunks(
+            units,
+            maximumCharacters: max(400, min(900, contextLimit / 3)),
+            maximumUnits: 10
+        )
+        var mergedVoices = availableVoices.isEmpty ? [TTSVoiceProfile(name: "旁白")] : availableVoices
+        var voiceIDsByName = Dictionary(
+            mergedVoices.map { ($0.name, $0.id) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var knownVoiceIDs = Set(mergedVoices.map(\.id))
+        var mergedSegments: [TTSSegment] = []
+        var knownRoleNames: [String] = []
+        var knownRoleVoiceIndices: [String: Int] = [:]
+
+        for chunk in chunks {
+            try Task.checkCancellation()
+            let raw = try await runLocalPrompt(
+                ttsRoleAnalysisPrompt(
+                    chunk,
+                    knownRoleNames: knownRoleNames,
+                    availableVoices: availableVoices,
+                    knownRoleVoiceIndices: knownRoleVoiceIndices
+                ),
+                task: .ocr,
+                model: model,
+                returnRawOutput: true
+            )
+            if ProcessInfo.processInfo.environment["LLMTOOLS_TTS_DEBUG_ANALYSIS"] == "1" {
+                // 默认不记录文案；仅显式调试时输出本地模型原始结果。
+                FileHandle.standardError.write(Data("[TTS role analysis]\n\(raw)\n".utf8))
+            }
+            let analysis = try TTSScriptParser.parseModelAssignments(
+                raw,
+                units: chunk,
+                availableVoices: availableVoices
+            )
+            var roleMapping: [UUID: UUID] = [:]
+            for voice in analysis.voices {
+                if knownVoiceIDs.contains(voice.id) {
+                    roleMapping[voice.id] = voice.id
+                    continue
+                }
+                if let existing = voiceIDsByName[voice.name] {
+                    roleMapping[voice.id] = existing
+                    continue
+                }
+                var merged = voice
+                merged.id = UUID()
+                mergedVoices.append(merged)
+                knownVoiceIDs.insert(merged.id)
+                voiceIDsByName[merged.name] = merged.id
+                if availableVoices.isEmpty {
+                    knownRoleNames.append(merged.name)
+                }
+                roleMapping[voice.id] = merged.id
+            }
+            for segment in analysis.segments {
+                var merged = segment
+                merged.index = mergedSegments.count
+                if let speakerName = merged.speakerName,
+                   let knownVoiceIndex = knownRoleVoiceIndices[speakerName],
+                   availableVoices.indices.contains(knownVoiceIndex) {
+                    // 首次识别结果成为角色锚点，后续分块即使模型漂移也保持同一音色。
+                    merged.roleID = availableVoices[knownVoiceIndex].id
+                } else {
+                    merged.roleID = roleMapping[segment.roleID] ?? mergedVoices[0].id
+                }
+                mergedSegments.append(merged)
+                if let speakerName = merged.speakerName,
+                   !speakerName.isEmpty,
+                   knownRoleVoiceIndices[speakerName] == nil,
+                   let voiceIndex = availableVoices.firstIndex(where: { $0.id == merged.roleID }) {
+                    knownRoleVoiceIndices[speakerName] = voiceIndex
+                }
+            }
+        }
+        guard !mergedSegments.isEmpty else { throw TTSError.invalidScript("没有识别出可朗读片段。") }
+        return TTSScriptAnalysis(voices: mergedVoices, segments: mergedSegments)
+    }
+
     public func diarizeMeetingFile(
         at audioURL: URL,
         expectedSpeakerCount: Int? = nil
@@ -1180,14 +1335,24 @@ public actor TaskEngine {
     }
 
     private func runLocalMeetingNotesPrompt(_ prompt: String, model: ModelDescriptor) async throws -> String {
-        let request = TaskRequest(task: .summarize, inputText: prompt)
+        try await runLocalPrompt(prompt, task: .summarize, model: model)
+    }
+
+    private func runLocalPrompt(
+        _ prompt: String,
+        task: TaskKind,
+        model: ModelDescriptor,
+        returnRawOutput: Bool = false
+    ) async throws -> String {
+        let request = TaskRequest(task: task, inputText: prompt)
         try validateInputSize(request, for: model)
         let runner = try runner(for: model)
         if await runner.loadedModelID() != model.id {
             await runner.unload()
             try await runner.load(model: model)
         }
-        return try await runner.generate(request: request, preferences: snapshot.preferences).text
+        let result = try await runner.generate(request: request, preferences: snapshot.preferences)
+        return returnRawOutput ? result.rawText : result.text
     }
 
     private func meetingTranscriptChunks(_ segments: [LiveMeetingSegment], maximumCharacters: Int) -> [[LiveMeetingSegment]] {
@@ -1247,6 +1412,62 @@ public actor TaskEngine {
 
         只输出该 Markdown，不要解释。
         \(partialNotes.enumerated().map { "### 分块\($0.offset + 1)\n\($0.element)" }.joined(separator: "\n\n"))
+        """
+    }
+
+    private func ttsRoleAnalysisPrompt(
+        _ units: [TTSSourceUnit],
+        knownRoleNames: [String],
+        availableVoices: [TTSVoiceProfile],
+        knownRoleVoiceIndices: [String: Int]
+    ) throws -> String {
+        let knownRoles = knownRoleNames.isEmpty ? "无" : knownRoleNames.joined(separator: "、")
+        let payload = units.map { ["index": $0.index, "text": $0.text] as [String: Any] }
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        guard let sourceJSON = String(data: data, encoding: .utf8) else {
+            throw TTSError.invalidScript("无法编码本地角色分析句段。")
+        }
+        let voiceCatalog = availableVoices.enumerated().map { index, voice in
+            [
+                "voiceIndex": index,
+                "name": voice.name.isEmpty ? "未命名音色" : voice.name,
+                "description": voice.instruction
+            ] as [String: Any]
+        }
+        let voiceCatalogData = try JSONSerialization.data(withJSONObject: voiceCatalog, options: [.sortedKeys])
+        guard let voiceCatalogJSON = String(data: voiceCatalogData, encoding: .utf8) else {
+            throw TTSError.invalidScript("无法编码本地音色目录。")
+        }
+        let knownVoiceMappings = knownRoleVoiceIndices
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=voiceIndex \($0.value)" }
+            .joined(separator: "；")
+        let assignmentShape = availableVoices.isEmpty
+            ? #"{"index":0,"speaker":"旁白或角色名","type":"narration或dialogue","deliveryStyle":"语气、情绪和语速","pauseAfterMilliseconds":400,"confidence":0.0}"#
+            : #"{"index":0,"speaker":"旁白或角色名","voiceIndex":0,"type":"narration或dialogue","deliveryStyle":"语气、情绪和语速","pauseAfterMilliseconds":400,"confidence":0.0}"#
+        let voiceRules = availableVoices.isEmpty ? "" : """
+        7. 每条 assignment 必须提供 voiceIndex，并且只能从下方音色目录选择；根据角色年龄、性别、性格、语境和叙事类型匹配音色。
+        8. 同一 speaker 必须始终复用同一个 voiceIndex。已有映射优先复用：\(knownVoiceMappings.isEmpty ? "无" : knownVoiceMappings)。
+
+        可用音色目录：
+        \(voiceCatalogJSON)
+        """
+        return """
+        你是本地有声文案角色与表达标注器。软件已把原文切成带 index 的句段；你只做结构化标注，不要改写或返回原文。
+        JSON 格式：
+        {"roles":[{"name":"角色名","aliases":[],"voiceHint":"简短音色建议"}],"assignments":[\(assignmentShape)]}
+
+        必须遵守：
+        1. 每个输入 index 必须在 assignments 中出现且只出现一次，顺序与输入一致。
+        2. 不要输出 text；只有叙述、环境和动作描写使用 narration/旁白。引号内台词必须使用 dialogue，并结合相邻句段推断最可能的说话角色。
+        3. speaker 只写稳定的人名或角色名，禁止写动作、神态或整句描述；已知角色优先复用：\(knownRoles)。
+        4. roles 不包含旁白，但必须列出本分块出现的其他角色。
+        5. deliveryStyle 用简短中文描述本段表达方式，例如“低声克制，带迟疑，语速稍慢”；只写语气、情绪、音量和语速，不要重复角色音色描述。
+        6. pauseAfterMilliseconds 是本段结束后的停顿整数：连续语句 250-400，完整句 400-600，换人或强烈情绪 500-800，场景或章节转换 800-1500。
+        \(voiceRules)
+
+        句段：
+        \(sourceJSON)
         """
     }
 
@@ -2415,6 +2636,13 @@ public actor TaskEngine {
         if format == .mlx,
            let resolvedPath,
            ModelDetection.isLocalVisionModel(at: resolvedPath) {
+            if ModelDetection.isGLMOCRModel(at: resolvedPath) {
+                return ModelCapabilities.ocrOnly(
+                    source: .detected,
+                    confidence: 0.95,
+                    note: "Detected GLM-OCR local single-image OCR metadata."
+                )
+            }
             return ModelCapabilities.vision(
                 source: .detected,
                 confidence: 0.9,
@@ -2436,11 +2664,21 @@ public actor TaskEngine {
                   ModelDetection.isLocalVisionModel(at: model.resolvedPath ?? model.sourcePath) else {
                 continue
             }
-            let capabilities = ModelCapabilities.vision(
-                source: .detected,
-                confidence: 0.9,
-                note: "Detected local MLX vision-language model metadata."
-            )
+            let modelPath = model.resolvedPath ?? model.sourcePath
+            let capabilities: ModelCapabilities
+            if ModelDetection.isGLMOCRModel(at: modelPath) {
+                capabilities = ModelCapabilities.ocrOnly(
+                    source: .detected,
+                    confidence: 0.95,
+                    note: "Detected GLM-OCR local single-image OCR metadata."
+                )
+            } else {
+                capabilities = ModelCapabilities.vision(
+                    source: .detected,
+                    confidence: 0.9,
+                    note: "Detected local MLX vision-language model metadata."
+                )
+            }
             if model.capabilities != capabilities {
                 snapshot.models[index].capabilities = capabilities
                 changed = true
@@ -2494,6 +2732,10 @@ public actor TaskEngine {
         preferences.textTaskModelIDs = preferences.textTaskModelIDs.filter { entry in
             TaskKind.perTaskModelCases.contains(entry.key)
                 && models.contains(where: { $0.id == entry.value && $0.enabled && $0.capabilities.supportsText })
+        }
+        if let modelID = preferences.detailedTranslationModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+            preferences.detailedTranslationModelID = nil
         }
         if let modelID = preferences.webPageTranslation.modelID,
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
@@ -2574,6 +2816,9 @@ public actor TaskEngine {
             return 2
         case .qwen3ASR06B:
             return 3
+        case .nemotron35ASRStreaming06B:
+            // 新增的低延迟模型不应擅自覆盖用户已经验证过的实时字幕选择。
+            return 4
         case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
             return 4
         }
@@ -2625,7 +2870,7 @@ public actor TaskEngine {
     }
 
     private func inferRole(format: ModelFormat, sizeClass: String) -> ModelRole {
-        if sizeClass == "0.8b" || sizeClass == "1.5b" {
+        if sizeClass == "0.6b" || sizeClass == "0.8b" || sizeClass == "0.9b" || sizeClass == "1b" || sizeClass == "1.5b" || sizeClass == "2b" {
             return .fast
         }
         if sizeClass == "9b" || sizeClass == "14b" || sizeClass == "27b" {

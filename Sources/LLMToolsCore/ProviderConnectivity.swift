@@ -147,7 +147,10 @@ public enum ProviderConnectivity {
             temperature: 0,
             stream: false,
             maxTokens: 64,
-            enableThinking: ProviderRequestOptions.enableThinking(for: configuration)
+            enableThinking: ProviderRequestOptions.enableThinking(
+                for: configuration,
+                requested: descriptor.thinkingModeEnabled
+            )
         )
         let chatData = try await performRequest(
             url: chatURL,

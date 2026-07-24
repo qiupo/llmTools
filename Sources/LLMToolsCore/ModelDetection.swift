@@ -99,6 +99,45 @@ public enum ModelDetection {
         return false
     }
 
+    public static func isGLMOCRModel(at url: URL) -> Bool {
+        configModelType(at: url)?.lowercased() == "glm_ocr"
+    }
+
+    public static func contextLength(at url: URL) -> Int? {
+        guard let directory = localModelDirectory(for: url),
+              let config = jsonDictionary(at: directory.appendingPathComponent("config.json")) else {
+            return nil
+        }
+        let textConfig = config["text_config"] as? [String: Any]
+        let candidates = [
+            config["max_position_embeddings"],
+            config["max_sequence_length"],
+            textConfig?["max_position_embeddings"],
+            textConfig?["max_sequence_length"]
+        ]
+        for candidate in candidates {
+            if let value = candidate as? Int, (1_024...1_048_576).contains(value) {
+                return value
+            }
+        }
+        return nil
+    }
+
+    public static func supportsThinkingModeControl(at url: URL) -> Bool {
+        guard let directory = localModelDirectory(for: url) else {
+            return false
+        }
+        // 只对模板明确声明 enable_thinking 的模型展示开关，避免出现无效控制项。
+        let templateFiles = ["chat_template.jinja", "tokenizer_config.json"]
+        return templateFiles.contains { fileName in
+            let fileURL = directory.appendingPathComponent(fileName)
+            guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else {
+                return false
+            }
+            return text.contains("enable_thinking")
+        }
+    }
+
     public static func detectSpeechModel(at url: URL) -> SpeechModelCapabilities? {
         let fm = FileManager.default
         guard fm.fileExists(atPath: url.path) else {
@@ -116,6 +155,13 @@ public enum ModelDetection {
                 source: .detected,
                 confidence: 0.86,
                 note: "Detected whisper.cpp ggml model with a compiled Core ML encoder. Uses persistent whisper-server/Core ML for realtime subtitles and whisper-cli for local file transcription."
+            )
+        }
+        if isNemotronStreamingCoreMLModel(at: url) {
+            return .nemotron35ASRStreaming06B(
+                source: .detected,
+                confidence: 0.92,
+                note: "Detected Nemotron 3.5 ASR Streaming multilingual Core ML assets. Realtime subtitles use the persistent cache-aware FluidAudio/Core ML session on Apple Silicon."
             )
         }
         if searchable.contains("fun-asr-mlt-nano")
@@ -228,6 +274,48 @@ public enum ModelDetection {
         return whisperCppCoreMLDirectory(for: modelURL) != nil
     }
 
+    public static func nemotronStreamingCoreMLVariantDirectory(at url: URL) -> URL? {
+        guard let directory = localModelDirectory(for: url) else {
+            return nil
+        }
+
+        if isNemotronStreamingCoreMLVariant(at: directory) {
+            return directory
+        }
+
+        // 官方仓库把可运行资产放在 multilingual/<latency> 子目录，优先低延迟的 1120ms。
+        let multilingualDirectory = directory.appendingPathComponent("multilingual", isDirectory: true)
+        guard let candidates = try? FileManager.default.contentsOfDirectory(
+            at: multilingualDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+        let sortedCandidates = candidates.sorted { lhs, rhs in
+            if lhs.lastPathComponent == "1120ms" { return true }
+            if rhs.lastPathComponent == "1120ms" { return false }
+            return lhs.lastPathComponent.localizedStandardCompare(rhs.lastPathComponent) == .orderedAscending
+        }
+        return sortedCandidates.first(where: isNemotronStreamingCoreMLVariant(at:))
+    }
+
+    public static func isNemotronStreamingCoreMLModel(at url: URL) -> Bool {
+        nemotronStreamingCoreMLVariantDirectory(at: url) != nil
+    }
+
+    private static func isNemotronStreamingCoreMLVariant(at directory: URL) -> Bool {
+        let fm = FileManager.default
+        let hasMetadata = fm.fileExists(atPath: directory.appendingPathComponent("metadata.json").path)
+        let hasTokenizer = fm.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
+        let hasEncoder = fm.fileExists(atPath: directory.appendingPathComponent("encoder.mlmodelc").path)
+        let hasFusedDecoder = fm.fileExists(atPath: directory.appendingPathComponent("decoder_joint.mlmodelc").path)
+        let hasSeparateDecoder = fm.fileExists(atPath: directory.appendingPathComponent("decoder.mlmodelc").path)
+            && fm.fileExists(atPath: directory.appendingPathComponent("joint.mlmodelc").path)
+        // Core ML bundle内部文件很多，直接检查顶层资产避免被递归文件数上限误判。
+        return hasMetadata && hasTokenizer && hasEncoder && (hasFusedDecoder || hasSeparateDecoder)
+    }
+
     private static func whisperCppModelBin(at url: URL) -> URL? {
         var isDirectory: ObjCBool = false
         if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), !isDirectory.boolValue {
@@ -285,7 +373,7 @@ public enum ModelDetection {
 
     private static func inferSizeClass(from name: String) -> String {
         let lower = name.lowercased()
-        for token in ["35b", "30b", "27b", "14b", "9b", "7b", "4b", "1.5b", "0.8b", "0.5b"] {
+        for token in ["35b", "30b", "27b", "14b", "9b", "7b", "4b", "3b", "2b", "1.5b", "1b", "0.9b", "0.8b", "0.6b", "0.5b"] {
             if containsBoundedToken(token, in: lower) {
                 return token
             }

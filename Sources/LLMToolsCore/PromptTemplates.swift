@@ -11,7 +11,7 @@ public enum PromptTemplates {
     public static func defaultSystemPrompt(for task: TaskKind) -> String {
         switch task {
         case .translate:
-            return "You are a translation engine. Preserve meaning, formatting, numbers, code, and names. Output only the translated text."
+            return "You are a professional translation and language-learning assistant. Preserve meaning, formatting, numbers, code, and names. Follow the requested output format exactly."
         case .webPageTranslate:
             return """
             You are a webpage translation engine. Translate webpage text to Simplified Chinese.
@@ -56,6 +56,7 @@ public enum PromptTemplates {
                 source: request.sourceLanguage,
                 target: target,
                 qualityMode: qualityMode,
+                outputMode: request.translationOutputMode,
                 isRetry: isRetry
             )
         case .webPageTranslate:
@@ -235,6 +236,7 @@ public enum PromptTemplates {
         source: String?,
         target: String,
         qualityMode: WebPageTranslationQualityMode,
+        outputMode: TranslationOutputMode,
         isRetry: Bool
     ) -> String {
         let targetLanguage = target == "auto"
@@ -243,15 +245,46 @@ public enum PromptTemplates {
         let sourceInstruction = sourceLanguageInstruction(for: source)
         let qualityInstruction = translationQualityInstruction(qualityMode)
 
-        if isRetry {
+        if outputMode == .plain {
             return """
             Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction) Output only the translation.
             \(inputText)
             """
         }
 
+        let retryInstruction = isRetry
+            ? "This is a retry. Return one complete JSON object with every required key."
+            : "Return one complete JSON object."
         return """
-        Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction) Output only the translation.
+        Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction)
+        \(retryInstruction) Use valid JSON with no Markdown fences or prose outside the object:
+        {
+          "translation": "complete primary translation",
+          "alternatives": ["one to three useful alternative translations"],
+          "keyTerms": [
+            {
+              "term": "important source-language word or phrase",
+              "pronunciation": "standard IPA for one word only; empty for phrases or when uncertain",
+              "partOfSpeech": "part of speech",
+              "meaning": "meaning in \(targetLanguage)",
+              "usage": "concise usage or nuance in \(targetLanguage)",
+              "example": "short natural example in the source language",
+              "exampleTranslation": "example translated to \(targetLanguage)"
+            }
+          ],
+          "notes": ["up to four grammar, culture, tone, or ambiguity notes in \(targetLanguage)"]
+        }
+
+        Rules:
+        - Keep "translation" complete and faithful; never replace it with a summary.
+        - Resolve ambiguous words from the full context and use standard domain terminology.
+        - For a complete sentence, include at least 1 useful alternative and 3 to 8 key terms when available.
+        - For a single word or very short phrase, include only genuinely useful alternatives and terms.
+        - Never invent pronunciation. Fill it only for a single word when standard IPA is known confidently; otherwise use an empty string.
+        - Keep alternatives, terms, examples, and notes grounded in the source text.
+        - Use empty arrays when a section has no useful content.
+
+        Source text:
         \(inputText)
         """
     }
@@ -547,7 +580,8 @@ public enum PromptTemplates {
     public static func ocrPrompt(
         mode: OCRMode,
         targetLanguage: String = "zh-Hans",
-        preferences: AppPreferences = AppPreferences()
+        preferences: AppPreferences = AppPreferences(),
+        dedicatedOCR: Bool = false
     ) -> String {
         let rawPrompt = preferences.promptTemplates.ocrPrompt(for: mode)
         if !rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -557,7 +591,20 @@ public enum PromptTemplates {
                 appendInputIfMissing: false
             )
         }
+        if dedicatedOCR {
+            return glmOCRPrompt(mode: mode)
+        }
         return defaultOCRPrompt(mode: mode, targetLanguage: targetLanguage)
+    }
+
+    public static func glmOCRPrompt(mode: OCRMode) -> String {
+        switch mode {
+        case .plainText, .structured, .extractThenTranslate:
+            // GLM-OCR 的单图识别协议，避免通用 VLM 提示语影响其专用模板。
+            return "Text Recognition:"
+        case .explainImage:
+            return ""
+        }
     }
 
     public static func defaultOCRPrompt(mode: OCRMode, targetLanguage: String = "zh-Hans") -> String {

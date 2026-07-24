@@ -58,6 +58,8 @@ private func speechRuntimeTitle(_ model: ModelDescriptor, language: AppLanguage)
         return "MLX / GGUF sidecar"
     case .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
         return "MLX sidecar"
+    case .nemotron35ASRStreaming06B:
+        return "FluidAudio Core ML"
     case .vibeVoiceASR:
         return chinese ? "MLX 文件运行时" : "MLX file runtime"
     case .whisperCppCoreML:
@@ -244,9 +246,35 @@ struct SelectionActionView: View {
     }
 }
 
+private enum QuickTTSDeliveryStyle: String, CaseIterable, Identifiable {
+    case natural = "自然流畅"
+    case warm = "温柔舒缓，语速稍慢"
+    case formal = "沉稳正式，咬字清晰"
+    case cheerful = "开心活泼，语速稍快"
+    case sad = "低沉悲伤，语速偏慢"
+    case excited = "激动有力，情绪饱满"
+    case whisper = "轻声耳语，音量较低"
+
+    var id: String { rawValue }
+
+    func title(language: AppLanguage) -> String {
+        let key = switch self {
+        case .natural: "Natural delivery"
+        case .warm: "Warm and gentle"
+        case .formal: "Calm and formal"
+        case .cheerful: "Cheerful and lively"
+        case .sad: "Sad and subdued"
+        case .excited: "Excited and powerful"
+        case .whisper: "Soft whisper"
+        }
+        return L10n.text(key, language: language)
+    }
+}
+
 struct QuickActionView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var pinState: WindowPinState
+    var onTitleChange: () -> Void = {}
     var onClose: () -> Void = {}
     @State private var showFileImporter = false
     @State private var showImageImporter = false
@@ -281,6 +309,8 @@ struct QuickActionView: View {
             }
         case .media:
             return true
+        case .speech:
+            return false
         }
     }
 
@@ -313,7 +343,8 @@ struct QuickActionView: View {
             bottomBar
                 .layoutPriority(2)
         }
-        .frame(minWidth: 560)
+        // 顶部增加“详解”后，为右侧“隐藏原文”保留固定安全间距。
+        .frame(minWidth: 600)
         .background(Color(NSColor.windowBackgroundColor))
         .sheet(isPresented: imagePreviewPresentation) {
             if let image = appState.ocrImageInput {
@@ -343,11 +374,23 @@ struct QuickActionView: View {
         }
         .onChange(of: appState.selectedTask) { _, _ in
             showsMarkdownSource = false
+            onTitleChange()
         }
         .onChange(of: appState.quickActionMode) { _, _ in
             showsMarkdownSource = false
+            onTitleChange()
         }
         .onChange(of: appState.ocrMode) { _, _ in
+            showsMarkdownSource = false
+        }
+        .onChange(of: appState.quickActionSessionRevision) { _, _ in
+            // 窗口关闭后连同视图本地草稿一起恢复初始状态，避免重新打开时残留内容。
+            showFileImporter = false
+            showImageImporter = false
+            showMediaImporter = false
+            showInput = true
+            imageURLDraft = ""
+            isImagePreviewPresented = false
             showsMarkdownSource = false
         }
     }
@@ -385,11 +428,11 @@ struct QuickActionView: View {
     }
 
     private var quickActionModePickerWidth: CGFloat {
-        168
+        208
     }
 
     private var quickActionModePickerVisualWidth: CGFloat {
-        140
+        180
     }
 
     private var controlsBarCompactGap: CGFloat {
@@ -424,12 +467,13 @@ struct QuickActionView: View {
             Text(L10n.text("Text mode", language: language)).tag(AppState.QuickActionMode.text)
             Text(L10n.text("Image mode", language: language)).tag(AppState.QuickActionMode.image)
             Text(L10n.text("Media mode", language: language)).tag(AppState.QuickActionMode.media)
+            Text(L10n.text("Speech mode", language: language)).tag(AppState.QuickActionMode.speech)
         }
         .labelsHidden()
         .pickerStyle(.segmented)
         .frame(width: quickActionModePickerWidth, alignment: .leading)
         .fixedSize(horizontal: true, vertical: false)
-        .disabled(appState.isRunning || appState.isPreparingOCRImage)
+        .disabled(appState.isRunning || appState.isPreparingOCRImage || appState.quickTTSIsGenerating)
     }
 
     private var hideSourceButton: some View {
@@ -463,9 +507,11 @@ struct QuickActionView: View {
         } else if appState.quickActionMode == .image {
             modeOptions
                 .frame(width: 126, alignment: .leading)
-        } else {
+        } else if appState.quickActionMode == .media {
             mediaModePicker
                 .frame(width: 126, alignment: .leading)
+        } else {
+            EmptyView()
         }
     }
 
@@ -486,20 +532,8 @@ struct QuickActionView: View {
         } else {
             switch appState.selectedTask {
             case .translate:
-                HStack(spacing: 4) {
-                    Text(L10n.text("Auto detect", language: language))
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .frame(width: 56)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 5)
-                        .background(.quaternary.opacity(0.45))
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
-                    Image(systemName: "arrow.right")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    // 源语言继续自动识别，工具栏只显示用户可操作的目标语言选择。
                     Picker("", selection: Binding(
                         get: { appState.preferences.defaultTranslationTarget },
                         set: { newValue in
@@ -514,8 +548,19 @@ struct QuickActionView: View {
                     }
                     .labelsHidden()
                     .frame(width: targetLanguagePickerWidth)
-                    .disabled(appState.isRunning)
+
+                    Toggle(L10n.text("Details", language: language), isOn: Binding(
+                        get: { appState.preferences.detailedTranslationEnabled },
+                        set: { newValue in
+                            appState.updatePreferences { $0.detailedTranslationEnabled = newValue }
+                        }
+                    ))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .fixedSize()
+                    .help(L10n.text("Detailed translation", language: language))
                 }
+                .disabled(appState.isRunning)
             case .polish:
                 Picker("", selection: Binding(
                     get: { appState.preferences.defaultPolishStyle },
@@ -618,9 +663,12 @@ struct QuickActionView: View {
                 imageMainContent
             } else if appState.quickActionMode == .media {
                 mediaMainContent
+            } else if appState.quickActionMode == .speech {
+                quickTTSMainContent
             } else {
                 VStack(spacing: 10) {
-                    if showInput || appState.outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if showInput || (!appState.isRunning
+                        && appState.outputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
                         inputPanel
                     }
                     resultPanel
@@ -660,6 +708,134 @@ struct QuickActionView: View {
                 mediaExportBar
             }
         }
+    }
+
+    private var quickTTSMainContent: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 8) {
+                Picker(
+                    L10n.text("Voice", language: language),
+                    selection: Binding(
+                        get: { appState.quickTTSSelectedVoice?.id },
+                        set: { value in
+                            if let value { appState.selectQuickTTSVoice(value) }
+                        }
+                    )
+                ) {
+                    TTSVoicePickerOptions(sections: appState.ttsVoiceSections)
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 170)
+                .disabled(appState.quickTTSIsGenerating)
+                .help(L10n.text("Voice", language: language))
+
+                quickTTSVoicePreviewButton
+
+                Picker(
+                    L10n.text("Delivery style", language: language),
+                    selection: quickTTSDeliveryStyleSelection
+                ) {
+                    ForEach(QuickTTSDeliveryStyle.allCases) { style in
+                        Text(style.title(language: language)).tag(style)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 150)
+                .disabled(appState.quickTTSIsGenerating)
+                .help(L10n.text("Delivery style", language: language))
+
+                Spacer(minLength: 0)
+            }
+            .frame(height: 28)
+
+            ZStack(alignment: .topLeading) {
+                if appState.quickTTSInputText.isEmpty {
+                    Text(L10n.text("Paste text to synthesize speech.", language: language))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                }
+                TextEditor(text: Binding(
+                    get: { appState.quickTTSInputText },
+                    set: { appState.updateQuickTTSInputText($0) }
+                ))
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .disabled(appState.quickTTSIsGenerating)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(NSColor.textBackgroundColor))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+            HStack(spacing: 8) {
+                Image(systemName: appState.quickTTSHasGeneratedAudio ? "waveform.circle.fill" : "waveform.circle")
+                    .foregroundStyle(appState.quickTTSHasGeneratedAudio ? Color.accentColor : Color.secondary)
+                Text(quickTTSOutputSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                if appState.quickTTSIsGenerating {
+                    ProgressView(value: appState.quickTTSGenerationProgress)
+                        .frame(width: 100)
+                } else if let duration = appState.quickTTSOutputDuration {
+                    Text(String(format: "%.1f s", duration))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(height: 28)
+        }
+    }
+
+    private var quickTTSVoicePreviewButton: some View {
+        Button {
+            appState.previewQuickTTSVoice()
+        } label: {
+            Image(systemName: quickTTSVoicePreviewIcon)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 26, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .disabled(!canPreviewQuickTTSVoice)
+        .help(L10n.text("Preview selected voice", language: language))
+    }
+
+    private var quickTTSDeliveryStyleSelection: Binding<QuickTTSDeliveryStyle> {
+        Binding(
+            get: {
+                QuickTTSDeliveryStyle(rawValue: appState.quickTTSDeliveryStyle) ?? .natural
+            },
+            set: { appState.updateQuickTTSDeliveryStyle($0.rawValue) }
+        )
+    }
+
+    private var quickTTSVoicePreviewIcon: String {
+        guard let voice = appState.quickTTSSelectedVoice else { return "play.fill" }
+        if appState.ttsVoicePreviewInProgressID == voice.id { return "stop.fill" }
+        return appState.isTTSPlaying(.voice(voice.id)) ? "pause.fill" : "play.fill"
+    }
+
+    private var canPreviewQuickTTSVoice: Bool {
+        guard let voice = appState.quickTTSSelectedVoice else { return false }
+        return !appState.quickTTSIsGenerating
+            && !appState.ttsIsGenerating
+            && !appState.ttsIsAnalyzing
+            && (appState.ttsVoicePreviewInProgressID == nil
+                || appState.ttsVoicePreviewInProgressID == voice.id)
+    }
+
+    private var quickTTSOutputSummary: String {
+        if appState.quickTTSIsGenerating { return appState.ttsStatusMessage }
+        if appState.quickTTSHasGeneratedAudio {
+            return L10n.text("Generated speech is ready to play or export.", language: language)
+        }
+        return L10n.text("Generate or preview speech here.", language: language)
     }
 
     private var mediaInputPanel: some View {
@@ -1120,26 +1296,37 @@ struct QuickActionView: View {
     }
 
     private var inputPanel: some View {
-        ZStack(alignment: .topLeading) {
-            if appState.inputText.isEmpty {
-                Text(inputPlaceholder)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 11)
-                    .padding(.vertical, 10)
-                    .allowsHitTesting(false)
+        ZStack(alignment: .topTrailing) {
+            ZStack(alignment: .topLeading) {
+                if appState.inputText.isEmpty {
+                    Text(inputPlaceholder)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 10)
+                        .allowsHitTesting(false)
+                }
+                EditableTextView(text: Binding(
+                    get: { appState.inputText },
+                    set: { newValue in
+                        appState.setInputText(newValue, origin: .manual, preserveOutput: true)
+                    }
+                ), onSubmit: {
+                    appState.runCurrentTask()
+                })
+                // 原文区保持紧凑，把主要垂直空间留给下方译文。
+                .frame(height: 78)
             }
-            EditableTextView(text: Binding(
-                get: { appState.inputText },
-                set: { newValue in
-                    appState.setInputText(newValue, origin: .manual)
-                }
-            ), onSubmit: {
-                guard !appState.isRunning else {
-                    return
-                }
-                appState.runCurrentTask()
-            })
-            .frame(minHeight: appState.outputText.isEmpty ? 155 : 88)
+            .padding(.trailing, appState.selectedTask == .translate ? 34 : 0)
+
+            if appState.selectedTask == .translate {
+                QuickTranslationSpeechButton(
+                    appState: appState,
+                    text: appState.inputText,
+                    target: .source,
+                    language: language
+                )
+                .padding(6)
+            }
         }
         .background(Color(NSColor.textBackgroundColor))
         .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.18)))
@@ -1180,6 +1367,29 @@ struct QuickActionView: View {
                 )
             } else if shouldRenderMarkdownPreview {
                 MarkdownResultPreview(markdown: displayedOutputText)
+            } else if appState.quickActionMode == .text,
+                      appState.selectedTask == .translate,
+                      !appState.showsRawOutput,
+                      let study = appState.translationStudyResult {
+                TranslationStudyResultPreview(
+                    appState: appState,
+                    result: study,
+                    language: language
+                )
+            } else if appState.quickActionMode == .text,
+                      appState.selectedTask == .translate,
+                      !appState.showsRawOutput {
+                ZStack(alignment: .topTrailing) {
+                    ReadOnlyTextView(text: displayedOutputText)
+                        .padding(.trailing, 34)
+                    QuickTranslationSpeechButton(
+                        appState: appState,
+                        text: displayedOutputText,
+                        target: .translation,
+                        language: language
+                    )
+                    .padding(6)
+                }
             } else {
                 ReadOnlyTextView(text: displayedOutputText)
             }
@@ -1198,40 +1408,71 @@ struct QuickActionView: View {
                 Label(L10n.text("Close", language: language), systemImage: "xmark.circle")
             }
 
-            Button {
+            if appState.quickActionMode == .speech {
+                quickTTSActions
+            } else {
                 if appState.isRunning {
-                    appState.cancelCurrentTask(unloadModel: true)
-                } else if appState.quickActionMode == .image {
-                    appState.runCurrentOCR()
-                } else if appState.quickActionMode == .media {
-                    appState.runCurrentMediaSubtitles()
-                } else {
-                    appState.runCurrentTask()
-                }
-            } label: {
-                if appState.isRunning {
-                    Label(L10n.text("Cancel", language: language), systemImage: "stop.fill")
-                } else if appState.quickActionMode == .image {
-                    Label(ocrRunButtonTitle, systemImage: ocrRunButtonIcon)
-                } else if appState.quickActionMode == .media {
-                    Label(mediaRunButtonTitle, systemImage: "waveform")
-                } else {
-                    Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
-                }
-            }
-            .disabled((appState.quickActionMode == .image && !appState.isRunning && !canRunOCR)
-                || (appState.quickActionMode == .media && !appState.isRunning && !canRunMediaSubtitles))
+                    Button {
+                        appState.cancelCurrentTask(unloadModel: true)
+                    } label: {
+                        Label(L10n.text("Cancel", language: language), systemImage: "stop.fill")
+                    }
 
-            Button {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(displayedOutputText, forType: .string)
-            } label: {
-                Label(L10n.text("Copy", language: language), systemImage: "doc.on.doc")
+                    if appState.quickActionMode == .text {
+                        Button {
+                            appState.runCurrentTask()
+                        } label: {
+                            Label(L10n.text("Regenerate", language: language), systemImage: "arrow.clockwise")
+                        }
+                    }
+                } else {
+                    Button {
+                        if appState.quickActionMode == .image {
+                            appState.runCurrentOCR()
+                        } else if appState.quickActionMode == .media {
+                            appState.runCurrentMediaSubtitles()
+                        } else {
+                            appState.runCurrentTask()
+                        }
+                    } label: {
+                        if appState.quickActionMode == .image {
+                            Label(ocrRunButtonTitle, systemImage: ocrRunButtonIcon)
+                        } else if appState.quickActionMode == .media {
+                            Label(mediaRunButtonTitle, systemImage: "waveform")
+                        } else {
+                            Label(appState.outputText.isEmpty ? L10n.text("Run", language: language) : L10n.text("Regenerate", language: language), systemImage: appState.outputText.isEmpty ? "play.fill" : "arrow.clockwise")
+                        }
+                    }
+                    .disabled((appState.quickActionMode == .image && !canRunOCR)
+                        || (appState.quickActionMode == .media && !canRunMediaSubtitles)
+                        || appState.quickTranslationSpeechGeneratingTarget != nil)
+                }
+
+                Button {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(displayedOutputText, forType: .string)
+                } label: {
+                    Label(L10n.text("Copy", language: language), systemImage: "doc.on.doc")
+                }
+                .disabled(displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            .disabled(displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
             Spacer()
-            if let error = appState.validationError {
+            if appState.quickActionMode == .speech {
+                Text(appState.ttsStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(appState.ttsStatusMessage)
+            } else if appState.quickActionMode == .text,
+                      appState.selectedTask == .translate,
+                      translationSpeechIsActive {
+                Text(appState.ttsStatusMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(appState.ttsStatusMessage)
+            } else if let error = appState.validationError {
                 Text(error)
                     .font(.caption)
                     .foregroundStyle(.red)
@@ -1249,6 +1490,43 @@ struct QuickActionView: View {
         .padding(.vertical, 9)
     }
 
+    @ViewBuilder
+    private var quickTTSActions: some View {
+        Button {
+            if appState.quickTTSIsGenerating {
+                appState.cancelQuickTTSGeneration()
+            } else {
+                appState.generateQuickTTS()
+            }
+        } label: {
+            Label(
+                L10n.text(appState.quickTTSIsGenerating ? "Stop generating" : "Generate speech", language: language),
+                systemImage: appState.quickTTSIsGenerating ? "stop.fill" : "waveform.badge.plus"
+            )
+        }
+        .keyboardShortcut(.return, modifiers: [.command])
+        .disabled(!appState.quickTTSIsGenerating && !canGenerateQuickTTS)
+
+        Button {
+            appState.playQuickTTS()
+        } label: {
+            let isPlaying = appState.isTTSPlaying(.quickAction)
+            Label(
+                L10n.text(isPlaying ? "Pause speech" : "Play speech", language: language),
+                systemImage: isPlaying ? "pause.fill" : "play.fill"
+            )
+        }
+        .disabled(!appState.quickTTSHasGeneratedAudio || appState.quickTTSIsGenerating)
+
+        Menu {
+            Button("WAV") { appState.exportQuickTTS(format: .wav) }
+            Button("M4A") { appState.exportQuickTTS(format: .m4a) }
+        } label: {
+            Label(L10n.text("Export", language: language), systemImage: "square.and.arrow.up")
+        }
+        .disabled(!appState.quickTTSHasGeneratedAudio || appState.quickTTSIsGenerating)
+    }
+
     private var canRunOCR: Bool {
         appState.ocrImageInput != nil
             && appState.preferences.ocr.enabled
@@ -1260,6 +1538,22 @@ struct QuickActionView: View {
         appState.mediaSubtitleFileURL != nil
             && appState.preferences.mediaSubtitles.isEnabled
             && appState.selectedFileASRModel != nil
+    }
+
+    private var canGenerateQuickTTS: Bool {
+        !appState.quickTTSInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && appState.quickTTSSelectedVoice != nil
+            && appState.ttsHealth?.status == .ready
+            && !appState.ttsIsGenerating
+            && !appState.ttsIsAnalyzing
+            && appState.ttsVoicePreviewInProgressID == nil
+    }
+
+    private var translationSpeechIsActive: Bool {
+        if appState.quickTranslationSpeechGeneratingTarget != nil { return true }
+        guard let target = appState.ttsPlaybackTarget else { return false }
+        if case .translation = target { return true }
+        return false
     }
 
     private var ocrRunButtonTitle: String {
@@ -1441,11 +1735,15 @@ struct QuickActionView: View {
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
+        if appState.quickActionMode == .speech {
+            return handleTextDrop(providers)
+        }
         if appState.quickActionMode == .media {
             return handleFileDrop(providers) || handleTextDrop(providers) || handleImageDrop(providers)
         }
         if appState.quickActionMode == .image {
-            return handleImageDrop(providers) || handleTextDrop(providers) || handleFileDrop(providers)
+            // 图片文件优先保留原始 URL，避免先转成 TIFF 后体积被无谓放大。
+            return handleFileDrop(providers) || handleImageDrop(providers) || handleTextDrop(providers)
         }
         return handleTextDrop(providers) || handleImageDrop(providers) || handleFileDrop(providers)
     }
@@ -1459,12 +1757,15 @@ struct QuickActionView: View {
                 return
             }
             DispatchQueue.main.async {
-                if appState.quickActionMode == .image,
+                if appState.quickActionMode == .speech {
+                    appState.updateQuickTTSInputText(text)
+                    appState.ttsStatusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
+                } else if appState.quickActionMode == .image,
                    text.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("http") {
                     imageURLDraft = text.trimmingCharacters(in: .whitespacesAndNewlines)
                     appState.loadOCRImageFromRemoteURL(imageURLDraft)
                 } else {
-                    appState.setInputText(text, origin: .manual)
+                    appState.setInputText(text, origin: .manual, preserveOutput: true)
                     appState.statusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
                 }
             }
@@ -1732,6 +2033,287 @@ struct ReadOnlyTextView: NSViewRepresentable {
         if let textView = textView as? CommandFriendlyTextView {
             textView.copyFallbackText = text
         }
+    }
+}
+
+// 结构化结果需要真实 NSTextView 承接选区与复制；SwiftUI textSelection 在浮窗中不会稳定成为 responder。
+private struct InlineSelectableTextView: NSViewRepresentable {
+    var text: String
+    var font: NSFont = .systemFont(ofSize: NSFont.systemFontSize)
+    var textColor: NSColor = .labelColor
+    var fillsWidth = true
+
+    func makeNSView(context: Context) -> NSTextView {
+        let textView = CommandFriendlyTextView()
+        textView.string = text
+        textView.font = font
+        textView.textColor = textColor
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = false
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.copyFallbackText = text
+        return textView
+    }
+
+    func updateNSView(_ textView: NSTextView, context: Context) {
+        if textView.string != text {
+            textView.string = text
+        }
+        textView.font = font
+        textView.textColor = textColor
+        if let textView = textView as? CommandFriendlyTextView {
+            textView.copyFallbackText = text
+        }
+    }
+
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView textView: NSTextView,
+        context: Context
+    ) -> CGSize? {
+        guard let textContainer = textView.textContainer,
+              let layoutManager = textView.layoutManager else {
+            return nil
+        }
+
+        let naturalWidth = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        let proposedWidth = proposal.width.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let availableWidth = max(1, proposedWidth ?? naturalWidth)
+        let width = fillsWidth ? availableWidth : min(availableWidth, max(1, naturalWidth))
+        textContainer.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude)
+        layoutManager.ensureLayout(for: textContainer)
+        let lineHeight = ceil(layoutManager.defaultLineHeight(for: font))
+        let height = max(lineHeight, ceil(layoutManager.usedRect(for: textContainer).height))
+        return CGSize(width: width, height: height)
+    }
+}
+
+private struct QuickTranslationSpeechButton: View {
+    @ObservedObject var appState: AppState
+    var text: String
+    var target: QuickTranslationSpeechTarget
+    var language: AppLanguage
+
+    var body: some View {
+        Button {
+            appState.toggleQuickTranslationSpeech(text: text, target: target)
+        } label: {
+            Image(systemName: iconName)
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 26, height: 24)
+        }
+        .buttonStyle(.borderless)
+        .disabled(isDisabled)
+        .help(helpText)
+    }
+
+    private var playbackTarget: TTSPlaybackTarget {
+        .translation(target)
+    }
+
+    private var iconName: String {
+        if appState.quickTranslationSpeechGeneratingTarget == target { return "stop.fill" }
+        if appState.isTTSPlaying(playbackTarget) { return "pause.fill" }
+        if appState.ttsPlaybackTarget == playbackTarget { return "play.fill" }
+        return "speaker.wave.2.fill"
+    }
+
+    private var isDisabled: Bool {
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        return appState.quickTTSIsGenerating
+            || appState.ttsIsGenerating
+            || appState.ttsIsAnalyzing
+            || appState.ttsVoicePreviewInProgressID != nil
+            || appState.ttsRuntimeInstallInProgress
+    }
+
+    private var helpText: String {
+        if appState.quickTranslationSpeechGeneratingTarget == target {
+            return L10n.text("Stop speech generation", language: language)
+        }
+        if appState.isTTSPlaying(playbackTarget) {
+            return L10n.text("Pause speech", language: language)
+        }
+        let key = switch target {
+        case .source: "Read source aloud"
+        case .translation: "Read translation aloud"
+        case .term: "Read word aloud"
+        }
+        let action = L10n.text(key, language: language)
+        return appState.quickTranslationSpeechVoice.map { "\(action) · \($0.name)" } ?? action
+    }
+}
+
+private struct TranslationStudyResultPreview: View {
+    @ObservedObject var appState: AppState
+    var result: TranslationStudyResult
+    var language: AppLanguage
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 10) {
+                sectionHeader(L10n.text("Translation", language: language)) {
+                    QuickTranslationSpeechButton(
+                        appState: appState,
+                        text: result.translation,
+                        target: .translation,
+                        language: language
+                    )
+                }
+                InlineSelectableTextView(
+                    text: result.translation,
+                    font: .systemFont(ofSize: 14, weight: .medium)
+                )
+
+                if !result.alternatives.isEmpty {
+                    Divider()
+                    InlineSelectableTextView(
+                        text: L10n.text("Alternative translations", language: language),
+                        font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                        textColor: .secondaryLabelColor
+                    )
+                    ForEach(Array(result.alternatives.enumerated()), id: \.offset) { offset, alternative in
+                        HStack(alignment: .firstTextBaseline, spacing: 7) {
+                            InlineSelectableTextView(
+                                text: "\(offset + 1).",
+                                font: .monospacedDigitSystemFont(
+                                    ofSize: NSFont.smallSystemFontSize,
+                                    weight: .regular
+                                ),
+                                textColor: .secondaryLabelColor,
+                                fillsWidth: false
+                            )
+                            InlineSelectableTextView(text: alternative)
+                        }
+                    }
+                }
+
+                if !result.keyTerms.isEmpty {
+                    Divider()
+                    InlineSelectableTextView(
+                        text: L10n.text("Key vocabulary", language: language),
+                        font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                        textColor: .secondaryLabelColor
+                    )
+                    ForEach(Array(result.keyTerms.enumerated()), id: \.offset) { offset, term in
+                        keyTermRow(term)
+                        if offset < result.keyTerms.count - 1 {
+                            Divider().opacity(0.65)
+                        }
+                    }
+                }
+
+                if !result.notes.isEmpty {
+                    Divider()
+                    InlineSelectableTextView(
+                        text: L10n.text("Language notes", language: language),
+                        font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                        textColor: .secondaryLabelColor
+                    )
+                    ForEach(Array(result.notes.enumerated()), id: \.offset) { _, note in
+                        HStack(alignment: .top, spacing: 7) {
+                            InlineSelectableTextView(
+                                text: "•",
+                                textColor: .controlAccentColor,
+                                fillsWidth: false
+                            )
+                            InlineSelectableTextView(text: note)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    private func sectionHeader<Accessory: View>(
+        _ title: String,
+        @ViewBuilder accessory: () -> Accessory
+    ) -> some View {
+        HStack(spacing: 8) {
+            InlineSelectableTextView(
+                text: title,
+                font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .semibold),
+                textColor: .secondaryLabelColor,
+                fillsWidth: false
+            )
+            Spacer(minLength: 8)
+            accessory()
+        }
+    }
+
+    private func keyTermRow(_ term: TranslationKeyTerm) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .center, spacing: 7) {
+                InlineSelectableTextView(
+                    text: term.term,
+                    font: .systemFont(ofSize: 14, weight: .semibold),
+                    fillsWidth: false
+                )
+                if !term.pronunciation.isEmpty {
+                    InlineSelectableTextView(
+                        text: term.pronunciation,
+                        font: .systemFont(ofSize: NSFont.smallSystemFontSize),
+                        textColor: .secondaryLabelColor,
+                        fillsWidth: false
+                    )
+                }
+                if !term.partOfSpeech.isEmpty {
+                    InlineSelectableTextView(
+                        text: term.partOfSpeech,
+                        font: .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium),
+                        textColor: .controlAccentColor,
+                        fillsWidth: false
+                    )
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.accentColor.opacity(0.10), in: RoundedRectangle(cornerRadius: 4))
+                }
+                Spacer(minLength: 8)
+                QuickTranslationSpeechButton(
+                    appState: appState,
+                    text: term.term,
+                    target: .term(term.term),
+                    language: language
+                )
+            }
+
+            if !term.meaning.isEmpty {
+                InlineSelectableTextView(text: term.meaning)
+            }
+            if !term.usage.isEmpty {
+                labeledLine(L10n.text("Usage", language: language), value: term.usage)
+            }
+            if !term.example.isEmpty {
+                labeledLine(L10n.text("Example", language: language), value: term.example)
+            }
+            if !term.exampleTranslation.isEmpty {
+                InlineSelectableTextView(
+                    text: term.exampleTranslation,
+                    font: .systemFont(ofSize: NSFont.smallSystemFontSize),
+                    textColor: .secondaryLabelColor
+                )
+            }
+        }
+        .padding(.vertical, 2)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func labeledLine(_ label: String, value: String) -> some View {
+        InlineSelectableTextView(
+            text: "\(label)：\(value)",
+            font: .systemFont(ofSize: NSFont.smallSystemFontSize)
+        )
     }
 }
 
@@ -2276,8 +2858,16 @@ private struct CompactSwitch: View {
 }
 
 final class CommandFriendlyTextView: NSTextView {
+    private static weak var activeSelectionTextView: CommandFriendlyTextView?
+
     var onSubmit: (() -> Void)?
     var copyFallbackText: String?
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        Self.activeSelectionTextView = self
+        super.mouseDown(with: event)
+    }
 
     override func keyDown(with event: NSEvent) {
         if let onSubmit,
@@ -2292,6 +2882,9 @@ final class CommandFriendlyTextView: NSTextView {
     }
 
     override func copy(_ sender: Any?) {
+        if copySelectedText() {
+            return
+        }
         if let copyFallbackText,
            !copyFallbackText.isEmpty,
            !selectedRanges.contains(where: { $0.rangeValue.length > 0 }) {
@@ -2301,6 +2894,28 @@ final class CommandFriendlyTextView: NSTextView {
         }
 
         super.copy(sender)
+    }
+
+    static func copyActiveSelectionIfNeeded(for event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers == .command,
+              event.charactersIgnoringModifiers?.lowercased() == "c",
+              let textView = activeSelectionTextView,
+              textView.window === event.window || textView.window?.isKeyWindow == true else {
+            return false
+        }
+        return textView.copySelectedText()
+    }
+
+    private func copySelectedText() -> Bool {
+        guard let range = selectedRanges.first?.rangeValue,
+              range.length > 0,
+              NSMaxRange(range) <= (string as NSString).length else {
+            return false
+        }
+        let selectedText = (string as NSString).substring(with: range)
+        NSPasteboard.general.clearContents()
+        return NSPasteboard.general.setString(selectedText, forType: .string)
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -2501,7 +3116,7 @@ struct FloatingWidgetView: View {
             EditableTextView(text: Binding(
                 get: { appState.inputText },
                 set: { newValue in
-                    appState.setInputText(newValue, origin: .manual)
+                    appState.setInputText(newValue, origin: .manual, preserveOutput: true)
                 }
             ))
                 .frame(height: 180)
@@ -2575,7 +3190,7 @@ struct FloatingWidgetView: View {
                 return
             }
             DispatchQueue.main.async {
-                appState.setInputText(text, origin: .manual)
+                appState.setInputText(text, origin: .manual, preserveOutput: true)
                 appState.statusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
             }
         }
@@ -3218,7 +3833,6 @@ struct LiveSubtitleFloatingView: View {
                 appearance: .subtitle
             )
             enterImmersiveButton
-            clearLiveSubtitleHistoryButton
             liveSubtitleToggleButton
             closeButton
         }
@@ -3412,11 +4026,10 @@ struct LiveSubtitleFloatingView: View {
         Button {
             appState.clearAppLiveSubtitleHistory()
         } label: {
-            Image(systemName: "trash")
-                .font(.system(size: 11, weight: .semibold))
+            immersiveButtonIcon("trash")
         }
-        .buttonStyle(.borderless)
-        .foregroundStyle(.white.opacity(0.82))
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.86))
         .disabled(!hasClearableLiveSubtitleHistory)
         .help(L10n.text("Clear subtitle history", language: language))
     }
@@ -3450,6 +4063,8 @@ struct LiveSubtitleFloatingView: View {
                 language: language,
                 appearance: .immersiveSubtitle
             )
+            // 清空字幕只保留在收起态，避免占用完整工具栏的常用操作空间。
+            clearLiveSubtitleHistoryButton
             exitImmersiveButton
             immersiveCloseButton
         }
@@ -4305,8 +4920,10 @@ private enum ShortcutCaptureTarget: Identifiable, Hashable {
     case quickActionTextMode
     case quickActionImageMode
     case quickActionMediaMode
+    case quickActionSpeechMode
     case textTask(TaskKind)
     case imageOCRMode(OCRMode)
+    case speechAction(QuickActionSpeechAction)
 
     var id: String {
         switch self {
@@ -4322,10 +4939,23 @@ private enum ShortcutCaptureTarget: Identifiable, Hashable {
             return "quickActionImageMode"
         case .quickActionMediaMode:
             return "quickActionMediaMode"
+        case .quickActionSpeechMode:
+            return "quickActionSpeechMode"
         case .textTask(let task):
             return "textTask:\(task.rawValue)"
         case .imageOCRMode(let mode):
             return "imageOCRMode:\(mode.rawValue)"
+        case .speechAction(let action):
+            return "speechAction:\(action.rawValue)"
+        }
+    }
+
+    var contextualMode: String? {
+        switch self {
+        case .textTask: return "text"
+        case .imageOCRMode: return "image"
+        case .speechAction: return "speech"
+        default: return nil
         }
     }
 }
@@ -4580,6 +5210,11 @@ struct SettingsView: View {
                         shortcut: appState.preferences.quickActionPopupShortcuts.mediaMode,
                         target: .quickActionMediaMode
                     )
+                    shortcutRecorderLine(
+                        title: L10n.text("Switch to speech mode", language: language),
+                        shortcut: appState.preferences.quickActionPopupShortcuts.speechMode,
+                        target: .quickActionSpeechMode
+                    )
                 }
             }
 
@@ -4609,6 +5244,18 @@ struct SettingsView: View {
                 }
             }
 
+            settingRow(title: L10n.text("Speech action shortcuts", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(QuickActionSpeechAction.allCases) { action in
+                        shortcutRecorderLine(
+                            title: quickActionSpeechActionTitle(action),
+                            shortcut: appState.preferences.quickActionPopupShortcuts.speechActionShortcut(for: action),
+                            target: .speechAction(action)
+                        )
+                    }
+                }
+            }
+
             if let shortcutRecorderMessage {
                 Text(shortcutRecorderMessage)
                     .font(.caption)
@@ -4617,6 +5264,17 @@ struct SettingsView: View {
                     .padding(.leading, 108)
             }
         }
+    }
+
+    private func quickActionSpeechActionTitle(_ action: QuickActionSpeechAction) -> String {
+        let key = switch action {
+        case .generate: "Generate speech"
+        case .voicePreview: "Preview selected voice"
+        case .playback: "Play generated speech"
+        case .exportWAV: "Export speech as WAV"
+        case .exportM4A: "Export speech as M4A"
+        }
+        return L10n.text(key, language: language)
     }
 
     private var selectionActionControls: some View {
@@ -6698,6 +7356,25 @@ struct SettingsView: View {
                 }
             }
 
+            settingRow(title: L10n.text("Detailed translation", language: language)) {
+                VStack(alignment: .leading, spacing: 7) {
+                    Toggle(L10n.text("Enable detailed translation", language: language), isOn: Binding(
+                        get: { appState.preferences.detailedTranslationEnabled },
+                        set: { newValue in
+                            appState.updatePreferences { $0.detailedTranslationEnabled = newValue }
+                        }
+                    ))
+                    .toggleStyle(.checkbox)
+
+                    HStack(spacing: 8) {
+                        Text(L10n.text("Model", language: language))
+                            .font(.subheadline)
+                            .frame(width: 88, alignment: .leading)
+                        detailedTranslationModelPicker
+                    }
+                }
+            }
+
             settingRow(title: L10n.text("Target", language: language)) {
                 translationTargetPicker
             }
@@ -7158,6 +7835,24 @@ struct SettingsView: View {
             }
         )) {
             Text(L10n.text("Use text default model", language: language)).tag(UUID?.none)
+            ForEach(appState.textCapableModels) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 230, alignment: .leading)
+        .disabled(appState.textCapableModels.isEmpty)
+    }
+
+    private var detailedTranslationModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.effectiveDetailedTranslationModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.detailedTranslationModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("No model", language: language)).tag(UUID?.none)
             ForEach(appState.textCapableModels) { model in
                 Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
             }
@@ -7981,10 +8676,14 @@ struct SettingsView: View {
                 preferences.quickActionPopupShortcuts.imageMode = shortcut
             case .quickActionMediaMode:
                 preferences.quickActionPopupShortcuts.mediaMode = shortcut
+            case .quickActionSpeechMode:
+                preferences.quickActionPopupShortcuts.speechMode = shortcut
             case .textTask(let task):
                 preferences.quickActionPopupShortcuts.setTextTaskShortcut(shortcut, for: task)
             case .imageOCRMode(let mode):
                 preferences.quickActionPopupShortcuts.setOCRModeShortcut(shortcut, for: mode)
+            case .speechAction(let action):
+                preferences.quickActionPopupShortcuts.setSpeechActionShortcut(shortcut, for: action)
             }
         }
         shortcutRecorderMessage = nil
@@ -8154,7 +8853,8 @@ struct SettingsView: View {
             (.liveSubtitles, appState.preferences.liveSubtitleShortcut),
             (.quickActionTextMode, popupShortcuts.textMode),
             (.quickActionImageMode, popupShortcuts.imageMode),
-            (.quickActionMediaMode, popupShortcuts.mediaMode)
+            (.quickActionMediaMode, popupShortcuts.mediaMode),
+            (.quickActionSpeechMode, popupShortcuts.speechMode)
         ]
         for task in TaskKind.interactiveCases {
             if let shortcut = popupShortcuts.textTaskShortcut(for: task) {
@@ -8164,16 +8864,15 @@ struct SettingsView: View {
         for mode in OCRMode.allCases {
             assignments.append((.imageOCRMode(mode), popupShortcuts.ocrModeShortcut(for: mode)))
         }
+        for action in QuickActionSpeechAction.allCases {
+            assignments.append((.speechAction(action), popupShortcuts.speechActionShortcut(for: action)))
+        }
         return assignments
     }
 
     private func canShareShortcut(_ lhs: ShortcutCaptureTarget, _ rhs: ShortcutCaptureTarget) -> Bool {
-        switch (lhs, rhs) {
-        case (.textTask, .imageOCRMode), (.imageOCRMode, .textTask):
-            return true
-        default:
-            return false
-        }
+        guard let lhsMode = lhs.contextualMode, let rhsMode = rhs.contextualMode else { return false }
+        return lhsMode != rhsMode
     }
 
     private func defaultShortcut(for target: ShortcutCaptureTarget) -> KeyboardShortcutPreference {
@@ -8191,10 +8890,14 @@ struct SettingsView: View {
             return popupDefaults.imageMode
         case .quickActionMediaMode:
             return popupDefaults.mediaMode
+        case .quickActionSpeechMode:
+            return popupDefaults.speechMode
         case .textTask(let task):
             return popupDefaults.textTaskShortcut(for: task) ?? .commandNumber(1)
         case .imageOCRMode(let mode):
             return popupDefaults.ocrModeShortcut(for: mode)
+        case .speechAction(let action):
+            return popupDefaults.speechActionShortcut(for: action)
         }
     }
 
@@ -8294,13 +8997,55 @@ struct SettingsView: View {
                 } else {
                     metaChip("\(L10n.text("Size", language: language)): \(model.sizeClass)", systemImage: "externaldrive")
                 }
-                metaChip("\(L10n.text("Ctx", language: language)): \(model.contextLength)", systemImage: "text.alignleft")
                 metaChip("\(L10n.text("Capability source", language: language)): \(capabilitySourceName(model.capabilities.source))", systemImage: capabilityIcon(model.capabilities))
                 Spacer(minLength: 8)
                 statusBadge(modelValidationBadgeText(model), systemImage: validationIcon(model.validationState))
             }
 
             capabilityDetails(model.capabilities)
+
+            if !model.capabilities.supportsSpeech {
+                Divider()
+                HStack(spacing: 8) {
+                    Label(L10n.text("Context", language: language), systemImage: "text.alignleft")
+                        .font(.caption)
+                    Picker("", selection: Binding(
+                        get: { model.contextLength },
+                        set: { appState.setModelContextLength(id: model.id, contextLength: $0) }
+                    )) {
+                        ForEach(modelContextLengthOptions(for: model), id: \.self) { contextLength in
+                            Text(modelContextLengthTitle(contextLength)).tag(contextLength)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.mini)
+                    .frame(width: 82)
+                    .disabled(appState.isRunning || isTestingThisProvider || isTestingVision)
+
+                    Spacer()
+
+                    if model.supportsThinkingModeControl {
+                        Label(L10n.text("Thinking mode", language: language), systemImage: "brain.head.profile")
+                            .font(.caption)
+                        Text(L10n.text(
+                            model.thinkingModeEnabled ? "Enabled" : "Disabled",
+                            language: language
+                        ))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        Toggle("", isOn: Binding(
+                            get: { model.thinkingModeEnabled },
+                            set: { appState.setModelThinkingModeEnabled(id: model.id, enabled: $0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .disabled(appState.isRunning || isTestingThisProvider || isTestingVision)
+                    }
+                }
+                .frame(height: 18)
+            }
 
             if let message = model.lastErrorMessage, !message.isEmpty {
                 Text(message)
@@ -8412,6 +9157,14 @@ struct SettingsView: View {
             .padding(.vertical, 4)
             .background(.quaternary.opacity(0.65))
             .clipShape(Capsule())
+    }
+
+    private func modelContextLengthOptions(for model: ModelDescriptor) -> [Int] {
+        Array(Set([4_096, 8_192, 16_384, 32_768, 65_536, 131_072, 262_144, model.contextLength])).sorted()
+    }
+
+    private func modelContextLengthTitle(_ contextLength: Int) -> String {
+        contextLength.isMultiple(of: 1_024) ? "\(contextLength / 1_024)K" : "\(contextLength)"
     }
 
     private func formatBadge(_ text: String, tint: Color) -> some View {
@@ -9226,6 +9979,8 @@ struct SettingsView: View {
             return "已移除 sherpa-onnx Qwen3"
         case (.chinese, .whisperCppCoreMLRunner):
             return "whisper.cpp CoreML"
+        case (.chinese, .fluidAudioNemotronCoreML):
+            return "FluidAudio Core ML"
         case (.chinese, .funASRGGUFAuto):
             return "自动 FunASR GGUF"
         case (.chinese, .funASRTorchStreaming):
@@ -9250,6 +10005,8 @@ struct SettingsView: View {
             return "Removed sherpa-onnx Qwen3"
         case (.english, .whisperCppCoreMLRunner):
             return "whisper.cpp Core ML"
+        case (.english, .fluidAudioNemotronCoreML):
+            return "FluidAudio Core ML"
         case (.english, .funASRGGUFAuto):
             return "Auto FunASR GGUF"
         case (.english, .funASRTorchStreaming):

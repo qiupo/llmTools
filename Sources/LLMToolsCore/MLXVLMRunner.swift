@@ -13,6 +13,8 @@ public actor MLXVLMRunner: VisionModelRunner {
     public private(set) var modelName: String?
 
     private var container: ModelContainer?
+    private var thinkingModeEnabled = false
+    private var dedicatedOCR = false
 
     public init() {}
 
@@ -47,6 +49,8 @@ public actor MLXVLMRunner: VisionModelRunner {
         container = loaded
         modelID = descriptor.id
         modelName = descriptor.name
+        thinkingModeEnabled = descriptor.thinkingModeEnabled
+        dedicatedOCR = ModelDetection.isGLMOCRModel(at: descriptor.resolvedPath ?? descriptor.sourcePath)
         isLoaded = true
     }
 
@@ -56,26 +60,44 @@ public actor MLXVLMRunner: VisionModelRunner {
         }
 
         try Task.checkCancellation()
-        let session = ChatSession(
+        let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
+        let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
+        var session = ChatSession(
             container,
-            instructions: PromptTemplates.systemPrompt(for: request.task, preferences: preferences),
-            generateParameters: LocalGenerationPolicy.parameters(for: request.task),
-            additionalContext: ["enable_thinking": false]
+            instructions: systemPrompt,
+            generateParameters: LocalGenerationPolicy.parameters(
+                for: request.task,
+                thinkingModeEnabled: thinkingModeEnabled
+            ),
+            additionalContext: ["enable_thinking": thinkingModeEnabled]
         )
-        let response = try await GeneratedOutputGuard.collectGuardedResponse(
-            from: session.streamResponse(
-                to: PromptTemplates.userPrompt(for: request, preferences: preferences)
-            )
+        var response = try await GeneratedOutputGuard.collectGuardedResponse(
+            from: session.streamResponse(to: userPrompt)
         )
         try Task.checkCancellation()
 
-        let rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        var rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = VisibleOutput.from(rawText: rawOutput)
+        if thinkingModeEnabled, output.isEmpty {
+            // 思考未收束时改用非思考模板重试，避免将中间过程误当成正文。
+            session = ChatSession(
+                container,
+                instructions: systemPrompt,
+                generateParameters: LocalGenerationPolicy.parameters(for: request.task),
+                additionalContext: ["enable_thinking": false]
+            )
+            response = try await GeneratedOutputGuard.collectGuardedResponse(
+                from: session.streamResponse(to: userPrompt)
+            )
+            try Task.checkCancellation()
+            rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            output = VisibleOutput.from(rawText: rawOutput)
+        }
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
 
-        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output.isEmpty ? rawOutput : output)
+        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output)
         return TaskResult(
             text: visibleOutput,
             rawText: rawOutput,
@@ -88,29 +110,55 @@ public actor MLXVLMRunner: VisionModelRunner {
         guard isLoaded, let container else {
             throw RunnerError.notLoaded
         }
+        if dedicatedOCR, request.mode == .explainImage {
+            throw OCRTaskError.unsupportedMode(modelName: modelName ?? "GLM-OCR", mode: request.mode)
+        }
 
         try Task.checkCancellation()
         guard let image = CIImage(data: request.image.data) else {
             throw OCRTaskError.unsupportedImageFormat
         }
 
-        let session = ChatSession(
+        let systemPrompt = dedicatedOCR ? nil : PromptTemplates.systemPrompt(for: .ocr, preferences: preferences)
+        let parameters = dedicatedOCR
+            ? GenerateParameters(maxTokens: request.mode == .structured ? 8_192 : 4_096, temperature: 0)
+            : LocalGenerationPolicy.parameters(
+                for: request.mode,
+                thinkingModeEnabled: thinkingModeEnabled
+            )
+        var session = ChatSession(
             container,
-            instructions: PromptTemplates.systemPrompt(for: .ocr, preferences: preferences),
-            generateParameters: LocalGenerationPolicy.parameters(for: request.mode),
-            additionalContext: ["enable_thinking": false]
+            instructions: systemPrompt,
+            generateParameters: parameters,
+            additionalContext: ["enable_thinking": thinkingModeEnabled]
         )
-        let response = try await GeneratedOutputGuard.collectGuardedResponse(
+        var response = try await GeneratedOutputGuard.collectGuardedResponse(
             from: session.streamResponse(to: request.prompt, image: .ciImage(image))
         )
         try Task.checkCancellation()
 
-        let rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        var rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = VisibleOutput.from(rawText: rawOutput)
+        if thinkingModeEnabled, output.isEmpty {
+            session = ChatSession(
+                container,
+                instructions: systemPrompt,
+                generateParameters: dedicatedOCR
+                    ? GenerateParameters(maxTokens: request.mode == .structured ? 8_192 : 4_096, temperature: 0)
+                    : LocalGenerationPolicy.parameters(for: request.mode),
+                additionalContext: ["enable_thinking": false]
+            )
+            response = try await GeneratedOutputGuard.collectGuardedResponse(
+                from: session.streamResponse(to: request.prompt, image: .ciImage(image))
+            )
+            try Task.checkCancellation()
+            rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            output = VisibleOutput.from(rawText: rawOutput)
+        }
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
-        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output.isEmpty ? rawOutput : output)
+        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output)
 
         return OCRTaskResult(
             text: visibleOutput,
@@ -129,6 +177,8 @@ public actor MLXVLMRunner: VisionModelRunner {
         isLoaded = false
         modelID = nil
         modelName = nil
+        thinkingModeEnabled = false
+        dedicatedOCR = false
         Memory.clearCache()
     }
 }

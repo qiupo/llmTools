@@ -8,6 +8,7 @@ struct LLMToolsChecks {
     static func main() async throws {
         try checkGGUFDetectionChoosesPrimaryModel()
         try checkMLXDetection()
+        try await checkMiniCPM5Registration()
         try await checkLocalMLXVisionMetadataDetection()
         try await checkModelDisplayName()
         try await checkProviderModelRegistration()
@@ -25,6 +26,7 @@ struct LLMToolsChecks {
         try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
         try checkPhase4XFoundationTypesAndPreferences()
         try await checkLiveMeetingTranscriptionFixtures()
+        try checkTextToSpeechProjectFixtures()
         try await checkLanguageDetectionFixture()
         try await checkLanguageRoutingCallerWiring()
         try await checkSpeakerDiarizationFixtureAndMapping()
@@ -77,6 +79,7 @@ struct LLMToolsChecks {
         try checkVisibleOutputHidesThinkBlock()
         try checkGeneratedOutputGuardTrimsDegenerateTail()
         try checkPromptsStayCompact()
+        try checkDetailedTranslationResultContract()
         print("LLMToolsChecks passed")
     }
 
@@ -96,6 +99,284 @@ struct LLMToolsChecks {
             "Expected primary GGUF, got \(detection.resolvedPath.path)."
         )
         try require(detection.sizeClass == "0.8b", "Expected 0.8b size class.")
+    }
+
+    private static func checkTextToSpeechProjectFixtures() throws {
+        let explicitSource = "旁白：夜色降临。\n张三：我们出发吧。\n[李四] 等一下！"
+        let explicit = try requireNonNil(
+            TTSScriptParser.explicitAnalysis(explicitSource),
+            "Expected explicit multi-role TTS parsing."
+        )
+        try require(explicit.voices.map(\.name) == ["旁白", "张三", "李四"], "Expected stable explicit role ordering.")
+        try require(explicit.segments.map(\.sourceText) == ["夜色降临。", "我们出发吧。", "等一下！"], "Explicit parsing must preserve spoken text.")
+        try require(explicit.segments[1].kind == .dialogue, "Expected role-prefixed line to become dialogue.")
+
+        let prose = "雨停了。张三说：“走吧。”李四回答：“好。”"
+        try require(TTSScriptParser.explicitAnalysis(prose) == nil, "Natural prose punctuation must not be treated as an explicit role prefix.")
+        let novelStyle = """
+        顾凡看着眼前挚爱的女人，声音低沉。
+        顾凡压低着声音：“你要离婚，我同意了。”
+        苏若冰俏脸一怒：“我心意已决。”
+        圆桌上，美味佳肴。
+        """
+        try require(
+            TTSScriptParser.explicitAnalysis(novelStyle) == nil,
+            "Novel action descriptions before a colon must not bypass local role analysis."
+        )
+        let sourceUnits = TTSScriptParser.sourceUnits(prose)
+        try require(
+            sourceUnits.map(\.text) == ["雨停了。", "张三说：", "“走吧。”", "李四回答：", "“好。”"],
+            "TTS source units should separate narration from inline dialogue."
+        )
+        let inlineDialogue = "顾凡看了一眼自己母亲与女儿：“你要离婚，我同意了，但能不能先把这顿饭吃完。”"
+        try require(
+            TTSScriptParser.sourceUnits(inlineDialogue).map(\.text) == [
+                "顾凡看了一眼自己母亲与女儿：",
+                "“你要离婚，我同意了，但能不能先把这顿饭吃完。”"
+            ],
+            "Inline novel dialogue must keep narration and character speech in separate units."
+        )
+        let assigned = try TTSScriptParser.parseModelAssignments(
+            """
+            {"roles":[{"name":"张三","voiceHint":"沉稳男声"},{"name":"李四","voiceHint":"清晰女声"}],"assignments":[{"index":0,"speaker":"旁白","type":"narration","confidence":1},{"index":1,"speaker":"旁白","type":"narration","confidence":1},{"index":2,"speaker":"张三","type":"dialogue","confidence":0.9},{"index":3,"speaker":"旁白","type":"narration","confidence":1},{"index":4,"speaker":"李四","type":"dialogue","confidence":0.9}]}
+            """,
+            units: sourceUnits
+        )
+        try require(assigned.segments.map(\.sourceText).joined() == prose, "Indexed role assignments must preserve source text.")
+        try require(
+            assigned.segments.map(\.speakerName) == ["旁白", "旁白", "张三", "旁白", "李四"],
+            "Indexed role assignments should preserve detected speaker names."
+        )
+        let voiceCatalog = [
+            TTSVoiceProfile(name: "沉稳旁白", instruction: "成熟男声，适合叙事"),
+            TTSVoiceProfile(name: "热血少年", instruction: "年轻男声，明亮坚定")
+        ]
+        let catalogAssigned = try TTSScriptParser.parseModelAssignments(
+            """
+            {"roles":[{"name":"张三"},{"name":"李四"}],"assignments":[{"index":0,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"沉稳舒缓，语速稍慢","pauseAfterMilliseconds":650},{"index":1,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"平静铺陈","pauseAfterMilliseconds":350},{"index":2,"speaker":"张三","voiceIndex":1,"type":"dialogue","deliveryStyle":"坚定直接","pauseAfterMilliseconds":450},{"index":3,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"平静铺陈","pauseAfterMilliseconds":350},{"index":4,"speaker":"李四","voiceIndex":1,"type":"dialogue","deliveryStyle":"急切回应","pauseAfterMilliseconds":550}]}
+            """,
+            units: sourceUnits,
+            availableVoices: voiceCatalog
+        )
+        try require(
+            catalogAssigned.segments.map(\.roleID) == [voiceCatalog[0].id, voiceCatalog[0].id, voiceCatalog[1].id, voiceCatalog[0].id, voiceCatalog[1].id],
+            "Role analysis should map voice indexes back to existing solidified voices."
+        )
+        try require(
+            catalogAssigned.voices == voiceCatalog,
+            "Catalog-backed role analysis must never create new voice profiles."
+        )
+        try require(
+            catalogAssigned.segments.map(\.deliveryStyle) == ["沉稳舒缓，语速稍慢", "平静铺陈", "坚定直接", "平静铺陈", "急切回应"]
+                && catalogAssigned.segments.map(\.pauseAfterMilliseconds) == [650, 350, 450, 350, 550],
+            "Role analysis should retain per-segment delivery styles and pauses."
+        )
+        let repairedCatalogAssignment = try TTSScriptParser.parseModelAssignments(
+            """
+            {"roles":[],"assignments":[{"index":0,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"平静铺陈","pauseAfterMilliseconds":600},{"index":1,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"平静铺陈","pauseAfterMilliseconds":350},{"index":2,"speaker":"张三","voiceIndex":1,"type":"dialogue","deliveryStyle":"压低声音","pauseAfterMilliseconds":500},{"index":3,"speaker":"旁白","voiceIndex":0,"type":"narration","deliveryStyle":"平静铺陈","pauseAfterMilliseconds":350},{"index":4,"speaker":"李四","voiceIndex":1,"type":"dialogue","deliveryStyle":"迅速回应","pauseAfterMilliseconds":550}]
+            """,
+            units: sourceUnits,
+            availableVoices: voiceCatalog
+        )
+        try require(
+            repairedCatalogAssignment.segments.map(\.deliveryStyle) == ["平静铺陈", "平静铺陈", "压低声音", "平静铺陈", "迅速回应"],
+            "Role analysis should repair a model response missing only its outer closing brace."
+        )
+        let groupedVoices = [
+            TTSVoiceProfile(name: "男声 A", groupName: "男声"),
+            TTSVoiceProfile(name: "未分组"),
+            TTSVoiceProfile(name: "女声 A", groupName: "女声"),
+            TTSVoiceProfile(name: "男声 B", groupName: " 男声 ")
+        ]
+        let voiceSections = TTSVoiceCatalog.sections(for: groupedVoices)
+        try require(
+            voiceSections.map(\.groupName) == ["男声", "女声", nil],
+            "TTS voice groups should preserve first-seen group order and place ungrouped voices last."
+        )
+        let reorderedVoices = try requireNonNil(
+            TTSVoiceCatalog.movingVoice(groupedVoices[3].id, by: -1, in: groupedVoices),
+            "Expected voice to move within its group."
+        )
+        try require(
+            TTSVoiceCatalog.sections(for: reorderedVoices)[0].voices.map(\.name) == ["男声 B", "男声 A"],
+            "TTS voice sorting should only change order inside the selected group."
+        )
+        do {
+            _ = try TTSScriptParser.parseModelAssignments(
+                #"{"roles":[],"assignments":[{"index":0,"speaker":"旁白","voiceIndex":0},{"index":1,"speaker":"旁白","voiceIndex":0},{"index":2,"speaker":"张三","voiceIndex":99},{"index":3,"speaker":"旁白","voiceIndex":0},{"index":4,"speaker":"李四","voiceIndex":1}]}"#,
+                units: sourceUnits,
+                availableVoices: voiceCatalog
+            )
+            throw CheckError("Expected out-of-range TTS voice indexes to be rejected.")
+        } catch is TTSError {
+            // Expected: invalid model output must not silently select the wrong solidified voice.
+        }
+        do {
+            _ = try TTSScriptParser.parseModelAssignments(
+                #"{"roles":[],"assignments":[{"index":0,"speaker":"旁白"}]}"#,
+                units: sourceUnits
+            )
+            throw CheckError("Expected incomplete indexed role assignments to be rejected.")
+        } catch is TTSError {
+            // Expected: every deterministic source index must be assigned exactly once.
+        }
+        let manyUnits = (0..<40).map {
+            TTSSourceUnit(index: $0, text: "句段\($0)。", sourceStart: $0 * 4, sourceEnd: $0 * 4 + 4)
+        }
+        let unitChunks = TTSScriptParser.sourceUnitChunks(manyUnits, maximumCharacters: 10_000)
+        try require(unitChunks.allSatisfy { $0.count <= 16 }, "Role-analysis chunks must respect the output-budget unit limit.")
+        try require(unitChunks.flatMap { $0 }.count == manyUnits.count, "Role-analysis chunking must retain every source unit.")
+        let longText = String(repeating: "这是一句需要保持原样的长文案。", count: 30)
+        let longVoice = TTSVoiceProfile(name: "旁白")
+        let synthesisReady = TTSScriptParser.synthesisReadyAnalysis(
+            TTSScriptAnalysis(
+                voices: [longVoice],
+                segments: [TTSSegment(
+                    index: 0,
+                    kind: .narration,
+                    roleID: longVoice.id,
+                    sourceText: longText,
+                    deliveryStyle: "沉稳叙述",
+                    pauseAfterMilliseconds: 700
+                )]
+            ),
+            maximumCharacters: 120
+        )
+        try require(synthesisReady.segments.count > 1, "Long TTS text should be split before synthesis.")
+        try require(synthesisReady.segments.map(\.sourceText).joined() == longText, "Synthesis splitting must preserve exact text.")
+        try require(
+            synthesisReady.segments.allSatisfy { $0.deliveryStyle == "沉稳叙述" }
+                && synthesisReady.segments.dropLast().allSatisfy { $0.pauseAfterMilliseconds == 180 }
+                && synthesisReady.segments.last?.pauseAfterMilliseconds == 700,
+            "Synthesis splitting should preserve delivery style and use audible internal pauses."
+        )
+        let emptyQuoteRemoved = TTSScriptParser.synthesisReadyAnalysis(
+            TTSScriptAnalysis(
+                voices: [longVoice],
+                segments: [
+                    TTSSegment(index: 0, kind: .narration, roleID: longVoice.id, sourceText: "可正常朗读。"),
+                    TTSSegment(index: 1, kind: .dialogue, roleID: longVoice.id, sourceText: "”")
+                ]
+            )
+        )
+        try require(
+            emptyQuoteRemoved.segments.map(\.sourceText) == ["可正常朗读。"]
+                && emptyQuoteRemoved.segments.map(\.index) == [0],
+            "Quote-only TTS segments must be removed before synthesis."
+        )
+
+        let root = try makeTemporaryDirectory(name: "tts-project")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = TTSProjectStore(rootDirectory: root.appendingPathComponent("projects"))
+        var project = TTSProject(name: "角色测试", mode: .multiRole, sourceText: explicitSource)
+        project.voicePreviewText = "这是需要跨启动保留的试听文案。"
+        project.voices = explicit.voices
+        project.voices[0].groupName = "旁白"
+        project.selectedVoiceID = explicit.voices[1].id
+        project.segments = explicit.segments
+        let audioDirectory = try store.audioDirectory(for: project.id)
+        for index in project.segments.indices {
+            let audioURL = audioDirectory.appendingPathComponent("segment-\(index).wav")
+            try LiveMeetingAudioStorage.writePCM16WAV(
+                data: Data(repeating: UInt8(index), count: 9_600),
+                sampleRate: 48_000,
+                to: audioURL
+            )
+            project.segments[index].generationState = .completed
+            project.segments[index].audioRelativePath = store.relativePath(for: audioURL, projectID: project.id)
+            project.segments[index].duration = 0.1
+            project.segments[index].pauseAfterMilliseconds = 100
+        }
+        project.voices[1].previewAudioRelativePath = project.segments[1].audioRelativePath
+        try store.save(project)
+        let restored = try requireNonNil(store.loadMostRecent(), "Expected TTS project recovery.")
+        try require(restored.sourceText == explicitSource && restored.segments.count == 3, "Expected complete TTS project recovery.")
+        try require(restored.selectedVoiceID == project.voices[1].id, "Expected selected TTS voice to persist.")
+        try require(
+            restored.voicePreviewText == project.voicePreviewText,
+            "Expected edited TTS voice preview text to persist."
+        )
+        try require(
+            restored.voices[1].previewAudioRelativePath == project.voices[1].previewAudioRelativePath,
+            "Expected solidified voice preview path to persist."
+        )
+        try require(restored.voices[0].groupName == "旁白", "Expected TTS voice groups to persist.")
+        let projectDirectory = store.projectDirectory(for: project.id)
+        let projectPermissions = try posixPermissions(at: projectDirectory)
+        let projectFileURL = projectDirectory.appendingPathComponent("project.json")
+        let projectFilePermissions = try posixPermissions(at: projectFileURL)
+        try require(projectPermissions == 0o700, "TTS project directory must be owner-only.")
+        try require(projectFilePermissions == 0o600, "TTS project JSON must be owner-only.")
+
+        // 旧项目没有当前音色、试听文案、说话角色和试听路径字段，升级后仍必须能正常恢复。
+        var legacyJSON = try requireNonNil(
+            JSONSerialization.jsonObject(with: Data(contentsOf: projectFileURL)) as? [String: Any],
+            "Expected decodable TTS project JSON."
+        )
+        legacyJSON.removeValue(forKey: "selectedVoiceID")
+        legacyJSON.removeValue(forKey: "voicePreviewText")
+        if var voices = legacyJSON["voices"] as? [[String: Any]] {
+            for index in voices.indices {
+                voices[index].removeValue(forKey: "previewAudioRelativePath")
+                voices[index].removeValue(forKey: "groupName")
+            }
+            legacyJSON["voices"] = voices
+        }
+        if var segments = legacyJSON["segments"] as? [[String: Any]] {
+            for index in segments.indices {
+                segments[index].removeValue(forKey: "speakerName")
+                segments[index].removeValue(forKey: "deliveryStyle")
+            }
+            legacyJSON["segments"] = segments
+        }
+        try JSONSerialization.data(withJSONObject: legacyJSON).write(to: projectFileURL, options: .atomic)
+        let legacyRestored = try requireNonNil(store.loadMostRecent(), "Expected legacy TTS project recovery.")
+        try require(legacyRestored.selectedVoiceID == nil, "Legacy selected voice should decode as unset.")
+        try require(legacyRestored.voicePreviewText == nil, "Legacy voice preview text should decode as unset.")
+        try require(
+            legacyRestored.segments.allSatisfy { $0.speakerName == nil },
+            "Legacy TTS segments should decode without speaker names."
+        )
+        try require(
+            legacyRestored.segments.allSatisfy { $0.deliveryStyle == nil },
+            "Legacy TTS segments should decode without delivery styles."
+        )
+        try require(
+            legacyRestored.voices.allSatisfy { $0.previewAudioRelativePath == nil },
+            "Legacy voice previews should decode as unset."
+        )
+        try require(
+            legacyRestored.voices.allSatisfy { $0.groupName == nil },
+            "Legacy TTS voices should decode without groups."
+        )
+
+        let composedURL = root.appendingPathComponent("composed.wav")
+        let composedDuration = try TTSAudioExporter.composeWAV(project: restored, store: store, outputURL: composedURL)
+        let composed = try LiveMeetingAudioStorage.readPCM16WAV(at: composedURL)
+        try require(composed.sampleRate == 48_000, "Expected 48 kHz TTS composition.")
+        try require(abs(composedDuration - 0.6) < 0.01, "Expected generated audio plus configured pauses.")
+        try require(composed.data.count == 57_600, "Expected deterministic PCM composition length.")
+        let subtitles = TTSAudioExporter.srt(project: restored)
+        try require(subtitles.contains("张三：我们出发吧。") && subtitles.contains("00:00:00,200"), "Expected role-aware TTS SRT timeline.")
+        var partialProject = restored
+        partialProject.segments[1].generationState = .failed
+        let partialSubtitles = TTSAudioExporter.srt(project: partialProject)
+        try require(!partialSubtitles.contains("张三：我们出发吧。"), "TTS SRT must exclude segments without completed audio.")
+        let m4aURL = root.appendingPathComponent("composed.m4a")
+        try TTSAudioExporter.convert(wavURL: composedURL, to: m4aURL, format: .m4a)
+        try require(FileManager.default.fileExists(atPath: m4aURL.path), "Expected native M4A export.")
+        let m4aPermissions = try posixPermissions(at: m4aURL)
+        try require(m4aPermissions == 0o600, "Exported M4A must be owner-only.")
+
+        let shardedModel = root.appendingPathComponent("VoxCPM2-bf16", isDirectory: true)
+        try FileManager.default.createDirectory(at: shardedModel, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: shardedModel.appendingPathComponent("config.json"))
+        try Data(#"{"weight_map":{"a":"model-00001.safetensors","b":"model-00002.safetensors"}}"#.utf8)
+            .write(to: shardedModel.appendingPathComponent("model.safetensors.index.json"))
+        try Data().write(to: shardedModel.appendingPathComponent("model-00001.safetensors"))
+        try require(!LocalTTSService.modelFilesAreComplete(at: shardedModel), "Incomplete sharded model must not report ready.")
+        try Data().write(to: shardedModel.appendingPathComponent("model-00002.safetensors"))
+        try require(LocalTTSService.modelFilesAreComplete(at: shardedModel), "Complete sharded model should report ready.")
     }
 
     private static func checkMLXDetection() throws {
@@ -121,6 +402,32 @@ struct LLMToolsChecks {
         let nineBDetection = try ModelDetection.detect(from: nineBRoot)
         try require(nineBDetection.format == .mlx, "Expected 9B MLX detection.")
         try require(nineBDetection.sizeClass == "9b", "Expected 9b size class.")
+    }
+
+    private static func checkMiniCPM5Registration() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDirectory = root.appendingPathComponent("MiniCPM5-1B-MLX", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDirectory, withIntermediateDirectories: true)
+        try Data("""
+        {
+          "architectures": ["LlamaForCausalLM"],
+          "max_position_embeddings": 131072,
+          "model_type": "llama"
+        }
+        """.utf8).write(to: modelDirectory.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: modelDirectory.appendingPathComponent("tokenizer.json"))
+        try Data().write(to: modelDirectory.appendingPathComponent("model.safetensors"))
+
+        let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
+        let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
+        let descriptor = try await engine.addModel(from: modelDirectory)
+
+        try require(descriptor.format == .mlx, "MiniCPM5-1B must register as an MLX text model.")
+        try require(descriptor.role == .fast, "MiniCPM5-1B must default to the fast local-model role.")
+        try require(descriptor.contextLength == 131_072, "MiniCPM5-1B must retain its 131K context metadata.")
+        try require(descriptor.capabilities.supportsText && !descriptor.capabilities.supportsImage, "MiniCPM5-1B must remain text-only.")
     }
 
     private static func checkLocalMLXVisionMetadataDetection() async throws {
@@ -164,6 +471,33 @@ struct LLMToolsChecks {
         }
         let selectablePreference = await engine.registry().preferences.ocr.modelID
         try require(selectablePreference == descriptor.id, "Expected detected local MLX VLM to remain selectable for OCR.")
+
+        let glmDirectory = root.appendingPathComponent("GLM-OCR-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: glmDirectory, withIntermediateDirectories: true)
+        try Data("""
+        {
+          "architectures": ["GlmOcrForConditionalGeneration"],
+          "model_type": "glm_ocr",
+          "image_token_id": 59280,
+          "text_config": {"max_position_embeddings": 131072},
+          "vision_config": {"model_type": "glm_ocr_vision", "image_size": 336}
+        }
+        """.utf8).write(to: glmDirectory.appendingPathComponent("config.json"))
+        try Data("""
+        {"image_processor_type":"Glm46VImageProcessor","processor_class":"Glm46VProcessor"}
+        """.utf8).write(to: glmDirectory.appendingPathComponent("preprocessor_config.json"))
+        try Data("{}".utf8).write(to: glmDirectory.appendingPathComponent("tokenizer.json"))
+        try Data().write(to: glmDirectory.appendingPathComponent("model.safetensors"))
+
+        try require(ModelDetection.isLocalVisionModel(at: glmDirectory), "Expected GLM-OCR metadata to detect image capability.")
+        try require(ModelDetection.isGLMOCRModel(at: glmDirectory), "Expected GLM-OCR model type detection.")
+        let glm = try await engine.addModel(from: glmDirectory)
+        try require(glm.capabilities.supportsImage && !glm.capabilities.supportsText, "GLM-OCR must be image-only rather than a generic text VLM.")
+        try await engine.updatePreferences { preferences in
+            preferences.ocr.modelID = glm.id
+        }
+        let glmOCRPreference = await engine.registry().preferences.ocr.modelID
+        try require(glmOCRPreference == glm.id, "GLM-OCR must remain selectable for OCR.")
     }
 
     private static func checkModelDisplayName() async throws {
@@ -183,6 +517,13 @@ struct LLMToolsChecks {
         let descriptor = try await engine.addModel(from: modelDirectory)
         try require(descriptor.name == "Qwen3.5-9B-MLX-4bit", "Expected full directory name, got \(descriptor.name).")
         try require(descriptor.providerID == .local, "Expected older local models to default to local provider.")
+        let updated = try await engine.setModelContextLength(id: descriptor.id, contextLength: 131_072)
+        try require(updated.contextLength == 131_072, "Expected local model context length to update independently.")
+        let persisted = try JSONDecoder().decode(
+            RegistrySnapshot.self,
+            from: Data(contentsOf: root.appendingPathComponent("registry.json"))
+        )
+        try require(persisted.models.first?.contextLength == 131_072, "Expected local model context length to persist.")
     }
 
     private static func checkProviderModelRegistration() async throws {
@@ -407,6 +748,24 @@ struct LLMToolsChecks {
             ProviderRequestOptions.enableThinking(for: qwen3Text) == false,
             "Expected SiliconFlow Qwen3 text models to disable thinking explicitly."
         )
+        try require(
+            ProviderRequestOptions.enableThinking(for: qwen3Text, requested: true) == true,
+            "Expected SiliconFlow Qwen3 text models to enable thinking when requested."
+        )
+        try require(
+            ProviderRequestOptions.supportsThinkingToggle(for: qwen3Text),
+            "Expected SiliconFlow Qwen3 text models to expose thinking mode control."
+        )
+        let remoteDescriptor = ModelDescriptor(
+            name: "Qwen3 remote",
+            sourcePath: URL(string: "https://api.siliconflow.cn/v1")!,
+            format: .openAICompatible,
+            sizeClass: "remote",
+            role: .default,
+            contextLength: 32_768,
+            providerConfiguration: qwen3Text
+        )
+        try require(remoteDescriptor.supportsThinkingModeControl, "Expected the supported remote model card to expose thinking mode control.")
 
         let qwen3Vision = ProviderConfiguration(
             providerID: .siliconFlow,
@@ -417,6 +776,21 @@ struct LLMToolsChecks {
             ProviderRequestOptions.enableThinking(for: qwen3Vision) == nil,
             "Expected SiliconFlow Qwen3-VL models not to receive unsupported enable_thinking."
         )
+
+        let localRoot = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: localRoot) }
+        try Data("{% if enable_thinking %}".utf8).write(
+            to: localRoot.appendingPathComponent("chat_template.jinja")
+        )
+        let localDescriptor = ModelDescriptor(
+            name: "Qwen3 local",
+            sourcePath: localRoot,
+            format: .mlx,
+            sizeClass: "4b",
+            role: .default,
+            contextLength: 8_192
+        )
+        try require(localDescriptor.supportsThinkingModeControl, "Expected a local MLX thinking template to expose thinking mode control.")
     }
 
     private static func checkHistoryLimit() async throws {
@@ -561,6 +935,8 @@ struct LLMToolsChecks {
         try await engine.updatePreferences { preferences in
             preferences.defaultModelID = defaultModel.id
             preferences.setTextModelID(taskModel.id, for: .polish)
+            preferences.detailedTranslationEnabled = true
+            preferences.detailedTranslationModelID = taskModel.id
         }
 
         let configured = await engine.registry().preferences
@@ -569,6 +945,8 @@ struct LLMToolsChecks {
             from: JSONEncoder().encode(configured)
         )
         try require(roundTripped.preferredTextModelID(for: .polish) == taskModel.id, "Expected the polish model override to persist.")
+        try require(roundTripped.detailedTranslationEnabled, "Expected detailed translation to stay enabled after preference round-trip.")
+        try require(roundTripped.detailedTranslationModelID == taskModel.id, "Expected the detailed translation model to persist.")
         for task in [TaskKind.summarize, .explain, .extractTodos] {
             try require(roundTripped.preferredTextModelID(for: task) == defaultModel.id, "Expected an unset task model to fall back to the default model.")
         }
@@ -619,10 +997,47 @@ struct LLMToolsChecks {
         try require(preferences.quickActionPopupShortcuts.textMode == .commandControlNumber(1), "Expected popup text-mode shortcut to default to Command-Control-1.")
         try require(preferences.quickActionPopupShortcuts.imageMode == .commandControlNumber(2), "Expected popup image-mode shortcut to default to Command-Control-2.")
         try require(preferences.quickActionPopupShortcuts.mediaMode == .commandControlNumber(3), "Expected popup media-mode shortcut to default to Command-Control-3.")
+        try require(preferences.quickActionPopupShortcuts.speechMode == .commandControlNumber(4), "Expected popup speech-mode shortcut to default to Command-Control-4.")
         try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .translate) == .commandNumber(1), "Expected popup translate shortcut to default to Command-1.")
         try require(preferences.quickActionPopupShortcuts.textTaskShortcut(for: .extractTodos) == .commandNumber(5), "Expected popup TODO shortcut to default to Command-5.")
         try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .plainText) == .commandNumber(1), "Expected popup plain OCR shortcut to default to Command-1.")
         try require(preferences.quickActionPopupShortcuts.ocrModeShortcut(for: .explainImage) == .commandNumber(4), "Expected popup image explanation shortcut to default to Command-4.")
+        for (index, action) in QuickActionSpeechAction.allCases.enumerated() {
+            try require(
+                preferences.quickActionPopupShortcuts.speechActionShortcut(for: action) == .commandNumber(index + 1),
+                "Expected popup speech action shortcut \(action.rawValue) to use Command-\(index + 1)."
+            )
+        }
+
+        // 旧快捷键 JSON 不含语音字段时，既要保留旧值，也要补上新的默认快捷键。
+        var legacyPopupSource = QuickActionPopupShortcuts()
+        legacyPopupSource.textMode = .commandControlNumber(9)
+        var legacyPopupJSON = try requireNonNil(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(legacyPopupSource)) as? [String: Any],
+            "Expected encodable popup shortcut preferences."
+        )
+        for key in [
+            "speechMode",
+            "speechGenerate",
+            "speechVoicePreview",
+            "speechPlayback",
+            "speechExportWAV",
+            "speechExportM4A"
+        ] {
+            legacyPopupJSON.removeValue(forKey: key)
+        }
+        let legacyPopup = try JSONDecoder().decode(
+            QuickActionPopupShortcuts.self,
+            from: JSONSerialization.data(withJSONObject: legacyPopupJSON)
+        )
+        try require(legacyPopup.textMode == .commandControlNumber(9), "Legacy popup shortcuts should preserve existing values.")
+        try require(legacyPopup.speechMode == .commandControlNumber(4), "Legacy popup shortcuts should add the speech-mode default.")
+        var remappedSpeechShortcuts = legacyPopup
+        remappedSpeechShortcuts.setSpeechActionShortcut(.commandNumber(9), for: .playback)
+        try require(
+            remappedSpeechShortcuts.speechAction(matching: .commandNumber(9)) == .playback,
+            "Speech shortcut setter and matching should use the same action mapping."
+        )
         try require(preferences.defaultTranslationTarget == "English", "Expected existing target language value to be preserved.")
         try require(preferences.defaultTranslationQuality == .natural, "Expected older registries to default translation quality to natural.")
         try require(preferences.defaultPolishStyle == "formal", "Expected existing polish style value to be preserved.")
@@ -630,6 +1045,8 @@ struct LLMToolsChecks {
         try require(preferences.defaultExplanationMode == .plain, "Expected older registries to default explanations to plain mode.")
         try require(preferences.defaultTodoExtractionMode == .actionItems, "Expected older registries to default TODO extraction to action items.")
         try require(preferences.textTaskModelIDs.isEmpty, "Expected older registries to keep per-task model overrides empty.")
+        try require(!preferences.detailedTranslationEnabled, "Expected detailed translation to default off for older registries.")
+        try require(preferences.detailedTranslationModelID == nil, "Expected older registries to leave the detailed translation model unset.")
         try require(preferences.recentHistoryLimit == 8, "Expected existing history limit to be preserved.")
 
         let legacySelectionLimitJSON = """
@@ -2847,6 +3264,15 @@ struct LLMToolsChecks {
         """.utf8))
         try require(localDescriptor.capabilities.supportsText, "Expected older local model to support text.")
         try require(!localDescriptor.capabilities.supportsImage, "Expected older local model to decode as text-only.")
+        try require(!localDescriptor.thinkingModeEnabled, "Expected older model registries to default thinking mode off.")
+
+        var thinkingDescriptor = localDescriptor
+        thinkingDescriptor.thinkingModeEnabled = true
+        let thinkingRoundTrip = try JSONDecoder().decode(
+            ModelDescriptor.self,
+            from: JSONEncoder().encode(thinkingDescriptor)
+        )
+        try require(thinkingRoundTrip.thinkingModeEnabled, "Expected thinking mode to persist in the model registry.")
 
         let providerDescriptor = ModelDescriptor(
             name: "OpenAI vision",
@@ -2877,9 +3303,19 @@ struct LLMToolsChecks {
         try require(explain.contains("Do not enumerate the same word"), "Expected image explanation prompt to discourage repeated labels.")
         let probe = PromptTemplates.visionProbePrompt()
         try require(probe.contains("VISION_OK"), "Expected deterministic vision probe output.")
+
+        let glmPrompt = PromptTemplates.ocrPrompt(mode: .plainText, dedicatedOCR: true)
+        try require(glmPrompt == "Text Recognition:", "GLM-OCR must receive its dedicated text-recognition prompt.")
+        try require(PromptTemplates.ocrPrompt(mode: .structured, dedicatedOCR: true) == "Text Recognition:", "GLM-OCR structured OCR must retain its dedicated prompt.")
+        try require(PromptTemplates.glmOCRPrompt(mode: .explainImage).isEmpty, "GLM-OCR must not advertise generic image explanation mode.")
     }
 
     private static func checkLocalGenerationTokenLimits() throws {
+        try require(
+            LocalGenerationPolicy.maxTokens(for: .translate, thinkingModeEnabled: true)
+                == LocalGenerationPolicy.maxTokens(for: .translate) * 2,
+            "Expected thinking mode to reserve additional local generation tokens for the final answer."
+        )
         try require(
             LocalGenerationPolicy.maxTokens(for: OCRMode.structured) > 0,
             "Expected structured OCR to have a local generation token limit."
@@ -2912,6 +3348,34 @@ struct LLMToolsChecks {
         try require(image.pixelWidth == 64 && image.pixelHeight == 64, "Expected fixture image dimensions to survive normalization.")
         try require(image.dataURL.hasPrefix("data:\(image.mimeType);base64,"), "Expected image data URL to use normalized local bytes.")
         try require(!image.dataURL.contains("http://") && !image.dataURL.contains("https://"), "Image data URL must not pass through a remote URL.")
+
+        // 本地粘贴和拖放可能产生很大的 TIFF/位图数据，不应在解码前按原始字节数拒绝。
+        var oversizedSource = OCRImagePreprocessor.probeImage.data
+        oversizedSource.append(Data(repeating: 0, count: 32_000_000))
+        let normalizedOversizedSource = try OCRImagePreprocessor.normalizeImageData(
+            oversizedSource,
+            preferences: OCRPreferences(),
+            fileName: "oversized-source.png",
+            sourceDescription: "Oversized source fixture"
+        )
+        try require(
+            normalizedOversizedSource.pixelWidth == 64 && normalizedOversizedSource.pixelHeight == 64,
+            "Local image normalization must accept source payloads above the former 32 MB limit."
+        )
+
+        let oversizedFileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("llmtools-oversized-image-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: oversizedFileURL) }
+        try oversizedSource.write(to: oversizedFileURL, options: .atomic)
+        let normalizedOversizedFile = try OCRImagePreprocessor.normalizeImageFile(
+            at: oversizedFileURL,
+            preferences: OCRPreferences(),
+            sourceDescription: "Oversized file fixture"
+        )
+        try require(
+            normalizedOversizedFile.pixelWidth == 64 && normalizedOversizedFile.pixelHeight == 64,
+            "Local image files above the former 32 MB limit must be decoded directly from their URL."
+        )
     }
 
     private static func checkRemoteImageURLPolicy() throws {
@@ -3462,6 +3926,22 @@ struct LLMToolsChecks {
             withIntermediateDirectories: true
         )
 
+        let nemotronDirectory = root
+            .appendingPathComponent("Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML", isDirectory: true)
+            .appendingPathComponent("multilingual", isDirectory: true)
+            .appendingPathComponent("1120ms", isDirectory: true)
+        try FileManager.default.createDirectory(at: nemotronDirectory, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: nemotronDirectory.appendingPathComponent("metadata.json"))
+        try Data("{}".utf8).write(to: nemotronDirectory.appendingPathComponent("tokenizer.json"))
+        try FileManager.default.createDirectory(
+            at: nemotronDirectory.appendingPathComponent("encoder.mlmodelc", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: nemotronDirectory.appendingPathComponent("decoder_joint.mlmodelc", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
         let detectedSense = try requireNonNil(ModelDetection.detectSpeechModel(at: senseDirectory), "Expected SenseVoiceSmall speech detection.")
         try require(detectedSense.family == .senseVoiceSmall, "Expected SenseVoiceSmall family detection.")
         try require(detectedSense.supports(.realtime), "SenseVoiceSmall must be realtime-capable.")
@@ -3514,6 +3994,16 @@ struct LLMToolsChecks {
         try require(detectedWhisper.supports(.fileOnly), "whisper.cpp CoreML must support file transcription.")
         try require(detectedWhisper.supports(.realtime), "whisper.cpp CoreML must be selectable for realtime subtitles through its persistent sidecar.")
 
+        let nemotronRepositoryDirectory = root
+            .appendingPathComponent("Nemotron-3.5-ASR-Streaming-Multilingual-0.6b-CoreML", isDirectory: true)
+        let detectedNemotron = try requireNonNil(
+            ModelDetection.detectSpeechModel(at: nemotronRepositoryDirectory),
+            "Expected Nemotron Core ML streaming speech detection."
+        )
+        try require(detectedNemotron.family == .nemotron35ASRStreaming06B, "Expected Nemotron streaming ASR family detection.")
+        try require(detectedNemotron.supports(.realtime), "Nemotron must be realtime-capable.")
+        try require(!detectedNemotron.supports(.fileOnly), "Nemotron must not claim file transcription capability.")
+
         let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
         let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
         let engine = TaskEngine(registryStore: registryStore, historyStore: historyStore)
@@ -3522,24 +4012,36 @@ struct LLMToolsChecks {
         let qwen = try await engine.addModel(from: qwenDirectory)
         let funMLT = try await engine.addModel(from: funMLTDirectory)
         let whisper = try await engine.addModel(from: whisperDirectory)
+        let nemotron = try await engine.addModel(from: nemotronRepositoryDirectory)
         try require(sense.format == .speech, "Expected SenseVoiceSmall to register as speech format.")
         try require(qwen.format == .speech, "Expected Qwen3-ASR-0.6B to register as speech format.")
         try require(funMLT.format == .speech, "Expected Fun-ASR-MLT-Nano to register as speech format.")
         try require(whisper.format == .speech, "Expected whisper.cpp CoreML to register as speech format.")
+        try require(nemotron.format == .speech, "Expected Nemotron Core ML model to register as speech format.")
+        try require(nemotron.sourcePath == nemotronRepositoryDirectory, "Nemotron must retain the user-selected repository directory.")
+        try require(
+            nemotron.resolvedPath?.standardizedFileURL.resolvingSymlinksInPath().path
+                == nemotronDirectory.standardizedFileURL.resolvingSymlinksInPath().path,
+            "Nemotron must resolve the repository to its executable 1120ms Core ML assets; got \(nemotron.resolvedPath?.path ?? "nil")."
+        )
         let speechModels = await engine.speechCapableModels()
         let realtimeSpeechModels = await engine.realtimeSpeechModels()
         let fileSpeechModels = await engine.fileSpeechModels()
-        try require(speechModels.count == 4, "Expected four speech-capable models after removing sherpa-onnx Qwen3-ASR.")
+        try require(speechModels.count == 5, "Expected five speech-capable models after adding the Nemotron streaming Core ML model.")
         try require(realtimeSpeechModels.map(\.id).contains(sense.id), "SenseVoiceSmall should be realtime-capable.")
         try require(realtimeSpeechModels.map(\.id).contains(funMLT.id), "Fun-ASR-MLT-Nano should be realtime-capable.")
         try require(realtimeSpeechModels.map(\.id).contains(qwen.id), "Qwen3-ASR-0.6B should be selectable for realtime subtitles.")
         try require(realtimeSpeechModels.map(\.id).contains(whisper.id), "whisper.cpp CoreML should be selectable for realtime subtitles.")
+        try require(realtimeSpeechModels.map(\.id).contains(nemotron.id), "Nemotron must be selectable for realtime subtitles.")
         try require(fileSpeechModels.map(\.id).contains(funMLT.id), "Fun-ASR-MLT-Nano should be selectable for file subtitles.")
         try require(fileSpeechModels.map(\.id).contains(qwen.id), "Qwen3-ASR-0.6B should be selectable for file subtitles.")
         try require(fileSpeechModels.map(\.id).contains(whisper.id), "whisper.cpp CoreML should be selectable for file subtitles.")
+        try require(!fileSpeechModels.map(\.id).contains(nemotron.id), "Nemotron must never enter file subtitle routing.")
+        try require(!nemotron.capabilities.supportsFileSpeech, "Nemotron descriptor must not expose file speech capability.")
+        try require(!nemotron.supportsMeetingCaptureSpeech, "Nemotron must stay out of the meeting capture pipeline.")
 
         var mediaPreferences = await engine.registry().preferences.mediaSubtitles
-        try require(mediaPreferences.realtimeASRModelID == funMLT.id, "Expected Fun-ASR-MLT-Nano to become preferred realtime ASR preference.")
+        try require(mediaPreferences.realtimeASRModelID == funMLT.id, "Adding Nemotron must not replace the existing realtime ASR preference automatically.")
         try require(mediaPreferences.fileASRModelID == sense.id, "Expected first file-capable ASR to seed file preference.")
 
         try await engine.updatePreferences { preferences in
@@ -3550,6 +4052,12 @@ struct LLMToolsChecks {
         try require(mediaPreferences.realtimeASRModelID == qwen.id, "Realtime preference should accept Qwen3-ASR when selected.")
         try require(mediaPreferences.fileASRModelID == qwen.id, "File subtitle preference should accept Qwen3-ASR.")
 
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.fileASRModelID = nemotron.id
+        }
+        mediaPreferences = await engine.registry().preferences.mediaSubtitles
+        try require(mediaPreferences.fileASRModelID != nemotron.id, "File subtitle preference must reject realtime-only Nemotron.")
+
         let health = try await engine.checkASRHealth(modelID: sense.id, mode: .realtime)
         try require(health.family == .senseVoiceSmall, "Expected SenseVoiceSmall ASR health family.")
         try require(health.isRealtimeCapable, "Expected SenseVoiceSmall health to report realtime capability.")
@@ -3559,6 +4067,11 @@ struct LLMToolsChecks {
         }
         let healthMessage = health.message.lowercased()
         try require(!healthMessage.contains("cloud") && !healthMessage.contains("remote"), "ASR health must not suggest a cloud fallback.")
+
+        let nemotronHealth = try await engine.checkASRHealth(modelID: nemotron.id, mode: .realtime)
+        try require(nemotronHealth.status == .ready, "Expected local Nemotron Core ML health to be ready.")
+        try require(nemotronHealth.runtimeSource == .fluidAudioNemotronCoreML, "Expected FluidAudio Core ML Nemotron runtime source.")
+        try require(nemotronHealth.isRealtimeCapable && !nemotronHealth.isFileCapable, "Nemotron health must report realtime-only capability.")
 
         try await engine.updatePreferences { preferences in
             preferences.mediaSubtitles.sourceLanguageHint = .zh
@@ -4038,6 +4551,68 @@ struct LLMToolsChecks {
         }
     }
 
+    private static func checkDetailedTranslationResultContract() throws {
+        let request = TaskRequest(
+            task: .translate,
+            inputText: "The launch was a turning point.",
+            targetLanguage: "Chinese",
+            translationOutputMode: .detailed
+        )
+        let prompt = PromptTemplates.userPrompt(for: request, preferences: AppPreferences())
+        try require(prompt.contains("\"translation\""), "Detailed translation prompt must require a primary translation.")
+        try require(prompt.contains("\"keyTerms\""), "Detailed translation prompt must require key vocabulary.")
+        try require(prompt.contains("\"exampleTranslation\""), "Detailed translation prompt must require translated examples.")
+
+        // 覆盖小模型常见的 Markdown 围栏，并验证重复、空值和数量上限会被收敛。
+        let parsed = try requireNonNil(
+            TranslationStudyResult.parse(modelText: """
+            ```json
+            {
+              "translation": "这次发布是一个转折点。",
+              "alternatives": ["这次发布成为了转折点。", "这次发布成为了转折点。", ""],
+              "keyTerms": [
+                {
+                  "term": "turning point",
+                  "pronunciation": "/ˈtɜːrnɪŋ pɔɪnt/",
+                  "partOfSpeech": "noun phrase",
+                  "meaning": "转折点",
+                  "usage": "表示带来重大变化的时刻",
+                  "example": "This decision was a turning point.",
+                  "exampleTranslation": "这个决定是一个转折点。"
+                }
+              ],
+              "notes": ["launch 在这里表示产品发布。"]
+            }
+            ```
+            """),
+            "Expected fenced detailed translation JSON to decode."
+        )
+        try require(parsed.translation == "这次发布是一个转折点。", "Expected primary translation to decode.")
+        try require(parsed.alternatives == ["这次发布成为了转折点。"], "Expected alternatives to be normalized and deduplicated.")
+        try require(parsed.keyTerms.first?.term == "turning point", "Expected key term to decode.")
+        try require(parsed.keyTerms.first?.exampleTranslation == "这个决定是一个转折点。", "Expected translated example to decode.")
+
+        let thinkingOnly = """
+        Thinking Process:
+        The requested schema is {"translation":"placeholder","alternatives":[],"keyTerms":[],"notes":[]}.
+        """
+        try require(
+            TranslationStudyResult.parse(modelText: thinkingOnly) == nil,
+            "Thinking-only schema examples must not be accepted as the detailed translation body."
+        )
+
+        let finalResult = try requireNonNil(
+            TranslationStudyResult.parse(modelText: """
+            Thinking Process:
+            Analyze the translation request.
+            Final Answer:
+            {"translation":"正文译文","alternatives":[],"keyTerms":[],"notes":[]}
+            """),
+            "Expected detailed translation JSON after a final-answer marker to decode."
+        )
+        try require(finalResult.translation == "正文译文", "Expected only the final detailed translation body.")
+    }
+
     private static func checkTaskEngineReturnsRawModelOutput() async throws {
         let root = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -4208,6 +4783,17 @@ struct LLMToolsChecks {
         你好
         """
         try require(VisibleOutput.from(rawText: raw) == "你好", "Expected visible output after think block.")
+        let textualThinking = """
+        Thinking Process:
+        Analyze the request.
+        Final Answer:
+        你好
+        """
+        try require(VisibleOutput.from(rawText: textualThinking) == "你好", "Expected output after a textual final-answer marker.")
+        try require(
+            VisibleOutput.from(rawText: "Thinking Process:\nAnalyze the request.").isEmpty,
+            "Expected thinking-only output to stay hidden."
+        )
         try require(VisibleOutput.from(rawText: "你好") == "你好", "Expected text without think block to stay unchanged.")
     }
 

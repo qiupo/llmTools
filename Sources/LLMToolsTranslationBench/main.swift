@@ -9,9 +9,19 @@ struct LLMToolsTranslationBench {
             try await runFastMTNLLBBenchmark()
             return
         }
+        if args.first == "--detailed", args.count >= 2 {
+            try await runDetailedTranslationSmoke(modelPath: args[1])
+            return
+        }
+        if args.first == "--text-suite", args.count >= 3 {
+            try await runTextFeatureSuite(modelPath: args[1], outputPath: args[2])
+            return
+        }
         guard let modelPath = args.first else {
             print("Usage: LLMToolsTranslationBench <model-path>")
             print("       LLMToolsTranslationBench --fast-mt-nllb")
+            print("       LLMToolsTranslationBench --detailed <model-path>")
+            print("       LLMToolsTranslationBench --text-suite <model-path> <output.json>")
             throw BenchError("Missing model path.")
         }
 
@@ -104,6 +114,130 @@ struct LLMToolsTranslationBench {
         print("END_WEBPAGE_BATCH")
     }
 
+    private static func runDetailedTranslationSmoke(modelPath: String) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("llmtools-detailed-translation-smoke", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        )
+        var preferences = await engine.registry().preferences
+        preferences.fastTranslation.forceLLM = true
+        preferences.defaultTranslationQuality = .natural
+        try await engine.setPreferences(preferences)
+        let model = try await engine.addModel(from: URL(fileURLWithPath: modelPath))
+
+        let started = Date()
+        let result = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "The browser extension preserves links and form fields, but the first launch can still feel overwhelming to new users.",
+                sourceLanguage: "en",
+                targetLanguage: "zh-Hans",
+                translationQuality: .natural,
+                translationOutputMode: .detailed
+            ),
+            modelID: model.id,
+            persistHistory: false
+        )
+        await engine.unloadAll()
+
+        guard let study = result.translationStudy, !study.keyTerms.isEmpty else {
+            throw BenchError("Detailed translation output did not satisfy the structured contract: \(result.rawText)")
+        }
+        print("model=\(model.name)")
+        print("seconds=\(String(format: "%.3f", Date().timeIntervalSince(started)))")
+        print("translation=\(study.translation)")
+        print("alternatives=\(study.alternatives.count) keyTerms=\(study.keyTerms.count) notes=\(study.notes.count)")
+        for term in study.keyTerms {
+            print("term=\(term.term) pronunciation=\(term.pronunciation) meaning=\(term.meaning)")
+        }
+    }
+
+    private static func runTextFeatureSuite(modelPath: String, outputPath: String) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("llmtools-text-feature-suite", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+        )
+        var preferences = await engine.registry().preferences
+        preferences.fastTranslation.forceLLM = true
+        preferences.defaultTranslationQuality = .natural
+        try await engine.setPreferences(preferences)
+        let model = try await engine.addModel(from: URL(fileURLWithPath: modelPath))
+
+        // 预热单独执行，避免把首次装载模型的成本混入功能延迟对比。
+        _ = try await engine.run(
+            request: TaskRequest(task: .explain, inputText: "用中文回答：预热完成。只输出这四个字。"),
+            modelID: model.id,
+            persistHistory: false
+        )
+
+        let cases = textFeatureSuiteCases
+        var results: [TextFeatureSuiteResult] = []
+        for item in cases {
+            let started = Date()
+            do {
+                let result = try await engine.run(
+                    request: item.request,
+                    modelID: model.id,
+                    persistHistory: false
+                )
+                let output = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                results.append(
+                    TextFeatureSuiteResult(
+                        id: item.id,
+                        title: item.title,
+                        task: item.request.task.rawValue,
+                        input: item.request.inputText,
+                        output: output,
+                        elapsedMilliseconds: Int((Date().timeIntervalSince(started) * 1_000).rounded()),
+                        error: nil
+                    )
+                )
+            } catch {
+                results.append(
+                    TextFeatureSuiteResult(
+                        id: item.id,
+                        title: item.title,
+                        task: item.request.task.rawValue,
+                        input: item.request.inputText,
+                        output: nil,
+                        elapsedMilliseconds: Int((Date().timeIntervalSince(started) * 1_000).rounded()),
+                        error: error.localizedDescription
+                    )
+                )
+            }
+        }
+        await engine.unloadAll()
+
+        let report = TextFeatureSuiteReport(
+            schemaVersion: 1,
+            generatedAt: ISO8601DateFormatter().string(from: Date()),
+            modelName: model.name,
+            modelPath: model.displayPath,
+            contextLength: model.contextLength,
+            warmupTask: "explain",
+            results: results
+        )
+        let destination = URL(fileURLWithPath: outputPath)
+        try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try encoder.encode(report).write(to: destination, options: .atomic)
+        print("Wrote text feature suite: \(destination.path)")
+        print("model=\(model.name) completed=\(results.filter { $0.error == nil }.count)/\(results.count)")
+    }
+
     private static func runFastMTNLLBBenchmark() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("llmtools-fastmt-nllb-bench", isDirectory: true)
@@ -176,6 +310,90 @@ private struct BenchSample {
     var target: String
     var text: String
 }
+
+private struct TextFeatureSuiteCase {
+    var id: String
+    var title: String
+    var request: TaskRequest
+}
+
+private struct TextFeatureSuiteReport: Encodable {
+    var schemaVersion: Int
+    var generatedAt: String
+    var modelName: String
+    var modelPath: String
+    var contextLength: Int
+    var warmupTask: String
+    var results: [TextFeatureSuiteResult]
+}
+
+private struct TextFeatureSuiteResult: Encodable {
+    var id: String
+    var title: String
+    var task: String
+    var input: String
+    var output: String?
+    var elapsedMilliseconds: Int
+    var error: String?
+}
+
+private let textFeatureSuiteCases: [TextFeatureSuiteCase] = [
+    TextFeatureSuiteCase(
+        id: "translate_en_zh",
+        title: "English to Simplified Chinese translation",
+        request: TaskRequest(
+            task: .translate,
+            inputText: "The release keeps local data on this Mac and applies the new model setting to the next request.",
+            sourceLanguage: "en",
+            targetLanguage: "zh-Hans",
+            translationQuality: .natural
+        )
+    ),
+    TextFeatureSuiteCase(
+        id: "translate_zh_en",
+        title: "Simplified Chinese to English translation",
+        request: TaskRequest(
+            task: .translate,
+            inputText: "实时字幕应先显示原文，再在本地模型完成后补充译文，并且不能上传音频。",
+            sourceLanguage: "zh-Hans",
+            targetLanguage: "en",
+            translationQuality: .natural
+        )
+    ),
+    TextFeatureSuiteCase(
+        id: "polish_zh",
+        title: "Chinese polishing",
+        request: TaskRequest(
+            task: .polish,
+            inputText: "这个功能现在已经可以用了但是第一次打开可能有点慢用户可以等一下再试。",
+            polishStyle: "professional"
+        )
+    ),
+    TextFeatureSuiteCase(
+        id: "summarize_zh",
+        title: "Chinese summarization",
+        request: TaskRequest(
+            task: .summarize,
+            inputText: "本次更新新增了本地实时字幕模型，并将其与文件转写路径分开。实时模式持续保留模型缓存以降低后续片段延迟；文件模式仍使用适合完整音频的转写模型。所有语音数据只在本机处理，模型切换后新的会话才会采用新设置。"
+        )
+    ),
+    TextFeatureSuiteCase(
+        id: "explain_en",
+        title: "Technical explanation",
+        request: TaskRequest(
+            task: .explain,
+            inputText: "Explain in Chinese why a streaming ASR decoder should retain state between consecutive audio chunks. Limit the answer to three sentences."
+        )
+    ),
+    TextFeatureSuiteCase(
+        id: "extract_todos",
+        title: "TODO extraction",
+        request: TaskRequest(
+            task: .extractTodos,
+            inputText: "发布前请完成三件事：下载 8bit ASR 权重，跑完中英文延迟测试，并把报告放进 docs。产品同学下周再确认默认模型文案。"
+        )
+    )
+]
 
 private let webpageTexts = [
     "Click the toolbar button again to restore the original page content.",

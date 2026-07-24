@@ -1,6 +1,6 @@
 # llmTools Roadmap
 
-Last updated: 2026-07-13
+Last updated: 2026-07-15
 
 ## Product Direction
 
@@ -11,6 +11,7 @@ llmTools is a native macOS local-model assistant. It is not primarily a chat app
 - native image OCR using explicitly configured vision-capable models
 - local-first media subtitles for audio, video, and desktop live playback, with direct Chinese translation
 - delayed live meeting transcription with speaker-aware notes as a separate work surface from live subtitles
+- local VoxCPM2 text-to-speech for ordinary copy, long text, reusable voices, and optional reviewed multi-role scripts
 - a floating desktop widget that accepts pasted text and dragged files
 - local model reuse through user-selected model files or model folders
 - task-first interaction, with model selection hidden behind sensible defaults
@@ -37,6 +38,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4.x language/speaker/fast-MT implementation is now in place: language-ID routing, file-scope speaker diarization, fast MT sidecar routing for subtitles/webpage translation, webpage cache v2 engine isolation, and dependency-free fixture checks.
 - Phase 4.x realtime speaker diarization is explicitly out of scope for the MVP. The live speaker toggle is hard-disabled until a later spike can prove that diarization never blocks ASR partial/final subtitle output.
 - Phase 4.y live meeting transcription has a separate local-only product surface with microphone, native system-audio, and local audio/video-file input. Recognition is capability-adaptive: native speaker-aware ASR (including VibeVoice) emits text/speakers/timestamps jointly; ordinary live ASR emits natural-pause transcript rows first and receives delayed local pyannote labels independently; transcript-only is the local failure fallback. Ordinary local files may still diarize first and transcribe stable speaker slices offline. This keeps live text responsive without changing the low-latency Live Subtitles contract, and includes editable grouped turns, speaker correction, recovery drafts, a 60-minute reminder, cancellable manual finalization, and after-stop chunked Chinese notes.
+- Local TTS V1 is implemented as a separate VoxCPM2-only workbench. bf16 is the quality default and 4bit is the low-memory option. Single-narrator copy is the default; multi-role analysis is optional, locally reviewed, and uses deterministic explicit-role parsing or a local GGUF/MLX text model. Projects, cloned references, generated segments, recovery, playback, and WAV/M4A/SRT export remain local.
 
 ## Confirmed Decisions
 
@@ -75,6 +77,7 @@ The app should default to local processing. Remote provider entries can exist in
 - Phase 4.x fast MT has a global killswitch (`fastTranslation.forceLLM`) and must fall back to LLM when configured to do so. Webpage translation cache keys must include source language, target language, engine id, engine model id, domain, and text hash so LLM and fast MT outputs do not mix.
 - Phase 4.x realtime diarization status is tracked in `docs/phase-4x-realtime-diarization-spike.md`; no 4.x.6 implementation should start until that spike passes the latency gate.
 - Phase 4.y live meeting transcription is tracked in `docs/phase-4y-live-meeting-transcription-prd.md`; it is allowed to lag and should not be implemented by simply enabling speaker labels in the live subtitle overlay.
+- Local TTS V1 is tracked in `docs/local-tts-voxcpm2-v1-prd.md`; it uses VoxCPM2 bf16/4bit only, keeps multi-role as an optional mode, rejects cloud fallback, and unloads text/TTS models between stages.
 
 ## Phase 1: Native MVP - Completed
 

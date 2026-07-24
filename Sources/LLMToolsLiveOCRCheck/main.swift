@@ -6,13 +6,34 @@ import LLMToolsCore
 struct LLMToolsLiveOCRCheck {
     static func main() async throws {
         let options = try Options.parse(Array(CommandLine.arguments.dropFirst()))
-        let engine = TaskEngine()
+        let temporaryRoot: URL?
+        let engine: TaskEngine
+        if options.localModelPath != nil {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("llmtools-live-ocr-local", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            temporaryRoot = root
+            engine = TaskEngine(
+                registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+                historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json"))
+            )
+        } else {
+            temporaryRoot = nil
+            engine = TaskEngine()
+        }
+        defer {
+            if let temporaryRoot {
+                try? FileManager.default.removeItem(at: temporaryRoot)
+            }
+        }
         await engine.bootstrap()
 
         let model = try await ensureVisionModel(options: options, engine: engine)
         try await configureOCRDefaults(modelID: model.id, engine: engine)
 
-        let probe = try await engine.testVisionCapability(id: model.id)
+        let dedicatedOCR = ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
+        let probe = dedicatedOCR ? nil : try await engine.testVisionCapability(id: model.id)
         let registry = await engine.registry()
         let image = try await MainActor.run {
             try makeFixtureImage(preferences: registry.preferences.ocr)
@@ -26,26 +47,42 @@ struct LLMToolsLiveOCRCheck {
         )
         try requireOCRText(ocr.text)
 
-        let explanation = try await engine.runOCR(
-            image: image,
-            mode: .explainImage,
-            modelID: model.id,
-            persistHistory: false
-        )
-        guard !explanation.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LiveOCRCheckError("Image explanation returned empty output.")
+        let explanation: TaskResult?
+        if dedicatedOCR {
+            // GLM-OCR 仅实现单图识别协议，不把通用图像理解误报为可用能力。
+            explanation = nil
+        } else {
+            let result = try await engine.runOCR(
+                image: image,
+                mode: .explainImage,
+                modelID: model.id,
+                persistHistory: false
+            )
+            guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw LiveOCRCheckError("Image explanation returned empty output.")
+            }
+            explanation = result
         }
 
         print("LLMToolsLiveOCRCheck passed")
         print("Model: \(model.name) (\(model.apiModelID ?? model.id.uuidString))")
         print("Model ID: \(model.id.uuidString)")
-        print("Probe output: \(oneLine(probe.message, limit: 180))")
+        print("Probe output: \(probe.map { oneLine($0.message, limit: 180) } ?? "not applicable for dedicated OCR")")
         print("OCR output: \(oneLine(ocr.text, limit: 240))")
-        print("Explanation output: \(oneLine(explanation.text, limit: 240))")
+        print("Explanation output: \(explanation.map { oneLine($0.text, limit: 240) } ?? "not supported by dedicated OCR")")
     }
 
     private static func ensureVisionModel(options: Options, engine: TaskEngine) async throws -> ModelDescriptor {
         let snapshot = await engine.registry()
+        if let localModelPath = options.localModelPath {
+            let modelURL = URL(fileURLWithPath: localModelPath).standardizedFileURL.resolvingSymlinksInPath()
+            if let existing = snapshot.models.first(where: {
+                ($0.resolvedPath ?? $0.sourcePath).standardizedFileURL.resolvingSymlinksInPath() == modelURL
+            }) {
+                return existing
+            }
+            return try await engine.addModel(from: modelURL)
+        }
         if let explicitID = options.existingModelID {
             guard let model = snapshot.models.first(where: { $0.id == explicitID }) else {
                 throw LiveOCRCheckError("Model \(explicitID.uuidString) was not found in the registry.")
@@ -162,6 +199,7 @@ struct LLMToolsLiveOCRCheck {
 private struct Options {
     var providerModelID: String = "Qwen/Qwen3-VL-8B-Instruct"
     var existingModelID: UUID?
+    var localModelPath: String?
 
     static func parse(_ args: [String]) throws -> Options {
         var options = Options()
@@ -181,14 +219,22 @@ private struct Options {
                     throw LiveOCRCheckError("--model-id requires a registry UUID.")
                 }
                 options.existingModelID = id
+            case "--local-path":
+                index += 1
+                guard index < args.count else {
+                    throw LiveOCRCheckError("--local-path requires a local model directory.")
+                }
+                options.localModelPath = args[index]
             case "--help", "-h":
                 print("""
                 Usage:
                   swift run LLMToolsLiveOCRCheck [--provider-model <provider-model-id>]
                   swift run LLMToolsLiveOCRCheck --model-id <registry-uuid>
+                  swift run LLMToolsLiveOCRCheck --local-path <model-directory>
 
                 The check uses the real llmTools registry, configures the selected model as the OCR model,
                 runs a live vision probe, OCRs a generated text image, and runs image explanation.
+                A local path uses a temporary registry; dedicated OCR models run recognition only.
                 """)
                 Foundation.exit(0)
             default:

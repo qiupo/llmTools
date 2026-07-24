@@ -46,6 +46,7 @@ The script verifies:
 - automatic sherpa-onnx SenseVoice compatibility
 - automatic whisper.cpp CoreML compatibility
 - automatic VibeVoice-ASR MLX runtime compatibility
+- automatic Nemotron Streaming Core ML compatibility
 - macOS media conversion tools needed by file intake
 
 Use --repair to install or reuse the matching isolated local ASR runtime. Managed
@@ -170,7 +171,13 @@ function modelFiles(modelPath) {
     "qwen3-0.6b-q8_0.gguf",
     "qwen3-0.6b-q4km.gguf",
     "qwen3-0.6b-f16.gguf",
-    "fsmn-vad.gguf"
+    "fsmn-vad.gguf",
+    "metadata.json",
+    "tokenizer.json",
+    "encoder.mlmodelc",
+    "decoder_joint.mlmodelc",
+    "decoder.mlmodelc",
+    "joint.mlmodelc"
   ];
   const files = {};
   for (const name of names) {
@@ -192,6 +199,26 @@ function safetensorsModelFilesExist(modelPath, files = {}) {
     return true;
   }
   return Object.entries(files).some(([name, exists]) => exists && name.endsWith(".safetensors"));
+}
+
+function nemotronStreamingCoreMLReady(modelPath, files = {}) {
+  if (!modelPath) {
+    return false;
+  }
+  const hasVariantAssets = (candidate, candidateFiles = modelFiles(candidate)) =>
+    candidateFiles["metadata.json"]
+      && candidateFiles["tokenizer.json"]
+      && candidateFiles["encoder.mlmodelc"]
+      && (candidateFiles["decoder_joint.mlmodelc"] || (candidateFiles["decoder.mlmodelc"] && candidateFiles["joint.mlmodelc"]));
+
+  if (hasVariantAssets(modelPath, files)) {
+    return true;
+  }
+
+  // 注册表旧版本可能保存 Core ML 仓库根目录，新版本保存具体延迟变体目录。
+  const multilingualRoot = path.join(modelPath, "multilingual");
+  const variants = readdirOrNull(multilingualRoot) ?? [];
+  return variants.some((variant) => hasVariantAssets(path.join(multilingualRoot, variant)));
 }
 
 function configModelType(modelPath) {
@@ -226,6 +253,21 @@ function resolveRuntime(model, preferences) {
       ready: true,
       source: "fixtureTranscript",
       reason: "LLMTOOLS_ASR_FIXTURE_JSON points to an existing transcript fixture."
+    };
+  }
+
+  if (family === "nemotron35ASRStreaming06B") {
+    if (nemotronStreamingCoreMLReady(modelPath, files)) {
+      return {
+        ready: true,
+        source: "fluidAudioNemotronCoreML",
+        reason: "FluidAudio can use the registered Nemotron Streaming Core ML assets directly."
+      };
+    }
+    return {
+      ready: false,
+      source: "unavailable",
+      reason: "Nemotron Streaming requires metadata.json, tokenizer.json, encoder.mlmodelc, and either decoder_joint.mlmodelc or decoder.mlmodelc plus joint.mlmodelc in a local Core ML variant directory."
     };
   }
 

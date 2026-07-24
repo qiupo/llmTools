@@ -11,6 +11,7 @@ public enum OCRTaskError: Error, LocalizedError, Sendable, Equatable {
     case missingVisionModel
     case modelNotVisionCapable(String)
     case unsupportedVisionRunner(String)
+    case unsupportedMode(modelName: String, mode: OCRMode)
     case unsupportedImageFormat
     case imageTooLarge(current: Int, limit: Int)
     case pixelCountTooLarge(current: Int, limit: Int)
@@ -30,6 +31,8 @@ public enum OCRTaskError: Error, LocalizedError, Sendable, Equatable {
             return "\(modelName) is not marked as vision-capable."
         case .unsupportedVisionRunner(let modelName):
             return "\(modelName) does not support Phase 3 image payloads."
+        case .unsupportedMode(let modelName, let mode):
+            return "\(modelName) does not support OCR mode: \(mode.title)."
         case .unsupportedImageFormat:
             return "Unsupported or unreadable image format."
         case .imageTooLarge(let current, let limit):
@@ -449,20 +452,11 @@ public enum OCRImagePreprocessor {
         preferences: OCRPreferences,
         sourceDescription: String? = nil
     ) throws -> OCRImageInput {
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        let fileSize = (attributes[.size] as? NSNumber)?.intValue ?? 0
-        let sourceByteLimit = sourceImageByteLimit(preferences: preferences)
-        guard fileSize <= sourceByteLimit else {
-            throw OCRTaskError.imageTooLarge(current: fileSize, limit: sourceByteLimit)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            throw OCRTaskError.unsupportedImageFormat
         }
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        let data = try handle.read(upToCount: sourceByteLimit + 1) ?? Data()
-        guard data.count <= sourceByteLimit else {
-            throw OCRTaskError.imageTooLarge(current: data.count, limit: sourceByteLimit)
-        }
-        return try normalizeImageData(
-            data,
+        return try normalizeImageSource(
+            source,
             preferences: preferences,
             fileName: url.lastPathComponent,
             sourceDescription: sourceDescription ?? "Image"
@@ -475,13 +469,23 @@ public enum OCRImagePreprocessor {
         fileName: String? = nil,
         sourceDescription: String = "Image"
     ) throws -> OCRImageInput {
-        let sourceByteLimit = sourceImageByteLimit(preferences: preferences)
-        guard data.count <= sourceByteLimit else {
-            throw OCRTaskError.imageTooLarge(current: data.count, limit: sourceByteLimit)
-        }
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
             throw OCRTaskError.unsupportedImageFormat
         }
+        return try normalizeImageSource(
+            source,
+            preferences: preferences,
+            fileName: fileName,
+            sourceDescription: sourceDescription
+        )
+    }
+
+    private static func normalizeImageSource(
+        _ source: CGImageSource,
+        preferences: OCRPreferences,
+        fileName: String?,
+        sourceDescription: String
+    ) throws -> OCRImageInput {
         guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] else {
             throw OCRTaskError.unsupportedImageFormat
         }
@@ -496,7 +500,7 @@ public enum OCRImagePreprocessor {
         guard !pixelCountOverflowed else {
             throw OCRTaskError.pixelCountTooLarge(current: Int.max, limit: maxPixels)
         }
-        let maxDimension: Int
+        var maxDimension: Int
         if pixelCount > maxPixels {
             let scale = sqrt(Double(maxPixels) / Double(pixelCount))
             maxDimension = max(1, Int(ceil(Double(max(width, height)) * scale)))
@@ -504,39 +508,48 @@ public enum OCRImagePreprocessor {
             maxDimension = max(width, height)
         }
 
-        let thumbnailOptions: [CFString: Any] = [
-            kCGImageSourceCreateThumbnailFromImageAlways: true,
-            kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxDimension
-        ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
-            throw OCRTaskError.unsupportedImageFormat
-        }
-        let (normalizedPixelCount, normalizedPixelCountOverflowed) = image.width.multipliedReportingOverflow(by: image.height)
-        guard !normalizedPixelCountOverflowed, normalizedPixelCount <= maxPixels else {
-            throw OCRTaskError.pixelCountTooLarge(
-                current: normalizedPixelCountOverflowed ? Int.max : normalizedPixelCount,
-                limit: maxPixels
-            )
-        }
+        while true {
+            let thumbnailOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxDimension
+            ]
+            guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+                throw OCRTaskError.unsupportedImageFormat
+            }
+            let (normalizedPixelCount, normalizedPixelCountOverflowed) = image.width.multipliedReportingOverflow(by: image.height)
+            guard !normalizedPixelCountOverflowed, normalizedPixelCount <= maxPixels else {
+                throw OCRTaskError.pixelCountTooLarge(
+                    current: normalizedPixelCountOverflowed ? Int.max : normalizedPixelCount,
+                    limit: maxPixels
+                )
+            }
 
-        let encoded = try encodeProviderImage(
-            image,
-            maximumImageBytes: encodedImageByteLimit(preferences: preferences)
-        )
-        let hash = SHA256.hash(data: encoded.data)
-            .map { String(format: "%02x", $0) }
-            .joined()
+            if let encoded = encodeProviderImage(
+                image,
+                maximumImageBytes: encodedImageByteLimit(preferences: preferences)
+            ) {
+                let hash = SHA256.hash(data: encoded.data)
+                    .map { String(format: "%02x", $0) }
+                    .joined()
 
-        return OCRImageInput(
-            data: encoded.data,
-            mimeType: encoded.mimeType,
-            fileName: fileName,
-            pixelWidth: image.width,
-            pixelHeight: image.height,
-            contentHash: hash,
-            sourceDescription: sourceDescription
-        )
+                return OCRImageInput(
+                    data: encoded.data,
+                    mimeType: encoded.mimeType,
+                    fileName: fileName,
+                    pixelWidth: image.width,
+                    pixelHeight: image.height,
+                    contentHash: hash,
+                    sourceDescription: sourceDescription
+                )
+            }
+
+            // 本地原图不设字节门槛；若规范化载荷仍偏大，就继续缩小后再交给模型。
+            guard maxDimension > 1 else {
+                throw OCRTaskError.unsupportedImageFormat
+            }
+            maxDimension = max(1, maxDimension / 2)
+        }
     }
 
     public static func downloadAndNormalizeRemoteImage(
@@ -544,7 +557,7 @@ public enum OCRImagePreprocessor {
         preferences: OCRPreferences
     ) async throws -> OCRImageInput {
         let url = try RemoteImageURLPolicy.validatedURL(value)
-        let maximumDownloadBytes = sourceImageByteLimit(preferences: preferences)
+        let maximumDownloadBytes = remoteImageDownloadByteLimit(preferences: preferences)
 
         do {
             // URLSessionDataDelegate 按数据块累计，达到硬上限立即取消连接。
@@ -567,7 +580,7 @@ public enum OCRImagePreprocessor {
         }
     }
 
-    private static func sourceImageByteLimit(preferences: OCRPreferences) -> Int {
+    private static func remoteImageDownloadByteLimit(preferences: OCRPreferences) -> Int {
         min(encodedImageByteLimit(preferences: preferences), 8_000_000) * 4
     }
 
@@ -618,7 +631,7 @@ public enum OCRImagePreprocessor {
     private static func encodeProviderImage(
         _ image: CGImage,
         maximumImageBytes: Int
-    ) throws -> (data: Data, mimeType: String) {
+    ) -> (data: Data, mimeType: String)? {
         if let pngData = encode(image, type: UTType.png.identifier as CFString, properties: [:]),
            pngData.count <= maximumImageBytes {
             return (pngData, "image/png")
@@ -630,8 +643,7 @@ public enum OCRImagePreprocessor {
            jpegData.count <= maximumImageBytes {
             return (jpegData, "image/jpeg")
         }
-        let byteCount = encode(image, type: UTType.jpeg.identifier as CFString, properties: jpegProperties)?.count ?? 0
-        throw OCRTaskError.imageTooLarge(current: byteCount, limit: maximumImageBytes)
+        return nil
     }
 
     private static func encode(

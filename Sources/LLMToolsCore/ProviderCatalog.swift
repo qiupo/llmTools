@@ -157,12 +157,16 @@ public enum ProviderEndpointPolicy {
 }
 
 public enum ProviderRequestOptions {
-    public static func enableThinking(for configuration: ProviderConfiguration) -> Bool? {
-        guard configuration.providerID == .siliconFlow,
-              siliconFlowSupportsThinkingToggle(modelID: configuration.modelID) else {
-            return nil
-        }
-        return false
+    public static func enableThinking(
+        for configuration: ProviderConfiguration,
+        requested: Bool = false
+    ) -> Bool? {
+        supportsThinkingToggle(for: configuration) ? requested : nil
+    }
+
+    public static func supportsThinkingToggle(for configuration: ProviderConfiguration) -> Bool {
+        configuration.providerID == .siliconFlow
+            && siliconFlowSupportsThinkingToggle(modelID: configuration.modelID)
     }
 
     private static func siliconFlowSupportsThinkingToggle(modelID: String) -> Bool {

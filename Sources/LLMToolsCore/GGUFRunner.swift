@@ -77,11 +77,11 @@ public actor GGUFRunner: ModelRunner {
         try Task.checkCancellation()
         let rawOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
         let visibleOutput = VisibleOutput.from(rawText: rawOutput)
-        guard !visibleOutput.isEmpty || !rawOutput.isEmpty else {
+        guard !visibleOutput.isEmpty else {
             throw RunnerError.emptyResult
         }
 
-        return TaskResult(text: visibleOutput.isEmpty ? rawOutput : visibleOutput, rawText: rawOutput, modelName: modelName ?? "GGUF", task: request.task)
+        return TaskResult(text: visibleOutput, rawText: rawOutput, modelName: modelName ?? "GGUF", task: request.task)
     }
 
     public func unload() async {

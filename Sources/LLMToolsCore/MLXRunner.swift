@@ -13,6 +13,7 @@ public actor MLXRunner: ModelRunner {
     public private(set) var modelName: String?
 
     private var container: ModelContainer?
+    private var thinkingModeEnabled = false
 
     public init() {}
 
@@ -47,6 +48,7 @@ public actor MLXRunner: ModelRunner {
         container = loaded
         modelID = descriptor.id
         modelName = descriptor.name
+        thinkingModeEnabled = descriptor.thinkingModeEnabled
         isLoaded = true
     }
 
@@ -58,24 +60,42 @@ public actor MLXRunner: ModelRunner {
         try Task.checkCancellation()
         let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
-        let session = ChatSession(
+        var session = ChatSession(
             container,
             instructions: systemPrompt,
-            generateParameters: LocalGenerationPolicy.parameters(for: request.task),
-            additionalContext: ["enable_thinking": false]
+            generateParameters: LocalGenerationPolicy.parameters(
+                for: request.task,
+                thinkingModeEnabled: thinkingModeEnabled
+            ),
+            additionalContext: ["enable_thinking": thinkingModeEnabled]
         )
-        let response = try await GeneratedOutputGuard.collectGuardedResponse(
+        var response = try await GeneratedOutputGuard.collectGuardedResponse(
             from: session.streamResponse(to: userPrompt)
         )
         try Task.checkCancellation()
 
-        let rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
-        let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        var rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = VisibleOutput.from(rawText: rawOutput)
+        if thinkingModeEnabled, output.isEmpty {
+            // 模型耗尽预算仍未结束思考时，自动关闭思考重试，保证只把可用正文交给界面。
+            session = ChatSession(
+                container,
+                instructions: systemPrompt,
+                generateParameters: LocalGenerationPolicy.parameters(for: request.task),
+                additionalContext: ["enable_thinking": false]
+            )
+            response = try await GeneratedOutputGuard.collectGuardedResponse(
+                from: session.streamResponse(to: userPrompt)
+            )
+            try Task.checkCancellation()
+            rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+            output = VisibleOutput.from(rawText: rawOutput)
+        }
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
 
-        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output.isEmpty ? rawOutput : output)
+        let visibleOutput = GeneratedOutputGuard.trimDegenerateTail(output)
         return TaskResult(text: visibleOutput, rawText: rawOutput, modelName: modelName ?? "MLX", task: request.task)
     }
 
@@ -88,6 +108,7 @@ public actor MLXRunner: ModelRunner {
         isLoaded = false
         modelID = nil
         modelName = nil
+        thinkingModeEnabled = false
         Memory.clearCache()
     }
 }

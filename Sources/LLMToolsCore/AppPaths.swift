@@ -60,6 +60,20 @@ public enum AppPaths {
         runtimeDirectory(environmentKey: "LLMTOOLS_FASTMT_RUNTIME_DIR", defaultName: "fastmt-runtime")
     }
 
+    public static var ttsRuntimeDirectory: URL {
+        runtimeDirectory(environmentKey: "LLMTOOLS_TTS_RUNTIME_ROOT", defaultName: "tts-runtime")
+    }
+
+    public static var ttsModelsDirectory: URL {
+        ttsRuntimeDirectory.appendingPathComponent("models", isDirectory: true)
+    }
+
+    public static var ttsProjectsDirectory: URL {
+        applicationSupportDirectory
+            .appendingPathComponent("tts", isDirectory: true)
+            .appendingPathComponent("projects", isDirectory: true)
+    }
+
     public static func preparePrivateFileStorage(at fileURL: URL) throws {
         let fm = FileManager.default
         let directory = fileURL.deletingLastPathComponent()

@@ -1,9 +1,34 @@
 import AppKit
+import AVFoundation
 import Foundation
 import ServiceManagement
 import SwiftUI
 import UniformTypeIdentifiers
 import LLMToolsCore
+
+enum QuickTranslationSpeechTarget: Hashable {
+    case source
+    case translation
+    case term(String)
+}
+
+enum TTSPlaybackTarget: Equatable {
+    case segment(UUID)
+    case project
+    case voice(UUID)
+    case quickAction
+    case translation(QuickTranslationSpeechTarget)
+}
+
+struct QuickTranslationSpeechCacheEntry {
+    var text: String
+    var audioURL: URL
+}
+
+struct PendingQuickTranslationSpeech {
+    var text: String
+    var target: QuickTranslationSpeechTarget
+}
 
 @MainActor
 final class AppState: ObservableObject {
@@ -24,6 +49,7 @@ final class AppState: ObservableObject {
         case text
         case image
         case media
+        case speech
     }
 
     private struct PendingLiveMeetingASRBatch {
@@ -45,6 +71,7 @@ final class AppState: ObservableObject {
         var outputText: String = ""
         var rawOutputText: String = ""
         var showsRawOutput: Bool = false
+        var translationStudy: TranslationStudyResult?
     }
 
     private struct LiveSubtitleRuntimeSession {
@@ -65,7 +92,7 @@ final class AppState: ObservableObject {
         var bufferedMilliseconds: Int = 0
         var asrInFlight = false
         var asrRevision = 0
-        var streamingASR: StreamingASRProcessSession?
+        var streamingASR: (any RealtimeASRSession)?
     }
 
     private struct LiveSubtitleASRStrategy {
@@ -109,6 +136,16 @@ final class AppState: ObservableObject {
                     silenceFrameThreshold: 4,
                     emitsPartialTranscripts: true
                 )
+            case .nemotron35ASRStreaming06B:
+                return LiveSubtitleASRStrategy(
+                    minimumPartialMilliseconds: 1_120,
+                    partialIntervalMilliseconds: 1_120,
+                    maximumPartialMilliseconds: nil,
+                    minimumFinalMilliseconds: 450,
+                    continuousFinalIntervalMilliseconds: 4_500,
+                    silenceFrameThreshold: 3,
+                    emitsPartialTranscripts: true
+                )
             case .whisperCppCoreML:
                 return LiveSubtitleASRStrategy(
                     minimumPartialMilliseconds: 2_000,
@@ -150,6 +187,7 @@ final class AppState: ObservableObject {
     @Published var models: [ModelDescriptor] = []
     @Published var preferences = AppPreferences()
     @Published var history: [HistoryItem] = []
+    @Published private(set) var quickActionSessionRevision = 0
     @Published var quickActionMode: QuickActionMode = .text {
         didSet {
             guard oldValue != quickActionMode else {
@@ -171,6 +209,7 @@ final class AppState: ObservableObject {
     @Published var outputText: String = ""
     @Published var rawOutputText: String = ""
     @Published var showsRawOutput: Bool = false
+    @Published var translationStudyResult: TranslationStudyResult?
     @Published var selectionInlineResultVisible: Bool = false
     @Published var statusMessage: String = L10n.text("Ready", language: .chinese)
     @Published var selectedModelID: UUID?
@@ -234,8 +273,32 @@ final class AppState: ObservableObject {
     @Published var liveMeetingNotesTaskIsRunning = false
     @Published var liveMeetingRecoveryDraft: LiveMeetingRecoveryDraft?
     @Published var liveMeetingStatusMessage: String?
+    @Published var ttsProject = TTSProject()
+    @Published var ttsHealth: TTSRuntimeHealth?
+    @Published var ttsStatusMessage = "本地 TTS 尚未检查"
+    @Published var ttsIsAnalyzing = false
+    @Published var ttsIsGenerating = false
+    @Published var ttsRuntimeInstallInProgress = false
+    @Published var ttsGenerationProgress: Double = 0
+    @Published var ttsSelectedVoiceID: UUID?
+    @Published var ttsAnalysisModelID: UUID?
+    @Published var ttsIsPlaying = false
+    @Published var ttsPlaybackTarget: TTSPlaybackTarget?
+    @Published var ttsVoicePreviewInProgressID: UUID?
+    @Published var quickTTSInputText = ""
+    @Published var quickTTSSelectedVoiceID: UUID?
+    // 保存给 VoxCPM2 的中文表达指令，界面再按应用语言显示对应名称。
+    @Published var quickTTSDeliveryStyle = "自然流畅"
+    @Published var quickTTSIsGenerating = false
+    @Published var quickTTSGenerationProgress: Double = 0
+    @Published var quickTTSOutputURL: URL?
+    @Published var quickTTSOutputDuration: TimeInterval?
+    @Published var quickTranslationSpeechGeneratingTarget: QuickTranslationSpeechTarget?
+    @Published var quickTranslationSpeechProgress: Double = 0
 
     let engine: TaskEngine
+    let ttsService = LocalTTSService()
+    let ttsProjectStore = TTSProjectStore()
     private var preferenceSaveRevision = 0
     private var currentRunTask: Task<Void, Never>?
     private var runRevision = 0
@@ -246,10 +309,11 @@ final class AppState: ObservableObject {
     private var textOutputState = QuickActionOutputState()
     private var imageOutputState = QuickActionOutputState()
     private var mediaOutputState = QuickActionOutputState()
+    private var speechOutputState = QuickActionOutputState()
     private var liveSubtitleSessions: [String: LiveSubtitleRuntimeSession] = [:]
     private var appLiveSubtitleSequence = -1
     private var liveMeetingCaptureService: LiveSubtitleCaptureService?
-    private var liveMeetingStreamingASR: StreamingASRProcessSession?
+    private var liveMeetingStreamingASR: (any RealtimeASRSession)?
     private var liveMeetingAudioBuffer = Data()
     private var liveMeetingAllAudioBuffer = Data()
     private var liveMeetingAudioCapturedMilliseconds = 0
@@ -270,6 +334,18 @@ final class AppState: ObservableObject {
     private var liveMeetingAutomaticStopReason: String?
     private var liveMeetingFinalizeTask: Task<Void, Never>?
     private var liveMeetingNotesTask: Task<Void, Never>?
+    var ttsAnalysisTask: Task<Void, Never>?
+    var ttsGenerationTask: Task<Void, Never>?
+    var ttsRuntimeInstallTask: Task<Void, Never>?
+    var ttsProjectSaveTask: Task<Void, Never>?
+    var ttsVoicePreviewTask: Task<Void, Never>?
+    var quickTTSGenerationTask: Task<Void, Never>?
+    var quickTranslationSpeechTask: Task<Void, Never>?
+    var quickTranslationSpeechPendingRequest: PendingQuickTranslationSpeech?
+    var quickTranslationSpeechVoiceID: UUID?
+    var quickTranslationSpeechCache: [QuickTranslationSpeechTarget: QuickTranslationSpeechCacheEntry] = [:]
+    var ttsPlaybackMonitorTask: Task<Void, Never>?
+    var ttsAudioPlayer: AVAudioPlayer?
     private let liveMeetingDiarizationService = LiveMeetingDiarizationService()
     private let liveMeetingRecoveryStore = LiveMeetingRecoveryStore()
     private lazy var liveSubtitleCaptureService = LiveSubtitleCaptureService { [weak self] data in
@@ -306,6 +382,7 @@ final class AppState: ObservableObject {
         self.history = await engine.recentHistory()
         liveMeetingRecoveryDraft = try? liveMeetingRecoveryStore.loadDiscardingTemporaryAudio()
         liveMeetingDiarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
+        await bootstrapTTS()
         self.statusMessage = snapshot.models.isEmpty
             ? t("No model configured")
             : t("Ready")
@@ -550,6 +627,52 @@ final class AppState: ObservableObject {
         }
     }
 
+    func setModelThinkingModeEnabled(id: UUID, enabled: Bool) {
+        guard let index = models.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let previousValue = models[index].thinkingModeEnabled
+        models[index].thinkingModeEnabled = enabled
+
+        Task {
+            do {
+                _ = try await engine.setModelThinkingModeEnabled(id: id, enabled: enabled)
+                await reloadSnapshot()
+                statusMessage = t(enabled ? "Thinking enabled" : "Thinking disabled")
+                validationError = nil
+            } catch {
+                if let currentIndex = models.firstIndex(where: { $0.id == id }) {
+                    models[currentIndex].thinkingModeEnabled = previousValue
+                }
+                validationError = error.localizedDescription
+                statusMessage = t("Failed to update thinking mode")
+            }
+        }
+    }
+
+    func setModelContextLength(id: UUID, contextLength: Int) {
+        guard let index = models.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        let previousValue = models[index].contextLength
+        models[index].contextLength = contextLength
+
+        Task {
+            do {
+                _ = try await engine.setModelContextLength(id: id, contextLength: contextLength)
+                await reloadSnapshot()
+                statusMessage = t("Context updated")
+                validationError = nil
+            } catch {
+                if let currentIndex = models.firstIndex(where: { $0.id == id }) {
+                    models[currentIndex].contextLength = previousValue
+                }
+                validationError = error.localizedDescription
+                statusMessage = t("Failed to update context")
+            }
+        }
+    }
+
     func testVisionCapability(id: UUID) {
         guard visionProbeModelID == nil else {
             return
@@ -592,7 +715,7 @@ final class AppState: ObservableObject {
             }
 
             let content = try String(contentsOf: url, encoding: .utf8)
-            setInputText(content, origin: .file)
+            setInputText(content, origin: .file, preserveOutput: true)
             validationError = nil
             statusMessage = "\(t("Loaded")) \(url.lastPathComponent)"
         } catch {
@@ -616,9 +739,6 @@ final class AppState: ObservableObject {
             mediaSubtitleDescriptor = descriptor
             mediaSubtitleSegments = []
             mediaSubtitleDiagnostics = nil
-            outputText = ""
-            rawOutputText = ""
-            showsRawOutput = false
             validationError = nil
             mediaSubtitleMode = preferences.mediaSubtitles.defaultSubtitleMode
             statusMessage = "\(t("Loaded")) \(descriptor.fileName)"
@@ -829,14 +949,17 @@ final class AppState: ObservableObject {
         updatePreferences { $0.defaultModelID = id }
     }
 
-    func setInputText(_ text: String, origin: InputOrigin) {
-        beginQuickActionInputChange()
+    func setInputText(_ text: String, origin: InputOrigin, preserveOutput: Bool = false) {
+        if !preserveOutput {
+            beginQuickActionInputChange()
+        }
         quickActionMode = .text
         inputText = text
         inputOrigin = origin
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
+        // 窗口内编辑只更新草稿，不取消正在执行的请求；回车或重新生成才提交新请求。
+        if !preserveOutput {
+            clearCurrentQuickActionOutput()
+        }
         selectionInlineResultVisible = false
         validationError = nil
         if origin != .selection {
@@ -846,7 +969,11 @@ final class AppState: ObservableObject {
 
     @discardableResult
     func switchQuickActionMode(to mode: QuickActionMode) -> Bool {
-        guard !isRunning, !isPreparingOCRImage else {
+        guard !isRunning,
+              !isPreparingOCRImage,
+              !quickTTSIsGenerating,
+              quickTranslationSpeechGeneratingTarget == nil
+        else {
             return mode == quickActionMode
         }
         quickActionMode = mode
@@ -862,9 +989,6 @@ final class AppState: ObservableObject {
         beginQuickActionInputChange()
         ocrImageInput = nil
         ocrPreviewImage = nil
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
         validationError = nil
         statusMessage = t("Ready")
     }
@@ -875,9 +999,6 @@ final class AppState: ObservableObject {
         mediaSubtitleDescriptor = nil
         mediaSubtitleSegments = []
         mediaSubtitleDiagnostics = nil
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
         validationError = nil
         statusMessage = t("Ready")
     }
@@ -1103,9 +1224,7 @@ final class AppState: ObservableObject {
         selectedTask = task
         inputText = text
         inputOrigin = .manual
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
+        clearCurrentQuickActionOutput()
         validationError = nil
         statusMessage = t("Ready")
     }
@@ -1118,9 +1237,7 @@ final class AppState: ObservableObject {
         guard characterCount <= limit else {
             inputText = ""
             inputOrigin = .selection
-            outputText = ""
-            rawOutputText = ""
-            showsRawOutput = false
+            clearCurrentQuickActionOutput()
             selectionInlineResultVisible = true
             validationError = "\(t("Selected text is too long for automatic translation.")) \(characterCount)/\(limit)"
             statusMessage = t("Selection too long")
@@ -1190,25 +1307,34 @@ final class AppState: ObservableObject {
         guard validateInputLength(text) else {
             return
         }
+        guard quickTranslationSpeechGeneratingTarget == nil else { return }
 
         currentRunTask?.cancel()
         cancelScheduledModelUnload()
         runRevision += 1
         let revision = runRevision
+        // 详解模式由持久化开关控制；普通翻译继续使用轻量默认模型。
+        let usesDetailedTranslation = preferences.detailedTranslationEnabled
+            && selectedTask == .translate
+            && !preferences.promptTemplates.translate.hasCustomPrompt
         let request = TaskRequest(
             task: selectedTask,
             inputText: text,
             targetLanguage: preferences.defaultTranslationTarget,
             translationQuality: preferences.defaultTranslationQuality,
+            translationOutputMode: usesDetailedTranslation ? .detailed : .plain,
             polishStyle: preferences.defaultPolishStyle,
             summaryMode: preferences.defaultSummaryMode,
             explanationMode: preferences.defaultExplanationMode,
             todoExtractionMode: preferences.defaultTodoExtractionMode
         )
-        let modelID = selectedModelID
+        let modelID = request.translationOutputMode == .detailed
+            ? resolvedDetailedTranslationModelID()
+            : selectedModelID
         let selectionCaptureID = inputOrigin == .selection
             ? SelectedTextService.currentCapturedSelectionID
             : nil
+        clearCurrentQuickActionOutput()
         isRunning = true
         validationError = nil
         statusMessage = "\(t("Running")) \(selectedTask.title(language: preferences.appLanguage))..."
@@ -1225,6 +1351,7 @@ final class AppState: ObservableObject {
                     }
                     outputText = result.text
                     rawOutputText = result.rawText
+                    translationStudyResult = result.translationStudy
                     showsRawOutput = false
                     statusMessage = finishedStatusMessage(for: result)
                     isRunning = false
@@ -1234,7 +1361,9 @@ final class AppState: ObservableObject {
                 guard revision == runRevision, !Task.isCancelled else {
                     return
                 }
-                replaceOriginalTextIfNeeded(result.text, selectionCaptureID: selectionCaptureID)
+                if request.translationOutputMode == .plain || result.translationStudy != nil {
+                    replaceOriginalTextIfNeeded(result.text, selectionCaptureID: selectionCaptureID)
+                }
                 await reloadSnapshot()
             } catch is CancellationError {
                 await MainActor.run {
@@ -1255,6 +1384,7 @@ final class AppState: ObservableObject {
                         validationError = nil
                         outputText = t("The model returned an empty result. Try regenerate.")
                         rawOutputText = outputText
+                        translationStudyResult = nil
                         showsRawOutput = false
                     } else {
                         validationError = error.localizedDescription
@@ -1289,11 +1419,9 @@ final class AppState: ObservableObject {
         runRevision += 1
         let revision = runRevision
         let mode = ocrMode
+        clearCurrentQuickActionOutput()
         isRunning = true
         validationError = nil
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
         statusMessage = "\(t("Running")) \(L10n.ocrModeName(mode, language: preferences.appLanguage))..."
         currentRunTask = Task {
             do {
@@ -1362,11 +1490,9 @@ final class AppState: ObservableObject {
         runRevision += 1
         let revision = runRevision
         let asrModelID = preferences.mediaSubtitles.fileASRModelID
+        clearCurrentQuickActionOutput()
         isRunning = true
         validationError = nil
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
         mediaSubtitleDiagnostics = nil
         let speakerDiarizationEnabled = preferences.speakerDiarization.enabledForFileSubtitles
         statusMessage = speakerDiarizationEnabled ? t("Transcribing and separating speakers") : t("Transcribing media")
@@ -1451,6 +1577,7 @@ final class AppState: ObservableObject {
         runRevision += 1
         let revision = runRevision
         let existing = mediaSubtitleSegments
+        clearCurrentQuickActionOutput()
         isRunning = true
         validationError = nil
         statusMessage = t("Translating subtitles")
@@ -1925,7 +2052,7 @@ final class AppState: ObservableObject {
         switch family {
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
             return true
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             return false
         }
     }
@@ -1934,7 +2061,7 @@ final class AppState: ObservableObject {
         switch family {
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
             return true
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             return false
         }
     }
@@ -1953,6 +2080,8 @@ final class AppState: ObservableObject {
             }
         case .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B, .vibeVoiceASR:
             try await repairMLXASRRuntime(model: model, family: family)
+        case .nemotron35ASRStreaming06B:
+            throw MediaSubtitleError.asrRuntimeMissing("Nemotron Core ML assets must be downloaded with the model; automatic runtime repair is not available.")
         case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             throw MediaSubtitleError.asrRuntimeMissing("Automatic repair is not available for this ASR family.")
         }
@@ -1995,7 +2124,7 @@ final class AppState: ObservableObject {
             preferences.qwen3ASRCommandTemplate = cleared(preferences.qwen3ASRCommandTemplate)
         case .vibeVoiceASR:
             preferences.vibeVoiceASRCommandTemplate = cleared(preferences.vibeVoiceASRCommandTemplate)
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             break
         }
     }
@@ -2079,7 +2208,7 @@ final class AppState: ObservableObject {
             moduleName = "qwen3_asr"
         case .vibeVoiceASR:
             moduleName = "vibevoice_asr"
-        case .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
+        case .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .whisperCppCoreML, .customLocal:
             return false
         }
         let fileManager = FileManager.default
@@ -2164,7 +2293,7 @@ final class AppState: ObservableObject {
             return "install-phase4-sensevoice-mlx-runtime.sh"
         case .qwen3ASR06B, .vibeVoiceASR:
             return "install-phase4-mlx-asr-runtime.sh"
-        case .qwen3ASRSherpaOnnx:
+        case .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx:
             return "install-phase4-mlx-asr-runtime.sh"
         case .whisperCppCoreML:
             return "install-phase4-whisper-coreml-runtime.sh"
@@ -2181,7 +2310,7 @@ final class AppState: ObservableObject {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "LLMTOOLS_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
@@ -2198,7 +2327,7 @@ final class AppState: ObservableObject {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
@@ -2563,7 +2692,7 @@ final class AppState: ObservableObject {
             liveMeetingStatusMessage = health.message
             return
         }
-        let streamingASR: StreamingASRProcessSession?
+        let streamingASR: (any RealtimeASRSession)?
         do {
             liveMeetingStatusMessage = runtimeMode == .realtime ? "正在加载本地实时 ASR 模型..." : "正在准备本地会议模型..."
             streamingASR = runtimeMode == .realtime
@@ -3900,9 +4029,36 @@ final class AppState: ObservableObject {
         ocrPreparationRevision += 1
         isPreparingOCRImage = false
         cancelCurrentTask()
+        cancelQuickTTSGeneration()
+        cancelQuickTranslationSpeech()
         if wasPreparingOCRImage {
             statusMessage = t("Cancelled")
         }
+    }
+
+    func resetQuickActionSession() {
+        cancelQuickActionWork()
+
+        // Quick Action 是临时工作台，关闭窗口后四个标签都从空会话重新开始。
+        inputText = ""
+        inputOrigin = .manual
+        ocrImageInput = nil
+        ocrPreviewImage = nil
+        mediaSubtitleFileURL = nil
+        mediaSubtitleDescriptor = nil
+        mediaSubtitleSegments = []
+        mediaSubtitleDiagnostics = nil
+        textOutputState = QuickActionOutputState()
+        imageOutputState = QuickActionOutputState()
+        mediaOutputState = QuickActionOutputState()
+        speechOutputState = QuickActionOutputState()
+        clearCurrentQuickActionOutput()
+        resetQuickActionSpeechSession()
+        selectionInlineResultVisible = false
+        validationError = nil
+        statusMessage = t("Ready")
+        quickActionSessionRevision += 1
+        SelectedTextService.clearCapturedSelectionSource()
     }
 
     func beginExternalModelUse() {
@@ -3960,11 +4116,17 @@ final class AppState: ObservableObject {
     private func createStreamingASRSessionIfNeeded(
         for model: ModelDescriptor,
         sourceLanguageHint: ASRSourceLanguageHint
-    ) async throws -> StreamingASRProcessSession? {
+    ) async throws -> (any RealtimeASRSession)? {
         let fixturePath = ProcessInfo.processInfo.environment["LLMTOOLS_ASR_FIXTURE_JSON"]?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !fixturePath.isEmpty {
             return nil
+        }
+        if model.capabilities.speech?.family == .nemotron35ASRStreaming06B {
+            return try await NemotronStreamingASRSession.start(
+                model: model,
+                sourceLanguageHint: sourceLanguageHint
+            )
         }
         return try await StreamingASRProcessSession.start(
             model: model,
@@ -4416,12 +4578,14 @@ final class AppState: ObservableObject {
         guard !session.audioBuffer.isEmpty else {
             return []
         }
-        let transcriptionBuffer = liveAudioBufferForASR(
-            session.audioBuffer,
-            sampleRate: session.sampleRate,
-            isFinal: isFinal,
-            strategy: strategy
-        )
+        let transcriptionBuffer = session.asrModel.capabilities.speech?.family == .nemotron35ASRStreaming06B
+            ? session.audioBuffer
+            : liveAudioBufferForASR(
+                session.audioBuffer,
+                sampleRate: session.sampleRate,
+                isFinal: isFinal,
+                strategy: strategy
+            )
         let duration = TimeInterval(chunkMilliseconds(data: transcriptionBuffer, sampleRate: session.sampleRate)) / 1_000
         if let streamingASR = session.streamingASR {
             var segments = try await streamingASR.transcribe(
@@ -4668,7 +4832,8 @@ final class AppState: ObservableObject {
         let state = QuickActionOutputState(
             outputText: outputText,
             rawOutputText: rawOutputText,
-            showsRawOutput: showsRawOutput
+            showsRawOutput: showsRawOutput,
+            translationStudy: translationStudyResult
         )
         switch mode {
         case .text:
@@ -4677,6 +4842,8 @@ final class AppState: ObservableObject {
             imageOutputState = state
         case .media:
             mediaOutputState = state
+        case .speech:
+            speechOutputState = state
         }
     }
 
@@ -4689,19 +4856,19 @@ final class AppState: ObservableObject {
             state = imageOutputState
         case .media:
             state = mediaOutputState
+        case .speech:
+            state = speechOutputState
         }
         outputText = state.outputText
         rawOutputText = state.rawOutputText
         showsRawOutput = state.showsRawOutput
+        translationStudyResult = state.translationStudy
     }
 
     private func setOCRImage(_ image: OCRImageInput) {
         quickActionMode = .image
         ocrImageInput = image
         ocrPreviewImage = NSImage(data: image.data)
-        outputText = ""
-        rawOutputText = ""
-        showsRawOutput = false
         validationError = nil
         if preferences.ocr.useModelRecognitionByDefault {
             ocrMode = preferences.ocr.defaultMode
@@ -4710,6 +4877,13 @@ final class AppState: ObservableObject {
 
     private func beginQuickActionInputChange() {
         // 新输入代表新的用户意图；旧推理或旧图片下载不能在稍后覆盖当前面板。
+        if quickTranslationSpeechTask != nil
+            || ttsPlaybackTarget.map({ target in
+                if case .translation = target { return true }
+                return false
+            }) == true {
+            cancelQuickTranslationSpeech()
+        }
         if isRunning {
             cancelCurrentTask()
         }
@@ -4719,6 +4893,13 @@ final class AppState: ObservableObject {
             ocrPreparationRevision += 1
             isPreparingOCRImage = false
         }
+    }
+
+    private func clearCurrentQuickActionOutput() {
+        outputText = ""
+        rawOutputText = ""
+        showsRawOutput = false
+        translationStudyResult = nil
     }
 
     private func clearMissingMediaSubtitlePreferences(
@@ -4816,6 +4997,25 @@ final class AppState: ObservableObject {
         return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
     }
 
+    var effectiveDetailedTranslationModelID: UUID? {
+        resolvedDetailedTranslationModelID()
+    }
+
+    private func resolvedDetailedTranslationModelID() -> UUID? {
+        if let configuredModelID = preferences.detailedTranslationModelID,
+           models.contains(where: {
+               $0.id == configuredModelID && $0.enabled && $0.capabilities.supportsText
+           }) {
+            return configuredModelID
+        }
+        // 未指定时优先选择已安装的本地质量模型，确保开箱即可生成稳定的结构化详解。
+        return models.first(where: {
+            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && $0.role == .quality
+        })?.id
+            ?? selectedModelID
+            ?? models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+    }
+
     private var inputCharacterLimit: Int {
         InputSizePolicy.maximumInputCharacters(forContextLength: selectedModelContextLength)
     }
@@ -4828,9 +5028,7 @@ final class AppState: ObservableObject {
         let characterCount = text.count
         let limit = inputCharacterLimit
         guard characterCount <= limit else {
-            outputText = ""
-            rawOutputText = ""
-            showsRawOutput = false
+            clearCurrentQuickActionOutput()
             validationError = "\(t("Input is too long for the selected model.")) \(characterCount)/\(limit)"
             statusMessage = t("Failed")
             if inputOrigin == .selection {
@@ -4978,6 +5176,8 @@ final class AppState: ObservableObject {
 
     private func realtimeSpeechPriority(_ model: ModelDescriptor) -> Int {
         switch model.capabilities.speech?.family {
+        case .nemotron35ASRStreaming06B:
+            return 4
         case .funASRMLTNano:
             return 0
         case .funASRNano:

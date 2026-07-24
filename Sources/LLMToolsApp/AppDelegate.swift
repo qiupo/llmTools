@@ -48,17 +48,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private let liveSubtitleImmersiveTwoLineHeight: CGFloat = 96
     private let liveSubtitleImmersiveBilingualHeight: CGFloat = 128
     private let liveMeetingWindowContentSize = NSSize(width: 980, height: 700)
+    private let ttsWindowContentSize = NSSize(width: 1_120, height: 760)
+    private let ttsVoiceWindowContentSize = NSSize(width: 760, height: 580)
     private let statusMenuMessageLimit = 32
 
     private let appState = AppState()
     private let hotKeyService = HotKeyService()
     private let selectionActionService = SelectionActionService()
     private let settingsNavigation = SettingsNavigationState()
-    private let quickActionPinState = WindowPinState()
+    // 快捷操作是高频临时窗口，默认置顶；用户仍可通过窗口内图钉随时取消。
+    private let quickActionPinState = WindowPinState(isPinned: true)
     private let selectionActionPinState = WindowPinState()
     private let floatingWidgetPinState = WindowPinState()
     private let liveSubtitlePinState = WindowPinState()
     private let liveMeetingPinState = WindowPinState()
+    private let ttsPinState = WindowPinState()
+    private let ttsVoicePinState = WindowPinState()
     private lazy var localAppBridgeServer = LocalAppBridgeServer(appState: appState)
     private var cancellables: Set<AnyCancellable> = []
     private var statusItem: NSStatusItem?
@@ -68,10 +73,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var floatingWindowController: WindowController?
     private var liveSubtitleWindowController: WindowController?
     private var liveMeetingWindowController: WindowController?
+    private var ttsWindowController: WindowController?
+    private var ttsVoiceWindowController: WindowController?
     private var settingsWindowController: WindowController?
     private var liveSubtitleWindowResizeObserver: Any?
     private var selectionDismissMonitors: [Any] = []
-    private var quickActionKeyboardMonitor: Any?
+    private var selectedTextCopyMonitor: Any?
     private var quickActionSelectionCaptureTask: Task<Void, Never>?
     private var quickActionSelectionCaptureRevision = 0
     private var selectionActionCaptureTask: Task<Void, Never>?
@@ -82,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var liveSubtitleEscapeMonitors: [Any] = []
     private var liveSubtitlePointerMonitors: [Any] = []
     private var liveSubtitleResizeCursorKind: LiveSubtitleResizeCursorKind?
+    private var terminationPreparationInProgress = false
     private var lastSelectionScreenPoint: NSPoint?
     private var selectionActionShownAt = Date.distantPast
     private var isSelectionActionEnabled = false
@@ -91,15 +99,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     func applicationDidFinishLaunching(_ notification: Notification) {
         hotKeyService.delegate = self
         selectionActionService.delegate = self
+        configureMainMenu()
         configureStatusItem()
         configureWindows()
         SelectedTextService.startMonitoringPasteboardOwnershipEvents()
-        installQuickActionKeyboardMonitor()
+        installSelectedTextCopyMonitor()
         installLiveSubtitleEscapeMonitors()
         installLiveSubtitlePointerMonitors()
         observeAppState()
         if ProcessInfo.processInfo.environment["LLMTOOLS_OPEN_MEETING_WINDOW"] == "1" {
             openLiveMeeting()
+        }
+        if ProcessInfo.processInfo.environment["LLMTOOLS_OPEN_TTS_WINDOW"] == "1" {
+            openTextToSpeech()
+        }
+        if ProcessInfo.processInfo.environment["LLMTOOLS_OPEN_TTS_VOICE_WINDOW"] == "1" {
+            openTTSVoiceManagement()
         }
         Task {
             await appState.bootstrap()
@@ -115,6 +130,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !terminationPreparationInProgress else { return .terminateLater }
+        terminationPreparationInProgress = true
+        Task { @MainActor [weak self] in
+            guard let self else {
+                sender.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            await appState.stopTTSForShutdown()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         hotKeyService.unregister()
         SelectedTextService.stopMonitoringPasteboardOwnershipEvents()
@@ -124,11 +153,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         if let liveSubtitleWindowResizeObserver {
             NotificationCenter.default.removeObserver(liveSubtitleWindowResizeObserver)
         }
-        removeQuickActionKeyboardMonitor()
+        removeSelectedTextCopyMonitor()
         removeLiveSubtitleEscapeMonitors()
         removeLiveSubtitlePointerMonitors()
         selectionActionService.stop()
         localAppBridgeServer.stop()
+    }
+
+    private func installSelectedTextCopyMonitor() {
+        removeSelectedTextCopyMonitor()
+        // 菜单栏浮窗可能在 Edit 菜单阶段丢失 copy:，仅对真实 NSTextView 选区做确定性兜底。
+        selectedTextCopyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard CommandFriendlyTextView.copyActiveSelectionIfNeeded(for: event) else {
+                return event
+            }
+            return nil
+        }
+    }
+
+    private func removeSelectedTextCopyMonitor() {
+        if let selectedTextCopyMonitor {
+            NSEvent.removeMonitor(selectedTextCopyMonitor)
+            self.selectedTextCopyMonitor = nil
+        }
+    }
+
+    private func configureMainMenu() {
+        let mainMenu = NSMenu()
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu(title: "llmTools")
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+
+        // accessory 应用也需要标准编辑菜单，TextField/TextEditor 才能把快捷键交给当前 responder。
+        let undoItem = NSMenuItem(title: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redoItem = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redoItem.keyEquivalentModifierMask = [.command, .shift]
+        let cutItem = NSMenuItem(title: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        let copyItem = NSMenuItem(title: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        let pasteItem = NSMenuItem(title: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        let pastePlainItem = NSMenuItem(
+            title: "粘贴并匹配样式",
+            action: #selector(NSText.paste(_:)),
+            keyEquivalent: "v"
+        )
+        pastePlainItem.keyEquivalentModifierMask = [.command, .option, .shift]
+        let selectAllItem = NSMenuItem(title: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        editMenu.addItem(undoItem)
+        editMenu.addItem(redoItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(cutItem)
+        editMenu.addItem(copyItem)
+        editMenu.addItem(pasteItem)
+        editMenu.addItem(pastePlainItem)
+        editMenu.addItem(.separator())
+        editMenu.addItem(selectAllItem)
+
+        appMenu.addItem(NSMenuItem(
+            title: "退出 llmTools",
+            action: #selector(NSApplication.terminate(_:)),
+            keyEquivalent: "q"
+        ))
+        appMenuItem.submenu = appMenu
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(appMenuItem)
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     private func configureStatusItem() {
@@ -149,6 +240,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         menu.addItem(NSMenuItem(title: "图片 OCR", action: #selector(openImageOCR), keyEquivalent: "i"))
         menu.addItem(NSMenuItem(title: "开始实时字幕", action: #selector(toggleAppLiveSubtitles), keyEquivalent: "l"))
         menu.addItem(NSMenuItem(title: "会议转写与纪要", action: #selector(openLiveMeeting), keyEquivalent: "m"))
+        menu.addItem(NSMenuItem(title: "文案转语音", action: #selector(openTextToSpeech), keyEquivalent: "t"))
+        menu.addItem(NSMenuItem(title: "音色管理", action: #selector(openTTSVoiceManagement), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "打开悬浮组件", action: #selector(openFloatingWidget), keyEquivalent: "w"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "模型", action: #selector(openModelSettings), keyEquivalent: ","))
@@ -166,9 +259,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         quickActionWindowController = WindowController(
             title: "快捷操作",
             frame: NSRect(x: 0, y: 0, width: 500, height: 400),
-            contentView: AnyView(QuickActionView(appState: appState, pinState: quickActionPinState) { [weak self] in
-                self?.quickActionWindowController?.close()
-            }),
+            contentView: AnyView(QuickActionView(
+                appState: appState,
+                pinState: quickActionPinState,
+                onTitleChange: { [weak self] in
+                    self?.refreshQuickActionWindowTitle()
+                },
+                onClose: { [weak self] in
+                    self?.quickActionWindowController?.close()
+                }
+            )),
             pinState: quickActionPinState
         )
         if let quickActionWindow = quickActionWindowController?.window as? FloatingWindow {
@@ -177,7 +277,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             }
             quickActionWindow.onClose = { [weak self] in
                 self?.cancelPendingQuickActionSelectionCapture()
-                self?.appState.cancelQuickActionWork()
+                self?.appState.resetQuickActionSession()
             }
             quickActionWindow.onKeyboardShortcut = { [weak self] shortcut in
                 self?.handleQuickActionShortcut(shortcut) ?? false
@@ -190,9 +290,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 }
                 appState.loadOCRImageFromPasteboard()
                 return true
-            }
-            quickActionWindow.onCommandCopy = { [weak self, weak quickActionWindow] in
-                self?.copyQuickActionOutputIfAllowed(in: quickActionWindow) ?? false
             }
         }
         selectionActionWindowController = WindowController(
@@ -260,6 +357,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             liveMeetingWindow.contentMinSize = NSSize(width: 760, height: 520)
             liveMeetingWindow.minSize = NSSize(width: 760, height: 520)
         }
+        ttsWindowController = WindowController(
+            title: "文案转语音",
+            frame: NSRect(origin: .zero, size: ttsWindowContentSize),
+            contentView: AnyView(
+                TextToSpeechView(appState: appState, pinState: ttsPinState) { [weak self] in
+                    self?.openTTSVoiceManagement()
+                }
+            ),
+            pinState: ttsPinState,
+            allowsResizing: true
+        )
+        if let ttsWindow = ttsWindowController?.window {
+            ttsWindow.contentMinSize = NSSize(width: 900, height: 600)
+            ttsWindow.minSize = NSSize(width: 900, height: 600)
+        }
+        // 音色配置独立成窗口，主工作台只保留选音色与生成音频的流程。
+        ttsVoiceWindowController = WindowController(
+            title: "音色管理",
+            frame: NSRect(origin: .zero, size: ttsVoiceWindowContentSize),
+            contentView: AnyView(TTSVoiceManagementView(appState: appState, pinState: ttsVoicePinState)),
+            pinState: ttsVoicePinState,
+            allowsResizing: true
+        )
+        if let voiceWindow = ttsVoiceWindowController?.window {
+            voiceWindow.contentMinSize = NSSize(width: 720, height: 520)
+            voiceWindow.minSize = NSSize(width: 720, height: 520)
+        }
         settingsWindowController = WindowController(
             title: "设置",
             frame: NSRect(origin: .zero, size: settingsWindowContentSize),
@@ -293,6 +417,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     @objc private func openLiveMeeting() {
         liveMeetingWindowController?.showWindow(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func openTextToSpeech() {
+        ttsWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        Task { @MainActor [weak self] in
+            await self?.appState.refreshTTSHealth()
+        }
+    }
+
+    @objc private func openTTSVoiceManagement() {
+        ttsVoiceWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        Task { @MainActor [weak self] in
+            await self?.appState.refreshTTSHealth()
+        }
     }
 
     @objc private func toggleAppLiveSubtitles() {
@@ -587,26 +727,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionWindowController?.window?.orderOut(nil)
     }
 
-    private func installQuickActionKeyboardMonitor() {
-        removeQuickActionKeyboardMonitor()
-        quickActionKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self else {
-                return event
-            }
-            guard self.handleQuickActionCommandCopyEvent(event) else {
-                return event
-            }
-            return nil
-        }
-    }
-
-    private func removeQuickActionKeyboardMonitor() {
-        if let quickActionKeyboardMonitor {
-            NSEvent.removeMonitor(quickActionKeyboardMonitor)
-            self.quickActionKeyboardMonitor = nil
-        }
-    }
-
     private func installLiveSubtitleEscapeMonitors() {
         removeLiveSubtitleEscapeMonitors()
 
@@ -746,31 +866,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
 
         closeLiveSubtitlesFromWindow()
-        return true
-    }
-
-    private func handleQuickActionCommandCopyEvent(_ event: NSEvent) -> Bool {
-        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard modifiers == .command,
-              event.charactersIgnoringModifiers?.lowercased() == "c",
-              let window = quickActionWindowController?.window as? FloatingWindow,
-              window.isVisible,
-              event.window === window || window.isKeyWindow else {
-            return false
-        }
-        return copyQuickActionOutputIfAllowed(in: window)
-    }
-
-    private func copyQuickActionOutputIfAllowed(in window: FloatingWindow?) -> Bool {
-        guard window?.shouldUseWindowCopyFallback() == true else {
-            return false
-        }
-        let text = appState.displayedOutputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else {
-            return false
-        }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
         return true
     }
 
@@ -1201,6 +1296,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 )
             case #selector(openFloatingWidget):
                 item.title = L10n.text("Open Floating Widget", language: appState.preferences.appLanguage)
+            case #selector(openTextToSpeech):
+                item.title = appState.preferences.appLanguage == .chinese ? "文案转语音" : "Text to Speech"
+            case #selector(openTTSVoiceManagement):
+                item.title = appState.preferences.appLanguage == .chinese ? "音色管理" : "Voice Management"
             case #selector(openModelSettings):
                 item.title = L10n.text("Models", language: appState.preferences.appLanguage)
             case #selector(openGeneralSettings):
@@ -1245,17 +1344,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         let shortcuts = appState.preferences.quickActionPopupShortcuts
 
         if shortcut == shortcuts.textMode {
-            _ = appState.switchQuickActionMode(to: .text)
+            guard appState.switchQuickActionMode(to: .text) else { return false }
             refreshQuickActionWindowTitle()
             return true
         }
         if shortcut == shortcuts.imageMode {
-            _ = appState.switchQuickActionMode(to: .image)
+            guard appState.switchQuickActionMode(to: .image) else { return false }
             refreshQuickActionWindowTitle()
             return true
         }
         if shortcut == shortcuts.mediaMode {
-            _ = appState.switchQuickActionMode(to: .media)
+            guard appState.switchQuickActionMode(to: .media) else { return false }
+            refreshQuickActionWindowTitle()
+            return true
+        }
+        if shortcut == shortcuts.speechMode {
+            guard appState.switchQuickActionMode(to: .speech) else { return false }
             refreshQuickActionWindowTitle()
             return true
         }
@@ -1277,6 +1381,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             return true
         case .media:
             return false
+        case .speech:
+            guard let action = shortcuts.speechAction(matching: shortcut) else {
+                return false
+            }
+            switch action {
+            case .generate:
+                if appState.quickTTSIsGenerating {
+                    appState.cancelQuickTTSGeneration()
+                } else {
+                    appState.generateQuickTTS()
+                }
+            case .voicePreview:
+                appState.previewQuickTTSVoice()
+            case .playback:
+                appState.playQuickTTS()
+            case .exportWAV:
+                appState.exportQuickTTS(format: .wav)
+            case .exportM4A:
+                appState.exportQuickTTS(format: .m4a)
+            }
+            return true
         }
     }
 
@@ -1286,6 +1411,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             quickActionWindowController?.window?.title = L10n.text("Image OCR", language: appState.preferences.appLanguage)
         case .media:
             quickActionWindowController?.window?.title = L10n.text("Media subtitles", language: appState.preferences.appLanguage)
+        case .speech:
+            quickActionWindowController?.window?.title = L10n.text("Generate speech", language: appState.preferences.appLanguage)
         case .text:
             quickActionWindowController?.window?.title = appState.selectedTask.title(language: appState.preferences.appLanguage)
         }
@@ -1587,7 +1714,6 @@ class FloatingWindow: NSWindow {
     var onClose: (() -> Void)?
     var onKeyboardShortcut: ((KeyboardShortcutPreference) -> Bool)?
     var onCommandPaste: (() -> Bool)?
-    var onCommandCopy: (() -> Bool)?
     private var expandedWidth: CGFloat = 360
     private let collapsedWidth: CGFloat = 42
     private let edgeTolerance: CGFloat = 24
@@ -1611,16 +1737,15 @@ class FloatingWindow: NSWindow {
                 onEscape()
                 return
             }
-            if modifiers == .command,
-               event.charactersIgnoringModifiers?.lowercased() == "v",
-               let onCommandPaste,
-               onCommandPaste() {
+            // 先走当前第一响应者的标准编辑命令，避免业务兜底吞掉 SwiftUI 的文本选区。
+            if performStandardEditingCommand(for: event) {
                 return
             }
             if modifiers == .command,
-               event.charactersIgnoringModifiers?.lowercased() == "c",
-               let onCommandCopy,
-               onCommandCopy() {
+               event.charactersIgnoringModifiers?.lowercased() == "v",
+               !isEditingText,
+               let onCommandPaste,
+               onCommandPaste() {
                 return
             }
             if let shortcut = KeyboardShortcutPreference(event: event),
@@ -1633,17 +1758,40 @@ class FloatingWindow: NSWindow {
         super.sendEvent(event)
     }
 
-    func shouldUseWindowCopyFallback() -> Bool {
-        guard let responder = firstResponder else {
-            return true
+    private var isEditingText: Bool {
+        if let textView = firstResponder as? NSTextView {
+            return textView.isEditable
         }
-        guard let textView = responder as? NSTextView else {
-            return true
+        if let textField = firstResponder as? NSTextField {
+            return textField.isEditable
         }
-        if textView.isEditable {
+        return false
+    }
+
+    private func performStandardEditingCommand(for event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard modifiers.contains(.command),
+              let characters = event.charactersIgnoringModifiers?.lowercased() else {
             return false
         }
-        return !textView.selectedRanges.contains { $0.rangeValue.length > 0 }
+
+        let action: Selector
+        switch characters {
+        case "a" where modifiers == .command:
+            action = #selector(NSText.selectAll(_:))
+        case "c" where modifiers == .command:
+            action = #selector(NSText.copy(_:))
+        case "v" where modifiers == .command:
+            action = #selector(NSText.paste(_:))
+        case "x" where modifiers == .command:
+            action = #selector(NSText.cut(_:))
+        case "z" where modifiers == .command || modifiers == [.command, .shift]:
+            action = Selector((event.modifierFlags.contains(.shift) ? "redo:" : "undo:"))
+        default:
+            return false
+        }
+
+        return firstResponder?.tryToPerform(action, with: nil) == true
     }
 
     override func setFrameOrigin(_ point: NSPoint) {

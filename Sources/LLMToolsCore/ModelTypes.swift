@@ -275,12 +275,14 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
 
     public var supportsFileSpeech: Bool {
         speech?.isSelectableASRBackend == true
-            && (speech?.supports(.fileOnly) == true || speech?.supports(.realtime) == true)
+            && speech?.supports(.fileOnly) == true
     }
 
     public var supportsMeetingCaptureSpeech: Bool {
-        supportsRealtimeSpeech
+        speech?.family != .nemotron35ASRStreaming06B
+            && (supportsRealtimeSpeech
             || (supportsFileSpeech && speech?.canEmitSpeakerLabels == true)
+        )
     }
 
     public var meetingCaptureRuntimeMode: SpeechRuntimeMode? {
@@ -303,6 +305,15 @@ public struct ModelCapabilities: Codable, Hashable, Sendable {
     public static func vision(source: ModelCapabilitySource, confidence: Double, note: String? = nil) -> ModelCapabilities {
         ModelCapabilities(
             inputs: [.text, .image],
+            source: source,
+            confidence: confidence,
+            note: note
+        )
+    }
+
+    public static func ocrOnly(source: ModelCapabilitySource, confidence: Double, note: String? = nil) -> ModelCapabilities {
+        ModelCapabilities(
+            inputs: [.image],
             source: source,
             confidence: confidence,
             note: note
@@ -450,6 +461,7 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var lastErrorMessage: String?
     public var providerConfiguration: ProviderConfiguration?
     public var capabilities: ModelCapabilities
+    public var thinkingModeEnabled: Bool
 
     public init(
         id: UUID = UUID(),
@@ -464,7 +476,8 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         validationState: ModelValidationState = .unknown,
         lastErrorMessage: String? = nil,
         providerConfiguration: ProviderConfiguration? = nil,
-        capabilities: ModelCapabilities? = nil
+        capabilities: ModelCapabilities? = nil,
+        thinkingModeEnabled: Bool = false
     ) {
         self.id = id
         self.name = name
@@ -482,6 +495,7 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
             format: format,
             providerConfiguration: providerConfiguration
         )
+        self.thinkingModeEnabled = thinkingModeEnabled
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -498,6 +512,7 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         case lastErrorMessage
         case providerConfiguration
         case capabilities
+        case thinkingModeEnabled
     }
 
     public init(from decoder: Decoder) throws {
@@ -516,6 +531,8 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         providerConfiguration = try container.decodeIfPresent(ProviderConfiguration.self, forKey: .providerConfiguration)
         capabilities = try container.decodeIfPresent(ModelCapabilities.self, forKey: .capabilities)
             ?? ModelCapabilities.inferred(format: format, providerConfiguration: providerConfiguration)
+        // 旧注册表没有该字段，默认关闭以保持升级前的生成行为。
+        thinkingModeEnabled = try container.decodeIfPresent(Bool.self, forKey: .thinkingModeEnabled) ?? false
     }
 
     public var displayPath: String {
@@ -543,6 +560,18 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
 
     public var supportsImageInput: Bool {
         enabled && capabilities.supportsImage
+    }
+
+    public var supportsThinkingModeControl: Bool {
+        guard capabilities.supportsText else { return false }
+        switch format {
+        case .mlx:
+            return ModelDetection.supportsThinkingModeControl(at: resolvedPath ?? sourcePath)
+        case .openAICompatible:
+            return providerConfiguration.map { ProviderRequestOptions.supportsThinkingToggle(for: $0) } ?? false
+        case .gguf, .anthropicMessages, .speech, .unknown:
+            return false
+        }
     }
 
     public var supportsMeetingCaptureSpeech: Bool {
@@ -959,10 +988,21 @@ public struct SelectionLineLimitRule: Codable, Identifiable, Sendable, Hashable 
     }
 }
 
+public enum QuickActionSpeechAction: String, Sendable, CaseIterable, Identifiable, Hashable {
+    case generate
+    case voicePreview
+    case playback
+    case exportWAV
+    case exportM4A
+
+    public var id: String { rawValue }
+}
+
 public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     public var textMode: KeyboardShortcutPreference
     public var imageMode: KeyboardShortcutPreference
     public var mediaMode: KeyboardShortcutPreference
+    public var speechMode: KeyboardShortcutPreference
     public var translate: KeyboardShortcutPreference
     public var polish: KeyboardShortcutPreference
     public var summarize: KeyboardShortcutPreference
@@ -972,11 +1012,17 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
     public var ocrStructured: KeyboardShortcutPreference
     public var ocrExtractThenTranslate: KeyboardShortcutPreference
     public var ocrExplainImage: KeyboardShortcutPreference
+    public var speechGenerate: KeyboardShortcutPreference
+    public var speechVoicePreview: KeyboardShortcutPreference
+    public var speechPlayback: KeyboardShortcutPreference
+    public var speechExportWAV: KeyboardShortcutPreference
+    public var speechExportM4A: KeyboardShortcutPreference
 
     public init(
         textMode: KeyboardShortcutPreference = .commandControlNumber(1),
         imageMode: KeyboardShortcutPreference = .commandControlNumber(2),
         mediaMode: KeyboardShortcutPreference = .commandControlNumber(3),
+        speechMode: KeyboardShortcutPreference = .commandControlNumber(4),
         translate: KeyboardShortcutPreference = .commandNumber(1),
         polish: KeyboardShortcutPreference = .commandNumber(2),
         summarize: KeyboardShortcutPreference = .commandNumber(3),
@@ -985,11 +1031,17 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         ocrPlainText: KeyboardShortcutPreference = .commandNumber(1),
         ocrStructured: KeyboardShortcutPreference = .commandNumber(2),
         ocrExtractThenTranslate: KeyboardShortcutPreference = .commandNumber(3),
-        ocrExplainImage: KeyboardShortcutPreference = .commandNumber(4)
+        ocrExplainImage: KeyboardShortcutPreference = .commandNumber(4),
+        speechGenerate: KeyboardShortcutPreference = .commandNumber(1),
+        speechVoicePreview: KeyboardShortcutPreference = .commandNumber(2),
+        speechPlayback: KeyboardShortcutPreference = .commandNumber(3),
+        speechExportWAV: KeyboardShortcutPreference = .commandNumber(4),
+        speechExportM4A: KeyboardShortcutPreference = .commandNumber(5)
     ) {
         self.textMode = textMode
         self.imageMode = imageMode
         self.mediaMode = mediaMode
+        self.speechMode = speechMode
         self.translate = translate
         self.polish = polish
         self.summarize = summarize
@@ -999,12 +1051,18 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         self.ocrStructured = ocrStructured
         self.ocrExtractThenTranslate = ocrExtractThenTranslate
         self.ocrExplainImage = ocrExplainImage
+        self.speechGenerate = speechGenerate
+        self.speechVoicePreview = speechVoicePreview
+        self.speechPlayback = speechPlayback
+        self.speechExportWAV = speechExportWAV
+        self.speechExportM4A = speechExportM4A
     }
 
     private enum CodingKeys: String, CodingKey {
         case textMode
         case imageMode
         case mediaMode
+        case speechMode
         case translate
         case polish
         case summarize
@@ -1014,6 +1072,11 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         case ocrStructured
         case ocrExtractThenTranslate
         case ocrExplainImage
+        case speechGenerate
+        case speechVoicePreview
+        case speechPlayback
+        case speechExportWAV
+        case speechExportM4A
     }
 
     public init(from decoder: Decoder) throws {
@@ -1022,6 +1085,7 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         textMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .textMode) ?? defaults.textMode
         imageMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .imageMode) ?? defaults.imageMode
         mediaMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .mediaMode) ?? defaults.mediaMode
+        speechMode = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechMode) ?? defaults.speechMode
         translate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .translate) ?? defaults.translate
         polish = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .polish) ?? defaults.polish
         summarize = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .summarize) ?? defaults.summarize
@@ -1031,6 +1095,11 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
         ocrStructured = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrStructured) ?? defaults.ocrStructured
         ocrExtractThenTranslate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrExtractThenTranslate) ?? defaults.ocrExtractThenTranslate
         ocrExplainImage = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .ocrExplainImage) ?? defaults.ocrExplainImage
+        speechGenerate = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechGenerate) ?? defaults.speechGenerate
+        speechVoicePreview = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechVoicePreview) ?? defaults.speechVoicePreview
+        speechPlayback = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechPlayback) ?? defaults.speechPlayback
+        speechExportWAV = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechExportWAV) ?? defaults.speechExportWAV
+        speechExportM4A = try container.decodeIfPresent(KeyboardShortcutPreference.self, forKey: .speechExportM4A) ?? defaults.speechExportM4A
     }
 
     public func textTaskShortcut(for task: TaskKind) -> KeyboardShortcutPreference? {
@@ -1099,6 +1168,33 @@ public struct QuickActionPopupShortcuts: Codable, Sendable, Hashable {
 
     public func ocrMode(matching shortcut: KeyboardShortcutPreference) -> OCRMode? {
         OCRMode.allCases.first { ocrModeShortcut(for: $0) == shortcut }
+    }
+
+    public func speechActionShortcut(for action: QuickActionSpeechAction) -> KeyboardShortcutPreference {
+        switch action {
+        case .generate: return speechGenerate
+        case .voicePreview: return speechVoicePreview
+        case .playback: return speechPlayback
+        case .exportWAV: return speechExportWAV
+        case .exportM4A: return speechExportM4A
+        }
+    }
+
+    public mutating func setSpeechActionShortcut(
+        _ shortcut: KeyboardShortcutPreference,
+        for action: QuickActionSpeechAction
+    ) {
+        switch action {
+        case .generate: speechGenerate = shortcut
+        case .voicePreview: speechVoicePreview = shortcut
+        case .playback: speechPlayback = shortcut
+        case .exportWAV: speechExportWAV = shortcut
+        case .exportM4A: speechExportM4A = shortcut
+        }
+    }
+
+    public func speechAction(matching shortcut: KeyboardShortcutPreference) -> QuickActionSpeechAction? {
+        QuickActionSpeechAction.allCases.first { speechActionShortcut(for: $0) == shortcut }
     }
 }
 
@@ -1506,6 +1602,8 @@ public struct FastTranslationPreferences: Codable, Sendable, Hashable {
 public struct AppPreferences: Codable, Sendable, Hashable {
     public var defaultModelID: UUID?
     public var textTaskModelIDs: [TaskKind: UUID]
+    public var detailedTranslationEnabled: Bool
+    public var detailedTranslationModelID: UUID?
     public var autoCollapseWidget: Bool
     public var widgetVisibleOnAllSpaces: Bool
     public var launchAtLogin: Bool
@@ -1539,6 +1637,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public init(
         defaultModelID: UUID? = nil,
         textTaskModelIDs: [TaskKind: UUID] = [:],
+        detailedTranslationEnabled: Bool = false,
+        detailedTranslationModelID: UUID? = nil,
         autoCollapseWidget: Bool = true,
         widgetVisibleOnAllSpaces: Bool = true,
         launchAtLogin: Bool = false,
@@ -1573,6 +1673,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     ) {
         self.defaultModelID = defaultModelID
         self.textTaskModelIDs = textTaskModelIDs
+        self.detailedTranslationEnabled = detailedTranslationEnabled
+        self.detailedTranslationModelID = detailedTranslationModelID
         self.autoCollapseWidget = autoCollapseWidget
         self.widgetVisibleOnAllSpaces = widgetVisibleOnAllSpaces
         self.launchAtLogin = launchAtLogin
@@ -1607,6 +1709,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case defaultModelID
         case textTaskModelIDs
+        case detailedTranslationEnabled
+        case detailedTranslationModelID
         case autoCollapseWidget
         case widgetVisibleOnAllSpaces
         case launchAtLogin
@@ -1643,6 +1747,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         defaultModelID = try container.decodeIfPresent(UUID.self, forKey: .defaultModelID)
         textTaskModelIDs = try container.decodeIfPresent([TaskKind: UUID].self, forKey: .textTaskModelIDs) ?? [:]
+        detailedTranslationEnabled = try container.decodeIfPresent(Bool.self, forKey: .detailedTranslationEnabled) ?? false
+        detailedTranslationModelID = try container.decodeIfPresent(UUID.self, forKey: .detailedTranslationModelID)
         autoCollapseWidget = try container.decodeIfPresent(Bool.self, forKey: .autoCollapseWidget) ?? true
         widgetVisibleOnAllSpaces = try container.decodeIfPresent(Bool.self, forKey: .widgetVisibleOnAllSpaces) ?? true
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
@@ -1691,6 +1797,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         var container = encoder.container(keyedBy: CodingKeys.self)
         try container.encodeIfPresent(defaultModelID, forKey: .defaultModelID)
         try container.encode(textTaskModelIDs, forKey: .textTaskModelIDs)
+        try container.encode(detailedTranslationEnabled, forKey: .detailedTranslationEnabled)
+        try container.encodeIfPresent(detailedTranslationModelID, forKey: .detailedTranslationModelID)
         try container.encode(autoCollapseWidget, forKey: .autoCollapseWidget)
         try container.encode(widgetVisibleOnAllSpaces, forKey: .widgetVisibleOnAllSpaces)
         try container.encode(launchAtLogin, forKey: .launchAtLogin)
@@ -1815,6 +1923,7 @@ public struct TaskRequest: Sendable, Hashable {
     public var sourceLanguage: String?
     public var targetLanguage: String?
     public var translationQuality: WebPageTranslationQualityMode?
+    public var translationOutputMode: TranslationOutputMode
     public var polishStyle: String?
     public var summaryMode: SummaryMode?
     public var explanationMode: ExplanationMode?
@@ -1826,6 +1935,7 @@ public struct TaskRequest: Sendable, Hashable {
         sourceLanguage: String? = nil,
         targetLanguage: String? = nil,
         translationQuality: WebPageTranslationQualityMode? = nil,
+        translationOutputMode: TranslationOutputMode = .plain,
         polishStyle: String? = nil,
         summaryMode: SummaryMode? = nil,
         explanationMode: ExplanationMode? = nil,
@@ -1836,6 +1946,7 @@ public struct TaskRequest: Sendable, Hashable {
         self.sourceLanguage = sourceLanguage
         self.targetLanguage = targetLanguage
         self.translationQuality = translationQuality
+        self.translationOutputMode = translationOutputMode
         self.polishStyle = polishStyle
         self.summaryMode = summaryMode
         self.explanationMode = explanationMode
@@ -1849,12 +1960,21 @@ public struct TaskResult: Sendable, Hashable {
     public var modelName: String
     public var task: TaskKind
     public var sourceLanguage: String?
+    public var translationStudy: TranslationStudyResult?
 
-    public init(text: String, rawText: String? = nil, modelName: String, task: TaskKind, sourceLanguage: String? = nil) {
+    public init(
+        text: String,
+        rawText: String? = nil,
+        modelName: String,
+        task: TaskKind,
+        sourceLanguage: String? = nil,
+        translationStudy: TranslationStudyResult? = nil
+    ) {
         self.text = text
         self.rawText = rawText ?? text
         self.modelName = modelName
         self.task = task
         self.sourceLanguage = sourceLanguage
+        self.translationStudy = translationStudy
     }
 }

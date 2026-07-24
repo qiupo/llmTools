@@ -87,12 +87,12 @@ public actor AnthropicMessagesRunner: ModelRunner {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
 
         return TaskResult(
-            text: output.isEmpty ? rawOutput : output,
+            text: output,
             rawText: rawOutput,
             modelName: modelName ?? configuration.modelID,
             task: request.task

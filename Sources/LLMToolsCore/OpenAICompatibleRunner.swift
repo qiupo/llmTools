@@ -7,6 +7,7 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
     public private(set) var modelName: String?
 
     private var configuration: ProviderConfiguration?
+    private var thinkingModeEnabled = false
 
     public init() {}
 
@@ -51,6 +52,7 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
         configuration = loadedConfiguration
         modelID = descriptor.id
         modelName = descriptor.name
+        thinkingModeEnabled = descriptor.thinkingModeEnabled
         isLoaded = true
     }
 
@@ -75,7 +77,10 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
             ],
             temperature: 0,
             stream: false,
-            enableThinking: ProviderRequestOptions.enableThinking(for: configuration)
+            enableThinking: ProviderRequestOptions.enableThinking(
+                for: configuration,
+                requested: thinkingModeEnabled
+            )
         )
 
         let data = try await performJSONRequest(
@@ -93,12 +98,12 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
 
         return TaskResult(
-            text: output.isEmpty ? rawOutput : output,
+            text: output,
             rawText: rawOutput,
             modelName: modelName ?? configuration.modelID,
             task: request.task
@@ -138,7 +143,10 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
             ],
             temperature: 0,
             stream: false,
-            enableThinking: ProviderRequestOptions.enableThinking(for: configuration)
+            enableThinking: ProviderRequestOptions.enableThinking(
+                for: configuration,
+                requested: thinkingModeEnabled
+            )
         )
 
         let data = try await performJSONRequest(
@@ -157,14 +165,14 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let output = VisibleOutput.from(rawText: rawOutput)
-        guard !output.isEmpty || !rawOutput.isEmpty else {
+        guard !output.isEmpty else {
             throw RunnerError.emptyResult
         }
 
         return OCRTaskResult(
-            text: output.isEmpty ? rawOutput : output,
+            text: output,
             rawModelText: rawOutput,
-            structuredMarkdown: request.mode == .structured ? (output.isEmpty ? rawOutput : output) : nil,
+            structuredMarkdown: request.mode == .structured ? output : nil,
             modelName: modelName ?? configuration.modelID,
             warnings: []
         )
@@ -175,6 +183,7 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
         isLoaded = false
         modelID = nil
         modelName = nil
+        thinkingModeEnabled = false
     }
 
     private func performJSONRequest<Body: Encodable>(

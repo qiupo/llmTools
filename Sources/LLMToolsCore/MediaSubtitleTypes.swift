@@ -12,6 +12,7 @@ public enum SpeechModelFamily: String, Codable, Sendable, CaseIterable, Identifi
     case funASRMLTNano
     case senseVoiceSmall
     case qwen3ASR06B
+    case nemotron35ASRStreaming06B
     case qwen3ASRSherpaOnnx
     case vibeVoiceASR
     case whisperCppCoreML
@@ -29,6 +30,8 @@ public enum SpeechModelFamily: String, Codable, Sendable, CaseIterable, Identifi
             return "SenseVoiceSmall"
         case .qwen3ASR06B:
             return "Qwen3-ASR"
+        case .nemotron35ASRStreaming06B:
+            return "Nemotron 3.5 ASR Streaming"
         case .qwen3ASRSherpaOnnx:
             return "Qwen3-ASR (sherpa-onnx)"
         case .vibeVoiceASR:
@@ -221,6 +224,25 @@ public struct SpeechModelCapabilities: Codable, Hashable, Sendable {
         )
     }
 
+    public static func nemotron35ASRStreaming06B(
+        source: ModelCapabilitySource = .inferred,
+        confidence: Double = 0.9,
+        note: String? = "Nemotron 3.5 ASR Streaming 0.6B local Core ML model. Realtime subtitles retain encoder and decoder state across audio chunks on Apple Silicon."
+    ) -> SpeechModelCapabilities {
+        SpeechModelCapabilities(
+            family: .nemotron35ASRStreaming06B,
+            modes: [.realtime],
+            supportedLanguageHints: [
+                "auto", "zh", "yue", "en", "ja", "ko", "vi", "id", "th", "ms",
+                "fil", "ar", "hi", "de", "fr", "es", "pt", "it", "ru"
+            ],
+            requiresLocalSidecar: false,
+            source: source,
+            confidence: confidence,
+            note: note
+        )
+    }
+
     public static func qwen3ASRSherpaOnnx(
         source: ModelCapabilitySource = .inferred,
         confidence: Double = 0.82,
@@ -337,6 +359,7 @@ public enum ASRRuntimeSource: String, Codable, Sendable, Hashable {
     case sherpaOnnxAuto
     case sherpaOnnxQwen3Runner
     case whisperCppCoreMLRunner
+    case fluidAudioNemotronCoreML
     case funASRGGUFAuto
     case funASRTorchStreaming
     case funASRCompositePipeline
@@ -554,6 +577,8 @@ public struct MediaSubtitlePreferences: Codable, Equatable, Sendable, Hashable {
             if let command = Self.nonEmpty(qwen3ASRCommandTemplate) {
                 return command
             }
+        case .nemotron35ASRStreaming06B:
+            break
         case .qwen3ASRSherpaOnnx:
             break
         case .vibeVoiceASR:

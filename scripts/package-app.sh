@@ -81,6 +81,12 @@ cp "$ROOT_DIR/scripts/install-phase4x-pyannote-diarization.sh" "$RESOURCES_DIR/d
 chmod +x \
     "$RESOURCES_DIR/diarization/llmtools-pyannote-diarization-sidecar.py" \
     "$RESOURCES_DIR/diarization/install-phase4x-pyannote-diarization.sh"
+mkdir -p "$RESOURCES_DIR/tts"
+cp "$ROOT_DIR/scripts/llmtools-tts-sidecar.py" "$RESOURCES_DIR/tts/llmtools-tts-sidecar.py"
+cp "$ROOT_DIR/scripts/install-tts-voxcpm2-runtime.sh" "$RESOURCES_DIR/tts/install-tts-voxcpm2-runtime.sh"
+chmod +x \
+    "$RESOURCES_DIR/tts/llmtools-tts-sidecar.py" \
+    "$RESOURCES_DIR/tts/install-tts-voxcpm2-runtime.sh"
 if [ ! -f "$ROOT_DIR/Resources/$APP_ICON_NAME.icns" ]; then
     echo "error: missing app icon at Resources/$APP_ICON_NAME.icns; run ./scripts/generate-app-icon.sh first." >&2
     exit 1

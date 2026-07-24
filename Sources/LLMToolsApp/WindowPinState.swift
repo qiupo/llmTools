@@ -8,6 +8,10 @@ final class WindowPinState: ObservableObject {
 
     private weak var window: NSWindow?
 
+    init(isPinned: Bool = false) {
+        self.isPinned = isPinned
+    }
+
     func attach(to window: NSWindow) {
         self.window = window
         applyWindowLevel()

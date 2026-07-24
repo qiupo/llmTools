@@ -290,7 +290,7 @@ public struct LocalASRProcessRunner: Sendable {
                 family: speech.family,
                 status: .modelMissing,
                 isRealtimeCapable: speech.supports(.realtime),
-                isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+                isFileCapable: speech.supports(.fileOnly),
                 runtimeSource: .unavailable,
                 message: "ASR model path is missing: \(model.sourcePath.lastPathComponent)"
             )
@@ -302,7 +302,7 @@ public struct LocalASRProcessRunner: Sendable {
                 family: speech.family,
                 status: .ready,
                 isRealtimeCapable: speech.supports(.realtime),
-                isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+                isFileCapable: speech.supports(.fileOnly),
                 runtimeSource: .fixtureTranscript,
                 message: "Local ASR fixture transcript is configured for verification."
             )
@@ -320,6 +320,19 @@ public struct LocalASRProcessRunner: Sendable {
                     message: "\(model.name) is not marked realtime-capable."
                 )
             }
+            if speech.family == .nemotron35ASRStreaming06B,
+               ModelDetection.isNemotronStreamingCoreMLModel(at: model.resolvedPath ?? model.sourcePath) {
+                return ASRHealthReport(
+                    modelID: model.id,
+                    modelName: model.name,
+                    family: speech.family,
+                    status: .ready,
+                    isRealtimeCapable: true,
+                    isFileCapable: false,
+                    runtimeSource: .fluidAudioNemotronCoreML,
+                    message: "Local FluidAudio/Core ML Nemotron streaming session is available."
+                )
+            }
             if let streamingHealth = StreamingASRProcessSession.realtimeHealth(for: model, family: speech.family) {
                 return ASRHealthReport(
                     modelID: model.id,
@@ -327,7 +340,7 @@ public struct LocalASRProcessRunner: Sendable {
                     family: speech.family,
                     status: .ready,
                     isRealtimeCapable: true,
-                    isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+                    isFileCapable: speech.supports(.fileOnly),
                     runtimeSource: streamingHealth.source,
                     message: streamingHealth.message
                 )
@@ -338,7 +351,7 @@ public struct LocalASRProcessRunner: Sendable {
                 family: speech.family,
                 status: .runtimeMissing,
                 isRealtimeCapable: true,
-                isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+                isFileCapable: speech.supports(.fileOnly),
                 runtimeSource: .unavailable,
                 message: "Local streaming ASR sidecar is not available for \(model.name). \(runtimeMissingMessage(for: model, family: speech.family))"
             )
@@ -355,7 +368,7 @@ public struct LocalASRProcessRunner: Sendable {
                 family: speech.family,
                 status: .runtimeMissing,
                 isRealtimeCapable: speech.supports(.realtime),
-                isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+                isFileCapable: speech.supports(.fileOnly),
                 runtimeSource: .unavailable,
                 message: runtimeMissingMessage(for: model, family: speech.family)
             )
@@ -366,7 +379,7 @@ public struct LocalASRProcessRunner: Sendable {
             family: speech.family,
             status: .ready,
             isRealtimeCapable: speech.supports(.realtime),
-            isFileCapable: speech.supports(.fileOnly) || speech.supports(.realtime),
+            isFileCapable: speech.supports(.fileOnly),
             runtimeSource: resolution.source,
             message: resolution.readyMessage
         )
@@ -465,6 +478,8 @@ public struct LocalASRProcessRunner: Sendable {
                 return "sherpa-onnx Qwen3-ASR has been removed; use MLX Qwen3-ASR on Apple Silicon."
             case .whisperCppCoreMLRunner:
                 return "Local whisper.cpp Core ML runtime is available."
+            case .fluidAudioNemotronCoreML:
+                return "Local FluidAudio Nemotron Core ML streaming runtime is available."
             case .funASRGGUFAuto:
                 return "Local Fun-ASR llama.cpp/GGUF runtime is available."
             case .funASRTorchStreaming:
@@ -502,6 +517,8 @@ public struct LocalASRProcessRunner: Sendable {
             if let value = nonEmpty(env["LLMTOOLS_QWEN3_ASR_COMMAND"]) {
                 return ASRCommandResolution(template: value, source: .environmentCommand)
             }
+        case .nemotron35ASRStreaming06B:
+            break
         case .qwen3ASRSherpaOnnx:
             return nil
         case .vibeVoiceASR:
@@ -806,7 +823,7 @@ public struct LocalASRProcessRunner: Sendable {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "LLMTOOLS_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
@@ -823,7 +840,7 @@ public struct LocalASRProcessRunner: Sendable {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR:
             return "venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
@@ -843,6 +860,8 @@ public struct LocalASRProcessRunner: Sendable {
             moduleName = "sensevoice"
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
+        case .nemotron35ASRStreaming06B:
+            return false
         case .qwen3ASRSherpaOnnx:
             return false
         case .vibeVoiceASR:
@@ -913,6 +932,9 @@ public struct LocalASRProcessRunner: Sendable {
         }
         if family == .qwen3ASR06B {
             parts.append("Official Qwen3-ASR streaming requires the local vLLM backend; configure a vLLM/streaming sidecar for realtime use or use it for file transcription.")
+        }
+        if family == .nemotron35ASRStreaming06B {
+            parts.append("Nemotron 3.5 ASR Streaming requires multilingual FluidAudio Core ML assets on Apple Silicon: metadata.json, tokenizer.json, encoder.mlmodelc, and a decoder/joint bundle.")
         }
         if family == .qwen3ASRSherpaOnnx {
             parts.append("The sherpa-onnx Qwen3-ASR backend has been removed because MLX Qwen3-ASR is faster on Apple Silicon.")
@@ -1237,7 +1259,7 @@ private struct ASRSidecarSegment: Decodable {
     }
 }
 
-public final class StreamingASRProcessSession: @unchecked Sendable {
+public final class StreamingASRProcessSession: @unchecked Sendable, RealtimeASRSession {
     private let model: ModelDescriptor
     private let process: Process
     private let inputHandle: FileHandle
@@ -1336,6 +1358,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return (.funASRTorchStreaming, "Official persistent Fun-ASR-Nano Torch/MPS streaming sidecar is available.")
         case .funASRNano, .funASRMLTNano, .senseVoiceSmall, .qwen3ASR06B:
             return (.mlxAudioRunner, "Local persistent MLX ASR streaming sidecar is available.")
+        case .nemotron35ASRStreaming06B:
+            return nil
         case .qwen3ASRSherpaOnnx:
             return nil
         case .vibeVoiceASR:
@@ -1568,6 +1592,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
                 return nil
             }
             return SidecarResolution(pythonPath: pythonPath, sidecarPath: sidecarPath)
+        case .nemotron35ASRStreaming06B:
+            return nil
         case .qwen3ASRSherpaOnnx:
             return nil
         case .vibeVoiceASR:
@@ -1713,7 +1739,7 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "LLMTOOLS_FUN_ASR_NANO_VENV"
         case .senseVoiceSmall:
             return "LLMTOOLS_SENSEVOICE_ASR_VENV"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
             return "LLMTOOLS_ASR_VENV"
         case .whisperCppCoreML:
             return "LLMTOOLS_WHISPER_CPP_ROOT"
@@ -1728,7 +1754,7 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             return "funasr-nano-venv"
         case .senseVoiceSmall:
             return "sensevoice-venv"
-        case .qwen3ASR06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
+        case .qwen3ASR06B, .nemotron35ASRStreaming06B, .qwen3ASRSherpaOnnx, .vibeVoiceASR, .customLocal:
             return "venv"
         case .whisperCppCoreML:
             return "whisper-cpp"
@@ -1746,6 +1772,8 @@ public final class StreamingASRProcessSession: @unchecked Sendable {
             moduleName = "sensevoice"
         case .qwen3ASR06B:
             moduleName = "qwen3_asr"
+        case .nemotron35ASRStreaming06B:
+            return false
         case .qwen3ASRSherpaOnnx:
             return false
         case .vibeVoiceASR:

@@ -7,14 +7,14 @@
 
 Languages: English | [简体中文](README.zh-CN.md)
 
-llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, running model-vision OCR, creating local media subtitles, and transcribing meetings. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
+llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, running model-vision OCR, creating local media subtitles, transcribing meetings, and generating local speech. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
 
 Latest release: [v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
 
 ## Highlights
 
-- Native macOS SwiftUI/AppKit app with global quick-action shortcuts.
-- Selected-text workflows for translation, writing polish, summaries, explanations, and TODO extraction.
+- Native macOS SwiftUI/AppKit app with Text, Image, Media, and Speech Quick Action modes plus configurable shortcuts.
+- Selected-text workflows for translation, writing polish, summaries, explanations, and TODO extraction. Quick Action translation also provides alternatives, key vocabulary, pronunciation, usage, examples, and local read-aloud controls.
 - Local model support for GGUF, MLX text models, and MLX vision-language model folders supported by MLX Swift LM.
 - Remote provider support for OpenAI-compatible endpoints and Anthropic Messages API.
 - Chromium webpage translation via Manifest V3 extension plus local native messaging host.
@@ -22,6 +22,7 @@ Latest release: [v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
 - Local media subtitles and desktop live captions with separate realtime/file ASR selection, translation, and SRT/VTT/TXT/Markdown export.
 - Local language routing, file-scope speaker diarization, fast MT routing, and engine-isolated webpage translation cache.
 - A separate local-only Meeting Transcription & Notes window for microphone, system audio, and offline audio/video input, with editable transcript rows, speaker correction, Chinese notes, recovery drafts, and Markdown/TXT/JSON export.
+- Local-only Text to Speech powered by VoxCPM2 bf16/4bit: Quick Action provides direct text, voice, delivery-style, preview, playback, and WAV/M4A export controls, while the separate workbench keeps reviewed multi-role scripts, resumable generation, and SRT export.
 - Pin controls for Quick Action, selection actions, the floating widget, Live Subtitles, and Meeting Transcription windows.
 - Capability-aware model settings with text-only, vision-capable, inferred, probed, and manual override states.
 - Privacy-oriented webpage diagnostics: hashed page/domain identifiers, no raw page text in diagnostics by default.
@@ -37,13 +38,15 @@ Meeting transcription is independent from the low-latency Live Subtitles overlay
 
 | Feature | Entry | How to use it |
 | --- | --- | --- |
-| Selected-text Quick Action | Select text in another app, then press `Option + Space` | Choose Translate, Polish, Summarize, Explain, or Extract TODOs. Grant Accessibility permission if automatic selection capture is needed. |
+| Selected-text Quick Action | Select text in another app, then press `Option + Space` | Choose Translate, Polish, Summarize, Explain, or Extract TODOs. Detailed translation prefers an enabled local quality model and includes alternatives, key vocabulary, and language notes. Source, translation, and key terms share the solidified `温柔女旁白` VoxCPM2 voice; clicking another read-aloud item cancels and replaces the active request. Grant Accessibility permission if automatic selection capture is needed. |
 | Pasted text and files | Status menu -> `Open Quick Action` or `Open Floating Widget` | Paste text, paste an image, or drag a supported file, choose a task/model, then copy or export the result. |
+| Quick speech generation | Quick Action -> `Speech` | Enter text, choose a voice and delivery style, preview the selected voice, generate local speech, then play or export WAV/M4A. |
 | Image OCR and explanation | Status menu -> `Image OCR` | In Settings -> `OCR`, select a vision-capable local or remote model, then paste, drag, or choose an image and run OCR, structured extraction, translation, or explanation. |
 | Webpage translation | Settings -> `Web Page Translation`, then the Chromium extension popup | Repair the local browser bridge, load `browser-extension/chromium` as an unpacked extension, grant site access, and translate/restore the current page from the popup. |
 | Media subtitles | Settings -> `Media`, then the media intake UI | Select a local file ASR model and healthy runtime, import audio/video, transcribe and optionally translate, then export SRT, VTT, TXT, or Markdown. |
 | Desktop Live Subtitles | Status menu -> `Start Live Subtitles`, or the configured global shortcut | Select a realtime local ASR model in Settings -> `Media`, choose microphone, system audio, or both, then read the native floating overlay. |
 | Meeting Transcription & Notes | Status menu -> `会议转写与纪要` | Configure local meeting models in Settings -> `Meeting`, start microphone/system capture or import a local audio/video file, edit transcript/speakers, stop, optionally finalize, generate local Chinese notes, and export. |
+| Local Text to Speech | Status menu -> `文案转语音` | Enter ordinary or long-form copy and optionally review a multi-role script. Use the separate voice manager to design or clone, solidify, and preview voices, then generate, pause/resume playback, and export WAV/M4A/SRT. |
 | Window pinning | Pin icon in a supported tool window | Keep Quick Action, selection actions, the floating widget, Live Subtitles, or Meeting Transcription above other windows until unpinned or the app exits. |
 
 ## Requirements
@@ -56,6 +59,7 @@ Meeting transcription is independent from the low-latency Live Subtitles overlay
 | Browser translation | Google Chrome or Microsoft Edge with Developer Mode enabled |
 | Local MLX models | `mlx.metallib` copied into the packaged app, or `MLX_METALLIB_PATH` during packaging |
 | Local MLX ASR setup | `uv`, Python 3.11 or 3.12, and a compatible local speech model |
+| Local VoxCPM2 TTS setup | `uv`, Python 3.11 or 3.12, `mlx-audio==0.4.5`, and VoxCPM2 bf16 or 4bit weights |
 | Selected-text capture | macOS Accessibility permission for llmTools |
 | Live audio capture | macOS Microphone permission and/or ScreenCaptureKit screen/system-audio permission |
 
@@ -126,6 +130,10 @@ Local MLX vision-language model folders must include MLX-compatible weights, tok
 | --- | --- |
 | `Option + Space` | Open Quick Action and try to capture the current selected text |
 | `Option + Shift + Space` | Open Quick Action with an empty input area |
+| `Control + Command + 1/2/3/4` | Switch Quick Action to Text/Image/Media/Speech mode |
+| `Command + 1...5` in Speech mode | Generate, preview voice, play generated speech, export WAV, or export M4A |
+
+Quick Action mode and contextual action shortcuts can be changed under Settings -> `Shortcuts`. `Command + Return` is also available as a fixed generate/stop alias in Speech mode.
 
 Selected-text capture depends on macOS Accessibility permission and the behavior of the focused app. If capture fails, paste text manually or grant permission in System Settings.
 
@@ -258,6 +266,8 @@ Privacy defaults stay restrictive: raw audio, full transcripts, translated subti
 | Install official FunASR Nano + CAM++ offline pipeline | `./scripts/install-phase4-funasr-pipeline-runtime.sh` |
 | Phase 4 real media pipeline smoke | `swift run LLMToolsMediaSmoke --output-dir dist/phase4-media-smoke` |
 | Phase 4.y meeting file smoke | `swift run LLMToolsMeetingSmoke --input /absolute/path/to/audio-or-video --output-dir dist/meeting-smoke` |
+| Install isolated VoxCPM2 TTS runtime | `LLMTOOLS_TTS_DOWNLOAD_MODEL=0 ./scripts/install-tts-voxcpm2-runtime.sh` |
+| Real VoxCPM2 TTS smoke | `swift run LLMToolsTTSSmoke --variant voxCPM2FourBit --output /tmp/llmtools-tts.wav` |
 | Package app | `./scripts/package-app.sh` |
 | Verify packaged code signature | `codesign --verify --deep --strict --verbose=2 dist/llmTools.app` |
 | Live OCR provider check | `swift run LLMToolsLiveOCRCheck` |
@@ -330,6 +340,7 @@ Sources/
   LLMToolsNativeHost/   Chromium native messaging host
   LLMToolsChecks/       fast regression checks
   LLMToolsMeetingSmoke/ local meeting-file pipeline smoke executable
+  LLMToolsTTSSmoke/     local VoxCPM2 and role-analysis smoke executable
 browser-extension/
   chromium/             Manifest V3 extension for webpage translation
 scripts/                packaging, diagnostics, browser checks, acceptance helpers
@@ -345,6 +356,7 @@ Resources/              app icon assets
 - [Phase 3 native task and OCR PRD](docs/phase-3-native-task-and-ocr-prd.md)
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
+- [Local VoxCPM2 TTS V1 PRD](docs/local-tts-voxcpm2-v1-prd.md)
 - [v0.4.1 release notes and usage](docs/releases/v0.4.1.md)
 - [v0.4.0 release notes and usage](docs/releases/v0.4.0.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)
