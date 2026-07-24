@@ -947,6 +947,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             }
             .store(in: &cancellables)
 
+        appState.$statusModelName
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.refreshStatusMenuItem()
+            }
+            .store(in: &cancellables)
+
         appState.$appLiveSubtitleRunState
             .dropFirst()
             .sink { [weak self] state in

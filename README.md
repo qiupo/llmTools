@@ -9,7 +9,7 @@ Languages: English | [简体中文](README.zh-CN.md)
 
 llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, running model-vision OCR, creating local media subtitles, transcribing meetings, and generating local speech. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
 
-Latest release: [v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
+Latest release: [v0.5.0](https://github.com/qiupo/llmTools/releases/tag/v0.5.0)
 
 ## Highlights
 
@@ -30,9 +30,9 @@ Latest release: [v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
 
 ## Status
 
-llmTools is under active development. The current `v0.4.1` release includes the desktop Quick Action flow, per-task text model defaults, hardened local/remote model configuration, local model-vision OCR, Chromium webpage translation, media subtitles, native desktop live captions, the official FunASR Nano + CAM++ offline speaker pipeline, local language/fast-MT routing, file speaker diarization, and local-only meeting transcription and notes.
+llmTools is under active development. The current `v0.5.0` release adds local VoxCPM2 speech generation, reviewed multi-role TTS projects, Nemotron streaming ASR, detailed translation results, dedicated GLM-OCR recognition with optional text post-processing, and stronger model lifecycle safeguards on top of the existing text, webpage, subtitle, live-caption, and meeting workflows.
 
-Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.4.1. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
+Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.5.0. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
 
 ## Features And Usage
 
@@ -245,7 +245,7 @@ Use the meeting workflow as follows:
 5. Stop capture. Use `Finalize` when transcript cleanup is wanted, `Generate Notes` to create local Chinese meeting notes, and `Export` to write Markdown, TXT, or JSON to Downloads. These are separate, cancellable actions.
 6. If the app exits abnormally during an active session, restore or delete the local recovery draft at the next launch. Recovery drafts keep transcript/speaker edits but do not retain temporary audio by default.
 
-Meeting capture intentionally does not mix microphone and system audio in v0.4.1. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
+Meeting capture intentionally does not mix microphone and system audio in v0.5.0. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
 
 Privacy defaults stay restrictive: raw audio, full transcripts, translated subtitles, page titles, full URLs, and full media paths are not written to diagnostics or history by default. Meeting workspaces are owner-only, unused per-callback PCM chunks are not persisted, and temporary normalized audio is deleted after ASR processing.
 
@@ -311,11 +311,11 @@ GitHub Actions release packaging lives in `.github/workflows/release.yml`.
 Trigger a release by pushing a version tag:
 
 ```sh
-git tag v0.4.1
-git push origin v0.4.1
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.4.1`.
+The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.5.0`.
 
 The workflow:
 
@@ -357,6 +357,7 @@ Resources/              app icon assets
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
 - [Local VoxCPM2 TTS V1 PRD](docs/local-tts-voxcpm2-v1-prd.md)
+- [v0.5.0 release notes and usage](docs/releases/v0.5.0.md)
 - [v0.4.1 release notes and usage](docs/releases/v0.4.1.md)
 - [v0.4.0 release notes and usage](docs/releases/v0.4.0.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)

@@ -56,6 +56,7 @@ struct LLMToolsChecks {
         try await checkManualVisionOverrideForLocalModel()
         try await checkTextOnlyModelRejectsOCRBeforeRunnerCall()
         try await checkStubVisionOCRAndHistoryRedaction()
+        try await checkDedicatedOCRTextProcessingPipeline()
         try checkBrowserIntegrationStateDecodesWithoutExtensionChannel()
         try checkBrowserNativeMessagingManifestDiagnostics()
         try await checkTaskEngineReturnsRawModelOutput()
@@ -981,6 +982,7 @@ struct LLMToolsChecks {
         try require(preferences.webPageTranslation.enabled, "Expected webpage translation to default on.")
         try require(preferences.webPageTranslation.defaultTargetLanguage == "zh-Hans", "Expected webpage translation target to default to Simplified Chinese.")
         try require(preferences.webPageTranslation.modelID == nil, "Expected webpage translation model to follow the default model.")
+        try require(preferences.ocr.postProcessingModelID == nil, "Expected older OCR preferences to follow the default text model.")
         try require(preferences.webPageTranslation.pendingIndicatorStyle == .loading, "Expected webpage pending indicator to default to loading.")
         try require(preferences.webPageTranslation.autoTranslateDomains.isEmpty, "Expected webpage auto-translate domains to default empty.")
         try require(preferences.webPageTranslation.disabledDomains.isEmpty, "Expected webpage disabled domains to default empty.")
@@ -3245,6 +3247,7 @@ struct LLMToolsChecks {
         """.utf8))
         try require(preferences.ocr.enabled, "Expected OCR preferences to default enabled.")
         try require(preferences.ocr.modelID == nil, "Expected OCR model to default empty.")
+        try require(preferences.ocr.postProcessingModelID == nil, "Expected older OCR preferences to follow the text default model.")
         try require(preferences.ocr.defaultMode == .plainText, "Expected OCR mode to default to plain text.")
         try require(!preferences.ocr.persistHistory, "Expected OCR history to default off.")
         try require(!preferences.ocr.useModelRecognitionByDefault, "Expected model recognition default to stay explicit.")
@@ -3308,13 +3311,45 @@ struct LLMToolsChecks {
         try require(glmPrompt == "Text Recognition:", "GLM-OCR must receive its dedicated text-recognition prompt.")
         try require(PromptTemplates.ocrPrompt(mode: .structured, dedicatedOCR: true) == "Text Recognition:", "GLM-OCR structured OCR must retain its dedicated prompt.")
         try require(PromptTemplates.glmOCRPrompt(mode: .explainImage).isEmpty, "GLM-OCR must not advertise generic image explanation mode.")
+
+        var customPreferences = AppPreferences()
+        customPreferences.promptTemplates.ocrPlainTextPrompt = "Generic custom vision prompt"
+        try require(
+            PromptTemplates.ocrPrompt(mode: .plainText, preferences: customPreferences, dedicatedOCR: true) == "Text Recognition:",
+            "GLM-OCR must retain its required recognition protocol even when a generic OCR prompt is configured."
+        )
+        let structuredPostProcessing = PromptTemplates.glmOCRTextPostProcessingPrompt(
+            mode: .structured,
+            recognizedText: "Title\\nValue: 42"
+        )
+        try require(structuredPostProcessing.contains("faithful Markdown"), "Expected GLM-OCR structured mode to use text post-processing.")
+        try require(structuredPostProcessing.contains("Value: 42"), "Expected structured post-processing to include recognized text.")
+        let explanationPostProcessing = PromptTemplates.glmOCRTextPostProcessingPrompt(
+            mode: .explainImage,
+            recognizedText: "Error 404",
+            targetLanguage: "zh-Hans"
+        )
+        try require(explanationPostProcessing.contains("Simplified Chinese"), "Expected GLM-OCR explanation to honor the target language.")
+        try require(explanationPostProcessing.contains("Do not guess colors"), "Expected GLM-OCR explanation to forbid unsupported visual guesses.")
     }
 
     private static func checkLocalGenerationTokenLimits() throws {
         try require(
             LocalGenerationPolicy.maxTokens(for: .translate, thinkingModeEnabled: true)
-                == LocalGenerationPolicy.maxTokens(for: .translate) * 2,
-            "Expected thinking mode to reserve additional local generation tokens for the final answer."
+                == LocalGenerationPolicy.maximumThinkingTokens,
+            "Expected thinking mode to use a bounded first-pass budget before the non-thinking retry."
+        )
+        try require(
+            LocalGenerationPolicy.shouldRetryThinkingGeneration(visibleOutput: "partial answer", reachedTokenLimit: true),
+            "Expected a token-limited thinking pass to retry even after producing partial visible text."
+        )
+        try require(
+            LocalGenerationPolicy.shouldRetryThinkingGeneration(visibleOutput: "", reachedTokenLimit: false),
+            "Expected a thinking-only pass to retry."
+        )
+        try require(
+            !LocalGenerationPolicy.shouldRetryThinkingGeneration(visibleOutput: "complete answer", reachedTokenLimit: false),
+            "Expected a completed thinking pass with visible text to stay accepted."
         )
         try require(
             LocalGenerationPolicy.maxTokens(for: OCRMode.structured) > 0,
@@ -3535,6 +3570,200 @@ struct LLMToolsChecks {
         try require(history.first?.task == .ocr, "Expected OCR history task.")
         try require(history.first?.inputPreview.contains("data:") == false, "OCR history must not contain base64 data URLs.")
         try require(history.first?.inputPreview.contains("Probe image") == true, "OCR history should use a redacted image descriptor.")
+
+        _ = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured,
+            modelID: descriptor.id,
+            persistHistory: false
+        )
+        _ = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .explainImage,
+            modelID: descriptor.id,
+            persistHistory: false
+        )
+        let directOCRRequests = await runner.recordedOCRRequests()
+        try require(directOCRRequests.map(\.mode) == [.plainText, .structured, .explainImage], "Expected a general vision model to handle OCR modes directly.")
+        let directTextRequests = await runner.recordedRequests()
+        try require(directTextRequests.isEmpty, "General vision structured and explanation modes must not invoke an extra text stage.")
+    }
+
+    private static func checkDedicatedOCRTextProcessingPipeline() async throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let defaultTextRunner = StubRunner(output: "WRONG DEFAULT MODEL")
+        let postProcessingRunner = StubRunner(
+            outputs: ["# Title\n\nValue: 42", "这是一个 404 错误。", "标题\n数值：42"],
+            format: .gguf
+        )
+        let visionRunner = StubVisionRunner(output: "Title\nValue: 42")
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: defaultTextRunner, .gguf: postProcessingRunner, .openAICompatible: visionRunner]
+        )
+        let defaultTextModel = try await engine.addModel(from: try makeMLXModelDirectory(root: root, name: "Qwen3.5-0.8B-MLX-8bit"))
+        let postProcessingModel = ModelDescriptor(
+            name: "OCR post-processing model",
+            sourcePath: root.appendingPathComponent("ocr-post-processing.gguf"),
+            format: .gguf,
+            sizeClass: "1b",
+            role: .fast,
+            contextLength: 8_192,
+            validationState: .valid,
+            capabilities: .textOnly(source: .detected)
+        )
+        try await engine.addModelDescriptorForTesting(postProcessingModel)
+        let glmDirectory = root.appendingPathComponent("GLM-OCR-4bit", isDirectory: true)
+        try FileManager.default.createDirectory(at: glmDirectory, withIntermediateDirectories: true)
+        try Data(#"{"model_type":"glm_ocr"}"#.utf8).write(to: glmDirectory.appendingPathComponent("config.json"))
+        let glmModel = ModelDescriptor(
+            name: "GLM-OCR-4bit",
+            sourcePath: glmDirectory,
+            resolvedPath: glmDirectory,
+            format: .openAICompatible,
+            sizeClass: "0.9b",
+            role: .fast,
+            contextLength: 131_072,
+            validationState: .valid,
+            capabilities: .ocrOnly(source: .detected, confidence: 1)
+        )
+        try await engine.addModelDescriptorForTesting(glmModel)
+        try await engine.updatePreferences { preferences in
+            preferences.defaultModelID = defaultTextModel.id
+            preferences.ocr.modelID = glmModel.id
+            preferences.ocr.postProcessingModelID = postProcessingModel.id
+            preferences.ocr.persistHistory = false
+            preferences.fastTranslation.forceLLM = true
+        }
+        let persistedPreferences = try JSONDecoder().decode(
+            AppPreferences.self,
+            from: JSONEncoder().encode(await engine.registry().preferences)
+        )
+        try require(
+            persistedPreferences.ocr.postProcessingModelID == postProcessingModel.id,
+            "Expected the OCR post-processing model to survive preference round-trip."
+        )
+
+        let plain = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .plainText,
+            persistHistory: false
+        )
+        try require(plain.text == "Title\nValue: 42", "Expected dedicated OCR plain mode to return recognition directly.")
+        let plainTextRequestCount = await postProcessingRunner.generatedRequestCount()
+        try require(plainTextRequestCount == 0, "Dedicated OCR plain mode must not invoke the text model.")
+
+        let structured = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured,
+            persistHistory: true
+        )
+        try require(structured.text.hasPrefix("# Title"), "Expected dedicated OCR structured mode to return text-model Markdown.")
+        try require(structured.modelName == "Vision Stub -> Stub", "Expected dedicated OCR result to expose both model stages.")
+        try require(structured.rawText.contains("OCR raw output:"), "Expected dedicated OCR result to retain raw recognition output.")
+        try require(structured.rawText.contains("Text processing raw output:"), "Expected dedicated OCR result to retain raw post-processing output.")
+
+        let explanation = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .explainImage,
+            persistHistory: false
+        )
+        try require(explanation.text == "这是一个 404 错误。", "Expected dedicated OCR explanation to come from the text model.")
+
+        let translation = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .extractThenTranslate,
+            persistHistory: false
+        )
+        try require(translation.text == "标题\n数值：42", "Expected dedicated OCR translation to use the existing text translation route.")
+
+        let visionRequests = await visionRunner.recordedOCRRequests()
+        try require(
+            visionRequests.map(\.mode) == [.plainText, .structured, .plainText, .plainText],
+            "Expected GLM-OCR to receive structured recognition only for structured mode and plain recognition otherwise."
+        )
+        try require(visionRequests.allSatisfy { $0.prompt == "Text Recognition:" }, "Expected every GLM-OCR request to use its dedicated protocol.")
+
+        let textRequests = await postProcessingRunner.recordedRequests()
+        try require(textRequests.map(\.task) == [.ocr, .ocr, .translate], "Expected GLM-OCR modes to route through the correct text tasks.")
+        try require(textRequests[0].inputText.contains("faithful Markdown"), "Expected structured mode to request faithful Markdown.")
+        try require(textRequests[1].inputText.contains("Do not guess colors"), "Expected explanation mode to forbid unsupported visual guesses.")
+        let defaultTextRequests = await defaultTextRunner.recordedRequests()
+        try require(defaultTextRequests.isEmpty, "Configured OCR post-processing must not fall back to the global text default model.")
+        let history = await engine.recentHistory()
+        try require(history.count == 1, "Expected one combined history entry for the two-stage OCR request.")
+        try require(history.first?.modelName == structured.modelName, "Expected OCR history to record the full model chain.")
+
+        let longStructuredText = String(
+            repeating: "文",
+            count: LocalGenerationPolicy.maximumStructuredOCRPostProcessingCharacters + 1
+        )
+        await visionRunner.setOutput(longStructuredText)
+        let postProcessingCountBeforeLongDocument = await postProcessingRunner.generatedRequestCount()
+        let longStructured = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured,
+            persistHistory: false
+        )
+        try require(longStructured.text == longStructuredText, "Long structured OCR must preserve the dedicated model output without truncating it in a second stage.")
+        let postProcessingCountAfterLongDocument = await postProcessingRunner.generatedRequestCount()
+        try require(
+            postProcessingCountAfterLongDocument == postProcessingCountBeforeLongDocument,
+            "Long structured OCR must skip bounded text post-processing."
+        )
+        await visionRunner.setOutput("Title\nValue: 42")
+
+        try await engine.removeModel(id: postProcessingModel.id)
+        let cleanedPreference = await engine.registry().preferences.ocr.postProcessingModelID
+        try require(cleanedPreference == nil, "Removing the OCR post-processing model must restore text-default fallback.")
+
+        let defaultProcessed = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured,
+            persistHistory: false
+        )
+        try require(defaultProcessed.text == "WRONG DEFAULT MODEL", "Unset OCR post-processing must use the text default model.")
+
+        try await engine.removeModel(id: defaultTextModel.id)
+        let structuredWithoutTextModel = try await engine.runOCR(
+            image: OCRImagePreprocessor.probeImage,
+            mode: .structured,
+            persistHistory: false
+        )
+        try require(
+            structuredWithoutTextModel.text == "Title\nValue: 42",
+            "Dedicated structured OCR must remain usable without a text model."
+        )
+        do {
+            _ = try await engine.runOCR(
+                image: OCRImagePreprocessor.probeImage,
+                mode: .explainImage,
+                persistHistory: false
+            )
+            throw CheckError("Expected dedicated OCR explanation to require a text model.")
+        } catch let error as OCRTaskError {
+            try require(error == .missingPostProcessingModel, "Expected a specific missing OCR post-processing model error.")
+        }
+
+        let replacementModel = ModelDescriptor(
+            name: "Replacement vision model",
+            sourcePath: root.appendingPathComponent("replacement-vision"),
+            format: .openAICompatible,
+            sizeClass: "remote",
+            role: .default,
+            contextLength: 8_192,
+            capabilities: .vision(source: .manual, confidence: 1)
+        )
+        try await visionRunner.load(model: replacementModel)
+        await visionRunner.unloadIfLoaded(modelID: glmModel.id)
+        let remainingVisionModelID = await visionRunner.loadedModelID()
+        try require(
+            remainingVisionModelID == replacementModel.id,
+            "An older OCR request must not unload a newer model from the shared vision runner."
+        )
     }
 
     private static func checkBrowserIntegrationStateDecodesWithoutExtensionChannel() throws {
@@ -4592,6 +4821,35 @@ struct LLMToolsChecks {
         try require(parsed.keyTerms.first?.term == "turning point", "Expected key term to decode.")
         try require(parsed.keyTerms.first?.exampleTranslation == "这个决定是一个转折点。", "Expected translated example to decode.")
 
+        // MiniCPM 偶尔会把 alternatives 错写成词条对象；可选字段异常不能拖垮整份详解结果。
+        let malformedAlternatives = try requireNonNil(
+            TranslationStudyResult.parse(modelText: """
+            ```json
+            {
+              "translation": "精度与召回率之间需要权衡。",
+              "alternatives": [
+                {
+                  "term": "precision vs recall trade-off",
+                  "meaning": "精度与召回率之间的权衡"
+                }
+              ],
+              "keyTerms": [
+                {
+                  "term": "false positive",
+                  "meaning": "假阳性"
+                }
+              ],
+              "notes": ["这是影响分析中的常用表达。"]
+            }
+            ```
+            """),
+            "Expected malformed optional alternatives to preserve the detailed translation."
+        )
+        try require(malformedAlternatives.translation == "精度与召回率之间需要权衡。", "Expected the valid primary translation to survive malformed alternatives.")
+        try require(malformedAlternatives.alternatives.isEmpty, "Expected object-valued alternatives to be ignored.")
+        try require(malformedAlternatives.keyTerms.first?.term == "false positive", "Expected valid key terms to remain available.")
+        try require(malformedAlternatives.notes == ["这是影响分析中的常用表达。"], "Expected valid notes to remain available.")
+
         let thinkingOnly = """
         Thinking Process:
         The requested schema is {"translation":"placeholder","alternatives":[],"keyTerms":[],"notes":[]}.
@@ -5041,6 +5299,7 @@ private actor StubVisionRunner: VisionModelRunner {
     private var output: String
     private var ocrCount = 0
     private var requests: [TaskRequest] = []
+    private var ocrRequests: [OCRTaskRequest] = []
 
     init(output: String = "OCR stub result") {
         self.output = output
@@ -5073,6 +5332,7 @@ private actor StubVisionRunner: VisionModelRunner {
 
     func generateOCR(request: OCRTaskRequest, preferences: AppPreferences) async throws -> OCRTaskResult {
         ocrCount += 1
+        ocrRequests.append(request)
         return OCRTaskResult(
             text: output,
             rawModelText: output,
@@ -5091,6 +5351,14 @@ private actor StubVisionRunner: VisionModelRunner {
 
     func recordedRequests() -> [TaskRequest] {
         requests
+    }
+
+    func recordedOCRRequests() -> [OCRTaskRequest] {
+        ocrRequests
+    }
+
+    func setOutput(_ output: String) {
+        self.output = output
     }
 }
 

@@ -9,7 +9,7 @@
 
 llmTools 是一个原生 macOS 菜单栏助手，用于对选中文本、网页、图片、音视频和桌面音频执行翻译、润色、总结、解释、TODO 提取、模型视觉 OCR、字幕、会议转写和本地语音生成。它支持本地模型、远程 LLM Provider，并提供一个开发通道的 Chromium 扩展，通过本地 native bridge 翻译网页。
 
-最新版本：[v0.4.1](https://github.com/qiupo/llmTools/releases/tag/v0.4.1)
+最新版本：[v0.5.0](https://github.com/qiupo/llmTools/releases/tag/v0.5.0)
 
 ## 功能亮点
 
@@ -30,9 +30,9 @@ llmTools 是一个原生 macOS 菜单栏助手，用于对选中文本、网页�
 
 ## 当前状态
 
-llmTools 仍在持续开发中。当前 `v0.4.1` 版本已经包含桌面 Quick Action、按文本任务选择默认模型、强化后的本地/远程模型配置、本地模型视觉 OCR、Chromium 网页翻译、媒体字幕、原生桌面实时字幕、官方 FunASR Nano + CAM++ 离线说话人管线、本地语言/fast-MT 路由、文件说话人分离，以及全本地会议转写与纪要。
+llmTools 仍在持续开发中。当前 `v0.5.0` 版本在既有文本、网页、字幕、实时字幕和会议工作流上，新增全本地 VoxCPM2 语音生成、可审阅的多角色 TTS 项目、Nemotron 流式 ASR、翻译详解、GLM-OCR 专用识别与可选文字后处理，并强化模型生命周期管理。
 
-会议转写与低延迟实时字幕是两条独立管线。实时会议支持麦克风或原生系统音频，本地音视频文件走离线处理；`v0.4.1` 不包含麦克风与系统音频混合的会议采集。实时字幕的说话人分离仍然硬禁用：当前 MVP 不持久化 speaker embedding，也不做跨文件说话人身份识别。
+会议转写与低延迟实时字幕是两条独立管线。实时会议支持麦克风或原生系统音频，本地音视频文件走离线处理；`v0.5.0` 不包含麦克风与系统音频混合的会议采集。实时字幕的说话人分离仍然硬禁用：当前 MVP 不持久化 speaker embedding，也不做跨文件说话人身份识别。
 
 Chromium 网页翻译目前仍是开发通道功能：Chrome 和 Edge 可以加载 unpacked extension，但 Chrome Web Store 分发和生产扩展 ID 暂时有意后置。
 
@@ -247,7 +247,7 @@ node scripts/check-phase4-local-asr-runtime.mjs
 5. 停止采集后，根据需要分别执行“最终整理”“生成纪要”和“导出”。三个动作互相独立且可取消；导出支持 Markdown、TXT 和 JSON，默认写入 Downloads。
 6. 活跃会议期间若 app 异常退出，下次启动可恢复或删除本地草稿。草稿保留转写和 speaker 编辑，但默认不保留临时音频。
 
-`v0.4.1` 暂不支持会议中的麦克风与系统音频混合采集。原生说话人模型把自然停顿保留为逻辑讲话边界，但连续讲话每 120 秒会封装一个有界的技术推理窗口；普通 ASR 优先在自然停顿处输出，并限制连续讲话的最大等待时间。如果本地 ASR 慢于采集且已经排队 2 个推理窗口，app 会自动停止采集并完成队列，避免内存继续无界增长。正常停止时默认删除临时会议音频；异常退出后的清理只处理已终止进程拥有的音频，不会误删另一个仍在运行的 app 实例。
+`v0.5.0` 暂不支持会议中的麦克风与系统音频混合采集。原生说话人模型把自然停顿保留为逻辑讲话边界，但连续讲话每 120 秒会封装一个有界的技术推理窗口；普通 ASR 优先在自然停顿处输出，并限制连续讲话的最大等待时间。如果本地 ASR 慢于采集且已经排队 2 个推理窗口，app 会自动停止采集并完成队列，避免内存继续无界增长。正常停止时默认删除临时会议音频；异常退出后的清理只处理已终止进程拥有的音频，不会误删另一个仍在运行的 app 实例。
 
 隐私默认保持收紧：默认不把原始音频、完整转写、字幕译文、页面标题、完整 URL 或完整媒体路径写入诊断或历史。会议工作目录仅当前用户可访问，不再逐回调落盘无用 PCM，ASR 处理后的临时归一化音频会删除。
 
@@ -313,11 +313,11 @@ GitHub Actions 发布打包位于 `.github/workflows/release.yml`。
 推送版本 tag 触发发布：
 
 ```sh
-git tag v0.4.1
-git push origin v0.4.1
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
-也可以在 GitHub Actions 手动运行 workflow，并传入类似 `v0.4.1` 的 `version` input。
+也可以在 GitHub Actions 手动运行 workflow，并传入类似 `v0.5.0` 的 `version` input。
 
 Workflow 会：
 
@@ -359,6 +359,7 @@ Resources/              app icon 资源
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
 - [本地 VoxCPM2 TTS V1 PRD](docs/local-tts-voxcpm2-v1-prd.md)
+- [v0.5.0 发布说明与使用方法](docs/releases/v0.5.0.md)
 - [v0.4.1 发布说明与使用方法](docs/releases/v0.4.1.md)
 - [v0.4.0 发布说明与使用方法](docs/releases/v0.4.0.md)
 - [Phase 4 live audio subtitles research](docs/phase-4-live-audio-subtitles-research.md)

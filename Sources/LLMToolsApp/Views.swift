@@ -5679,6 +5679,10 @@ struct SettingsView: View {
                 }
             }
 
+            settingRow(title: L10n.text("Post-processing model", language: language)) {
+                ocrPostProcessingModelPicker
+            }
+
             settingRow(title: L10n.text("Default recognition mode", language: language)) {
                 Picker("", selection: Binding(
                     get: { appState.preferences.ocr.defaultMode },
@@ -6373,6 +6377,24 @@ struct SettingsView: View {
         .pickerStyle(.menu)
         .frame(width: 260, alignment: .leading)
         .disabled(appState.visionCapableModels.isEmpty)
+    }
+
+    private var ocrPostProcessingModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.ocr.postProcessingModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.ocr.postProcessingModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("Use text default model", language: language)).tag(UUID?.none)
+            ForEach(appState.textCapableModels) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 260, alignment: .leading)
+        .disabled(appState.textCapableModels.isEmpty)
     }
 
     private var settingsMediaFileASRPicker: some View {
@@ -8076,7 +8098,7 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.4.1"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.5.0"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
     }

@@ -1,6 +1,12 @@
 import Foundation
+import MLXLMCommon
 
 public enum GeneratedOutputGuard {
+    struct CollectedResponse {
+        var text: String
+        var reachedTokenLimit: Bool
+    }
+
     public static func trimDegenerateTail(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let cutIndex = degenerateTailCutIndex(in: trimmed) else {
@@ -20,6 +26,24 @@ public enum GeneratedOutputGuard {
             response += chunk
         }
         return response
+    }
+
+    static func collectGuardedResponse(from stream: AsyncThrowingStream<Generation, Error>) async throws -> CollectedResponse {
+        var response = ""
+        var reachedTokenLimit = false
+        for try await generation in stream {
+            switch generation {
+            case .chunk(let chunk):
+                response += chunk
+            case .info(let info):
+                if case .length = info.stopReason {
+                    reachedTokenLimit = true
+                }
+            case .toolCall:
+                break
+            }
+        }
+        return CollectedResponse(text: response, reachedTokenLimit: reachedTokenLimit)
     }
 
     private static func degenerateTailCutIndex(in text: String) -> String.Index? {

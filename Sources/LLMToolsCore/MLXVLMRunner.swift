@@ -71,22 +71,26 @@ public actor MLXVLMRunner: VisionModelRunner {
             ),
             additionalContext: ["enable_thinking": thinkingModeEnabled]
         )
-        var response = try await GeneratedOutputGuard.collectGuardedResponse(
-            from: session.streamResponse(to: userPrompt)
+        let firstGeneration = try await GeneratedOutputGuard.collectGuardedResponse(
+            from: session.streamDetails(to: userPrompt)
         )
         try Task.checkCancellation()
 
-        var rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        var rawOutput = firstGeneration.text.trimmingCharacters(in: .whitespacesAndNewlines)
         var output = VisibleOutput.from(rawText: rawOutput)
-        if thinkingModeEnabled, output.isEmpty {
-            // 思考未收束时改用非思考模板重试，避免将中间过程误当成正文。
+        if thinkingModeEnabled,
+           LocalGenerationPolicy.shouldRetryThinkingGeneration(
+               visibleOutput: output,
+               reachedTokenLimit: firstGeneration.reachedTokenLimit
+           ) {
+            // 达到首轮上限时少量正文也可能已被截断，统一关闭思考后完整重试。
             session = ChatSession(
                 container,
                 instructions: systemPrompt,
                 generateParameters: LocalGenerationPolicy.parameters(for: request.task),
                 additionalContext: ["enable_thinking": false]
             )
-            response = try await GeneratedOutputGuard.collectGuardedResponse(
+            let response = try await GeneratedOutputGuard.collectGuardedResponse(
                 from: session.streamResponse(to: userPrompt)
             )
             try Task.checkCancellation()
@@ -132,14 +136,18 @@ public actor MLXVLMRunner: VisionModelRunner {
             generateParameters: parameters,
             additionalContext: ["enable_thinking": thinkingModeEnabled]
         )
-        var response = try await GeneratedOutputGuard.collectGuardedResponse(
-            from: session.streamResponse(to: request.prompt, image: .ciImage(image))
+        let firstGeneration = try await GeneratedOutputGuard.collectGuardedResponse(
+            from: session.streamDetails(to: request.prompt, images: [.ciImage(image)])
         )
         try Task.checkCancellation()
 
-        var rawOutput = response.trimmingCharacters(in: .whitespacesAndNewlines)
+        var rawOutput = firstGeneration.text.trimmingCharacters(in: .whitespacesAndNewlines)
         var output = VisibleOutput.from(rawText: rawOutput)
-        if thinkingModeEnabled, output.isEmpty {
+        if thinkingModeEnabled,
+           LocalGenerationPolicy.shouldRetryThinkingGeneration(
+               visibleOutput: output,
+               reachedTokenLimit: firstGeneration.reachedTokenLimit
+           ) {
             session = ChatSession(
                 container,
                 instructions: systemPrompt,
@@ -148,7 +156,7 @@ public actor MLXVLMRunner: VisionModelRunner {
                     : LocalGenerationPolicy.parameters(for: request.mode),
                 additionalContext: ["enable_thinking": false]
             )
-            response = try await GeneratedOutputGuard.collectGuardedResponse(
+            let response = try await GeneratedOutputGuard.collectGuardedResponse(
                 from: session.streamResponse(to: request.prompt, image: .ciImage(image))
             )
             try Task.checkCancellation()
@@ -169,6 +177,12 @@ public actor MLXVLMRunner: VisionModelRunner {
     }
 
     public func unload() async {
+        unloadSync()
+    }
+
+    public func unloadIfLoaded(modelID: UUID) async {
+        // 比较和卸载都在同一个 actor turn 内完成，旧 OCR 请求不会卸载后来加载的模型。
+        guard self.modelID == modelID else { return }
         unloadSync()
     }
 

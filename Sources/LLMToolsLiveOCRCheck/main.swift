@@ -8,7 +8,7 @@ struct LLMToolsLiveOCRCheck {
         let options = try Options.parse(Array(CommandLine.arguments.dropFirst()))
         let temporaryRoot: URL?
         let engine: TaskEngine
-        if options.localModelPath != nil {
+        if options.localModelPath != nil || options.textModelPath != nil {
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("llmtools-live-ocr-local", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
@@ -29,8 +29,13 @@ struct LLMToolsLiveOCRCheck {
         }
         await engine.bootstrap()
 
+        let textModel = try await ensureTextModel(options: options, engine: engine)
         let model = try await ensureVisionModel(options: options, engine: engine)
-        try await configureOCRDefaults(modelID: model.id, engine: engine)
+        try await configureOCRDefaults(
+            modelID: model.id,
+            postProcessingModelID: textModel?.id,
+            engine: engine
+        )
 
         let dedicatedOCR = ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
         let probe = dedicatedOCR ? nil : try await engine.testVisionCapability(id: model.id)
@@ -47,10 +52,39 @@ struct LLMToolsLiveOCRCheck {
         )
         try requireOCRText(ocr.text)
 
+        let structured: TaskResult?
         let explanation: TaskResult?
-        if dedicatedOCR {
-            // GLM-OCR 仅实现单图识别协议，不把通用图像理解误报为可用能力。
+        let translation: TaskResult?
+        if dedicatedOCR, textModel != nil {
+            // 专用 OCR 的高阶模式必须经过默认文字模型，真实检查同时覆盖完整二阶段链路。
+            let structuredResult = try await engine.runOCR(
+                image: image,
+                mode: .structured,
+                modelID: model.id,
+                persistHistory: false
+            )
+            let explanationResult = try await engine.runOCR(
+                image: image,
+                mode: .explainImage,
+                modelID: model.id,
+                persistHistory: false
+            )
+            let translationResult = try await engine.runOCR(
+                image: image,
+                mode: .extractThenTranslate,
+                modelID: model.id,
+                persistHistory: false
+            )
+            try requireTextStage(structuredResult, mode: "Structured extraction")
+            try requireTextStage(explanationResult, mode: "Image explanation")
+            try requireTextStage(translationResult, mode: "Extract then translate")
+            structured = structuredResult
+            explanation = explanationResult
+            translation = translationResult
+        } else if dedicatedOCR {
+            structured = nil
             explanation = nil
+            translation = nil
         } else {
             let result = try await engine.runOCR(
                 image: image,
@@ -61,7 +95,9 @@ struct LLMToolsLiveOCRCheck {
             guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw LiveOCRCheckError("Image explanation returned empty output.")
             }
+            structured = nil
             explanation = result
+            translation = nil
         }
 
         print("LLMToolsLiveOCRCheck passed")
@@ -69,7 +105,30 @@ struct LLMToolsLiveOCRCheck {
         print("Model ID: \(model.id.uuidString)")
         print("Probe output: \(probe.map { oneLine($0.message, limit: 180) } ?? "not applicable for dedicated OCR")")
         print("OCR output: \(oneLine(ocr.text, limit: 240))")
-        print("Explanation output: \(explanation.map { oneLine($0.text, limit: 240) } ?? "not supported by dedicated OCR")")
+        print("Structured output: \(structured.map { oneLine($0.text, limit: 240) } ?? "not run")")
+        print("Explanation output: \(explanation.map { oneLine($0.text, limit: 240) } ?? "not run")")
+        print("Translation output: \(translation.map { oneLine($0.text, limit: 240) } ?? "not run")")
+    }
+
+    private static func ensureTextModel(options: Options, engine: TaskEngine) async throws -> ModelDescriptor? {
+        guard let textModelPath = options.textModelPath else {
+            return nil
+        }
+        let modelURL = URL(fileURLWithPath: textModelPath).standardizedFileURL.resolvingSymlinksInPath()
+        let snapshot = await engine.registry()
+        if let existing = snapshot.models.first(where: {
+            ($0.resolvedPath ?? $0.sourcePath).standardizedFileURL.resolvingSymlinksInPath() == modelURL
+        }) {
+            guard existing.capabilities.supportsText else {
+                throw LiveOCRCheckError("Text model path does not provide text generation: \(textModelPath)")
+            }
+            return existing
+        }
+        let model = try await engine.addModel(from: modelURL)
+        guard model.capabilities.supportsText else {
+            throw LiveOCRCheckError("Text model path does not provide text generation: \(textModelPath)")
+        }
+        return model
     }
 
     private static func ensureVisionModel(options: Options, engine: TaskEngine) async throws -> ModelDescriptor {
@@ -122,10 +181,18 @@ struct LLMToolsLiveOCRCheck {
         )
     }
 
-    private static func configureOCRDefaults(modelID: UUID, engine: TaskEngine) async throws {
+    private static func configureOCRDefaults(
+        modelID: UUID,
+        postProcessingModelID: UUID?,
+        engine: TaskEngine
+    ) async throws {
         try await engine.updatePreferences { preferences in
             preferences.ocr.enabled = true
             preferences.ocr.modelID = modelID
+            // 未显式传文字模型时保留真实 registry 中用户已有的后处理选择。
+            if let postProcessingModelID {
+                preferences.ocr.postProcessingModelID = postProcessingModelID
+            }
             preferences.ocr.defaultMode = .plainText
             preferences.ocr.useModelRecognitionByDefault = true
             preferences.ocr.persistHistory = false
@@ -184,6 +251,15 @@ struct LLMToolsLiveOCRCheck {
         }
     }
 
+    private static func requireTextStage(_ result: TaskResult, mode: String) throws {
+        guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw LiveOCRCheckError("\(mode) returned empty output.")
+        }
+        guard result.modelName.contains(" -> ") else {
+            throw LiveOCRCheckError("\(mode) did not report a two-stage model chain: \(result.modelName)")
+        }
+    }
+
     private static func oneLine(_ value: String, limit: Int) -> String {
         let collapsed = value
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
@@ -200,6 +276,7 @@ private struct Options {
     var providerModelID: String = "Qwen/Qwen3-VL-8B-Instruct"
     var existingModelID: UUID?
     var localModelPath: String?
+    var textModelPath: String?
 
     static func parse(_ args: [String]) throws -> Options {
         var options = Options()
@@ -225,16 +302,23 @@ private struct Options {
                     throw LiveOCRCheckError("--local-path requires a local model directory.")
                 }
                 options.localModelPath = args[index]
+            case "--text-model-path":
+                index += 1
+                guard index < args.count else {
+                    throw LiveOCRCheckError("--text-model-path requires a local model directory.")
+                }
+                options.textModelPath = args[index]
             case "--help", "-h":
                 print("""
                 Usage:
                   swift run LLMToolsLiveOCRCheck [--provider-model <provider-model-id>]
                   swift run LLMToolsLiveOCRCheck --model-id <registry-uuid>
-                  swift run LLMToolsLiveOCRCheck --local-path <model-directory>
+                  swift run LLMToolsLiveOCRCheck --local-path <model-directory> [--text-model-path <model-directory>]
 
                 The check uses the real llmTools registry, configures the selected model as the OCR model,
                 runs a live vision probe, OCRs a generated text image, and runs image explanation.
-                A local path uses a temporary registry; dedicated OCR models run recognition only.
+                A local path uses a temporary registry. Pass --text-model-path to exercise the
+                dedicated OCR model's structured, explanation, and translation text stages.
                 """)
                 Foundation.exit(0)
             default:

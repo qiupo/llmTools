@@ -31,6 +31,14 @@ public protocol ModelRunner: Actor, Sendable {
     func load(model: ModelDescriptor) async throws
     func generate(request: TaskRequest, preferences: AppPreferences) async throws -> TaskResult
     func unload() async
+    func unloadIfLoaded(modelID: UUID) async
+}
+
+public extension ModelRunner {
+    func unloadIfLoaded(modelID: UUID) async {
+        guard await loadedModelID() == modelID else { return }
+        await unload()
+    }
 }
 
 public protocol VisionModelRunner: ModelRunner {

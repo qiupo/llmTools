@@ -72,6 +72,7 @@ final class AppState: ObservableObject {
         var rawOutputText: String = ""
         var showsRawOutput: Bool = false
         var translationStudy: TranslationStudyResult?
+        var modelName: String?
     }
 
     private struct LiveSubtitleRuntimeSession {
@@ -212,6 +213,7 @@ final class AppState: ObservableObject {
     @Published var translationStudyResult: TranslationStudyResult?
     @Published var selectionInlineResultVisible: Bool = false
     @Published var statusMessage: String = L10n.text("Ready", language: .chinese)
+    @Published private(set) var statusModelName: String?
     @Published var selectedModelID: UUID?
     @Published var isRunning: Bool = false
     @Published var isPreparingOCRImage: Bool = false
@@ -1314,9 +1316,7 @@ final class AppState: ObservableObject {
         runRevision += 1
         let revision = runRevision
         // 详解模式由持久化开关控制；普通翻译继续使用轻量默认模型。
-        let usesDetailedTranslation = preferences.detailedTranslationEnabled
-            && selectedTask == .translate
-            && !preferences.promptTemplates.translate.hasCustomPrompt
+        let usesDetailedTranslation = usesDetailedTranslationForCurrentTask
         let request = TaskRequest(
             task: selectedTask,
             inputText: text,
@@ -1335,6 +1335,7 @@ final class AppState: ObservableObject {
             ? SelectedTextService.currentCapturedSelectionID
             : nil
         clearCurrentQuickActionOutput()
+        statusModelName = models.first(where: { $0.id == modelID })?.name
         isRunning = true
         validationError = nil
         statusMessage = "\(t("Running")) \(selectedTask.title(language: preferences.appLanguage))..."
@@ -1353,6 +1354,7 @@ final class AppState: ObservableObject {
                     rawOutputText = result.rawText
                     translationStudyResult = result.translationStudy
                     showsRawOutput = false
+                    statusModelName = result.modelName
                     statusMessage = finishedStatusMessage(for: result)
                     isRunning = false
                     currentRunTask = nil
@@ -1420,6 +1422,7 @@ final class AppState: ObservableObject {
         let revision = runRevision
         let mode = ocrMode
         clearCurrentQuickActionOutput()
+        statusModelName = models.first(where: { $0.id == modelID })?.name
         isRunning = true
         validationError = nil
         statusMessage = "\(t("Running")) \(L10n.ocrModeName(mode, language: preferences.appLanguage))..."
@@ -1438,6 +1441,7 @@ final class AppState: ObservableObject {
                     outputText = result.text
                     rawOutputText = result.rawText
                     showsRawOutput = false
+                    statusModelName = result.modelName
                     statusMessage = finishedStatusMessage(for: result)
                     isRunning = false
                     currentRunTask = nil
@@ -4815,11 +4819,13 @@ final class AppState: ObservableObject {
         _ preferences: inout AppPreferences,
         models: [ModelDescriptor]
     ) {
-        guard let modelID = preferences.ocr.modelID else {
-            return
-        }
-        if !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
+        if let modelID = preferences.ocr.modelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
             preferences.ocr.modelID = nil
+        }
+        if let modelID = preferences.ocr.postProcessingModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+            preferences.ocr.postProcessingModelID = nil
         }
     }
 
@@ -4833,7 +4839,8 @@ final class AppState: ObservableObject {
             outputText: outputText,
             rawOutputText: rawOutputText,
             showsRawOutput: showsRawOutput,
-            translationStudy: translationStudyResult
+            translationStudy: translationStudyResult,
+            modelName: statusModelName
         )
         switch mode {
         case .text:
@@ -4863,6 +4870,7 @@ final class AppState: ObservableObject {
         rawOutputText = state.rawOutputText
         showsRawOutput = state.showsRawOutput
         translationStudyResult = state.translationStudy
+        statusModelName = state.modelName
     }
 
     private func setOCRImage(_ image: OCRImageInput) {
@@ -4900,6 +4908,7 @@ final class AppState: ObservableObject {
         rawOutputText = ""
         showsRawOutput = false
         translationStudyResult = nil
+        statusModelName = nil
     }
 
     private func clearMissingMediaSubtitlePreferences(
@@ -5001,6 +5010,12 @@ final class AppState: ObservableObject {
         resolvedDetailedTranslationModelID()
     }
 
+    private var usesDetailedTranslationForCurrentTask: Bool {
+        preferences.detailedTranslationEnabled
+            && selectedTask == .translate
+            && !preferences.promptTemplates.translate.hasCustomPrompt
+    }
+
     private func resolvedDetailedTranslationModelID() -> UUID? {
         if let configuredModelID = preferences.detailedTranslationModelID,
            models.contains(where: {
@@ -5040,7 +5055,12 @@ final class AppState: ObservableObject {
     }
 
     func selectedModelDisplayName(limit: Int = 18) -> String {
-        let resolvedName = models.first(where: { $0.id == selectedModelID })?.name
+        // 完成后优先显示 runner 返回的真实模型；运行前再按当前任务路由推导。
+        let effectiveModelID = usesDetailedTranslationForCurrentTask
+            ? resolvedDetailedTranslationModelID()
+            : selectedModelID
+        let resolvedName = statusModelName
+            ?? models.first(where: { $0.id == effectiveModelID })?.name
             ?? models.first?.name
             ?? t("No model configured")
         return Self.condensedModelName(resolvedName, limit: limit)

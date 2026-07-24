@@ -344,6 +344,9 @@ public actor TaskEngine {
         if snapshot.preferences.ocr.modelID == id {
             snapshot.preferences.ocr.modelID = nil
         }
+        if snapshot.preferences.ocr.postProcessingModelID == id {
+            snapshot.preferences.ocr.postProcessingModelID = nil
+        }
         if snapshot.preferences.mediaSubtitles.realtimeASRModelID == id {
             snapshot.preferences.mediaSubtitles.realtimeASRModelID = nil
         }
@@ -680,17 +683,20 @@ public actor TaskEngine {
         }
 
         let dedicatedOCR = ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
-        if dedicatedOCR, mode == .explainImage {
-            throw OCRTaskError.unsupportedMode(modelName: model.name, mode: mode)
+        // GLM-OCR 只负责视觉文字识别；解释模式先降级为纯 OCR，再由默认文字模型处理。
+        let recognitionMode: OCRMode = if dedicatedOCR, mode != .structured {
+            .plainText
+        } else {
+            mode
         }
         let prompt = PromptTemplates.ocrPrompt(
-            mode: mode,
+            mode: recognitionMode,
             targetLanguage: snapshot.preferences.defaultTranslationTarget,
             preferences: snapshot.preferences,
             dedicatedOCR: dedicatedOCR
         )
         let ocrResult = try await visionRunner.generateOCR(
-            request: OCRTaskRequest(image: image, mode: mode, prompt: prompt),
+            request: OCRTaskRequest(image: image, mode: recognitionMode, prompt: prompt),
             preferences: snapshot.preferences
         )
         let rawModelText = ocrResult.rawModelText ?? ocrResult.text
@@ -699,8 +705,54 @@ public actor TaskEngine {
         let finalRawText: String
         let finalModelName: String
         var detectedOCRSourceLanguage: String?
+        let hasReadableText = !isNoReadableText(visibleOCRText)
+        let hasTextPostProcessingModel = snapshot.models.contains {
+            $0.enabled && $0.capabilities.supportsText
+        }
+        // 长文档直接保留 GLM 的结构结果，避免短输出预算在二次生成时截断正文。
+        let shouldPostProcessStructuredText = mode == .structured
+            && visibleOCRText.count <= LocalGenerationPolicy.maximumStructuredOCRPostProcessingCharacters
 
-        if mode == .extractThenTranslate && !isNoReadableText(visibleOCRText) {
+        try Task.checkCancellation()
+        if dedicatedOCR, hasReadableText, mode == .explainImage, !hasTextPostProcessingModel {
+            throw OCRTaskError.missingPostProcessingModel
+        }
+
+        if dedicatedOCR,
+           hasReadableText,
+           hasTextPostProcessingModel,
+           (shouldPostProcessStructuredText || mode == .explainImage) {
+            // 二阶段处理前释放专用视觉模型，避免与默认文字模型同时常驻内存。
+            await runner.unloadIfLoaded(modelID: model.id)
+            let processing = try await run(
+                request: TaskRequest(
+                    task: .ocr,
+                    inputText: PromptTemplates.glmOCRTextPostProcessingPrompt(
+                        mode: mode,
+                        recognizedText: visibleOCRText,
+                        targetLanguage: snapshot.preferences.defaultTranslationTarget
+                    )
+                ),
+                modelID: snapshot.preferences.ocr.postProcessingModelID,
+                persistHistory: false
+            )
+            finalText = processing.text
+            finalRawText = """
+            OCR raw output:
+            \(rawModelText)
+
+            Text processing raw output:
+            \(processing.rawText)
+            """
+            finalModelName = "\(ocrResult.modelName ?? model.name) -> \(processing.modelName)"
+        } else if mode == .extractThenTranslate && hasReadableText {
+            if dedicatedOCR {
+                // 翻译同样属于文字阶段，先回收 GLM-OCR 再沿用现有翻译路由。
+                guard hasTextPostProcessingModel else {
+                    throw OCRTaskError.missingPostProcessingModel
+                }
+                await runner.unloadIfLoaded(modelID: model.id)
+            }
             let sourceLanguage = await detectedSourceLanguageIfNeeded(
                 for: visibleOCRText,
                 currentSourceLanguage: nil,
@@ -716,7 +768,7 @@ public actor TaskEngine {
                     sourceLanguage: sourceLanguage,
                     targetLanguage: snapshot.preferences.defaultTranslationTarget
                 ),
-                modelID: nil,
+                modelID: snapshot.preferences.ocr.postProcessingModelID,
                 persistHistory: false
             )
             finalText = translation.text
@@ -742,7 +794,7 @@ public actor TaskEngine {
             sourceLanguage: detectedOCRSourceLanguage
         )
         if persistHistory ?? snapshot.preferences.ocr.persistHistory {
-            appendOCRHistory(model: model, result: result, image: image)
+            appendOCRHistory(result: result, image: image)
         }
         return result
     }
@@ -2745,6 +2797,10 @@ public actor TaskEngine {
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
             preferences.ocr.modelID = nil
         }
+        if let modelID = preferences.ocr.postProcessingModelID,
+           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+            preferences.ocr.postProcessingModelID = nil
+        }
         if let modelID = preferences.mediaSubtitles.realtimeASRModelID,
            !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) {
             preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
@@ -2842,10 +2898,10 @@ public actor TaskEngine {
         }
     }
 
-    private func appendOCRHistory(model: ModelDescriptor, result: TaskResult, image: OCRImageInput) {
+    private func appendOCRHistory(result: TaskResult, image: OCRImageInput) {
         let entry = HistoryItem(
             task: .ocr,
-            modelName: model.name,
+            modelName: result.modelName,
             inputPreview: image.redactedHistoryPreview,
             outputPreview: result.text.prefix(240).description
         )

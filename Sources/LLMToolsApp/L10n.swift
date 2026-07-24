@@ -447,6 +447,7 @@ enum L10n {
         "Run recognition after image loads": "图片加载后默认识别",
         "OCR model": "识别模型",
         "Default recognition model": "默认识别模型",
+        "Post-processing model": "后处理模型",
         "OCR mode": "识别模式",
         "Default recognition mode": "默认识别模式",
         "OCR history": "图片识别历史",

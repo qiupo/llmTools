@@ -607,6 +607,7 @@ public enum OCRMode: String, Codable, Sendable, CaseIterable, Identifiable, Hash
 public struct OCRPreferences: Codable, Hashable, Sendable {
     public var enabled: Bool
     public var modelID: UUID?
+    public var postProcessingModelID: UUID?
     public var defaultMode: OCRMode
     public var persistHistory: Bool
     public var useModelRecognitionByDefault: Bool
@@ -616,6 +617,7 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
     public init(
         enabled: Bool = true,
         modelID: UUID? = nil,
+        postProcessingModelID: UUID? = nil,
         defaultMode: OCRMode = .plainText,
         persistHistory: Bool = false,
         useModelRecognitionByDefault: Bool = false,
@@ -624,6 +626,7 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
     ) {
         self.enabled = enabled
         self.modelID = modelID
+        self.postProcessingModelID = postProcessingModelID
         self.defaultMode = defaultMode
         self.persistHistory = persistHistory
         self.useModelRecognitionByDefault = useModelRecognitionByDefault
@@ -634,6 +637,7 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case enabled
         case modelID
+        case postProcessingModelID
         case defaultMode
         case persistHistory
         case useModelRecognitionByDefault
@@ -645,6 +649,7 @@ public struct OCRPreferences: Codable, Hashable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         modelID = try container.decodeIfPresent(UUID.self, forKey: .modelID)
+        postProcessingModelID = try container.decodeIfPresent(UUID.self, forKey: .postProcessingModelID)
         defaultMode = try container.decodeIfPresent(OCRMode.self, forKey: .defaultMode) ?? .plainText
         persistHistory = try container.decodeIfPresent(Bool.self, forKey: .persistHistory) ?? false
         useModelRecognitionByDefault = try container.decodeIfPresent(Bool.self, forKey: .useModelRecognitionByDefault) ?? false

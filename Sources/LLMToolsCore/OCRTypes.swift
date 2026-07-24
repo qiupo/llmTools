@@ -12,6 +12,7 @@ public enum OCRTaskError: Error, LocalizedError, Sendable, Equatable {
     case modelNotVisionCapable(String)
     case unsupportedVisionRunner(String)
     case unsupportedMode(modelName: String, mode: OCRMode)
+    case missingPostProcessingModel
     case unsupportedImageFormat
     case imageTooLarge(current: Int, limit: Int)
     case pixelCountTooLarge(current: Int, limit: Int)
@@ -33,6 +34,8 @@ public enum OCRTaskError: Error, LocalizedError, Sendable, Equatable {
             return "\(modelName) does not support Phase 3 image payloads."
         case .unsupportedMode(let modelName, let mode):
             return "\(modelName) does not support OCR mode: \(mode.title)."
+        case .missingPostProcessingModel:
+            return "Choose an enabled text model for OCR post-processing."
         case .unsupportedImageFormat:
             return "Unsupported or unreadable image format."
         case .imageTooLarge(let current, let limit):

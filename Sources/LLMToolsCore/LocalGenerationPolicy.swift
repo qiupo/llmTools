@@ -2,6 +2,9 @@ import Foundation
 import MLXLMCommon
 
 public enum LocalGenerationPolicy {
+    public static let maximumThinkingTokens = 256
+    public static let maximumStructuredOCRPostProcessingCharacters = 1_024
+
     public static func maxTokens(for task: TaskKind) -> Int {
         switch task {
         case .translate, .polish:
@@ -18,8 +21,17 @@ public enum LocalGenerationPolicy {
     }
 
     public static func maxTokens(for task: TaskKind, thinkingModeEnabled: Bool) -> Int {
-        // 思考 token 与正文共享上限；开启时扩容，避免在正文生成前被截断。
-        maxTokens(for: task) * (thinkingModeEnabled ? 2 : 1)
+        let regularLimit = maxTokens(for: task)
+        guard thinkingModeEnabled else { return regularLimit }
+        // 小模型可能把全部预算耗在隐藏思考里；限制首轮预算，未产出正文时由 runner 关闭思考重试。
+        return min(regularLimit, maximumThinkingTokens)
+    }
+
+    public static func shouldRetryThinkingGeneration(
+        visibleOutput: String,
+        reachedTokenLimit: Bool
+    ) -> Bool {
+        visibleOutput.isEmpty || reachedTokenLimit
     }
 
     public static func maxTokens(for mode: OCRMode) -> Int {
@@ -40,7 +52,8 @@ public enum LocalGenerationPolicy {
     }
 
     static func parameters(for mode: OCRMode, thinkingModeEnabled: Bool = false) -> GenerateParameters {
-        let maxTokens = maxTokens(for: mode) * (thinkingModeEnabled ? 2 : 1)
+        let regularLimit = maxTokens(for: mode)
+        let maxTokens = thinkingModeEnabled ? min(regularLimit, maximumThinkingTokens) : regularLimit
         return GenerateParameters(maxTokens: maxTokens, temperature: 0)
     }
 }
