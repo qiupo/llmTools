@@ -486,7 +486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         showSettings(tab: .general)
     }
 
-    @objc private func openModelSettings() {
+    @objc func openModelSettings() {
         showSettings(tab: .models)
     }
 
@@ -596,6 +596,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         guard !appState.selectedTextModelIsRemote else {
             appState.statusMessage = L10n.text(
                 "Selected text is ready. Choose an action to send it to the remote provider.",
+                language: appState.preferences.appLanguage
+            )
+            return
+        }
+        guard appState.currentTextTaskIsReady else {
+            appState.statusMessage = L10n.text(
+                "Model setup required",
                 language: appState.preferences.appLanguage
             )
             return
@@ -941,6 +948,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .store(in: &cancellables)
 
         appState.$statusMessage
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.refreshStatusMenuItem()
+            }
+            .store(in: &cancellables)
+
+        appState.$statusModelName
             .dropFirst()
             .sink { [weak self] _ in
                 self?.refreshStatusMenuItem()

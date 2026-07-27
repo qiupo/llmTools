@@ -24,6 +24,8 @@ const POPUP_TEXT = {
   "zh-Hans": {
     ready: "就绪",
     localModel: "本地模型",
+    featureDisabled: "网页翻译：已关闭",
+    modelNotConfigured: "模型：尚未配置",
     model: ({ modelName }) => `模型：${modelName}`,
     engine: ({ engineName }) => `引擎：${engineName}`,
     engineWithDetail: ({ engineName, engineID }) => `引擎：${engineName}（${engineID}）`,
@@ -80,6 +82,8 @@ const POPUP_TEXT = {
   en: {
     ready: "Ready",
     localModel: "Local model",
+    featureDisabled: "Webpage translation: disabled",
+    modelNotConfigured: "Model: not configured",
     model: ({ modelName }) => `Model: ${modelName}`,
     engine: ({ engineName }) => `Engine: ${engineName}`,
     engineWithDetail: ({ engineName, engineID }) => `Engine: ${engineName} (${engineID})`,
@@ -256,6 +260,12 @@ function shortHash(value = "") {
 }
 
 function modelStatusText(state) {
+  if (state?.webPageTranslationEnabled === false) {
+    return t("featureDisabled");
+  }
+  if (state?.webPageTranslationReady === false) {
+    return t("modelNotConfigured");
+  }
   const engine = state?.translationEngine || "";
   const engineID = state?.translationEngineID || "";
   if (engine === "fastMT") {
@@ -320,8 +330,9 @@ function render(state) {
   const total = Math.max(state.total || 0, 1);
   const done = Math.min(state.done || 0, total);
   barEl.style.width = `${Math.round((done / total) * 100)}%`;
-  translateBtn.disabled = state.status === "translating" || state.status === "discovering";
-  retranslateBtn.disabled = state.status === "translating" || state.status === "discovering";
+  const modelUnavailable = state.webPageTranslationReady === false;
+  translateBtn.disabled = modelUnavailable || state.status === "translating" || state.status === "discovering";
+  retranslateBtn.disabled = modelUnavailable || state.status === "translating" || state.status === "discovering";
   cancelBtn.disabled = state.status !== "translating" && state.status !== "discovering";
   restoreBtn.disabled = !state.hasTranslations;
   const cacheDisabled = state.canClearCache === false;

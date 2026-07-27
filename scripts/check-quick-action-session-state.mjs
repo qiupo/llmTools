@@ -69,6 +69,12 @@ for (const required of [
   expect(reset.includes(required), `Session reset is missing: ${required}`);
 }
 
+const storeOutputState = functionSource(appState, "private func storeCurrentOutputState(");
+const restoreOutputState = functionSource(appState, "private func restoreOutputState(");
+expect(storeOutputState.includes("modelName: statusModelName"), "Quick Action tabs must save the result model name");
+expect(restoreOutputState.includes("statusModelName = state.modelName"), "Quick Action tabs must restore the result model name");
+expect(appDelegate.includes("appState.$statusModelName"), "Status menu must observe result model changes");
+
 expect(appDelegate.includes("quickActionWindow.onClose"), "Quick Action close callback is missing");
 expect(appDelegate.includes("appState.resetQuickActionSession()"), "Window close must reset the Quick Action session");
 expect(views.includes("preserveOutput: true"), "Quick Action editors must preserve results while editing");

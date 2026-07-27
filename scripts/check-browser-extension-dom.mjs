@@ -104,6 +104,9 @@ async function runBackgroundBatchCheck() {
     domainTranslationEngines: {}
   };
   let nativePendingIndicatorStyle = "flipText";
+  let nativeWebPageTranslationReady = true;
+  let nativeWebPageTranslationEnabled = true;
+  let nativeModelSetup = { textTasks: true, fastTranslation: true };
   let currentUnsupportedEmbeddedContent = { frames: 0, canvas: 0, images: 0, pdf: 0, total: 0 };
   const grantedOrigins = new Set();
   const tabURLs = new Map([[7, "https://example.test/article"]]);
@@ -120,6 +123,9 @@ async function runBackgroundBatchCheck() {
         status: "ok",
         payload: {
           modelName: "stub-model",
+          webPageTranslationReady: nativeWebPageTranslationReady,
+          webPageTranslationEnabled: nativeWebPageTranslationEnabled,
+          modelSetup: nativeModelSetup,
           webPageTranslationEngine: "llm",
           webPageTranslationEngineID: "llm",
           webPageTranslationEngineModelID: "stub-model-id",
@@ -424,7 +430,7 @@ async function runBackgroundBatchCheck() {
         if (message.type === "getPageTranslationState") {
           return Promise.resolve({
             ok: true,
-            url: "https://example.test/article",
+            url: tabURLs.get(tabID) || "https://example.test/article",
             title: "Test Article",
             pageSessionID: "mock-page-session",
             trackedCount: discoveredSegments.length,
@@ -475,6 +481,45 @@ async function runBackgroundBatchCheck() {
   assert(!contextMenuItems.has("llmtools-toggle-live-subtitles"), "live subtitles context menu should not be created");
   assert(contextMenuItems.get("llmtools-toggle-page").title === "翻译/原文", "toggle context menu should use the requested label");
   assert(contextMenuItems.get("llmtools-toggle-page").enabled !== false, "toggle context menu should start enabled");
+
+  nativeWebPageTranslationReady = false;
+  nativeModelSetup = { textTasks: false, fastTranslation: false };
+  tabURLs.set(70, "https://model-missing.test/article");
+  const missingModelStatus = await sendBackgroundMessage(backgroundListener, { type: "checkStatus", tabID: 70 });
+  assert(missingModelStatus.status === "modelMissing", `expected modelMissing status, got ${missingModelStatus.status}`);
+  assert(missingModelStatus.webPageTranslationReady === false, "missing-model status must preserve webpage readiness");
+  const translateCountBeforeMissingModel = nativeTranslatePayloads.length;
+  const missingModelTranslation = await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 70 });
+  assert(missingModelTranslation.status === "failed", `expected missing-model translation to fail, got ${missingModelTranslation.status}`);
+  assert(
+    nativeTranslatePayloads.length === translateCountBeforeMissingModel,
+    "missing-model translation must stop before sending page text to the native host"
+  );
+  nativeWebPageTranslationReady = true;
+  nativeModelSetup = { textTasks: true, fastTranslation: true };
+
+  nativeWebPageTranslationEnabled = false;
+  tabURLs.set(71, "https://feature-disabled.test/article");
+  const disabledFeatureStatus = await sendBackgroundMessage(backgroundListener, { type: "checkStatus", tabID: 71 });
+  assert(disabledFeatureStatus.status === "disabled", `expected disabled status, got ${disabledFeatureStatus.status}`);
+  assert(disabledFeatureStatus.webPageTranslationEnabled === false, "disabled feature must not be reported as a missing model");
+  nativeWebPageTranslationEnabled = true;
+
+  nativeModelSetup = { textTasks: false, fastTranslation: true };
+  nativeDomainRules.domainTranslationEngines["fast-only.test"] = "fastMT";
+  tabURLs.set(72, "https://fast-only.test/article");
+  const fastOverrideStatus = await sendBackgroundMessage(backgroundListener, { type: "checkStatus", tabID: 72 });
+  assert(
+    fastOverrideStatus.status === "idle",
+    `a site Fast MT override must work without an LLM model when Fast MT is ready: ${JSON.stringify(fastOverrideStatus)}`
+  );
+  nativeDomainRules.domainTranslationEngines["llm-only.test"] = "llm";
+  tabURLs.set(73, "https://llm-only.test/article");
+  const llmOverrideStatus = await sendBackgroundMessage(backgroundListener, { type: "checkStatus", tabID: 73 });
+  assert(llmOverrideStatus.status === "modelMissing", "a site LLM override must require a text model even when Fast MT is ready");
+  delete nativeDomainRules.domainTranslationEngines["fast-only.test"];
+  delete nativeDomainRules.domainTranslationEngines["llm-only.test"];
+  nativeModelSetup = { textTasks: true, fastTranslation: true };
 
   contextMenuClickListener({ menuItemId: "llmtools-toggle-page" }, { id: 7 });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "background did not apply all translations");
@@ -527,7 +572,7 @@ async function runBackgroundBatchCheck() {
   });
   assert(restoredPendingStyleState.pendingIndicatorStyle === "flipText", "background should allow returning pending style to flip text");
   assert(finalState.diagnostics?.browserID === "chrome", "diagnostics should include the browser id");
-  assert(finalState.diagnostics?.extensionVersion === "0.4.1", `unexpected diagnostics extension version: ${finalState.diagnostics?.extensionVersion}`);
+  assert(finalState.diagnostics?.extensionVersion === "0.5.1", `unexpected diagnostics extension version: ${finalState.diagnostics?.extensionVersion}`);
   assert(finalState.diagnostics?.counts?.done === 3 && finalState.diagnostics?.counts?.total === 3, "diagnostics should include redacted progress counts");
   assert(finalState.diagnostics?.timings?.elapsedMs != null, "diagnostics should include elapsed timing");
   assert(finalState.diagnostics?.model?.name === "stub-model", `diagnostics should include model name, got ${finalState.diagnostics?.model?.name}`);
@@ -937,6 +982,8 @@ async function runPopupPermissionCheck() {
   const runtimeMessages = [];
   const permissionRequests = [];
   let permissionGranted = false;
+  let webpageTranslationReady = true;
+  let webpageTranslationEnabled = true;
 
   function element() {
     return {
@@ -1006,6 +1053,8 @@ async function runPopupPermissionCheck() {
           message: message.type === "setDomainRule" ? `rule:${message.rule}` : "Ready",
           appLanguage: "en",
           modelName: "stub-model",
+          webPageTranslationReady: webpageTranslationReady,
+          webPageTranslationEnabled: webpageTranslationEnabled,
           done: 0,
           total: 0,
           hasTranslations: false,
@@ -1018,7 +1067,7 @@ async function runPopupPermissionCheck() {
             pendingIndicatorStyle: message.pendingIndicatorStyle || "loading",
           diagnostics: {
             browserID: "chrome",
-            extensionVersion: "0.4.1",
+            extensionVersion: "0.5.1",
             status: "idle",
             domainHash: "h12345678",
             urlHash: "abcdef1234567890",
@@ -1048,6 +1097,22 @@ async function runPopupPermissionCheck() {
   assert(elements.diagnostics.textContent.includes("source en"), "popup diagnostics should render the detected source language");
   assert(elements.diagnostics.textContent.includes("h12345678"), "popup diagnostics should show the domain hash");
   assert(!elements.diagnostics.textContent.includes("example.test"), "popup diagnostics should not include the raw domain");
+  assert(elements.translate.disabled === false, "popup translate button should be enabled when a translation route is ready");
+
+  webpageTranslationReady = false;
+  await elements.statusBtn.listeners.click();
+  assert(elements.translate.disabled === true && elements.retranslate.disabled === true, "popup translation actions must be disabled without a usable model");
+  assert(elements.model.textContent === "Model: not configured", `unexpected missing-model label: ${elements.model.textContent}`);
+  webpageTranslationReady = true;
+  await elements.statusBtn.listeners.click();
+
+  webpageTranslationEnabled = false;
+  webpageTranslationReady = false;
+  await elements.statusBtn.listeners.click();
+  assert(elements.model.textContent === "Webpage translation: disabled", `unexpected disabled-feature label: ${elements.model.textContent}`);
+  webpageTranslationEnabled = true;
+  webpageTranslationReady = true;
+  await elements.statusBtn.listeners.click();
 
   elements.domainRule.value = "alwaysTranslate";
   permissionGranted = false;

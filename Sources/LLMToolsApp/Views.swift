@@ -337,6 +337,10 @@ struct QuickActionView: View {
             controlsBar
                 .layoutPriority(2)
             Divider()
+            if let message = currentModeUnavailableMessage {
+                ModelSetupRequiredBanner(message: message, language: language)
+                Divider()
+            }
             mainContent
                 .layoutPriority(1)
             Divider()
@@ -392,6 +396,27 @@ struct QuickActionView: View {
             imageURLDraft = ""
             isImagePreviewPresented = false
             showsMarkdownSource = false
+        }
+    }
+
+    private var currentModeUnavailableMessage: String? {
+        switch appState.quickActionMode {
+        case .text:
+            return appState.currentTextTaskIsReady
+                ? nil
+                : L10n.text("Text tasks need a usable text model. Open model setup to download or add one.", language: language)
+        case .image:
+            return appState.modelFeatureAvailability.imageRecognition
+                ? nil
+                : L10n.text("Image recognition needs a usable vision model. Open model setup to download or add one.", language: language)
+        case .media:
+            return appState.modelFeatureAvailability.mediaTranscription
+                ? nil
+                : L10n.text("Media transcription needs a usable local ASR model. Open model setup to download or add one.", language: language)
+        case .speech:
+            return appState.modelFeatureAvailability.textToSpeech
+                ? nil
+                : L10n.text("Speech generation needs the TTS runtime and a VoxCPM2 model. Open model setup to install them.", language: language)
         }
     }
 
@@ -1445,6 +1470,7 @@ struct QuickActionView: View {
                     }
                     .disabled((appState.quickActionMode == .image && !canRunOCR)
                         || (appState.quickActionMode == .media && !canRunMediaSubtitles)
+                        || (appState.quickActionMode == .text && !appState.currentTextTaskIsReady)
                         || appState.quickTranslationSpeechGeneratingTarget != nil)
                 }
 
@@ -1825,6 +1851,32 @@ struct QuickActionView: View {
 
     private func isMediaFile(_ url: URL) -> Bool {
         MediaIntakeService.isSupportedMediaFile(url)
+    }
+}
+
+private struct ModelSetupRequiredBanner: View {
+    let message: String
+    let language: AppLanguage
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button {
+                NSApp.sendAction(#selector(AppDelegate.openModelSettings), to: NSApp.delegate, from: nil)
+            } label: {
+                Label(L10n.text("Open Model Setup", language: language), systemImage: "arrow.right.circle")
+            }
+            .controlSize(.small)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
     }
 }
 
@@ -3113,6 +3165,13 @@ struct FloatingWidgetView: View {
             TaskOptionsView(appState: appState)
             ModelPickerView(appState: appState)
 
+            if !appState.currentTextTaskIsReady {
+                ModelSetupRequiredBanner(
+                    message: L10n.text("Text tasks need a usable text model. Open model setup to download or add one.", language: language),
+                    language: language
+                )
+            }
+
             EditableTextView(text: Binding(
                 get: { appState.inputText },
                 set: { newValue in
@@ -3136,6 +3195,7 @@ struct FloatingWidgetView: View {
                         systemImage: appState.isRunning ? "stop.fill" : "play.fill"
                     )
                 }
+                .disabled(!appState.isRunning && !appState.currentTextTaskIsReady)
 
                 Button {
                     NSPasteboard.general.clearContents()
@@ -3296,7 +3356,11 @@ struct LiveMeetingView: View {
             } label: {
                 Label("本地文件", systemImage: "folder")
             }
-            .disabled(appState.liveMeetingIsRunning || appState.liveMeetingHasUnresolvedRecoveryDraft)
+            .disabled(
+                appState.liveMeetingIsRunning
+                    || appState.liveMeetingHasUnresolvedRecoveryDraft
+                    || appState.selectedLiveMeetingFileASRModel == nil
+            )
             if session?.state == .stopping {
                 Button {
                     appState.cancelLiveMeetingStop()
@@ -3318,6 +3382,7 @@ struct LiveMeetingView: View {
                 } label: {
                     Label("开始转写", systemImage: "record.circle")
                 }
+                .disabled(appState.selectedLiveMeetingRealtimeASRModel == nil)
                 .disabled(appState.liveMeetingHasUnresolvedRecoveryDraft)
             }
             WindowPinButton(pinState: pinState, language: appState.preferences.appLanguage)
@@ -4008,6 +4073,7 @@ struct LiveSubtitleFloatingView: View {
         .buttonStyle(.borderless)
         .foregroundStyle(.white.opacity(0.82))
         .help(L10n.text(appState.appLiveSubtitlesAreRunning ? "Stop live subtitles" : "Start live subtitles", language: language))
+        .disabled(!appState.appLiveSubtitlesAreRunning && appState.selectedRealtimeASRModel == nil)
     }
 
     private var enterImmersiveButton: some View {
@@ -4443,17 +4509,17 @@ struct ModelPickerView: View {
             get: { appState.selectedModelID },
             set: { appState.selectedModelID = $0 }
         )) {
-            if appState.models.isEmpty {
+            if appState.textCapableModels.isEmpty {
                 Text(L10n.text("No model", language: language)).tag(UUID?.none)
             } else {
-                ForEach(appState.models) { model in
+                ForEach(appState.textCapableModels) { model in
                     Text(modelPickerTitle(model))
                         .tag(Optional(model.id))
                 }
             }
         }
         .pickerStyle(.menu)
-        .disabled(appState.models.isEmpty || appState.isRunning)
+        .disabled(appState.textCapableModels.isEmpty || appState.isRunning)
     }
 
     private func modelPickerTitle(_ model: ModelDescriptor) -> String {
@@ -4666,36 +4732,66 @@ private struct SupportedModelDownloadEntry: Identifiable {
     }
 }
 
+private let recommendedTextModelDownload = SupportedModelDownloadEntry(
+    id: "qwen35-08b-8bit",
+    chineseName: "文本首选 · Qwen3.5 0.8B 8bit",
+    englishName: "Text default · Qwen3.5 0.8B 8bit",
+    modelName: "lmstudio-community/Qwen3.5-0.8B-MLX-8bit",
+    downloadURL: "https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-MLX-8bit",
+    mirrorURL: "https://hf-mirror.com/lmstudio-community/Qwen3.5-0.8B-MLX-8bit",
+    copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download lmstudio-community/Qwen3.5-0.8B-MLX-8bit --local-dir ~/code/models/lmstudio-community/Qwen3.5-0.8B-MLX-8bit",
+    installerScript: nil,
+    chineseNote: "用于翻译、润色、总结、解释、待办、LLM 网页翻译、OCR 后处理和本地会议纪要；下载后添加整个模型目录。",
+    englishNote: "Covers text tasks, LLM webpage translation, OCR post-processing, and local meeting notes. Add the complete model directory after download."
+)
+
+private let recommendedOCRModelDownload = SupportedModelDownloadEntry(
+    id: "glm-ocr-4bit",
+    chineseName: "OCR 首选 · GLM-OCR 4bit",
+    englishName: "OCR default · GLM-OCR 4bit",
+    modelName: "mlx-community/GLM-OCR-4bit",
+    downloadURL: "https://huggingface.co/mlx-community/GLM-OCR-4bit",
+    mirrorURL: "https://hf-mirror.com/mlx-community/GLM-OCR-4bit",
+    copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/GLM-OCR-4bit --local-dir ~/code/models/mlx-community/GLM-OCR-4bit",
+    installerScript: nil,
+    chineseNote: "用于基础 OCR 和结构化识别；图片解释、提取后翻译等模式还需要一个文本模型。",
+    englishNote: "Covers OCR and structured recognition. Image explanation and translation after extraction also need a text model."
+)
+
+private let recommendedASRModelDownload = SupportedModelDownloadEntry(
+    id: "qwen3-asr-06b-8bit",
+    chineseName: "ASR 首选 · Qwen3-ASR 0.6B 8bit",
+    englishName: "ASR default · Qwen3-ASR 0.6B 8bit",
+    modelName: "mlx-community/Qwen3-ASR-0.6B-8bit",
+    downloadURL: "https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit",
+    mirrorURL: "https://hf-mirror.com/mlx-community/Qwen3-ASR-0.6B-8bit",
+    copyCommand: "HF_ENDPOINT=https://hf-mirror.com huggingface-cli download mlx-community/Qwen3-ASR-0.6B-8bit --local-dir ~/code/models/mlx-community/Qwen3-ASR-0.6B-8bit",
+    installerScript: "scripts/install-phase4-mlx-asr-runtime.sh",
+    chineseNote: "准确性优先的实时字幕、文件字幕和会议转写首选；下载并添加目录后，在模型管理中运行健康检查或修复 runtime。",
+    englishNote: "Accuracy-first default for live subtitles, file subtitles, and meeting transcription. Add the folder, then run Health Check or repair its runtime."
+)
+
+private let recommendedTTSModelDownload = SupportedModelDownloadEntry(
+    id: "voxcpm2-bf16",
+    chineseName: "TTS 首选 · VoxCPM2 bf16",
+    englishName: "TTS default · VoxCPM2 bf16",
+    modelName: "mlx-community/VoxCPM2-bf16",
+    downloadURL: "https://huggingface.co/mlx-community/VoxCPM2-bf16",
+    mirrorURL: "https://hf-mirror.com/mlx-community/VoxCPM2-bf16",
+    copyCommand: "HF_ENDPOINT=https://hf-mirror.com LLMTOOLS_TTS_VARIANT=bf16 LLMTOOLS_TTS_DOWNLOAD_MODEL=1 ./scripts/install-tts-voxcpm2-runtime.sh",
+    installerScript: "scripts/install-tts-voxcpm2-runtime.sh",
+    chineseNote: "用于单旁白和多角色语音生成；多角色文本分析还需要本地 GGUF 或 MLX 文本模型。低内存机器可在高级列表选择 4bit。",
+    englishNote: "Covers single-narrator and multi-role speech generation. Multi-role text analysis also needs a local GGUF or MLX text model. Use 4bit from the advanced list on lower-memory Macs."
+)
+
 private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
     SupportedModelDownloadSection(
         id: "text-ocr",
         chineseTitle: "文本 / OCR",
         englishTitle: "Text / OCR",
         entries: [
-            SupportedModelDownloadEntry(
-                id: "mlx-text",
-                chineseName: "MLX 文本模型目录",
-                englishName: "MLX text model folder",
-                modelName: "MLX Swift LM-compatible text model",
-                downloadURL: "https://huggingface.co/models?library=mlx&pipeline_tag=text-generation",
-                mirrorURL: nil,
-                copyCommand: "huggingface-cli download <model-id> --local-dir ~/code/models/<model-id>",
-                installerScript: nil,
-                chineseNote: "用于翻译、润色、总结、解释、网页翻译等本地 LLM 任务；下载后在模型页添加包含 config/tokenizer/weights 的目录。",
-                englishNote: "Used for local LLM tasks such as translate, polish, summarize, explain, and webpage translation. Add the downloaded folder that contains config, tokenizer, and weights."
-            ),
-            SupportedModelDownloadEntry(
-                id: "mlx-vision",
-                chineseName: "MLX 视觉语言模型目录",
-                englishName: "MLX vision-language model folder",
-                modelName: "MLX Swift LM-compatible VLM",
-                downloadURL: "https://huggingface.co/models?library=mlx&pipeline_tag=image-text-to-text",
-                mirrorURL: nil,
-                copyCommand: "huggingface-cli download <model-id> --local-dir ~/code/models/<model-id>",
-                installerScript: nil,
-                chineseNote: "用于图片 OCR、结构化提取和图片解释；需要模型目录带 vision/processor 配置。",
-                englishNote: "Used for image OCR, structured extraction, and image explanation. The model folder must include vision and processor metadata."
-            ),
+            recommendedTextModelDownload,
+            recommendedOCRModelDownload,
             SupportedModelDownloadEntry(
                 id: "gguf-text",
                 chineseName: "GGUF 文本模型文件",
@@ -4715,6 +4811,7 @@ private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
         chineseTitle: "媒体 ASR",
         englishTitle: "Media ASR",
         entries: [
+            recommendedASRModelDownload,
             SupportedModelDownloadEntry(
                 id: "qwen3-asr-06b-bf16",
                 chineseName: "Qwen3-ASR-0.6B bf16",
@@ -4810,6 +4907,26 @@ private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
                 installerScript: "scripts/install-phase4-whisper-coreml-runtime.sh",
                 chineseNote: "安装脚本会下载 Whisper checkpoint、转换 ggml，并生成相邻的 Core ML encoder。",
                 englishNote: "The installer downloads the Whisper checkpoint, converts ggml, and generates the adjacent Core ML encoder."
+            )
+        ]
+    ),
+    SupportedModelDownloadSection(
+        id: "tts",
+        chineseTitle: "文案转语音",
+        englishTitle: "Text to Speech",
+        entries: [
+            recommendedTTSModelDownload,
+            SupportedModelDownloadEntry(
+                id: "voxcpm2-4bit",
+                chineseName: "VoxCPM2 4bit · 低内存备选",
+                englishName: "VoxCPM2 4bit · lower-memory option",
+                modelName: "mlx-community/VoxCPM2-4bit",
+                downloadURL: "https://huggingface.co/mlx-community/VoxCPM2-4bit",
+                mirrorURL: "https://hf-mirror.com/mlx-community/VoxCPM2-4bit",
+                copyCommand: "HF_ENDPOINT=https://hf-mirror.com LLMTOOLS_TTS_VARIANT=4bit LLMTOOLS_TTS_DOWNLOAD_MODEL=1 ./scripts/install-tts-voxcpm2-runtime.sh",
+                installerScript: "scripts/install-tts-voxcpm2-runtime.sh",
+                chineseNote: "显存压力较低的 VoxCPM2 备选，不作为首次安装默认。",
+                englishNote: "Lower-memory VoxCPM2 alternative; not the first-install default."
             )
         ]
     ),
@@ -4966,6 +5083,7 @@ private enum WebPageDomainRuleKind {
 }
 
 private enum ModelSettingsPane: String, CaseIterable, Identifiable {
+    case setup
     case settings
     case management
 
@@ -4973,10 +5091,34 @@ private enum ModelSettingsPane: String, CaseIterable, Identifiable {
 
     func title(language: AppLanguage) -> String {
         switch self {
+        case .setup:
+            return L10n.text("Get Started", language: language)
         case .settings:
             return L10n.text("Model Settings", language: language)
         case .management:
             return L10n.text("Model Management", language: language)
+        }
+    }
+}
+
+private enum ModelSetupRowState {
+    case ready
+    case partial
+    case unavailable
+
+    var icon: String {
+        switch self {
+        case .ready: return "checkmark.circle.fill"
+        case .partial: return "exclamationmark.circle.fill"
+        case .unavailable: return "xmark.circle.fill"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .ready: return .green
+        case .partial: return .orange
+        case .unavailable: return .red
         }
     }
 }
@@ -4998,7 +5140,7 @@ struct SettingsView: View {
     @State private var selectionLimitDraftLineCount = 2
     @State private var webPageDomainDraft = ""
     @State private var speakerDiarizationTokenDraft = ""
-    @State private var selectedModelSettingsPane: ModelSettingsPane = .settings
+    @State private var selectedModelSettingsPane: ModelSettingsPane = .setup
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -5402,9 +5544,11 @@ struct SettingsView: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 240, alignment: .leading)
+            .frame(width: 360, alignment: .leading)
 
             switch selectedModelSettingsPane {
+            case .setup:
+                modelSetupPage
             case .settings:
                 modelConfigurationPage
             case .management:
@@ -5412,6 +5556,269 @@ struct SettingsView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var modelSetupPage: some View {
+        ScrollView {
+            settingsForm(maxWidth: 620) {
+                settingRow(title: localizedSettingsText(chinese: "功能可用性", english: "Feature availability")) {
+                    modelSetupAvailabilityRows
+                }
+
+                settingRow(title: localizedSettingsText(chinese: "推荐起步组合", english: "Recommended starter set")) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(localizedSettingsText(
+                            chinese: "不需要下载所有模型。按要使用的功能各选一个即可；下面是首次使用最省心的四个首选，已有选择不会被覆盖。",
+                            english: "You do not need every model. Install one per feature you plan to use; these are the simplest first-use choices, and existing selections are preserved."
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                        recommendedModelRow(
+                            recommendedTextModelDownload,
+                            isInstalled: recommendedModelIsInstalled(recommendedTextModelDownload)
+                        )
+                        Divider()
+                        recommendedModelRow(
+                            recommendedOCRModelDownload,
+                            isInstalled: recommendedModelIsInstalled(recommendedOCRModelDownload)
+                        )
+                        Divider()
+                        recommendedModelRow(
+                            recommendedASRModelDownload,
+                            isInstalled: recommendedModelIsInstalled(recommendedASRModelDownload)
+                        )
+                        Divider()
+                        recommendedModelRow(
+                            recommendedTTSModelDownload,
+                            isInstalled: recommendedModelIsInstalled(recommendedTTSModelDownload),
+                            installIsComplete: appState.ttsHealth?.status == .ready
+                                && recommendedModelIsInstalled(recommendedTTSModelDownload),
+                            installTitle: localizedSettingsText(chinese: "安装 Runtime 和模型", english: "Install runtime and model")
+                        ) {
+                            appState.installTTSRuntime(downloadModel: true)
+                        }
+                    }
+                }
+
+                settingRow(title: localizedSettingsText(chinese: "高级兼容", english: "Advanced compatibility")) {
+                    DisclosureGroup(localizedSettingsText(
+                        chinese: "所有支持的模型与可选 runtime",
+                        english: "All supported models and optional runtimes"
+                    )) {
+                        allSupportedModelDownloadChecklist
+                            .padding(.top, 8)
+                    }
+                }
+            }
+            .padding(.bottom, 2)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var modelSetupAvailabilityRows: some View {
+        let availability = appState.modelFeatureAvailability
+        return VStack(alignment: .leading, spacing: 9) {
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "文本任务", english: "Text tasks"),
+                state: availability.textTasks ? .ready : .unavailable,
+                detail: availability.textTasks
+                    ? localizedSettingsText(chinese: "翻译、润色、总结、解释和待办可用。", english: "Translate, polish, summarize, explain, and todo tasks are available.")
+                    : localizedSettingsText(chinese: "不可用：需要本地文本模型或远程 Provider。", english: "Unavailable: add a local text model or remote provider.")
+            )
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "网页翻译", english: "Webpage translation"),
+                state: availability.webPageTranslation ? .ready : .unavailable,
+                detail: availability.webPageTranslation
+                    ? localizedSettingsText(chinese: "文本模型或 Fast MT 路径可用。", english: "A text-model or Fast MT route is available.")
+                    : localizedSettingsText(chinese: "不可用：需要文本模型，或安装并检查 Fast MT。", english: "Unavailable: add a text model, or install and check Fast MT.")
+            )
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "图片 OCR", english: "Image OCR"),
+                state: availability.imageRecognition
+                    ? (availability.imagePostProcessing ? .ready : .partial)
+                    : .unavailable,
+                detail: availability.imageRecognition
+                    ? (availability.imagePostProcessing
+                        ? localizedSettingsText(chinese: "识别、解释和提取后翻译可用。", english: "Recognition, explanation, and translation after extraction are available.")
+                        : localizedSettingsText(chinese: "基础识别可用；解释和翻译还缺文本模型。", english: "Basic recognition is available; explanation and translation still need a text model."))
+                    : localizedSettingsText(chinese: "不可用：需要视觉模型或支持图片的远程 Provider。", english: "Unavailable: add a vision model or image-capable remote provider.")
+            )
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "字幕与转写", english: "Subtitles and transcription"),
+                state: availability.realtimeSubtitles && availability.mediaTranscription
+                    ? (availability.subtitleTranslation ? .ready : .partial)
+                    : ((availability.realtimeSubtitles || availability.mediaTranscription) ? .partial : .unavailable),
+                detail: subtitleAvailabilityDetail(availability)
+            )
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "会议", english: "Meetings"),
+                state: availability.meetingTranscription
+                    ? (availability.meetingNotes ? .ready : .partial)
+                    : .unavailable,
+                detail: meetingAvailabilityDetail(availability)
+            )
+            modelSetupAvailabilityRow(
+                title: localizedSettingsText(chinese: "文案转语音", english: "Text to speech"),
+                state: availability.textToSpeech
+                    ? (availability.multiRoleTextToSpeech ? .ready : .partial)
+                    : .unavailable,
+                detail: ttsAvailabilityDetail(availability)
+            )
+
+            if availability.missingLocalFileCount > 0 {
+                Label(
+                    localizedSettingsText(
+                        chinese: "有 \(availability.missingLocalFileCount) 个注册项的模型文件已丢失，已从所有功能候选中排除。请到“模型管理”移除或重新添加。",
+                        english: "\(availability.missingLocalFileCount) registered local model path(s) are missing and have been excluded from every feature. Remove or add them again in Model Management."
+                    ),
+                    systemImage: "externaldrive.badge.xmark"
+                )
+                .font(.caption)
+                .foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func modelSetupAvailabilityRow(
+        title: String,
+        state: ModelSetupRowState,
+        detail: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: state.icon)
+                .foregroundStyle(state.color)
+                .frame(width: 16, height: 18)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.subheadline.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func recommendedModelRow(
+        _ entry: SupportedModelDownloadEntry,
+        isInstalled: Bool,
+        installIsComplete: Bool? = nil,
+        installTitle: String? = nil,
+        installAction: (() -> Void)? = nil
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(entry.name(language: language))
+                        .font(.subheadline.weight(.semibold))
+                    Text(entry.modelName)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 8)
+                Label(
+                    isInstalled
+                        ? localizedSettingsText(chinese: "已安装", english: "Installed")
+                        : L10n.text("Not installed", language: language),
+                    systemImage: isInstalled ? "checkmark.circle.fill" : "arrow.down.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(isInstalled ? .green : .secondary)
+            }
+
+            Text(entry.note(language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 7) {
+                Button {
+                    openExternalURL(entry.downloadURL)
+                } label: {
+                    Label(localizedSettingsText(chinese: "下载页", english: "Download"), systemImage: "safari")
+                }
+                Button {
+                    copyToPasteboard(entry.copyCommand)
+                } label: {
+                    Label(L10n.text("Copy", language: language), systemImage: "doc.on.doc")
+                }
+                if let installTitle, let installAction {
+                    Button(action: installAction) {
+                        Label(installTitle, systemImage: appState.ttsRuntimeInstallInProgress ? "clock" : "arrow.down.circle")
+                    }
+                    .disabled((installIsComplete ?? isInstalled) || appState.ttsRuntimeInstallInProgress)
+                } else {
+                    Button {
+                        openLocalModelPanel()
+                    } label: {
+                        Label(L10n.text("Add Local Model", language: language), systemImage: "externaldrive.badge.plus")
+                    }
+                }
+            }
+            .controlSize(.small)
+        }
+    }
+
+    private func recommendedModelIsInstalled(_ entry: SupportedModelDownloadEntry) -> Bool {
+        if entry.modelName == TTSModelVariant.voxCPM2BF16.repositoryID {
+            return LocalTTSService.modelFilesAreComplete(
+                at: LocalTTSService.modelURL(for: .voxCPM2BF16)
+            )
+        }
+        let expectedName = entry.modelName
+            .split(separator: "/")
+            .last
+            .map(String.init)?
+            .lowercased() ?? entry.modelName.lowercased()
+        return appState.models.contains { model in
+            guard !model.isRemoteProvider, model.localFilesAreUsable else { return false }
+            return "\(model.name) \(model.displayPath)".lowercased().contains(expectedName)
+        }
+    }
+
+    private func subtitleAvailabilityDetail(_ availability: ModelFeatureAvailability) -> String {
+        guard availability.realtimeSubtitles || availability.mediaTranscription else {
+            return localizedSettingsText(
+                chinese: "不可用：需要本地 ASR。Qwen3-ASR 首选同时覆盖实时和文件转写。",
+                english: "Unavailable: add local ASR. The recommended Qwen3-ASR covers both live and file transcription."
+            )
+        }
+        if !availability.subtitleTranslation {
+            return localizedSettingsText(
+                chinese: "原文转写可用；译文/双语字幕还需要文本模型或 Fast MT。",
+                english: "Original transcription is available; translated or bilingual subtitles still need a text model or Fast MT."
+            )
+        }
+        if !availability.realtimeSubtitles || !availability.mediaTranscription {
+            return localizedSettingsText(
+                chinese: "仅部分 ASR 模式可用；首选模型可同时补齐实时和文件转写。",
+                english: "Only part of ASR is available; the recommended model covers both live and file transcription."
+            )
+        }
+        return localizedSettingsText(chinese: "实时字幕、文件转写和字幕翻译可用。", english: "Live subtitles, file transcription, and subtitle translation are available.")
+    }
+
+    private func meetingAvailabilityDetail(_ availability: ModelFeatureAvailability) -> String {
+        guard availability.meetingTranscription else {
+            return localizedSettingsText(chinese: "不可用：需要支持会议采集的本地 ASR。", english: "Unavailable: add local ASR that supports meeting capture.")
+        }
+        return availability.meetingNotes
+            ? localizedSettingsText(chinese: "会议转写和本地纪要可用；说话人分离是可选增强。", english: "Meeting transcription and local notes are available; speaker diarization is optional.")
+            : localizedSettingsText(chinese: "会议转写可用；生成纪要还需要本地文本模型。", english: "Meeting transcription is available; notes still need a local text model.")
+    }
+
+    private func ttsAvailabilityDetail(_ availability: ModelFeatureAvailability) -> String {
+        guard availability.textToSpeech else {
+            return appState.ttsHealth?.message
+                ?? localizedSettingsText(chinese: "不可用：需要独立 TTS runtime 和 VoxCPM2 模型。", english: "Unavailable: install the separate TTS runtime and a VoxCPM2 model.")
+        }
+        return availability.multiRoleTextToSpeech
+            ? localizedSettingsText(chinese: "单旁白与多角色生成可用。", english: "Single-narrator and multi-role generation are available.")
+            : localizedSettingsText(chinese: "单旁白生成可用；多角色分析还需要本地文本模型。", english: "Single-narrator generation is available; multi-role analysis still needs a local text model.")
     }
 
     private var modelConfigurationPage: some View {
@@ -5677,6 +6084,10 @@ struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
+            }
+
+            settingRow(title: L10n.text("Post-processing model", language: language)) {
+                ocrPostProcessingModelPicker
             }
 
             settingRow(title: L10n.text("Default recognition mode", language: language)) {
@@ -6375,6 +6786,24 @@ struct SettingsView: View {
         .disabled(appState.visionCapableModels.isEmpty)
     }
 
+    private var ocrPostProcessingModelPicker: some View {
+        Picker("", selection: Binding<UUID?>(
+            get: { appState.preferences.ocr.postProcessingModelID },
+            set: { newValue in
+                appState.updatePreferences { $0.ocr.postProcessingModelID = newValue }
+            }
+        )) {
+            Text(L10n.text("Use text default model", language: language)).tag(UUID?.none)
+            ForEach(appState.textCapableModels) { model in
+                Text(defaultModelPickerTitle(model)).tag(Optional(model.id))
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.menu)
+        .frame(width: 260, alignment: .leading)
+        .disabled(appState.textCapableModels.isEmpty)
+    }
+
     private var settingsMediaFileASRPicker: some View {
         Picker("", selection: Binding<UUID?>(
             get: { appState.preferences.mediaSubtitles.fileASRModelID },
@@ -6383,14 +6812,14 @@ struct SettingsView: View {
             }
         )) {
             Text(L10n.text("No model", language: language)).tag(UUID?.none)
-            ForEach(appState.fileSpeechModels) { model in
+            ForEach(appState.configuredFileSpeechModels) { model in
                 Text(settingsSpeechModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(width: 440, alignment: .leading)
-        .disabled(appState.fileSpeechModels.isEmpty)
+        .disabled(appState.configuredFileSpeechModels.isEmpty)
     }
 
     private var settingsMediaRealtimeASRPicker: some View {
@@ -6401,14 +6830,14 @@ struct SettingsView: View {
             }
         )) {
             Text(L10n.text("No model", language: language)).tag(UUID?.none)
-            ForEach(appState.realtimeSpeechModels) { model in
+            ForEach(appState.configuredRealtimeSpeechModels) { model in
                 Text(settingsSpeechModelPickerTitle(model)).tag(Optional(model.id))
             }
         }
         .labelsHidden()
         .pickerStyle(.menu)
         .frame(width: 440, alignment: .leading)
-        .disabled(appState.realtimeSpeechModels.isEmpty)
+        .disabled(appState.configuredRealtimeSpeechModels.isEmpty)
     }
 
     private var settingsLiveMeetingFileASRPicker: some View {
@@ -6674,7 +7103,7 @@ struct SettingsView: View {
             settingRow(title: L10n.text("Default realtime model", language: language)) {
                 VStack(alignment: .leading, spacing: 8) {
                     settingsMediaRealtimeASRPicker
-                    if let model = appState.selectedRealtimeASRModel {
+                    if let model = appState.configuredRealtimeASRModel {
                         settingsLiveASRPartialControl(for: model)
                     }
                     HStack(spacing: 8) {
@@ -6684,7 +7113,7 @@ struct SettingsView: View {
                             Label(L10n.text("Health Check", language: language), systemImage: appState.mediaSubtitleHealthCheckMode == .realtime ? "clock" : "stethoscope")
                         }
                         .controlSize(.small)
-                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedRealtimeASRModel == nil)
+                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.configuredRealtimeASRModel == nil)
                         Text(localizedSettingsText(
                             chinese: "选择器已按模型族、用途和说话人能力标注；健康检查验证当前模型的实际本地运行时。",
                             english: "The picker labels model family, usage, and speaker capability; Health Check verifies the selected local runtime."
@@ -6693,7 +7122,7 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     if let report = appState.mediaSubtitleHealthReport,
-                       report.modelID == appState.selectedRealtimeASRModel?.id {
+                       report.modelID == appState.configuredRealtimeASRModel?.id {
                         mediaASRHealthReportView(report, mode: .realtime)
                     }
                 }
@@ -6709,13 +7138,13 @@ struct SettingsView: View {
                             Label(L10n.text("Health Check", language: language), systemImage: appState.mediaSubtitleHealthCheckMode == .fileOnly ? "clock" : "stethoscope")
                         }
                         .controlSize(.small)
-                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.selectedFileASRModel == nil)
+                        .disabled(appState.mediaSubtitleHealthCheckMode != nil || appState.configuredFileASRModel == nil)
                         Text(selectedFileSpeakerPipelineSummary)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
                     if let report = appState.mediaSubtitleHealthReport,
-                       report.modelID == appState.selectedFileASRModel?.id {
+                       report.modelID == appState.configuredFileASRModel?.id {
                         mediaASRHealthReportView(report, mode: .fileOnly)
                     }
                 }
@@ -7692,6 +8121,45 @@ struct SettingsView: View {
     }
 
     private var modelDownloadChecklist: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(localizedSettingsText(
+                chinese: "首次使用只需按功能选择下面的首选模型，不需要下载全部兼容项。",
+                english: "For first use, choose only the default for each feature you need; you do not need every compatible model."
+            ))
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+
+            recommendedModelRow(recommendedTextModelDownload, isInstalled: recommendedModelIsInstalled(recommendedTextModelDownload))
+            Divider()
+            recommendedModelRow(recommendedOCRModelDownload, isInstalled: recommendedModelIsInstalled(recommendedOCRModelDownload))
+            Divider()
+            recommendedModelRow(
+                recommendedASRModelDownload,
+                isInstalled: recommendedModelIsInstalled(recommendedASRModelDownload)
+            )
+            Divider()
+            recommendedModelRow(
+                recommendedTTSModelDownload,
+                isInstalled: recommendedModelIsInstalled(recommendedTTSModelDownload),
+                installIsComplete: appState.ttsHealth?.status == .ready
+                    && recommendedModelIsInstalled(recommendedTTSModelDownload),
+                installTitle: localizedSettingsText(chinese: "安装 Runtime 和模型", english: "Install runtime and model")
+            ) {
+                appState.installTTSRuntime(downloadModel: true)
+            }
+
+            DisclosureGroup(localizedSettingsText(
+                chinese: "查看全部兼容模型与可选 runtime",
+                english: "Show all compatible models and optional runtimes"
+            )) {
+                allSupportedModelDownloadChecklist
+                    .padding(.top, 8)
+            }
+        }
+    }
+
+    private var allSupportedModelDownloadChecklist: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(localizedSettingsText(
                 chinese: "新电脑迁移时，先按用途下载下面的模型/运行时文件，再回到模型页添加本地目录或运行对应安装脚本。",
@@ -8039,6 +8507,18 @@ struct SettingsView: View {
             Text(L10n.text("No models registered yet.", language: language))
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+            Text(L10n.text("Start with one recommended model for each feature you need. You do not need to download every supported model.", language: language))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: 430)
+            Button {
+                selectedModelSettingsPane = .setup
+            } label: {
+                Label(L10n.text("Open Model Setup", language: language), systemImage: "list.bullet.clipboard")
+            }
+            .controlSize(.small)
             Button {
                 openLocalModelPanel()
             } label: {
@@ -8076,7 +8556,7 @@ struct SettingsView: View {
 
     private var appVersionText: String {
         let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "0.4.1"
+        let version = info?["CFBundleShortVersionString"] as? String ?? "0.5.1"
         let build = info?["CFBundleVersion"] as? String ?? "dev"
         return "\(version) (\(build))"
     }
@@ -8999,7 +9479,10 @@ struct SettingsView: View {
                 }
                 metaChip("\(L10n.text("Capability source", language: language)): \(capabilitySourceName(model.capabilities.source))", systemImage: capabilityIcon(model.capabilities))
                 Spacer(minLength: 8)
-                statusBadge(modelValidationBadgeText(model), systemImage: validationIcon(model.validationState))
+                statusBadge(
+                    model.localFilesAreUsable ? modelValidationBadgeText(model) : L10n.text("Model files missing", language: language),
+                    systemImage: model.localFilesAreUsable ? validationIcon(model.validationState) : "externaldrive.badge.xmark"
+                )
             }
 
             capabilityDetails(model.capabilities)
@@ -9122,7 +9605,7 @@ struct SettingsView: View {
                     }
                 }
 
-                if !isDefault {
+                if !isDefault && model.isAvailableForUse && model.capabilities.supportsText {
                     Button {
                         appState.setDefaultModel(id: model.id)
                     } label: {

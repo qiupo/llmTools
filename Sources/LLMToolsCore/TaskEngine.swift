@@ -21,6 +21,7 @@ public actor TaskEngine {
     private var snapshot: RegistrySnapshot
     private var history: [HistoryItem]
     private var runners: [RunnerSlot: any ModelRunner]
+    private var registryLoadWarning: String?
 
     public init(
         registryStore: RegistryStore = RegistryStore(),
@@ -38,18 +39,22 @@ public actor TaskEngine {
         self.snapshot = .init()
         self.history = []
         self.runners = Dictionary(uniqueKeysWithValues: runners.map { (.format($0.key), $0.value) })
+        self.registryLoadWarning = nil
     }
 
     public func bootstrap() async {
         do {
             snapshot = try await registryStore.load()
+            registryLoadWarning = nil
         } catch {
             snapshot = .init()
+            registryLoadWarning = error.localizedDescription
         }
+        let previousPreferences = snapshot.preferences
         let refreshedVision = refreshDetectedLocalVisionCapabilities()
         let refreshedSpeech = refreshDetectedSpeechCapabilities()
-        if refreshedVision || refreshedSpeech {
-            sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        sanitizePreferences(&snapshot.preferences, models: snapshot.models)
+        if refreshedVision || refreshedSpeech || snapshot.preferences != previousPreferences {
             try? await registryStore.save(snapshot)
         }
 
@@ -62,6 +67,10 @@ public actor TaskEngine {
 
     public func registry() -> RegistrySnapshot {
         snapshot
+    }
+
+    public func registryBootstrapWarning() -> String? {
+        registryLoadWarning
     }
 
     public func recentHistory() -> [HistoryItem] {
@@ -106,7 +115,7 @@ public actor TaskEngine {
     public func addModelDescriptorForTesting(_ descriptor: ModelDescriptor) async throws {
         snapshot.models.removeAll { $0.id == descriptor.id }
         snapshot.models.append(descriptor)
-        if snapshot.preferences.defaultModelID == nil && descriptor.enabled && descriptor.capabilities.supportsText {
+        if snapshot.preferences.defaultModelID == nil && descriptor.isAvailableForUse && descriptor.capabilities.supportsText {
             snapshot.preferences.defaultModelID = descriptor.id
         }
         sanitizePreferences(&snapshot.preferences, models: snapshot.models)
@@ -147,10 +156,6 @@ public actor TaskEngine {
         )
         snapshot.models.append(descriptor)
         sanitizePreferences(&snapshot.preferences, models: snapshot.models)
-        if descriptor.capabilities.supportsRealtimeSpeech,
-           shouldPromoteRealtimeSpeechModel(descriptor, over: snapshot.preferences.mediaSubtitles.realtimeASRModelID, models: snapshot.models) {
-            snapshot.preferences.mediaSubtitles.realtimeASRModelID = descriptor.id
-        }
         if snapshot.preferences.mediaSubtitles.fileASRModelID == nil,
            descriptor.capabilities.supportsFileSpeech {
             snapshot.preferences.mediaSubtitles.fileASRModelID = descriptor.id
@@ -344,6 +349,9 @@ public actor TaskEngine {
         if snapshot.preferences.ocr.modelID == id {
             snapshot.preferences.ocr.modelID = nil
         }
+        if snapshot.preferences.ocr.postProcessingModelID == id {
+            snapshot.preferences.ocr.postProcessingModelID = nil
+        }
         if snapshot.preferences.mediaSubtitles.realtimeASRModelID == id {
             snapshot.preferences.mediaSubtitles.realtimeASRModelID = nil
         }
@@ -376,19 +384,19 @@ public actor TaskEngine {
     }
 
     public func visionCapableModels() -> [ModelDescriptor] {
-        snapshot.models.filter { $0.enabled && $0.capabilities.supportsImage }
+        snapshot.models.filter { $0.isAvailableForUse && $0.capabilities.supportsImage }
     }
 
     public func speechCapableModels() -> [ModelDescriptor] {
-        snapshot.models.filter { $0.enabled && $0.capabilities.supportsSpeech }
+        snapshot.models.filter { $0.isAvailableForUse && $0.capabilities.supportsSpeech }
     }
 
     public func realtimeSpeechModels() -> [ModelDescriptor] {
-        snapshot.models.filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
+        snapshot.models.filter { $0.isAvailableForUse && $0.capabilities.supportsRealtimeSpeech }
     }
 
     public func fileSpeechModels() -> [ModelDescriptor] {
-        snapshot.models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
+        snapshot.models.filter { $0.isAvailableForUse && $0.capabilities.supportsFileSpeech }
     }
 
     public func checkASRHealth(
@@ -396,7 +404,7 @@ public actor TaskEngine {
         mode: SpeechRuntimeMode = .fileOnly,
         sourceLanguageHint: ASRSourceLanguageHint? = nil
     ) async throws -> ASRHealthReport {
-        let model = try resolveSpeechModel(for: modelID, mode: mode)
+        let model = try resolveSpeechModelForHealthCheck(modelID: modelID, mode: mode)
         let runner = LocalASRProcessRunner()
         var asrPreferences = snapshot.preferences.mediaSubtitles
         if let sourceLanguageHint {
@@ -497,8 +505,8 @@ public actor TaskEngine {
             throw RunnerError.unsupportedConfiguration("Model not found.")
         }
         var model = snapshot.models[index]
-        guard model.enabled else {
-            throw RunnerError.unsupportedConfiguration("Model is disabled.")
+        guard model.isAvailableForUse else {
+            throw RunnerError.unsupportedConfiguration(model.localFilesExist ? "Model is disabled." : "Model files are missing.")
         }
         let runner = try runner(for: model, requiringVision: true)
         guard let visionRunner = runner as? any VisionModelRunner else {
@@ -580,15 +588,15 @@ public actor TaskEngine {
     }
 
     public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
-        let preferredModelID = modelID ?? snapshot.preferences.preferredTextModelID(for: request.task)
-        let model = try resolveModel(for: preferredModelID)
         let routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
         if let fastResult = try await translateTextWithFastMTIfSelected(routedRequest) {
             if persistHistory {
-                appendHistory(model: model, result: fastResult, request: routedRequest)
+                appendHistory(result: fastResult, request: routedRequest)
             }
             return fastResult
         }
+        let preferredModelID = modelID ?? snapshot.preferences.preferredTextModelID(for: request.task)
+        let model = try resolveModel(for: preferredModelID)
         try validateInputSize(routedRequest, for: model)
         let runner = try runner(for: model)
         if await runner.loadedModelID() != model.id {
@@ -605,7 +613,7 @@ public actor TaskEngine {
             result.translationStudy = study
         }
         if persistHistory {
-            appendHistory(model: model, result: result, request: routedRequest)
+            appendHistory(result: result, request: routedRequest)
         }
         return result
     }
@@ -680,17 +688,20 @@ public actor TaskEngine {
         }
 
         let dedicatedOCR = ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
-        if dedicatedOCR, mode == .explainImage {
-            throw OCRTaskError.unsupportedMode(modelName: model.name, mode: mode)
+        // GLM-OCR 只负责视觉文字识别；解释模式先降级为纯 OCR，再由默认文字模型处理。
+        let recognitionMode: OCRMode = if dedicatedOCR, mode != .structured {
+            .plainText
+        } else {
+            mode
         }
         let prompt = PromptTemplates.ocrPrompt(
-            mode: mode,
+            mode: recognitionMode,
             targetLanguage: snapshot.preferences.defaultTranslationTarget,
             preferences: snapshot.preferences,
             dedicatedOCR: dedicatedOCR
         )
         let ocrResult = try await visionRunner.generateOCR(
-            request: OCRTaskRequest(image: image, mode: mode, prompt: prompt),
+            request: OCRTaskRequest(image: image, mode: recognitionMode, prompt: prompt),
             preferences: snapshot.preferences
         )
         let rawModelText = ocrResult.rawModelText ?? ocrResult.text
@@ -699,8 +710,54 @@ public actor TaskEngine {
         let finalRawText: String
         let finalModelName: String
         var detectedOCRSourceLanguage: String?
+        let hasReadableText = !isNoReadableText(visibleOCRText)
+        let hasTextPostProcessingModel = snapshot.models.contains {
+            $0.isAvailableForUse && $0.capabilities.supportsText
+        }
+        // 长文档直接保留 GLM 的结构结果，避免短输出预算在二次生成时截断正文。
+        let shouldPostProcessStructuredText = mode == .structured
+            && visibleOCRText.count <= LocalGenerationPolicy.maximumStructuredOCRPostProcessingCharacters
 
-        if mode == .extractThenTranslate && !isNoReadableText(visibleOCRText) {
+        try Task.checkCancellation()
+        if dedicatedOCR, hasReadableText, mode == .explainImage, !hasTextPostProcessingModel {
+            throw OCRTaskError.missingPostProcessingModel
+        }
+
+        if dedicatedOCR,
+           hasReadableText,
+           hasTextPostProcessingModel,
+           (shouldPostProcessStructuredText || mode == .explainImage) {
+            // 二阶段处理前释放专用视觉模型，避免与默认文字模型同时常驻内存。
+            await runner.unloadIfLoaded(modelID: model.id)
+            let processing = try await run(
+                request: TaskRequest(
+                    task: .ocr,
+                    inputText: PromptTemplates.glmOCRTextPostProcessingPrompt(
+                        mode: mode,
+                        recognizedText: visibleOCRText,
+                        targetLanguage: snapshot.preferences.defaultTranslationTarget
+                    )
+                ),
+                modelID: snapshot.preferences.ocr.postProcessingModelID,
+                persistHistory: false
+            )
+            finalText = processing.text
+            finalRawText = """
+            OCR raw output:
+            \(rawModelText)
+
+            Text processing raw output:
+            \(processing.rawText)
+            """
+            finalModelName = "\(ocrResult.modelName ?? model.name) -> \(processing.modelName)"
+        } else if mode == .extractThenTranslate && hasReadableText {
+            if dedicatedOCR {
+                // 翻译同样属于文字阶段，先回收 GLM-OCR 再沿用现有翻译路由。
+                guard hasTextPostProcessingModel else {
+                    throw OCRTaskError.missingPostProcessingModel
+                }
+                await runner.unloadIfLoaded(modelID: model.id)
+            }
             let sourceLanguage = await detectedSourceLanguageIfNeeded(
                 for: visibleOCRText,
                 currentSourceLanguage: nil,
@@ -716,7 +773,7 @@ public actor TaskEngine {
                     sourceLanguage: sourceLanguage,
                     targetLanguage: snapshot.preferences.defaultTranslationTarget
                 ),
-                modelID: nil,
+                modelID: snapshot.preferences.ocr.postProcessingModelID,
                 persistHistory: false
             )
             finalText = translation.text
@@ -742,7 +799,7 @@ public actor TaskEngine {
             sourceLanguage: detectedOCRSourceLanguage
         )
         if persistHistory ?? snapshot.preferences.ocr.persistHistory {
-            appendOCRHistory(model: model, result: result, image: image)
+            appendOCRHistory(result: result, image: image)
         }
         return result
     }
@@ -1319,7 +1376,7 @@ public actor TaskEngine {
     private func resolveLocalMeetingNotesModel(for modelID: UUID?) throws -> ModelDescriptor {
         let preferredID = modelID ?? snapshot.preferences.liveMeeting.notesModelID ?? snapshot.preferences.defaultModelID
         let candidates = snapshot.models.filter {
-            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+            $0.isAvailableForUse && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
         }
         guard !candidates.isEmpty else { throw LiveMeetingError.missingLocalTextModel }
         if let preferredID,
@@ -1883,14 +1940,14 @@ public actor TaskEngine {
     }
 
     private func resolveTextModel(for modelID: UUID?) throws -> ModelDescriptor {
-        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return model
         }
         if let preferred = snapshot.preferences.defaultModelID,
-           let model = snapshot.models.first(where: { $0.id == preferred && $0.enabled && $0.capabilities.supportsText }) {
+           let model = snapshot.models.first(where: { $0.id == preferred && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return model
         }
-        if let firstEnabled = snapshot.models.first(where: { $0.enabled && $0.capabilities.supportsText }) {
+        if let firstEnabled = snapshot.models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return firstEnabled
         }
         throw RunnerError.unsupportedConfiguration("No enabled model is registered.")
@@ -1898,7 +1955,7 @@ public actor TaskEngine {
 
     private func resolveSpeechModel(for modelID: UUID?, mode: SpeechRuntimeMode) throws -> ModelDescriptor {
         let supportsRequestedMode: (ModelDescriptor) -> Bool = { model in
-            guard model.enabled, model.capabilities.supportsSpeech else {
+            guard model.isAvailableForUse, model.capabilities.supportsSpeech else {
                 return false
             }
             switch mode {
@@ -1929,12 +1986,39 @@ public actor TaskEngine {
         throw MediaSubtitleError.missingASRModel
     }
 
+    private func resolveSpeechModelForHealthCheck(modelID: UUID?, mode: SpeechRuntimeMode) throws -> ModelDescriptor {
+        let supportsRequestedMode: (ModelDescriptor) -> Bool = { model in
+            guard model.isConfiguredForUse, model.capabilities.supportsSpeech else { return false }
+            switch mode {
+            case .realtime:
+                return model.capabilities.supportsRealtimeSpeech
+            case .fileOnly:
+                return model.capabilities.supportsFileSpeech
+            }
+        }
+        if let modelID,
+           let model = snapshot.models.first(where: { $0.id == modelID && supportsRequestedMode($0) }) {
+            return model
+        }
+        let preferredID = mode == .realtime
+            ? snapshot.preferences.mediaSubtitles.realtimeASRModelID
+            : snapshot.preferences.mediaSubtitles.fileASRModelID
+        if let preferredID,
+           let model = snapshot.models.first(where: { $0.id == preferredID && supportsRequestedMode($0) }) {
+            return model
+        }
+        if let model = snapshot.models.first(where: supportsRequestedMode) {
+            return model
+        }
+        throw MediaSubtitleError.missingASRModel
+    }
+
     private func resolveOCRModel(for modelID: UUID?) throws -> ModelDescriptor {
-        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.enabled }) {
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && $0.isAvailableForUse }) {
             return model
         }
         if let preferred = snapshot.preferences.ocr.modelID,
-           let model = snapshot.models.first(where: { $0.id == preferred && $0.enabled }) {
+           let model = snapshot.models.first(where: { $0.id == preferred && $0.isAvailableForUse }) {
             return model
         }
         throw OCRTaskError.missingVisionModel
@@ -2726,50 +2810,60 @@ public actor TaskEngine {
 
     private func sanitizePreferences(_ preferences: inout AppPreferences, models: [ModelDescriptor]) {
         if let modelID = preferences.defaultModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
-            preferences.defaultModelID = models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
+            preferences.defaultModelID = nil
+        }
+        if preferences.defaultModelID == nil {
+            preferences.defaultModelID = ModelRecommendationPolicy.preferredTextModel(in: models)?.id
         }
         preferences.textTaskModelIDs = preferences.textTaskModelIDs.filter { entry in
             TaskKind.perTaskModelCases.contains(entry.key)
-                && models.contains(where: { $0.id == entry.value && $0.enabled && $0.capabilities.supportsText })
+                && models.contains(where: { $0.id == entry.value && $0.capabilities.supportsText })
         }
         if let modelID = preferences.detailedTranslationModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
             preferences.detailedTranslationModelID = nil
         }
         if let modelID = preferences.webPageTranslation.modelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
             preferences.webPageTranslation.modelID = nil
         }
         if let modelID = preferences.ocr.modelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsImage }) {
             preferences.ocr.modelID = nil
         }
+        if preferences.ocr.modelID == nil {
+            preferences.ocr.modelID = ModelRecommendationPolicy.preferredVisionModel(in: models)?.id
+        }
+        if let modelID = preferences.ocr.postProcessingModelID,
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
+            preferences.ocr.postProcessingModelID = nil
+        }
         if let modelID = preferences.mediaSubtitles.realtimeASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) {
-            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsRealtimeSpeech }) {
+            preferences.mediaSubtitles.realtimeASRModelID = nil
         }
         if let modelID = preferences.mediaSubtitles.fileASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }) {
-            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsFileSpeech }) {
+            preferences.mediaSubtitles.fileASRModelID = nil
         }
         if preferences.mediaSubtitles.fileASRModelID == nil {
-            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+            preferences.mediaSubtitles.fileASRModelID = ModelRecommendationPolicy.preferredFileSpeechModel(in: models)?.id
         }
         if preferences.mediaSubtitles.realtimeASRModelID == nil {
-            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+            preferences.mediaSubtitles.realtimeASRModelID = ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: models)?.id
         }
         if let modelID = preferences.liveMeeting.realtimeASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.supportsMeetingCaptureSpeech }) {
+           !models.contains(where: { $0.id == modelID && $0.supportsMeetingCaptureSpeech }) {
             preferences.liveMeeting.realtimeASRModelID = nil
         }
         if let modelID = preferences.liveMeeting.fileASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsFileSpeech }) {
             preferences.liveMeeting.fileASRModelID = nil
         }
         if let modelID = preferences.liveMeeting.notesModelID,
            !models.contains(where: {
-               $0.id == modelID && $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+               $0.id == modelID && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
            }) {
             preferences.liveMeeting.notesModelID = nil
         }
@@ -2778,53 +2872,7 @@ public actor TaskEngine {
         }
     }
 
-    private func shouldPromoteRealtimeSpeechModel(
-        _ candidate: ModelDescriptor,
-        over currentID: UUID?,
-        models: [ModelDescriptor]
-    ) -> Bool {
-        guard candidate.enabled, candidate.capabilities.supportsRealtimeSpeech else {
-            return false
-        }
-        guard let currentID,
-              let current = models.first(where: { $0.id == currentID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) else {
-            return true
-        }
-        return realtimeSpeechPriority(candidate) < realtimeSpeechPriority(current)
-    }
-
-    private func preferredRealtimeSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
-        models
-            .filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
-            .min { lhs, rhs in
-                let lhsPriority = realtimeSpeechPriority(lhs)
-                let rhsPriority = realtimeSpeechPriority(rhs)
-                if lhsPriority == rhsPriority {
-                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-                }
-                return lhsPriority < rhsPriority
-            }
-    }
-
-    private func realtimeSpeechPriority(_ model: ModelDescriptor) -> Int {
-        switch model.capabilities.speech?.family {
-        case .funASRMLTNano:
-            return 0
-        case .funASRNano:
-            return 1
-        case .senseVoiceSmall:
-            return 2
-        case .qwen3ASR06B:
-            return 3
-        case .nemotron35ASRStreaming06B:
-            // 新增的低延迟模型不应擅自覆盖用户已经验证过的实时字幕选择。
-            return 4
-        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
-            return 4
-        }
-    }
-
-    private func appendHistory(model: ModelDescriptor, result: TaskResult, request: TaskRequest) {
+    private func appendHistory(result: TaskResult, request: TaskRequest) {
         let entry = HistoryItem(
             task: request.task,
             modelName: result.modelName,
@@ -2842,10 +2890,10 @@ public actor TaskEngine {
         }
     }
 
-    private func appendOCRHistory(model: ModelDescriptor, result: TaskResult, image: OCRImageInput) {
+    private func appendOCRHistory(result: TaskResult, image: OCRImageInput) {
         let entry = HistoryItem(
             task: .ocr,
-            modelName: model.name,
+            modelName: result.modelName,
             inputPreview: image.redactedHistoryPreview,
             outputPreview: result.text.prefix(240).description
         )

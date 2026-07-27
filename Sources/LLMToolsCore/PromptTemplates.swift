@@ -583,6 +583,9 @@ public enum PromptTemplates {
         preferences: AppPreferences = AppPreferences(),
         dedicatedOCR: Bool = false
     ) -> String {
+        if dedicatedOCR {
+            return glmOCRPrompt(mode: mode)
+        }
         let rawPrompt = preferences.promptTemplates.ocrPrompt(for: mode)
         if !rawPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return renderPromptTemplate(
@@ -590,9 +593,6 @@ public enum PromptTemplates {
                 variables: ocrVariables(mode: mode, targetLanguage: targetLanguage),
                 appendInputIfMissing: false
             )
-        }
-        if dedicatedOCR {
-            return glmOCRPrompt(mode: mode)
         }
         return defaultOCRPrompt(mode: mode, targetLanguage: targetLanguage)
     }
@@ -604,6 +604,44 @@ public enum PromptTemplates {
             return "Text Recognition:"
         case .explainImage:
             return ""
+        }
+    }
+
+    public static func glmOCRTextPostProcessingPrompt(
+        mode: OCRMode,
+        recognizedText: String,
+        targetLanguage: String = "zh-Hans"
+    ) -> String {
+        switch mode {
+        case .structured:
+            return """
+            The original image is unavailable. The content below is OCR output from a dedicated recognition model.
+            Reformat it as faithful Markdown.
+            Rules:
+            - Preserve every readable word, number, punctuation mark, language, and line that carries meaning.
+            - Reconstruct headings, lists, key-value pairs, and tables only when the OCR text clearly supports that structure.
+            - Do not translate, summarize, explain, correct, or add content.
+            - Keep ambiguous lines as plain text instead of guessing their structure.
+            - Output only the Markdown result.
+
+            OCR content:
+            \(recognizedText)
+            """
+        case .explainImage:
+            return """
+            The original image is unavailable. The content below is OCR output from a dedicated recognition model.
+            Explain the recognized document, interface, message, or error in \(targetLanguageName(for: targetLanguage)).
+            Rules:
+            - Base the explanation only on the OCR content and its textual layout.
+            - Do not guess colors, objects, people, icons, chart trends, or any visual detail absent from the OCR content.
+            - If the OCR content is insufficient, state that limitation clearly.
+            - Output only the concise explanation.
+
+            OCR content:
+            \(recognizedText)
+            """
+        case .plainText, .extractThenTranslate:
+            return recognizedText
         }
     }
 

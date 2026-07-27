@@ -83,11 +83,12 @@ public struct TranslationStudyResult: Decodable, Sendable, Hashable {
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         translation = try container.decodeIfPresent(String.self, forKey: .translation) ?? ""
-        alternatives = try container.decodeIfPresent([String].self, forKey: .alternatives) ?? []
-        keyTerms = try container.decodeIfPresent([TranslationKeyTerm].self, forKey: .keyTerms)
-            ?? container.decodeIfPresent([TranslationKeyTerm].self, forKey: .importantWords)
+        // 小模型偶尔会破坏可选字段的类型；主译文合法时仍展示其余可解析内容。
+        alternatives = (try? container.decode([String].self, forKey: .alternatives)) ?? []
+        keyTerms = (try? container.decode([TranslationKeyTerm].self, forKey: .keyTerms))
+            ?? (try? container.decode([TranslationKeyTerm].self, forKey: .importantWords))
             ?? []
-        notes = try container.decodeIfPresent([String].self, forKey: .notes) ?? []
+        notes = (try? container.decode([String].self, forKey: .notes)) ?? []
     }
 
     public static func parse(modelText: String) -> TranslationStudyResult? {
