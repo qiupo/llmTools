@@ -7,6 +7,7 @@ import LLMToolsCore
 struct LLMToolsChecks {
     static func main() async throws {
         try checkGGUFDetectionChoosesPrimaryModel()
+        try await checkModelSetupStates()
         try checkMLXDetection()
         try await checkMiniCPM5Registration()
         try await checkLocalMLXVisionMetadataDetection()
@@ -100,6 +101,227 @@ struct LLMToolsChecks {
             "Expected primary GGUF, got \(detection.resolvedPath.path)."
         )
         try require(detection.sizeClass == "0.8b", "Expected 0.8b size class.")
+    }
+
+    private static func checkModelSetupStates() async throws {
+        let root = try makeTemporaryDirectory(name: "model-setup-states")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let emptyStore = RegistryStore(fileURL: root.appendingPathComponent("missing-registry.json"))
+        let emptySnapshot = try await emptyStore.load()
+        let empty = ModelFeatureAvailability(models: emptySnapshot.models)
+        try require(empty.registeredModelCount == 0 && empty.availableModelCount == 0, "Expected a missing registry to produce an empty setup state.")
+        try require(!empty.hasAnyProcessingFeature, "Expected every processing feature to be unavailable without models.")
+
+        func directory(_ name: String) throws -> URL {
+            let url = root.appendingPathComponent(name, isDirectory: true)
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try Data("{}".utf8).write(to: url.appendingPathComponent("config.json"))
+            try Data("{}".utf8).write(to: url.appendingPathComponent("tokenizer.json"))
+            FileManager.default.createFile(
+                atPath: url.appendingPathComponent("model.safetensors").path,
+                contents: Data()
+            )
+            return url
+        }
+
+        let textModel = ModelDescriptor(
+            name: "Qwen3.5-0.8B-MLX-8bit",
+            sourcePath: try directory("Qwen3.5-0.8B-MLX-8bit"),
+            format: .mlx,
+            sizeClass: "0.8b",
+            role: .default,
+            contextLength: 32_768,
+            capabilities: .textOnly(source: .manual)
+        )
+        let textOnly = ModelFeatureAvailability(models: [textModel])
+        try require(textOnly.textTasks && textOnly.webPageTranslation, "Expected one text model to unlock text and webpage tasks.")
+        try require(!textOnly.imageRecognition && !textOnly.mediaTranscription, "Text-only setup must not unlock OCR or ASR.")
+
+        let visionModel = ModelDescriptor(
+            name: "GLM-OCR-4bit",
+            sourcePath: try directory("GLM-OCR-4bit"),
+            format: .mlx,
+            sizeClass: "0.9b",
+            role: .fast,
+            contextLength: 32_768,
+            capabilities: .ocrOnly(source: .manual, confidence: 1)
+        )
+        let visionOnly = ModelFeatureAvailability(models: [visionModel], selectedOCRModelID: visionModel.id)
+        try require(visionOnly.imageRecognition && !visionOnly.imagePostProcessing, "OCR-only setup should allow recognition but not text post-processing.")
+
+        let generalVisionModel = ModelDescriptor(
+            name: "General VLM",
+            sourcePath: textModel.sourcePath,
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 32_768,
+            capabilities: .vision(source: .manual, confidence: 1)
+        )
+        let generalVisionOnly = ModelFeatureAvailability(
+            models: [generalVisionModel],
+            selectedOCRModelID: generalVisionModel.id
+        )
+        try require(
+            generalVisionOnly.imageRecognition && generalVisionOnly.imagePostProcessing,
+            "A general VLM should handle image explanation without requiring a second text model."
+        )
+
+        let speechModel = ModelDescriptor(
+            name: "Qwen3-ASR-0.6B-8bit",
+            sourcePath: try directory("Qwen3-ASR-0.6B-8bit"),
+            format: .speech,
+            sizeClass: "0.6b",
+            role: .default,
+            contextLength: 0,
+            capabilities: .speech(.qwen3ASR06B(source: .manual, confidence: 1))
+        )
+        let speechOnly = ModelFeatureAvailability(models: [speechModel])
+        try require(speechOnly.realtimeSubtitles && speechOnly.mediaTranscription && speechOnly.meetingTranscription, "Recommended ASR should unlock live, file, and meeting transcription.")
+        try require(!speechOnly.subtitleTranslation && !speechOnly.meetingNotes, "ASR-only setup must keep translation and notes unavailable.")
+
+        let fastMTOnly = ModelFeatureAvailability(models: [], fastTranslationReady: true)
+        try require(fastMTOnly.webPageTranslation && fastMTOnly.subtitleTranslation && !fastMTOnly.textTasks, "Fast MT alone should unlock translation routes, not general text tasks.")
+        let incompleteFastMTDirectory = root.appendingPathComponent("incomplete-fastmt", isDirectory: true)
+        try FileManager.default.createDirectory(at: incompleteFastMTDirectory, withIntermediateDirectories: true)
+        var incompleteFastMTPreferences = FastTranslationPreferences()
+        incompleteFastMTPreferences.nllb200Distilled600MCT2ModelPath = incompleteFastMTDirectory.path
+        try require(
+            FastTranslationCommandRunner.passiveHealth(preferences: incompleteFastMTPreferences).status != .ready,
+            "An empty Fast MT model directory must not pass the startup readiness check."
+        )
+
+        let complete = ModelFeatureAvailability(
+            models: [textModel, visionModel, speechModel],
+            selectedOCRModelID: visionModel.id,
+            fastTranslationReady: false,
+            textToSpeechReady: true
+        )
+        try require(
+            complete.textTasks && complete.imagePostProcessing && complete.realtimeSubtitles
+                && complete.mediaTranscription && complete.meetingNotes && complete.multiRoleTextToSpeech,
+            "Expected one recommended model per core feature to form a complete setup."
+        )
+
+        let staleModel = ModelDescriptor(
+            name: "Moved model",
+            sourcePath: root.appendingPathComponent("does-not-exist"),
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 4_096,
+            capabilities: .textOnly(source: .manual)
+        )
+        let stale = ModelFeatureAvailability(models: [staleModel])
+        try require(stale.registeredModelCount == 1 && stale.availableModelCount == 0 && stale.missingLocalFileCount == 1, "Expected a stale local path to stay registered but be unavailable.")
+        try require(!stale.textTasks, "A missing local path must not unlock text tasks.")
+
+        let emptyDirectoryURL = root.appendingPathComponent("empty-model", isDirectory: true)
+        try FileManager.default.createDirectory(at: emptyDirectoryURL, withIntermediateDirectories: true)
+        let emptyDirectoryModel = ModelDescriptor(
+            name: "Empty model directory",
+            sourcePath: emptyDirectoryURL,
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 4_096,
+            capabilities: .textOnly(source: .manual)
+        )
+        let emptyDirectoryState = ModelFeatureAvailability(models: [emptyDirectoryModel])
+        try require(
+            emptyDirectoryState.availableModelCount == 0 && emptyDirectoryState.missingLocalFileCount == 1,
+            "A directory without model files must not be treated as an installed model."
+        )
+
+        let failedModel = ModelDescriptor(
+            name: "Failed text model",
+            sourcePath: textModel.sourcePath,
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 4_096,
+            validationState: .failed,
+            capabilities: .textOnly(source: .manual)
+        )
+        try require(
+            !ModelFeatureAvailability(models: [failedModel]).textTasks,
+            "A model with an explicit failed validation state must not unlock features."
+        )
+
+        let funASRModel = ModelDescriptor(
+            name: "Fun-ASR-MLT-Nano",
+            sourcePath: try directory("Fun-ASR-MLT-Nano"),
+            format: .speech,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 0,
+            capabilities: .speech(.funASRMLTNano(source: .manual, confidence: 1))
+        )
+        try require(
+            ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: [funASRModel, speechModel])?.id == speechModel.id,
+            "Expected Qwen3-ASR 0.6B 8bit to be the accuracy-first automatic recommendation."
+        )
+
+        let preferenceStore = RegistryStore(fileURL: root.appendingPathComponent("preference-registry.json"))
+        let engine = TaskEngine(
+            registryStore: preferenceStore,
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("preference-history.json"))
+        )
+        try await engine.addModelDescriptorForTesting(funASRModel)
+        try await engine.updatePreferences { preferences in
+            preferences.mediaSubtitles.realtimeASRModelID = funASRModel.id
+        }
+        try await engine.addModelDescriptorForTesting(speechModel)
+        let retainedSelection = await engine.registry().preferences.mediaSubtitles.realtimeASRModelID
+        try require(retainedSelection == funASRModel.id, "Adding a recommended ASR model must not replace an existing valid user selection.")
+
+        let externalModelURL = try directory("external-text-model")
+        let externalModel = ModelDescriptor(
+            name: "External text model",
+            sourcePath: externalModelURL,
+            format: .mlx,
+            sizeClass: "fixture",
+            role: .default,
+            contextLength: 4_096,
+            validationState: .valid,
+            capabilities: .textOnly(source: .manual)
+        )
+        let externalStore = RegistryStore(fileURL: root.appendingPathComponent("external-registry.json"))
+        let externalHistory = HistoryStore(fileURL: root.appendingPathComponent("external-history.json"))
+        let externalEngine = TaskEngine(registryStore: externalStore, historyStore: externalHistory)
+        try await externalEngine.addModelDescriptorForTesting(externalModel)
+        try await externalEngine.updatePreferences { $0.defaultModelID = externalModel.id }
+        try FileManager.default.removeItem(at: externalModelURL)
+
+        let offlineEngine = TaskEngine(registryStore: externalStore, historyStore: externalHistory)
+        await offlineEngine.bootstrap()
+        let offlineSnapshot = await offlineEngine.registry()
+        try require(
+            offlineSnapshot.preferences.defaultModelID == externalModel.id,
+            "A temporarily unavailable external model must keep the user's preference."
+        )
+        _ = try directory("external-text-model")
+        let remountedEngine = TaskEngine(registryStore: externalStore, historyStore: externalHistory)
+        await remountedEngine.bootstrap()
+        let remountedSnapshot = await remountedEngine.registry()
+        try require(
+            remountedSnapshot.preferences.defaultModelID == externalModel.id
+                && remountedSnapshot.models.first(where: { $0.id == externalModel.id })?.isAvailableForUse == true,
+            "The preserved preference must become usable again after the model path is restored."
+        )
+
+        let ocrStore = RegistryStore(fileURL: root.appendingPathComponent("ocr-registry.json"))
+        let ocrEngine = TaskEngine(
+            registryStore: ocrStore,
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("ocr-history.json"))
+        )
+        try await ocrEngine.addModelDescriptorForTesting(visionModel)
+        let selectedOCRModelID = await ocrEngine.registry().preferences.ocr.modelID
+        try require(
+            selectedOCRModelID == visionModel.id,
+            "The first usable OCR model should be selected automatically."
+        )
     }
 
     private static func checkTextToSpeechProjectFixtures() throws {
@@ -931,6 +1153,14 @@ struct LLMToolsChecks {
             contextLength: 4_096,
             capabilities: .textOnly(source: .manual)
         )
+        try FileManager.default.createDirectory(at: defaultModel.sourcePath, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: defaultModel.sourcePath.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: defaultModel.sourcePath.appendingPathComponent("tokenizer.json"))
+        FileManager.default.createFile(
+            atPath: defaultModel.sourcePath.appendingPathComponent("model.safetensors").path,
+            contents: Data()
+        )
+        FileManager.default.createFile(atPath: taskModel.sourcePath.path, contents: Data())
         try await engine.addModelDescriptorForTesting(defaultModel)
         try await engine.addModelDescriptorForTesting(taskModel)
         try await engine.updatePreferences { preferences in
@@ -2025,6 +2255,13 @@ struct LLMToolsChecks {
                 baseURL: URL(string: "https://example.invalid"),
                 modelID: "remote"
             )
+        )
+        try FileManager.default.createDirectory(at: localModel.sourcePath, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: localModel.sourcePath.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: localModel.sourcePath.appendingPathComponent("tokenizer.json"))
+        FileManager.default.createFile(
+            atPath: localModel.sourcePath.appendingPathComponent("model.safetensors").path,
+            contents: Data()
         )
         let runner = StubRunner(output: """
         ## 摘要
@@ -3615,10 +3852,16 @@ struct LLMToolsChecks {
             validationState: .valid,
             capabilities: .textOnly(source: .detected)
         )
+        FileManager.default.createFile(atPath: postProcessingModel.sourcePath.path, contents: Data())
         try await engine.addModelDescriptorForTesting(postProcessingModel)
         let glmDirectory = root.appendingPathComponent("GLM-OCR-4bit", isDirectory: true)
         try FileManager.default.createDirectory(at: glmDirectory, withIntermediateDirectories: true)
         try Data(#"{"model_type":"glm_ocr"}"#.utf8).write(to: glmDirectory.appendingPathComponent("config.json"))
+        try Data("{}".utf8).write(to: glmDirectory.appendingPathComponent("tokenizer.json"))
+        FileManager.default.createFile(
+            atPath: glmDirectory.appendingPathComponent("model.safetensors").path,
+            contents: Data()
+        )
         let glmModel = ModelDescriptor(
             name: "GLM-OCR-4bit",
             sourcePath: glmDirectory,
@@ -4122,6 +4365,7 @@ struct LLMToolsChecks {
         let qwenDirectory = root.appendingPathComponent("Qwen3-ASR-0.6B", isDirectory: true)
         try FileManager.default.createDirectory(at: qwenDirectory, withIntermediateDirectories: true)
         FileManager.default.createFile(atPath: qwenDirectory.appendingPathComponent("config.json").path, contents: Data("{}".utf8))
+        FileManager.default.createFile(atPath: qwenDirectory.appendingPathComponent("model.safetensors").path, contents: Data())
 
         let sherpaQwenDirectory = root.appendingPathComponent("sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25", isDirectory: true)
         try FileManager.default.createDirectory(at: sherpaQwenDirectory, withIntermediateDirectories: true)
@@ -4270,7 +4514,7 @@ struct LLMToolsChecks {
         try require(!nemotron.supportsMeetingCaptureSpeech, "Nemotron must stay out of the meeting capture pipeline.")
 
         var mediaPreferences = await engine.registry().preferences.mediaSubtitles
-        try require(mediaPreferences.realtimeASRModelID == funMLT.id, "Adding Nemotron must not replace the existing realtime ASR preference automatically.")
+        try require(mediaPreferences.realtimeASRModelID == sense.id, "Adding later ASR models must not replace the existing realtime ASR preference automatically.")
         try require(mediaPreferences.fileASRModelID == sense.id, "Expected first file-capable ASR to seed file preference.")
 
         try await engine.updatePreferences { preferences in

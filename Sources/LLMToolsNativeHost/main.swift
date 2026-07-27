@@ -127,11 +127,12 @@ final class NativeMessagingHost: @unchecked Sendable {
                 error: nil
             )
         } catch let error as NativeHostHTTPError {
-            return try encodeErrorResponse(
+            return try encodeEnvelope(
                 requestID: request.requestID,
                 type: "\(request.type).result",
-                code: error.code,
-                message: error.message
+                status: "error",
+                payload: nil,
+                error: error.webPageError
             )
         }
     }
@@ -178,9 +179,13 @@ final class NativeMessagingHost: @unchecked Sendable {
             throw NativeHostHTTPError(code: .appNotRunning, message: "本地桥接没有响应。")
         }
         guard (200..<300).contains(httpResponse.statusCode) else {
-            let message = (try? makeDecoder().decode(BridgeErrorEnvelope.self, from: data).error.message)
-                ?? HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
-            throw NativeHostHTTPError(code: .translationFailed, message: message)
+            if let bridgeError = try? makeDecoder().decode(BridgeErrorEnvelope.self, from: data).error {
+                throw NativeHostHTTPError(webPageError: bridgeError)
+            }
+            throw NativeHostHTTPError(
+                code: .translationFailed,
+                message: HTTPURLResponse.localizedString(forStatusCode: httpResponse.statusCode)
+            )
         }
         return data
     }
@@ -305,8 +310,18 @@ private struct BridgeErrorEnvelope: Decodable {
 }
 
 private struct NativeHostHTTPError: Error {
-    var code: WebPageTranslationErrorCode
-    var message: String
+    var webPageError: WebPageTranslationError
+
+    init(code: WebPageTranslationErrorCode, message: String) {
+        webPageError = WebPageTranslationError(code: code, message: message)
+    }
+
+    init(webPageError: WebPageTranslationError) {
+        self.webPageError = webPageError
+    }
+
+    var code: WebPageTranslationErrorCode { webPageError.code }
+    var message: String { webPageError.message }
 }
 
 private enum JSONValue: Decodable {

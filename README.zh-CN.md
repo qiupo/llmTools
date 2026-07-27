@@ -9,7 +9,7 @@
 
 llmTools 是一个原生 macOS 菜单栏助手，用于对选中文本、网页、图片、音视频和桌面音频执行翻译、润色、总结、解释、TODO 提取、模型视觉 OCR、字幕、会议转写和本地语音生成。它支持本地模型、远程 LLM Provider，并提供一个开发通道的 Chromium 扩展，通过本地 native bridge 翻译网页。
 
-最新版本：[v0.5.0](https://github.com/qiupo/llmTools/releases/tag/v0.5.0)
+最新版本：[v0.5.1](https://github.com/qiupo/llmTools/releases/tag/v0.5.1)
 
 ## 功能亮点
 
@@ -30,9 +30,9 @@ llmTools 是一个原生 macOS 菜单栏助手，用于对选中文本、网页�
 
 ## 当前状态
 
-llmTools 仍在持续开发中。当前 `v0.5.0` 版本在既有文本、网页、字幕、实时字幕和会议工作流上，新增全本地 VoxCPM2 语音生成、可审阅的多角色 TTS 项目、Nemotron 流式 ASR、翻译详解、GLM-OCR 专用识别与可选文字后处理，并强化模型生命周期管理。
+llmTools 仍在持续开发中。当前 `v0.5.1` 版本在 `v0.5.0` 的本地 TTS、ASR、翻译详解与 GLM-OCR 基础上，统一模型可用性判断，新增“开始使用”首屏、按功能单一首选、无模型功能状态和可执行下载指引，并改善网页 bridge/扩展在缺少模型时的诊断。
 
-会议转写与低延迟实时字幕是两条独立管线。实时会议支持麦克风或原生系统音频，本地音视频文件走离线处理；`v0.5.0` 不包含麦克风与系统音频混合的会议采集。实时字幕的说话人分离仍然硬禁用：当前 MVP 不持久化 speaker embedding，也不做跨文件说话人身份识别。
+会议转写与低延迟实时字幕是两条独立管线。实时会议支持麦克风或原生系统音频，本地音视频文件走离线处理；`v0.5.1` 不包含麦克风与系统音频混合的会议采集。实时字幕的说话人分离仍然硬禁用：当前 MVP 不持久化 speaker embedding，也不做跨文件说话人身份识别。
 
 Chromium 网页翻译目前仍是开发通道功能：Chrome 和 Edge 可以加载 unpacked extension，但 Chrome Web Store 分发和生产扩展 ID 暂时有意后置。
 
@@ -71,7 +71,23 @@ Chromium 网页翻译目前仍是开发通道功能：Chrome 和 Edge 可以加�
 2. 解压后，把 `llmTools.app` 移到 `/Applications` 或其他可信目录。
 3. 启动应用。如果 macOS 因为 ad-hoc 签名且未 notarize 而阻止首次启动，请使用 Finder 的 Open 流程，或在 System Settings -> Privacy & Security 中允许。
 4. 如果需要选中文本捕获，请授予 Accessibility 权限。
-5. 如果需要网页翻译，打开 Settings -> `网页翻译`，修复浏览器 bridge，然后按应用显示的路径加载 unpacked Chromium 扩展目录。
+5. 打开“设置 -> 模型 -> 开始使用”。只按自己需要的功能各安装一个推荐模型；安装包不包含模型权重。
+6. 如果需要网页翻译，打开 Settings -> `网页翻译`，修复浏览器 bridge，然后按应用显示的路径加载 unpacked Chromium 扩展目录。
+
+## 首次模型配置
+
+安装包包含 runner 和安装脚本，但不包含模型权重。完全没有本地模型文件、也没有远程 Provider 时，设置、Provider 配置、权限管理和已有历史仍可使用；文本任务、网页翻译、OCR、字幕/ASR、会议转写与纪要、文案转语音均不可用。“模型”首屏会逐项显示这些功能的真实状态；注册项对应的本地文件如果被移动或删除，也会从所有可运行候选中排除。
+
+不需要下载全部支持模型。默认起步组合是：
+
+| 功能 | 推荐首选 | 可用范围 |
+| --- | --- | --- |
+| 文本 | [Qwen3.5-0.8B-MLX-8bit](https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-MLX-8bit) | 文本任务、LLM 网页翻译、OCR 后处理和本地会议纪要。远程文本 Provider 可替代一般文本任务，但会议纪要仍坚持本地模型。 |
+| OCR | [GLM-OCR-4bit](https://huggingface.co/mlx-community/GLM-OCR-4bit) | 基础 OCR 和结构化识别；图片解释、提取后翻译还需要文本模型。 |
+| ASR | [Qwen3-ASR-0.6B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) | 实时字幕、文件转写和会议转写。“仅原文”字幕不需要文本模型，译文/双语仍需要。 |
+| TTS | [VoxCPM2-bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16) | 安装独立 TTS runtime 后可做单旁白生成；多角色分析还需要本地 GGUF 或 MLX 文本模型。 |
+
+文本、OCR、ASR 模型下载后，通过“模型 -> 模型管理 -> 添加本地模型”添加整个目录；ASR 还要执行对应的健康检查/修复 runtime。“开始使用”里的 TTS 行可以一次安装 runtime 和模型。Fast MT、fastText 语言识别和 pyannote 说话人分离都是可选增强；其他兼容模型统一保留在高级折叠区。
 
 Release 还包含这些资产：
 
@@ -247,7 +263,7 @@ node scripts/check-phase4-local-asr-runtime.mjs
 5. 停止采集后，根据需要分别执行“最终整理”“生成纪要”和“导出”。三个动作互相独立且可取消；导出支持 Markdown、TXT 和 JSON，默认写入 Downloads。
 6. 活跃会议期间若 app 异常退出，下次启动可恢复或删除本地草稿。草稿保留转写和 speaker 编辑，但默认不保留临时音频。
 
-`v0.5.0` 暂不支持会议中的麦克风与系统音频混合采集。原生说话人模型把自然停顿保留为逻辑讲话边界，但连续讲话每 120 秒会封装一个有界的技术推理窗口；普通 ASR 优先在自然停顿处输出，并限制连续讲话的最大等待时间。如果本地 ASR 慢于采集且已经排队 2 个推理窗口，app 会自动停止采集并完成队列，避免内存继续无界增长。正常停止时默认删除临时会议音频；异常退出后的清理只处理已终止进程拥有的音频，不会误删另一个仍在运行的 app 实例。
+`v0.5.1` 暂不支持会议中的麦克风与系统音频混合采集。原生说话人模型把自然停顿保留为逻辑讲话边界，但连续讲话每 120 秒会封装一个有界的技术推理窗口；普通 ASR 优先在自然停顿处输出，并限制连续讲话的最大等待时间。如果本地 ASR 慢于采集且已经排队 2 个推理窗口，app 会自动停止采集并完成队列，避免内存继续无界增长。正常停止时默认删除临时会议音频；异常退出后的清理只处理已终止进程拥有的音频，不会误删另一个仍在运行的 app 实例。
 
 隐私默认保持收紧：默认不把原始音频、完整转写、字幕译文、页面标题、完整 URL 或完整媒体路径写入诊断或历史。会议工作目录仅当前用户可访问，不再逐回调落盘无用 PCM，ASR 处理后的临时归一化音频会删除。
 
@@ -313,11 +329,11 @@ GitHub Actions 发布打包位于 `.github/workflows/release.yml`。
 推送版本 tag 触发发布：
 
 ```sh
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.5.1
+git push origin v0.5.1
 ```
 
-也可以在 GitHub Actions 手动运行 workflow，并传入类似 `v0.5.0` 的 `version` input。
+也可以在 GitHub Actions 手动运行 workflow，并传入类似 `v0.5.1` 的 `version` input。
 
 Workflow 会：
 
@@ -359,6 +375,7 @@ Resources/              app icon 资源
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
 - [本地 VoxCPM2 TTS V1 PRD](docs/local-tts-voxcpm2-v1-prd.md)
+- [v0.5.1 发布说明与使用方法](docs/releases/v0.5.1.md)
 - [v0.5.0 发布说明与使用方法](docs/releases/v0.5.0.md)
 - [v0.4.1 发布说明与使用方法](docs/releases/v0.4.1.md)
 - [v0.4.0 发布说明与使用方法](docs/releases/v0.4.0.md)

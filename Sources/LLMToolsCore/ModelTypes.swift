@@ -558,8 +558,52 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
         providerConfiguration?.isRemote ?? false
     }
 
+    public var localFilesExist: Bool {
+        guard !isRemoteProvider else { return true }
+        return FileManager.default.fileExists(atPath: (resolvedPath ?? sourcePath).path)
+    }
+
+    public var localFilesAreUsable: Bool {
+        guard !isRemoteProvider else { return true }
+        let modelURL = resolvedPath ?? sourcePath
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: modelURL.path, isDirectory: &isDirectory) else {
+            return false
+        }
+        guard isDirectory.boolValue else {
+            return format == .gguf || modelURL.pathExtension.lowercased() == "gguf"
+        }
+
+        switch format {
+        case .mlx, .openAICompatible:
+            return (try? ModelDetection.detect(from: modelURL))?.format == .mlx
+        case .speech:
+            guard ModelDetection.detectSpeechModel(at: modelURL) != nil else { return false }
+            return ModelDetection.isNemotronStreamingCoreMLModel(at: modelURL)
+                || Self.directoryContainsModelPayload(modelURL)
+        case .gguf:
+            return (try? ModelDetection.detect(from: modelURL))?.format == .gguf
+        case .anthropicMessages, .unknown:
+            return Self.directoryContainsRegularFile(modelURL)
+        }
+    }
+
+    public var isConfiguredForUse: Bool {
+        enabled && localFilesAreUsable
+    }
+
+    public var isAvailableForUse: Bool {
+        guard isConfiguredForUse else { return false }
+        switch validationState {
+        case .invalid, .loading, .failed:
+            return false
+        case .unknown, .valid, .ready:
+            return true
+        }
+    }
+
     public var supportsImageInput: Bool {
-        enabled && capabilities.supportsImage
+        isAvailableForUse && capabilities.supportsImage
     }
 
     public var supportsThinkingModeControl: Bool {
@@ -583,6 +627,192 @@ public struct ModelDescriptor: Codable, Identifiable, Hashable, Sendable {
     public var meetingCaptureRuntimeMode: SpeechRuntimeMode? {
         guard supportsMeetingCaptureSpeech else { return nil }
         return capabilities.meetingCaptureRuntimeMode
+    }
+
+    private static func directoryContainsRegularFile(_ directory: URL) -> Bool {
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        var inspectedCount = 0
+        while let value = enumerator.nextObject() as? URL, inspectedCount < 256 {
+            inspectedCount += 1
+            if (try? value.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                return true
+            }
+        }
+        return false
+    }
+
+    private static func directoryContainsModelPayload(_ directory: URL) -> Bool {
+        let extensions = Set(["safetensors", "gguf", "bin", "pt", "onnx", "npz"])
+        guard let enumerator = FileManager.default.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        var inspectedCount = 0
+        while let value = enumerator.nextObject() as? URL, inspectedCount < 256 {
+            inspectedCount += 1
+            let name = value.lastPathComponent.lowercased()
+            if extensions.contains(value.pathExtension.lowercased())
+                || name == "model.safetensors.index.json" {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+public struct ModelFeatureAvailability: Equatable, Sendable {
+    public var registeredModelCount: Int
+    public var availableModelCount: Int
+    public var missingLocalFileCount: Int
+    public var fastTranslation: Bool
+    public var textTasks: Bool
+    public var webPageTranslation: Bool
+    public var imageRecognition: Bool
+    public var imagePostProcessing: Bool
+    public var realtimeSubtitles: Bool
+    public var mediaTranscription: Bool
+    public var subtitleTranslation: Bool
+    public var meetingTranscription: Bool
+    public var meetingNotes: Bool
+    public var textToSpeech: Bool
+    public var multiRoleTextToSpeech: Bool
+
+    public init(
+        models: [ModelDescriptor],
+        selectedOCRModelID: UUID? = nil,
+        fastTranslationReady: Bool = false,
+        textToSpeechReady: Bool = false
+    ) {
+        let availableModels = models.filter(\.isAvailableForUse)
+        let hasText = availableModels.contains { $0.capabilities.supportsText }
+        let selectedVision = selectedOCRModelID.flatMap { modelID in
+            availableModels.first { $0.id == modelID && $0.capabilities.supportsImage }
+        }
+        let hasLocalText = availableModels.contains {
+            $0.capabilities.supportsText
+                && !$0.isRemoteProvider
+                && ($0.format == .gguf || $0.format == .mlx)
+        }
+
+        registeredModelCount = models.count
+        availableModelCount = availableModels.count
+        missingLocalFileCount = models.filter { !$0.isRemoteProvider && !$0.localFilesAreUsable }.count
+        fastTranslation = fastTranslationReady
+        textTasks = hasText
+        webPageTranslation = hasText || fastTranslationReady
+        imageRecognition = selectedVision != nil
+        // 通用 VLM 可直接完成解释/翻译；只有纯 OCR 模型才需要第二个文本模型。
+        imagePostProcessing = selectedVision.map { $0.capabilities.supportsText || hasText } ?? false
+        realtimeSubtitles = availableModels.contains { $0.capabilities.supportsRealtimeSpeech }
+        mediaTranscription = availableModels.contains { $0.capabilities.supportsFileSpeech }
+        subtitleTranslation = hasText || fastTranslationReady
+        meetingTranscription = availableModels.contains { $0.supportsMeetingCaptureSpeech }
+        meetingNotes = hasLocalText
+        textToSpeech = textToSpeechReady
+        multiRoleTextToSpeech = textToSpeechReady && hasLocalText
+    }
+
+    public var hasAnyProcessingFeature: Bool {
+        textTasks || webPageTranslation || imageRecognition || realtimeSubtitles
+            || mediaTranscription || meetingTranscription || textToSpeech
+    }
+}
+
+public enum ModelRecommendationPolicy {
+    public static func preferredTextModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
+        models
+            .filter { $0.isAvailableForUse && $0.capabilities.supportsText }
+            .min { lhs, rhs in
+                let lhsRank = textRank(lhs)
+                let rhsRank = textRank(rhs)
+                if lhsRank == rhsRank {
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                return lhsRank < rhsRank
+            }
+    }
+
+    public static func preferredVisionModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
+        models
+            .filter { $0.isAvailableForUse && $0.capabilities.supportsImage }
+            .min { lhs, rhs in
+                let lhsRank = visionRank(lhs)
+                let rhsRank = visionRank(rhs)
+                if lhsRank == rhsRank {
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                return lhsRank < rhsRank
+            }
+    }
+
+    public static func preferredRealtimeSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
+        preferredSpeechModel(in: models) { $0.capabilities.supportsRealtimeSpeech }
+    }
+
+    public static func preferredFileSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
+        preferredSpeechModel(in: models) { $0.capabilities.supportsFileSpeech }
+    }
+
+    private static func preferredSpeechModel(
+        in models: [ModelDescriptor],
+        supportsMode: (ModelDescriptor) -> Bool
+    ) -> ModelDescriptor? {
+        models
+            .filter { $0.isAvailableForUse && supportsMode($0) }
+            .min { lhs, rhs in
+                let lhsRank = speechRank(lhs)
+                let rhsRank = speechRank(rhs)
+                if lhsRank == rhsRank {
+                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+                }
+                return lhsRank < rhsRank
+            }
+    }
+
+    private static func speechRank(_ model: ModelDescriptor) -> Int {
+        let identity = "\(model.name) \(model.displayPath)".lowercased()
+        switch model.capabilities.speech?.family {
+        case .qwen3ASR06B:
+            // benchmark 的准确性首选是 0.6B 8bit；量化或尺寸不明时仍优先留在 Qwen 家族。
+            if identity.contains("0.6b") && identity.contains("8bit") { return 0 }
+            if identity.contains("0.6b") { return 1 }
+            return 2
+        case .funASRMLTNano:
+            return 10
+        case .funASRNano:
+            return 11
+        case .senseVoiceSmall:
+            return 12
+        case .nemotron35ASRStreaming06B:
+            return 20
+        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
+            return 30
+        }
+    }
+
+    private static func textRank(_ model: ModelDescriptor) -> Int {
+        let identity = "\(model.name) \(model.displayPath)".lowercased()
+        if identity.contains("qwen3.5-0.8b") && identity.contains("8bit") { return 0 }
+        if identity.contains("qwen3.5-0.8b") { return 1 }
+        if model.role == .default { return 10 }
+        return 20
+    }
+
+    private static func visionRank(_ model: ModelDescriptor) -> Int {
+        let identity = "\(model.name) \(model.displayPath)".lowercased()
+        if identity.contains("glm-ocr") && identity.contains("4bit") { return 0 }
+        if ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath) { return 1 }
+        if model.role == .fast { return 10 }
+        return 20
     }
 }
 

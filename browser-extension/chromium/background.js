@@ -1,5 +1,5 @@
 const HOST_NAME = "com.llmtools.native_host";
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const LOCAL_SEGMENTS_PER_BATCH = 5;
 const LOCAL_CHARS_PER_BATCH = 800;
 const REMOTE_SEGMENTS_PER_BATCH = 5;
@@ -40,6 +40,8 @@ const EXTENSION_TEXT = {
     pageChangedReady: "页面已变化。就绪。",
     translated: "已翻译。",
     localAppConnected: "本地应用已连接。",
+    webPageTranslationDisabled: "网页翻译已在 llmTools 设置中关闭。",
+    modelSetupRequired: "本地应用已连接，但网页翻译还没有可用模型。请打开 llmTools > 模型 > 开始使用。",
     discoveringVisibleText: "正在发现可见文本...",
     discoveringPageText: "正在发现整页文本...",
     noVisibleText: "没有找到可翻译的可见文本。",
@@ -100,6 +102,8 @@ const EXTENSION_TEXT = {
     pageChangedReady: "Page changed. Ready.",
     translated: "Translated.",
     localAppConnected: "Local app connected.",
+    webPageTranslationDisabled: "Webpage translation is disabled in llmTools settings.",
+    modelSetupRequired: "The local app is connected, but webpage translation has no usable model. Open llmTools > Models > Get Started.",
     discoveringVisibleText: "Discovering visible text...",
     discoveringPageText: "Discovering full-page text...",
     noVisibleText: "No translatable visible text found.",
@@ -303,6 +307,23 @@ function translationEngineModelIDForPreference(engine, fallbackModelID = "") {
   case TRANSLATION_ENGINE_LLM:
   default:
     return fallbackModelID || "";
+  }
+}
+
+function modelRouteReadyForEngine(engine, modelSetup, fallbackReady) {
+  if (!modelSetup || typeof modelSetup !== "object") {
+    return fallbackReady;
+  }
+  const textReady = modelSetup.textTasks === true;
+  const fastMTReady = modelSetup.fastTranslation === true;
+  switch (normalizeTranslationEngine(engine)) {
+  case TRANSLATION_ENGINE_FAST_MT:
+    return fastMTReady;
+  case TRANSLATION_ENGINE_AUTO:
+    return textReady || fastMTReady;
+  case TRANSLATION_ENGINE_LLM:
+  default:
+    return textReady;
   }
 }
 
@@ -1294,6 +1315,8 @@ async function checkStatus(tabID) {
   const payload = response?.payload || {};
   const appLanguage = setCurrentAppLanguage(payload.appLanguage);
   const modelName = payload.modelName || "";
+  const fallbackWebPageTranslationReady = payload.webPageTranslationReady !== false;
+  const webPageTranslationEnabled = payload.webPageTranslationEnabled !== false;
   const modelIsRemoteProvider = Boolean(payload.modelIsRemoteProvider);
   const maxConcurrentTranslationRequests = normalizeTranslationConcurrency(
     payload.maxConcurrentTranslationRequests,
@@ -1316,11 +1339,21 @@ async function checkStatus(tabID) {
     domain: current.domain || "",
     domainRule: current.domainRule || DOMAIN_RULE_ASK
   }));
+  const effectiveTranslationEngine = normalizeTranslationEngine(
+    domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine
+  );
+  const webPageTranslationReady = webPageTranslationEnabled && modelRouteReadyForEngine(
+    effectiveTranslationEngine,
+    payload.modelSetup,
+    fallbackWebPageTranslationReady
+  );
   if (current.hasTranslations) {
     return stateFor(tabID, current.status || "translated", localizedMessageForState(current, appLanguage), {
       ...domainPatch,
       appLanguage,
       modelName,
+      webPageTranslationEnabled,
+      webPageTranslationReady,
       modelIsRemoteProvider,
       maxConcurrentTranslationRequests,
       translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
@@ -1329,10 +1362,22 @@ async function checkStatus(tabID) {
       pendingIndicatorStyle
     });
   }
-  return stateFor(tabID, "idle", t("localAppConnected", {}, appLanguage), {
+  return stateFor(
+    tabID,
+    webPageTranslationReady ? "idle" : (webPageTranslationEnabled ? "modelMissing" : "disabled"),
+    t(
+      webPageTranslationReady
+        ? "localAppConnected"
+        : (webPageTranslationEnabled ? "modelSetupRequired" : "webPageTranslationDisabled"),
+      {},
+      appLanguage
+    ),
+    {
     ...domainPatch,
     appLanguage,
     modelName,
+    webPageTranslationEnabled,
+    webPageTranslationReady,
     modelIsRemoteProvider,
     maxConcurrentTranslationRequests,
     translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
@@ -1476,6 +1521,19 @@ async function translatePage(tabID, options = {}) {
       notice: true
     });
   }
+  const status = await checkStatus(tabID);
+  if (status.webPageTranslationEnabled === false) {
+    const error = new Error(t("webPageTranslationDisabled", {}, status.appLanguage));
+    error.code = "permission_missing";
+    error.repairAction = "open_webpage_settings";
+    throw error;
+  }
+  if (status.webPageTranslationReady === false) {
+    const error = new Error(t("modelSetupRequired", {}, status.appLanguage));
+    error.code = "model_not_configured";
+    error.repairAction = "open_model_settings";
+    throw error;
+  }
   try {
     await ensureContentScript(tabID);
   } catch (error) {
@@ -1484,7 +1542,6 @@ async function translatePage(tabID, options = {}) {
       tabURL
     });
   }
-  const status = await checkStatus(tabID);
   const batchLimits = batchLimitsForModel(Boolean(status.modelIsRemoteProvider));
   const job = {
     pageSessionID: crypto.randomUUID(),
@@ -2490,7 +2547,7 @@ function refreshContextMenu(tabID, state = getState(tabID)) {
   }
   const active = state.status === "discovering" || state.status === "translating";
   chrome.contextMenus.update(MENU_TOGGLE_ID, {
-    enabled: !active,
+    enabled: !active && state.webPageTranslationReady !== false,
     title: t("contextMenuToggle", {}, state.appLanguage)
   }, ignoreLastError);
 }
@@ -2522,7 +2579,11 @@ async function nativeRequest(type, payload, context = {}) {
   };
   const response = await postNativeMessage(message);
   if (!response || response.status === "error") {
-    throw new Error(response?.error?.message || t("nativeHostRequestFailed"));
+    const error = new Error(response?.error?.message || t("nativeHostRequestFailed"));
+    error.code = response?.error?.code || "native_host_request_failed";
+    error.repairAction = response?.error?.repairAction || null;
+    error.diagnostic = response?.error?.diagnostic || null;
+    throw error;
   }
   return response;
 }

@@ -384,10 +384,18 @@ final class AppState: ObservableObject {
         self.history = await engine.recentHistory()
         liveMeetingRecoveryDraft = try? liveMeetingRecoveryStore.loadDiscardingTemporaryAudio()
         liveMeetingDiarizationHealth = await liveMeetingDiarizationService.health(preferences: preferences.speakerDiarization)
+        fastTranslationHealthReport = FastTranslationCommandRunner.passiveHealth(
+            preferences: preferences.fastTranslation
+        )
         await bootstrapTTS()
-        self.statusMessage = snapshot.models.isEmpty
-            ? t("No model configured")
-            : t("Ready")
+        if let warning = await engine.registryBootstrapWarning() {
+            validationError = "\(t("Model registry could not be loaded")): \(warning)"
+            statusMessage = t("Model setup needs attention")
+        } else {
+            statusMessage = modelFeatureAvailability.hasAnyProcessingFeature
+                ? t("Ready")
+                : t("No usable model configured")
+        }
     }
 
     private func registerInstalledFunASRPipelineModelIfNeeded() async {
@@ -455,7 +463,9 @@ final class AppState: ObservableObject {
         if !liveMeetingIsRunning {
             liveMeetingAudioSource = preferences.liveMeeting.defaultAudioSource
         }
-        if let currentModelID, snapshot.models.contains(where: { $0.id == currentModelID }) {
+        if let currentModelID, snapshot.models.contains(where: {
+            $0.id == currentModelID && $0.isAvailableForUse && $0.capabilities.supportsText
+        }) {
             selectedModelID = currentModelID
         } else {
             selectedModelID = resolvedTextModelID(for: selectedTask)
@@ -891,6 +901,11 @@ final class AppState: ObservableObject {
         }
 
         preferences = updated
+        if updated.fastTranslation != previous.fastTranslation {
+            fastTranslationHealthReport = FastTranslationCommandRunner.passiveHealth(
+                preferences: updated.fastTranslation
+            )
+        }
         if updated.preferredTextModelID(for: selectedTask) != previous.preferredTextModelID(for: selectedTask) {
             selectedModelID = resolvedTextModelID(for: selectedTask)
         }
@@ -945,7 +960,7 @@ final class AppState: ObservableObject {
     }
 
     func setDefaultModel(id: UUID) {
-        guard models.contains(where: { $0.id == id && $0.enabled && $0.capabilities.supportsText }) else {
+        guard models.contains(where: { $0.id == id && $0.isAvailableForUse && $0.capabilities.supportsText }) else {
             return
         }
         updatePreferences { $0.defaultModelID = id }
@@ -1309,6 +1324,11 @@ final class AppState: ObservableObject {
         guard validateInputLength(text) else {
             return
         }
+        guard currentTextTaskIsReady else {
+            validationError = t("No usable text model is configured. Open Models > Get Started to download or add one.")
+            statusMessage = t("Model setup required")
+            return
+        }
         guard quickTranslationSpeechGeneratingTarget == nil else { return }
 
         currentRunTask?.cancel()
@@ -1520,12 +1540,23 @@ final class AppState: ObservableObject {
                     mediaSubtitleDescriptor = result.descriptor
                     mediaSubtitleSegments = result.segments
                     mediaSubtitleDiagnostics = result.diagnostics
-                    statusMessage = t("Translating subtitles")
+                    statusMessage = mediaSubtitleMode == .original ? t("Preparing subtitles") : t("Translating subtitles")
                 }
-                let translated = try await engine.translateSubtitleSegments(
-                    result.segments,
-                    targetLanguage: preferences.mediaSubtitles.defaultTargetLanguage
-                )
+                let translated: [SubtitleSegment]
+                if mediaSubtitleMode == .original {
+                    // 仅原文模式只依赖 ASR，不能因为没有文本模型而丢掉已经成功的转写。
+                    translated = result.segments
+                } else {
+                    guard modelFeatureAvailability.subtitleTranslation else {
+                        throw RunnerError.unsupportedConfiguration(
+                            t("Subtitle translation needs a text model or a ready Fast MT runtime.")
+                        )
+                    }
+                    translated = try await engine.translateSubtitleSegments(
+                        result.segments,
+                        targetLanguage: preferences.mediaSubtitles.defaultTargetLanguage
+                    )
+                }
                 try Task.checkCancellation()
                 let preview = try SubtitleExporter.render(
                     segments: translated,
@@ -2046,9 +2077,9 @@ final class AppState: ObservableObject {
     private func mediaSubtitleASRModel(for mode: SpeechRuntimeMode) -> ModelDescriptor? {
         switch mode {
         case .realtime:
-            return selectedRealtimeASRModel
+            return configuredRealtimeASRModel
         case .fileOnly:
-            return selectedFileASRModel
+            return configuredFileASRModel
         }
     }
 
@@ -3852,7 +3883,7 @@ final class AppState: ObservableObject {
 
     var selectedLiveMeetingNotesModel: ModelDescriptor? {
         let candidates = models.filter {
-            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+            $0.isAvailableForUse && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
         }
         if let modelID = preferences.liveMeeting.notesModelID,
            let selected = candidates.first(where: { $0.id == modelID }) { return selected }
@@ -4154,7 +4185,7 @@ final class AppState: ObservableObject {
             return
         }
         guard let modelID,
-              let model = models.first(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) else {
+              let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsRealtimeSpeech }) else {
             appLiveSubtitleMessage = t("Choose a local speech ASR model first.")
             if let previousModelID {
                 updatePreferences { $0.mediaSubtitles.realtimeASRModelID = previousModelID }
@@ -4810,7 +4841,7 @@ final class AppState: ObservableObject {
         guard let modelID = preferences.webPageTranslation.modelID else {
             return
         }
-        if !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+        if !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
             preferences.webPageTranslation.modelID = nil
         }
     }
@@ -4820,11 +4851,14 @@ final class AppState: ObservableObject {
         models: [ModelDescriptor]
     ) {
         if let modelID = preferences.ocr.modelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsImage }) {
             preferences.ocr.modelID = nil
         }
+        if preferences.ocr.modelID == nil {
+            preferences.ocr.modelID = ModelRecommendationPolicy.preferredVisionModel(in: models)?.id
+        }
         if let modelID = preferences.ocr.postProcessingModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsText }) {
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsText }) {
             preferences.ocr.postProcessingModelID = nil
         }
     }
@@ -4916,18 +4950,18 @@ final class AppState: ObservableObject {
         models: [ModelDescriptor]
     ) {
         if let modelID = preferences.mediaSubtitles.realtimeASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }) {
-            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsRealtimeSpeech }) {
+            preferences.mediaSubtitles.realtimeASRModelID = nil
         }
         if let modelID = preferences.mediaSubtitles.fileASRModelID,
-           !models.contains(where: { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }) {
-            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+           !models.contains(where: { $0.id == modelID && $0.capabilities.supportsFileSpeech }) {
+            preferences.mediaSubtitles.fileASRModelID = nil
         }
         if preferences.mediaSubtitles.realtimeASRModelID == nil {
-            preferences.mediaSubtitles.realtimeASRModelID = preferredRealtimeSpeechModel(in: models)?.id
+            preferences.mediaSubtitles.realtimeASRModelID = ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: models)?.id
         }
         if preferences.mediaSubtitles.fileASRModelID == nil {
-            preferences.mediaSubtitles.fileASRModelID = models.first(where: { $0.enabled && $0.capabilities.supportsFileSpeech })?.id
+            preferences.mediaSubtitles.fileASRModelID = ModelRecommendationPolicy.preferredFileSpeechModel(in: models)?.id
         }
     }
 
@@ -4935,27 +4969,32 @@ final class AppState: ObservableObject {
         _ preferences: inout AppPreferences,
         models: [ModelDescriptor]
     ) {
-        let realtimeModels = models.filter { $0.enabled && $0.supportsMeetingCaptureSpeech }
-        let fileModels = models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
-        let notesModels = models.filter {
-            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+        let registeredRealtimeModels = models.filter(\.supportsMeetingCaptureSpeech)
+        let registeredFileModels = models.filter { $0.capabilities.supportsFileSpeech }
+        let registeredNotesModels = models.filter {
+            $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
+        }
+        let realtimeModels = registeredRealtimeModels.filter(\.isAvailableForUse)
+        let fileModels = registeredFileModels.filter(\.isAvailableForUse)
+        let notesModels = registeredNotesModels.filter {
+            $0.isAvailableForUse && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
         }
         if let modelID = preferences.liveMeeting.realtimeASRModelID,
-           !realtimeModels.contains(where: { $0.id == modelID }) {
+           !registeredRealtimeModels.contains(where: { $0.id == modelID }) {
             preferences.liveMeeting.realtimeASRModelID = nil
         }
         if let modelID = preferences.liveMeeting.fileASRModelID,
-           !fileModels.contains(where: { $0.id == modelID }) {
+           !registeredFileModels.contains(where: { $0.id == modelID }) {
             preferences.liveMeeting.fileASRModelID = nil
         }
         if let modelID = preferences.liveMeeting.notesModelID,
-           !notesModels.contains(where: { $0.id == modelID }) {
+           !registeredNotesModels.contains(where: { $0.id == modelID }) {
             preferences.liveMeeting.notesModelID = nil
         }
         if preferences.liveMeeting.realtimeASRModelID == nil {
             preferences.liveMeeting.realtimeASRModelID = preferences.mediaSubtitles.realtimeASRModelID.flatMap { candidate in
                 realtimeModels.first(where: { $0.id == candidate })?.id
-            } ?? preferredRealtimeSpeechModel(in: realtimeModels)?.id ?? realtimeModels.first?.id
+            } ?? ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: realtimeModels)?.id ?? realtimeModels.first?.id
         }
         if preferences.liveMeeting.fileASRModelID == nil {
             preferences.liveMeeting.fileASRModelID = preferences.mediaSubtitles.fileASRModelID ?? fileModels.first?.id
@@ -4988,22 +5027,22 @@ final class AppState: ObservableObject {
 
     private var selectedModelContextLength: Int? {
         if let selectedModelID,
-           let model = models.first(where: { $0.id == selectedModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let model = models.first(where: { $0.id == selectedModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return model.contextLength
         }
         if let defaultModelID = preferences.defaultModelID,
-           let model = models.first(where: { $0.id == defaultModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let model = models.first(where: { $0.id == defaultModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return model.contextLength
         }
-        return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.contextLength
+        return models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })?.contextLength
     }
 
     private func resolvedTextModelID(for task: TaskKind) -> UUID? {
         if let preferredModelID = preferences.preferredTextModelID(for: task),
-           models.contains(where: { $0.id == preferredModelID && $0.enabled && $0.capabilities.supportsText }) {
+           models.contains(where: { $0.id == preferredModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return preferredModelID
         }
-        return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+        return models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })?.id
     }
 
     var effectiveDetailedTranslationModelID: UUID? {
@@ -5019,16 +5058,16 @@ final class AppState: ObservableObject {
     private func resolvedDetailedTranslationModelID() -> UUID? {
         if let configuredModelID = preferences.detailedTranslationModelID,
            models.contains(where: {
-               $0.id == configuredModelID && $0.enabled && $0.capabilities.supportsText
+               $0.id == configuredModelID && $0.isAvailableForUse && $0.capabilities.supportsText
            }) {
             return configuredModelID
         }
         // 未指定时优先选择已安装的本地质量模型，确保开箱即可生成稳定的结构化详解。
         return models.first(where: {
-            $0.enabled && $0.capabilities.supportsText && !$0.isRemoteProvider && $0.role == .quality
+            $0.isAvailableForUse && $0.capabilities.supportsText && !$0.isRemoteProvider && $0.role == .quality
         })?.id
             ?? selectedModelID
-            ?? models.first(where: { $0.enabled && $0.capabilities.supportsText })?.id
+            ?? models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })?.id
     }
 
     private var inputCharacterLimit: Int {
@@ -5061,7 +5100,7 @@ final class AppState: ObservableObject {
             : selectedModelID
         let resolvedName = statusModelName
             ?? models.first(where: { $0.id == effectiveModelID })?.name
-            ?? models.first?.name
+            ?? textCapableModels.first?.name
             ?? t("No model configured")
         return Self.condensedModelName(resolvedName, limit: limit)
     }
@@ -5076,14 +5115,14 @@ final class AppState: ObservableObject {
 
     var selectedTextModelIsRemote: Bool {
         if let selectedModelID,
-           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return selectedModel.isRemoteProvider
         }
         if let defaultModelID = preferences.defaultModelID,
-           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return defaultModel.isRemoteProvider
         }
-        return models.first(where: { $0.enabled && $0.capabilities.supportsText })?.isRemoteProvider ?? false
+        return models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })?.isRemoteProvider ?? false
     }
 
     var webPageTranslationConcurrencyLimit: Int {
@@ -5097,20 +5136,57 @@ final class AppState: ObservableObject {
         return 1
     }
 
+    var modelFeatureAvailability: ModelFeatureAvailability {
+        ModelFeatureAvailability(
+            models: models,
+            selectedOCRModelID: selectedOCRModel?.id,
+            fastTranslationReady: fastTranslationHealthReport?.status == .ready,
+            textToSpeechReady: ttsHealth?.status == .ready
+        )
+    }
+
+    var currentTextTaskIsReady: Bool {
+        if selectedTask == .translate,
+           !usesDetailedTranslationForCurrentTask,
+           preferences.fastTranslation.engine(for: .translate) != .llm,
+           LanguageCodeNormalizer.normalizedBCP47(preferences.defaultTranslationTarget) != nil,
+           fastTranslationHealthReport?.status == .ready {
+            return true
+        }
+        return modelFeatureAvailability.textTasks
+    }
+
+    var webPageTranslationIsReady: Bool {
+        preferences.webPageTranslation.enabled && webPageTranslationRouteIsReady()
+    }
+
+    func webPageTranslationRouteIsReady(for domainOverride: FastTranslationSurfaceEngine? = nil) -> Bool {
+        let configuredEngine = preferences.fastTranslation.engine(for: .webPageTranslate)
+        let effectiveEngine = domainOverride.flatMap { $0 == .auto ? nil : $0 } ?? configuredEngine
+        switch effectiveEngine {
+        case .llm:
+            return modelFeatureAvailability.textTasks
+        case .fastMT:
+            return fastTranslationHealthReport?.status == .ready
+        case .auto:
+            return modelFeatureAvailability.textTasks || fastTranslationHealthReport?.status == .ready
+        }
+    }
+
     private var webPageTranslationModel: ModelDescriptor? {
         if let modelID = preferences.webPageTranslation.modelID,
-           let model = models.first(where: { $0.id == modelID && $0.enabled }) {
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return model
         }
         if let selectedModelID,
-           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let selectedModel = models.first(where: { $0.id == selectedModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return selectedModel
         }
         if let defaultModelID = preferences.defaultModelID,
-           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.enabled && $0.capabilities.supportsText }) {
+           let defaultModel = models.first(where: { $0.id == defaultModelID && $0.isAvailableForUse && $0.capabilities.supportsText }) {
             return defaultModel
         }
-        return models.first(where: { $0.enabled && $0.capabilities.supportsText })
+        return models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })
     }
 
     func webPageTranslationModelDisplayName(limit: Int = 18) -> String {
@@ -5121,94 +5197,96 @@ final class AppState: ObservableObject {
     }
 
     var visionCapableModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsImage }
+        models.filter { $0.isAvailableForUse && $0.capabilities.supportsImage }
     }
 
     var textCapableModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsText }
+        models.filter { $0.isAvailableForUse && $0.capabilities.supportsText }
     }
 
     var speechCapableModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsSpeech }
+        models.filter { $0.isAvailableForUse && $0.capabilities.supportsSpeech }
     }
 
     var realtimeSpeechModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
+        models.filter { $0.isAvailableForUse && $0.capabilities.supportsRealtimeSpeech }
     }
 
     var fileSpeechModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.capabilities.supportsFileSpeech }
+        models.filter { $0.isAvailableForUse && $0.capabilities.supportsFileSpeech }
+    }
+
+    var configuredRealtimeSpeechModels: [ModelDescriptor] {
+        models.filter { $0.isConfiguredForUse && $0.capabilities.supportsRealtimeSpeech }
+    }
+
+    var configuredFileSpeechModels: [ModelDescriptor] {
+        models.filter { $0.isConfiguredForUse && $0.capabilities.supportsFileSpeech }
     }
 
     var meetingCaptureSpeechModels: [ModelDescriptor] {
-        models.filter { $0.enabled && $0.supportsMeetingCaptureSpeech }
+        models.filter { $0.isAvailableForUse && $0.supportsMeetingCaptureSpeech }
     }
 
     var selectedOCRModel: ModelDescriptor? {
-        guard let modelID = preferences.ocr.modelID else {
-            return nil
+        if let modelID = preferences.ocr.modelID,
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsImage }) {
+            return model
         }
-        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsImage }
+        return ModelRecommendationPolicy.preferredVisionModel(in: models)
     }
 
     var selectedRealtimeASRModel: ModelDescriptor? {
-        guard let modelID = preferences.mediaSubtitles.realtimeASRModelID else {
-            return nil
+        if let modelID = preferences.mediaSubtitles.realtimeASRModelID,
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsRealtimeSpeech }) {
+            return model
         }
-        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsRealtimeSpeech }
+        return ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: models)
     }
 
     var selectedFileASRModel: ModelDescriptor? {
-        guard let modelID = preferences.mediaSubtitles.fileASRModelID else {
-            return nil
+        if let modelID = preferences.mediaSubtitles.fileASRModelID,
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsFileSpeech }) {
+            return model
         }
-        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }
+        return ModelRecommendationPolicy.preferredFileSpeechModel(in: models)
+    }
+
+    var configuredRealtimeASRModel: ModelDescriptor? {
+        guard let modelID = preferences.mediaSubtitles.realtimeASRModelID else { return nil }
+        return models.first {
+            $0.id == modelID && $0.isConfiguredForUse && $0.capabilities.supportsRealtimeSpeech
+        }
+    }
+
+    var configuredFileASRModel: ModelDescriptor? {
+        guard let modelID = preferences.mediaSubtitles.fileASRModelID else { return nil }
+        return models.first {
+            $0.id == modelID && $0.isConfiguredForUse && $0.capabilities.supportsFileSpeech
+        }
     }
 
     var selectedLiveMeetingRealtimeASRModel: ModelDescriptor? {
-        guard let modelID = preferences.liveMeeting.realtimeASRModelID else { return nil }
-        return models.first { $0.id == modelID && $0.enabled && $0.supportsMeetingCaptureSpeech }
+        if let modelID = preferences.liveMeeting.realtimeASRModelID,
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.supportsMeetingCaptureSpeech }) {
+            return model
+        }
+        let candidates = models.filter { $0.isAvailableForUse && $0.supportsMeetingCaptureSpeech }
+        return ModelRecommendationPolicy.preferredRealtimeSpeechModel(in: candidates) ?? candidates.first
     }
 
     var selectedLiveMeetingFileASRModel: ModelDescriptor? {
-        guard let modelID = preferences.liveMeeting.fileASRModelID else { return nil }
-        return models.first { $0.id == modelID && $0.enabled && $0.capabilities.supportsFileSpeech }
+        if let modelID = preferences.liveMeeting.fileASRModelID,
+           let model = models.first(where: { $0.id == modelID && $0.isAvailableForUse && $0.capabilities.supportsFileSpeech }) {
+            return model
+        }
+        return ModelRecommendationPolicy.preferredFileSpeechModel(in: models)
     }
 
     private var liveMeetingASRPreferences: MediaSubtitlePreferences {
         var result = preferences.mediaSubtitles
         result.sourceLanguageHint = preferences.liveMeeting.sourceLanguageHint
         return result
-    }
-
-    private func preferredRealtimeSpeechModel(in models: [ModelDescriptor]) -> ModelDescriptor? {
-        models
-            .filter { $0.enabled && $0.capabilities.supportsRealtimeSpeech }
-            .min { lhs, rhs in
-                let lhsPriority = realtimeSpeechPriority(lhs)
-                let rhsPriority = realtimeSpeechPriority(rhs)
-                if lhsPriority == rhsPriority {
-                    return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
-                }
-                return lhsPriority < rhsPriority
-            }
-    }
-
-    private func realtimeSpeechPriority(_ model: ModelDescriptor) -> Int {
-        switch model.capabilities.speech?.family {
-        case .nemotron35ASRStreaming06B:
-            return 4
-        case .funASRMLTNano:
-            return 0
-        case .funASRNano:
-            return 1
-        case .senseVoiceSmall:
-            return 2
-        case .qwen3ASR06B:
-            return 3
-        case .qwen3ASRSherpaOnnx, .vibeVoiceASR, .whisperCppCoreML, .customLocal, .none:
-            return 4
-        }
     }
 
     func ocrModelDisplayName(limit: Int = 18) -> String {

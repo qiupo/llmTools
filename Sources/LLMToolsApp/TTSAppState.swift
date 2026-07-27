@@ -12,7 +12,7 @@ extension AppState {
 
     var localTTSAnalysisModels: [ModelDescriptor] {
         models.filter {
-            $0.enabled
+            $0.isAvailableForUse
                 && $0.capabilities.supportsText
                 && !$0.isRemoteProvider
                 && ($0.format == .gguf || $0.format == .mlx)

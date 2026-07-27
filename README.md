@@ -9,7 +9,7 @@ Languages: English | [简体中文](README.zh-CN.md)
 
 llmTools is a native macOS menu-bar assistant for translating, polishing, summarizing, explaining, extracting TODOs, running model-vision OCR, creating local media subtitles, transcribing meetings, and generating local speech. It supports local models, remote LLM providers, and a development Chromium extension for page translation through a local native bridge.
 
-Latest release: [v0.5.0](https://github.com/qiupo/llmTools/releases/tag/v0.5.0)
+Latest release: [v0.5.1](https://github.com/qiupo/llmTools/releases/tag/v0.5.1)
 
 ## Highlights
 
@@ -30,9 +30,9 @@ Latest release: [v0.5.0](https://github.com/qiupo/llmTools/releases/tag/v0.5.0)
 
 ## Status
 
-llmTools is under active development. The current `v0.5.0` release adds local VoxCPM2 speech generation, reviewed multi-role TTS projects, Nemotron streaming ASR, detailed translation results, dedicated GLM-OCR recognition with optional text post-processing, and stronger model lifecycle safeguards on top of the existing text, webpage, subtitle, live-caption, and meeting workflows.
+llmTools is under active development. Building on the local TTS, ASR, detailed translation, and GLM-OCR work in `v0.5.0`, the current `v0.5.1` release unifies model-readiness checks, adds a first-use setup page with one recommended model per feature, explains every no-model state, provides actionable download guidance, and improves missing-model diagnostics in the webpage bridge and extension.
 
-Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.5.0. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
+Meeting transcription is independent from the low-latency Live Subtitles overlay. Live meetings can use microphone or native system audio; local audio/video files use offline processing. Microphone+system mixed meeting capture is not included in v0.5.1. Chromium webpage translation remains a development-channel feature: Chrome and Edge can load the unpacked extension, but Chrome Web Store distribution and production extension IDs are intentionally deferred.
 
 ## Features And Usage
 
@@ -69,7 +69,23 @@ Meeting transcription is independent from the low-latency Live Subtitles overlay
 2. Unzip it and move `llmTools.app` to `/Applications` or another trusted location.
 3. Launch the app. If macOS blocks the first launch because the app is ad-hoc signed and not notarized, use Finder's Open flow or System Settings -> Privacy & Security.
 4. Grant Accessibility permission when selected-text capture is needed.
-5. For webpage translation, open Settings -> `网页翻译`, repair the browser bridge, and load the unpacked Chromium extension folder shown by the app.
+5. Open Settings -> `Models` -> `Get Started`. Install only one recommended model for each feature you plan to use; the app does not bundle model weights.
+6. For webpage translation, open Settings -> `网页翻译`, repair the browser bridge, and load the unpacked Chromium extension folder shown by the app.
+
+## First Model Setup
+
+The packaged app contains runners and installers, but no model weights. With no local model files and no remote provider, settings, provider setup, permissions, and existing history remain available; text tasks, webpage translation, OCR, ASR/subtitles, meeting transcription/notes, and speech generation are unavailable. The Models page reports each feature separately and excludes registered local models whose files were moved or deleted.
+
+You do not need every supported model. The default starter set is:
+
+| Feature | Recommended default | What it unlocks |
+| --- | --- | --- |
+| Text | [Qwen3.5-0.8B-MLX-8bit](https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-MLX-8bit) | Text tasks, LLM webpage translation, OCR post-processing, and local meeting notes. A remote text provider can replace this for general text tasks, but meeting notes remain local-only. |
+| OCR | [GLM-OCR-4bit](https://huggingface.co/mlx-community/GLM-OCR-4bit) | Basic OCR and structured recognition. Explanation and translation after extraction also need a text model. |
+| ASR | [Qwen3-ASR-0.6B-8bit](https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-8bit) | Live subtitles, file transcription, and meeting transcription. Original-only subtitles need no text model; translated/bilingual output does. |
+| TTS | [VoxCPM2-bf16](https://huggingface.co/mlx-community/VoxCPM2-bf16) | Single-narrator speech after the separate TTS runtime is installed. Multi-role analysis also needs a local GGUF or MLX text model. |
+
+Download a text, OCR, or ASR model, then use `Models -> Model Management -> Add Local Model` to add its directory. ASR also needs its matching runtime health check/repair. The TTS row in `Get Started` installs its runtime and model in one action. Fast MT, fastText language ID, and pyannote speaker diarization are optional enhancements; all alternatives remain under the advanced compatibility disclosure.
 
 Release assets also include:
 
@@ -245,7 +261,7 @@ Use the meeting workflow as follows:
 5. Stop capture. Use `Finalize` when transcript cleanup is wanted, `Generate Notes` to create local Chinese meeting notes, and `Export` to write Markdown, TXT, or JSON to Downloads. These are separate, cancellable actions.
 6. If the app exits abnormally during an active session, restore or delete the local recovery draft at the next launch. Recovery drafts keep transcript/speaker edits but do not retain temporary audio by default.
 
-Meeting capture intentionally does not mix microphone and system audio in v0.5.0. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
+Meeting capture intentionally does not mix microphone and system audio in v0.5.1. A speaker-aware capture model keeps natural pauses as logical turn boundaries, but seals a bounded technical inference window every 120 seconds during uninterrupted speech. Ordinary ASR prefers natural pauses and enforces a bounded continuous-speech delay. If two inference windows are already queued because local ASR is slower than capture, the app automatically stops capture and finishes the queue instead of allowing memory use to grow without bound. Normal stop deletes temporary session audio by default; crash recovery removes audio owned by the terminated process without touching another live app instance.
 
 Privacy defaults stay restrictive: raw audio, full transcripts, translated subtitles, page titles, full URLs, and full media paths are not written to diagnostics or history by default. Meeting workspaces are owner-only, unused per-callback PCM chunks are not persisted, and temporary normalized audio is deleted after ASR processing.
 
@@ -311,11 +327,11 @@ GitHub Actions release packaging lives in `.github/workflows/release.yml`.
 Trigger a release by pushing a version tag:
 
 ```sh
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.5.1
+git push origin v0.5.1
 ```
 
-The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.5.0`.
+The same workflow can be run manually from GitHub Actions with a `version` input such as `v0.5.1`.
 
 The workflow:
 
@@ -357,6 +373,7 @@ Resources/              app icon assets
 - [Phase 4 media intake and live subtitles PRD](docs/phase-4-media-live-subtitles-prd.md)
 - [Phase 4.y live meeting transcription PRD](docs/phase-4y-live-meeting-transcription-prd.md)
 - [Local VoxCPM2 TTS V1 PRD](docs/local-tts-voxcpm2-v1-prd.md)
+- [v0.5.1 release notes and usage](docs/releases/v0.5.1.md)
 - [v0.5.0 release notes and usage](docs/releases/v0.5.0.md)
 - [v0.4.1 release notes and usage](docs/releases/v0.4.1.md)
 - [v0.4.0 release notes and usage](docs/releases/v0.4.0.md)

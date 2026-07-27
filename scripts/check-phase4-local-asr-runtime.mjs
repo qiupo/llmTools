@@ -878,7 +878,10 @@ function markSpeechModelReady(model) {
 
 async function run() {
   const args = parseArgs(process.argv.slice(2));
-  const registry = loadJSON(args.registry);
+  // 全新安装尚未生成注册表时按空配置检查；已有但损坏的 JSON 仍然必须报错。
+  const registry = existsSync(args.registry)
+    ? loadJSON(args.registry)
+    : { models: [], preferences: {} };
   const models = Array.isArray(registry.models) ? registry.models : [];
   const speechModels = models.filter((model) => {
     const family = model.capabilities?.speech?.family;

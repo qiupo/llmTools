@@ -137,6 +137,7 @@ final class LocalAppBridgeServer {
             }
             switch (request.method, request.path) {
             case ("GET", "/status"):
+                let availability = appState.modelFeatureAvailability
                 sendResponse(
                     connection: connection,
                     statusCode: 200,
@@ -144,6 +145,7 @@ final class LocalAppBridgeServer {
                         appName: "llmTools",
                         protocolVersion: 1,
                         bridgeReady: true,
+                        webPageTranslationReady: appState.webPageTranslationIsReady,
                         modelName: webPageTranslationBridgeModelName,
                         modelIsRemoteProvider: webPageTranslationBridgeModelIsRemote,
                         maxConcurrentTranslationRequests: appState.webPageTranslationConcurrencyLimit,
@@ -166,11 +168,36 @@ final class LocalAppBridgeServer {
                         appLiveSubtitleIsRunning: appState.appLiveSubtitlesAreRunning,
                         appLiveSubtitleSessionID: appState.appLiveSubtitleSessionID,
                         appLiveSubtitleAudioSource: appState.appLiveSubtitleAudioSource.rawValue,
-                        appLiveSubtitleWindowOpacity: appState.preferences.mediaSubtitles.liveWindowOpacity
+                        appLiveSubtitleWindowOpacity: appState.preferences.mediaSubtitles.liveWindowOpacity,
+                        modelSetup: BridgeModelSetupPayload(availability: availability)
                     )
                 )
             case ("POST", "/translateSegments"):
+                guard appState.preferences.webPageTranslation.enabled else {
+                    sendResponse(
+                        connection: connection,
+                        statusCode: 403,
+                        payload: errorPayload(
+                            code: .permissionMissing,
+                            message: "网页翻译已关闭。",
+                            repairAction: "open_webpage_settings"
+                        )
+                    )
+                    return
+                }
                 let payload = try decoder.decode(WebPageTranslateSegmentsPayload.self, from: request.body)
+                guard appState.webPageTranslationRouteIsReady(for: payload.translationEngine) else {
+                    sendResponse(
+                        connection: connection,
+                        statusCode: 409,
+                        payload: errorPayload(
+                            code: .modelNotConfigured,
+                            message: "网页翻译没有可用的文本模型或 Fast MT runtime。请打开 llmTools > 模型 > 开始使用。",
+                            repairAction: "open_model_settings"
+                        )
+                    )
+                    return
+                }
                 let taskID = UUID()
                 appState.beginExternalModelUse()
                 let task = Task {
@@ -326,8 +353,20 @@ final class LocalAppBridgeServer {
         })
     }
 
-    private func errorPayload(code: WebPageTranslationErrorCode, message: String) -> [String: WebPageTranslationError] {
-        ["error": WebPageTranslationError(code: code, message: message)]
+    private func errorPayload(
+        code: WebPageTranslationErrorCode,
+        message: String,
+        repairAction: String? = nil,
+        diagnostic: String? = nil
+    ) -> [String: WebPageTranslationError] {
+        [
+            "error": WebPageTranslationError(
+                code: code,
+                message: message,
+                repairAction: repairAction,
+                diagnostic: diagnostic
+            )
+        ]
     }
 
     private func setDomainRule(domain rawDomain: String, rule rawRule: String) -> DomainRuleResponsePayload {
@@ -589,6 +628,7 @@ private struct BridgeStatusPayload: Codable {
     var appName: String
     var protocolVersion: Int
     var bridgeReady: Bool
+    var webPageTranslationReady: Bool
     var modelName: String
     var modelIsRemoteProvider: Bool
     var maxConcurrentTranslationRequests: Int
@@ -612,6 +652,37 @@ private struct BridgeStatusPayload: Codable {
     var appLiveSubtitleSessionID: String?
     var appLiveSubtitleAudioSource: String
     var appLiveSubtitleWindowOpacity: Double
+    var modelSetup: BridgeModelSetupPayload
+}
+
+private struct BridgeModelSetupPayload: Codable {
+    var registeredModelCount: Int
+    var availableModelCount: Int
+    var missingLocalFileCount: Int
+    var fastTranslation: Bool
+    var textTasks: Bool
+    var webPageTranslation: Bool
+    var imageRecognition: Bool
+    var realtimeSubtitles: Bool
+    var mediaTranscription: Bool
+    var meetingTranscription: Bool
+    var meetingNotes: Bool
+    var textToSpeech: Bool
+
+    init(availability: ModelFeatureAvailability) {
+        registeredModelCount = availability.registeredModelCount
+        availableModelCount = availability.availableModelCount
+        missingLocalFileCount = availability.missingLocalFileCount
+        fastTranslation = availability.fastTranslation
+        textTasks = availability.textTasks
+        webPageTranslation = availability.webPageTranslation
+        imageRecognition = availability.imageRecognition
+        realtimeSubtitles = availability.realtimeSubtitles
+        mediaTranscription = availability.mediaTranscription
+        meetingTranscription = availability.meetingTranscription
+        meetingNotes = availability.meetingNotes
+        textToSpeech = availability.textToSpeech
+    }
 }
 
 private struct CancelJobPayload: Codable {
@@ -662,7 +733,9 @@ private enum HTTPReason {
         case 200: return "OK"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
+        case 403: return "Forbidden"
         case 404: return "Not Found"
+        case 409: return "Conflict"
         case 413: return "Payload Too Large"
         case 499: return "Client Closed Request"
         case 500: return "Internal Server Error"

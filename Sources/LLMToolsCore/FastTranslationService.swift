@@ -264,6 +264,60 @@ public actor FastTranslationCommandRunner: FastTranslationService {
             .path
     }
 
+    public static func passiveHealth(preferences: FastTranslationPreferences) -> FastTranslationHealth {
+        guard !preferences.forceLLM else {
+            return FastTranslationHealth(
+                status: .disabled,
+                source: .unavailable,
+                message: "Fast translation is disabled by the forceLLM killswitch."
+            )
+        }
+        if let fixture = try? fixtureEvent() {
+            return FastTranslationHealth(
+                status: .ready,
+                source: .fixtureJSON,
+                engineID: fixture.engineID ?? .ctranslate2,
+                modelID: fixture.model,
+                supportedPairs: fixture.supportedPairs ?? [],
+                message: "Fast translation fixture is configured."
+            )
+        }
+        do {
+            let resolution = try commandResolution(preferences: preferences)
+            guard resolution.engineID == .ctranslate2,
+                  let modelPath = resolution.modelID,
+                  ctranslate2ModelFilesAreComplete(at: URL(fileURLWithPath: modelPath)),
+                  let pythonPath = pythonPath(),
+                  pythonModuleExists("ctranslate2", pythonPath: pythonPath) else {
+                return FastTranslationHealth(
+                    status: .runtimeMissing,
+                    source: .unavailable,
+                    message: "Fast translation needs a successful health check before it can be used."
+                )
+            }
+            // 启动阶段只检查磁盘配置，绝不为了显示 Ready 而拉起常驻翻译 sidecar。
+            return FastTranslationHealth(
+                status: .ready,
+                source: resolution.source,
+                engineID: resolution.engineID,
+                modelID: modelPath,
+                message: "Fast translation runtime files are configured."
+            )
+        } catch let error as FastTranslationError {
+            return FastTranslationHealth(
+                status: error.healthStatus,
+                source: .unavailable,
+                message: error.localizedDescription
+            )
+        } catch {
+            return FastTranslationHealth(
+                status: .failed,
+                source: .unavailable,
+                message: error.localizedDescription
+            )
+        }
+    }
+
     public static func commandResolution(preferences: FastTranslationPreferences) throws -> CommandResolution {
         if let template = preferences.commandTemplates.template(for: .customCommand) {
             let command = renderCommandTemplate(
@@ -545,6 +599,34 @@ public actor FastTranslationCommandRunner: FastTranslationService {
             rawValue = preferences.nllb200Distilled600MCT2ModelPath
         }
         return expandedNonEmptyPath(rawValue)
+    }
+
+    private static func ctranslate2ModelFilesAreComplete(at modelURL: URL) -> Bool {
+        let fileManager = FileManager.default
+        return fileManager.fileExists(atPath: modelURL.appendingPathComponent("config.json").path)
+            && fileManager.fileExists(atPath: modelURL.appendingPathComponent("model.bin").path)
+    }
+
+    private static func pythonModuleExists(_ moduleName: String, pythonPath: String) -> Bool {
+        let pythonURL = URL(fileURLWithPath: pythonPath)
+        let environmentRoot = pythonURL.deletingLastPathComponent().deletingLastPathComponent()
+        let libURL = environmentRoot.appendingPathComponent("lib", isDirectory: true)
+        guard let pythonDirectories = try? FileManager.default.contentsOfDirectory(
+            at: libURL,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return false
+        }
+        return pythonDirectories.contains { directory in
+            directory.lastPathComponent.hasPrefix("python")
+                && FileManager.default.fileExists(
+                    atPath: directory
+                        .appendingPathComponent("site-packages", isDirectory: true)
+                        .appendingPathComponent(moduleName, isDirectory: true)
+                        .path
+                )
+        }
     }
 
     private static func pythonPath() -> String? {
