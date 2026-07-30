@@ -1,6 +1,11 @@
 import Foundation
 
 public enum PromptTemplates {
+    public static func systemPrompt(for request: TaskRequest, preferences: AppPreferences) -> String {
+        let override = request.systemPromptOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return override.isEmpty ? systemPrompt(for: request.task, preferences: preferences) : override
+    }
+
     public static func systemPrompt(for task: TaskKind, preferences: AppPreferences) -> String {
         if let customPrompt = customSystemPrompt(for: task, preferences: preferences) {
             return customPrompt
@@ -40,6 +45,10 @@ public enum PromptTemplates {
     }
 
     public static func userPrompt(for request: TaskRequest, preferences: AppPreferences) -> String {
+        let override = request.userPromptOverride?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !override.isEmpty {
+            return override
+        }
         if let customPrompt = customUserPrompt(for: request, preferences: preferences, isRetry: false) {
             return customPrompt
         }

@@ -67,7 +67,7 @@ public actor OpenAICompatibleRunner: VisionModelRunner {
         let endpoint = baseURL
             .appendingPathComponent("chat")
             .appendingPathComponent("completions")
-        let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
+        let systemPrompt = PromptTemplates.systemPrompt(for: request, preferences: preferences)
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
         let payload = ChatCompletionsRequest(
             model: configuration.modelID,

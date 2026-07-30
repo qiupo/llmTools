@@ -56,10 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private let hotKeyService = HotKeyService()
     private let selectionActionService = SelectionActionService()
     private let settingsNavigation = SettingsNavigationState()
+    private lazy var assistantCoordinator = AssistantContextCoordinator(appState: appState)
     // 快捷操作是高频临时窗口，默认置顶；用户仍可通过窗口内图钉随时取消。
     private let quickActionPinState = WindowPinState(isPinned: true)
     private let selectionActionPinState = WindowPinState()
-    private let floatingWidgetPinState = WindowPinState()
     private let liveSubtitlePinState = WindowPinState()
     private let liveMeetingPinState = WindowPinState()
     private let ttsPinState = WindowPinState()
@@ -70,7 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     private var statusMenuItem: NSMenuItem?
     private var quickActionWindowController: WindowController?
     private var selectionActionWindowController: WindowController?
-    private var floatingWindowController: WindowController?
+    private var assistantWindowController: FloatingAssistantWindowController?
     private var liveSubtitleWindowController: WindowController?
     private var liveMeetingWindowController: WindowController?
     private var ttsWindowController: WindowController?
@@ -118,8 +118,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         }
         Task {
             await appState.bootstrap()
+            await assistantCoordinator.bootstrap()
+            if ProcessInfo.processInfo.environment["LLMTOOLS_ASSISTANT_STAGE_A_PREVIEW"] == "1" {
+                assistantCoordinator.installStageAPreview()
+            }
+            localAppBridgeServer.assistantCoordinator = assistantCoordinator
             localAppBridgeServer.start()
-            applyWindowPreferences()
             applySelectionActionPreference()
             applyHotKeyPreferences()
             refreshStatusMenuItem()
@@ -139,6 +143,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 return
             }
             await appState.stopTTSForShutdown()
+            await assistantCoordinator.shutdown()
+            await appState.prepareModelServicesForApplicationTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
@@ -242,7 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         menu.addItem(NSMenuItem(title: "会议转写与纪要", action: #selector(openLiveMeeting), keyEquivalent: "m"))
         menu.addItem(NSMenuItem(title: "文案转语音", action: #selector(openTextToSpeech), keyEquivalent: "t"))
         menu.addItem(NSMenuItem(title: "音色管理", action: #selector(openTTSVoiceManagement), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "打开悬浮组件", action: #selector(openFloatingWidget), keyEquivalent: "w"))
+        menu.addItem(NSMenuItem(title: "启用桌面情境助手", action: #selector(showDesktopAssistant), keyEquivalent: "w"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "模型", action: #selector(openModelSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "设置", action: #selector(openGeneralSettings), keyEquivalent: "s"))
@@ -304,13 +310,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         selectionActionWindowController?.window?.isOpaque = false
         selectionActionWindowController?.window?.backgroundColor = .clear
         selectionActionWindowController?.window?.hasShadow = false
-        floatingWindowController = WindowController(
-            title: "悬浮组件",
-            frame: NSRect(x: 0, y: 0, width: 360, height: 520),
-            contentView: AnyView(FloatingWidgetView(appState: appState, pinState: floatingWidgetPinState)),
-            pinState: floatingWidgetPinState,
-            autoCollapseAtScreenEdge: appState.preferences.autoCollapseWidget
-        )
+        assistantWindowController = FloatingAssistantWindowController(coordinator: assistantCoordinator)
+        assistantCoordinator.onOpenQuickAction = { [weak self] content in
+            guard let self else { return }
+            _ = appState.switchQuickActionMode(to: .text)
+            appState.selectedTask = .explain
+            if let content, !content.isEmpty {
+                appState.setInputText(content, origin: .manual)
+                appState.markDesktopAssistantWorkbenchHandoff()
+            }
+            openQuickActionWindow(nearSelection: false)
+        }
+        assistantCoordinator.onOpenQuickActionTask = { [weak self] content, task in
+            guard let self, appState.switchQuickActionMode(to: .text) else { return }
+            appState.selectedTask = task
+            appState.setInputText(content, origin: .manual)
+            appState.markDesktopAssistantWorkbenchHandoff()
+            openQuickActionWindow(nearSelection: false)
+        }
+        assistantCoordinator.onReturnToWorkbench = { [weak self] route in
+            guard let self else { return }
+            let mode: AppState.QuickActionMode = switch route {
+            case .text: .text
+            case .image: .image
+            case .media: .media
+            }
+            guard appState.switchQuickActionMode(to: mode) else { return }
+            openQuickActionWindow(nearSelection: false)
+        }
+        assistantCoordinator.onRunDroppedText = { [weak self] payload, task -> Bool in
+            guard let self, appState.switchQuickActionMode(to: .text) else { return false }
+            switch payload {
+            case .text(let text):
+                appState.setInputText(text, origin: .manual)
+            case .file(let url, .textFile):
+                appState.setInputText("", origin: .manual)
+                appState.loadInputFile(from: url)
+            default:
+                return false
+            }
+            appState.selectedTask = task
+            openQuickActionWindow(nearSelection: false)
+            if appState.validationError == nil,
+               !appState.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                appState.markDesktopAssistantWorkbenchHandoff()
+                appState.runCurrentTask(localOnly: true)
+            }
+            return true
+        }
+        assistantCoordinator.onOpenDroppedImage = { [weak self] url, mode -> Bool in
+            guard let self, appState.switchQuickActionMode(to: .image) else { return false }
+            appState.setOCRMode(mode)
+            appState.loadOCRImageFile(from: url, autoRunDefaultRecognition: false)
+            if appState.validationError == nil, appState.ocrImageInput != nil {
+                appState.markDesktopAssistantWorkbenchHandoff()
+            }
+            openQuickActionWindow(nearSelection: false)
+            return true
+        }
+        assistantCoordinator.onOpenDroppedMedia = { [weak self] url, mode -> Bool in
+            guard let self, appState.switchQuickActionMode(to: .media) else { return false }
+            appState.setMediaSubtitleMode(mode)
+            appState.loadMediaSubtitleFile(from: url)
+            if appState.validationError == nil, appState.mediaSubtitleFileURL != nil {
+                appState.markDesktopAssistantWorkbenchHandoff()
+            }
+            openQuickActionWindow(nearSelection: false)
+            return true
+        }
+        assistantCoordinator.onOpenSettings = { [weak self] in self?.showSettings(tab: .assistant) }
+        assistantCoordinator.onOpenModelSettings = { [weak self] in self?.openAssistantModelSettings() }
+        assistantCoordinator.onQuit = { NSApp.terminate(nil) }
         liveSubtitleWindowController = WindowController(
             title: "实时字幕",
             frame: NSRect(origin: .zero, size: liveSubtitleWindowInitialSize),
@@ -387,7 +457,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         settingsWindowController = WindowController(
             title: "设置",
             frame: NSRect(origin: .zero, size: settingsWindowContentSize),
-            contentView: AnyView(SettingsView(appState: appState, navigation: settingsNavigation))
+            contentView: AnyView(SettingsView(
+                appState: appState,
+                navigation: settingsNavigation,
+                assistantCoordinator: assistantCoordinator
+            ))
         )
         if let settingsWindow = settingsWindowController?.window {
             settingsWindow.contentMinSize = NSSize(width: settingsWindowContentSize.width, height: 380)
@@ -409,9 +483,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         openQuickActionWindow(nearSelection: false)
     }
 
-    @objc private func openFloatingWidget() {
-        floatingWindowController?.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
+    @objc private func showDesktopAssistant() {
+        assistantCoordinator.show()
     }
 
     @objc private func openLiveMeeting() {
@@ -490,6 +563,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         showSettings(tab: .models)
     }
 
+    private func openAssistantModelSettings() {
+        settingsNavigation.selectedModelSettingsPane = .settings
+        showSettings(tab: .models)
+    }
+
     private func showSettings(tab: SettingsTab) {
         settingsNavigation.selectedTab = tab
         settingsWindowController?.showWindow(nil)
@@ -529,7 +607,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         source: SelectionActionTriggerSource,
         gesture: SelectionActionGesture?
     ) {
-        guard isSelectionActionEnabled else {
+        guard shouldCaptureSelection(source: source) else {
             return
         }
 
@@ -555,7 +633,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         gesture: SelectionActionGesture?,
         revision: Int
     ) async {
-        guard isSelectionActionEnabled else {
+        guard shouldCaptureSelection(source: source) else {
             return
         }
         guard shouldHandleSelectionActionTrigger(source: source, gesture: gesture) else {
@@ -578,6 +656,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             return
         }
         guard !Task.isCancelled, revision == selectionCaptureRevision else {
+            return
+        }
+
+        if assistantSelectionCaptureIsEnabled() {
+            assistantCoordinator.recordSelection(
+                selectedText,
+                bundleID: SelectedTextService.currentCapturedSourceBundleID
+            )
+        }
+
+        // 助手可静默接入选区；只有划词面板自己的触发项开启时才继续弹出面板。
+        guard shouldShowSelectionActionPanel(source: source) else {
             return
         }
 
@@ -622,7 +712,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             }
             guard !Task.isCancelled,
                   revision == selectionCaptureRevision,
-                  isSelectionActionEnabled else {
+                  shouldCaptureSelection(source: source) else {
                 return nil
             }
             if let selectedText = await SelectedTextService.captureSelectedText(
@@ -667,6 +757,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                 guard !Task.isCancelled, revision == quickActionSelectionCaptureRevision else {
                     return
                 }
+                assistantCoordinator.recordSelection(
+                    selectedText,
+                    bundleID: SelectedTextService.currentCapturedSourceBundleID
+                )
                 appState.setInputText(selectedText, origin: .selection)
                 appState.statusMessage = L10n.text("Captured selected text", language: appState.preferences.appLanguage)
             } else if !SelectedTextService.isAccessibilityTrusted {
@@ -933,10 +1027,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
         appState.$preferences
             .dropFirst()
             .sink { [weak self] preferences in
-                self?.applyWindowPreferences(preferences)
+                self?.assistantCoordinator.preferencesDidChange(preferences.desktopAssistant)
                 self?.applySelectionActionPreference(preferences)
                 self?.applyHotKeyPreferences(preferences)
                 self?.refreshStatusMenuItem()
+            }
+            .store(in: &cancellables)
+
+        assistantCoordinator.$lifecycle
+            .dropFirst()
+            .sink { [weak self] _ in
+                self?.applySelectionActionPreference()
             }
             .store(in: &cancellables)
 
@@ -944,6 +1045,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .dropFirst()
             .sink { [weak self] _ in
                 self?.refreshStatusMenuItem()
+                self?.assistantCoordinator.refreshQualificationStates()
             }
             .store(in: &cancellables)
 
@@ -991,6 +1093,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .dropFirst()
             .sink { [weak self] _ in
                 self?.refreshSelectionActionWindowLayout()
+                self?.refreshAssistantModelResourceState()
+            }
+            .store(in: &cancellables)
+
+        Publishers.MergeMany([
+            appState.$isPreparingOCRImage.map { _ in () }.eraseToAnyPublisher(),
+            appState.$appLiveSubtitleRunState.map { _ in () }.eraseToAnyPublisher(),
+            appState.$liveMeetingSession.map { _ in () }.eraseToAnyPublisher(),
+            appState.$liveMeetingASRInFlight.map { _ in () }.eraseToAnyPublisher(),
+            appState.$liveMeetingFinalizeTaskIsRunning.map { _ in () }.eraseToAnyPublisher(),
+            appState.$liveMeetingNotesTaskIsRunning.map { _ in () }.eraseToAnyPublisher(),
+            appState.$ttsIsAnalyzing.map { _ in () }.eraseToAnyPublisher(),
+            appState.$ttsIsGenerating.map { _ in () }.eraseToAnyPublisher(),
+            appState.$quickTTSIsGenerating.map { _ in () }.eraseToAnyPublisher()
+        ])
+        .dropFirst()
+        .sink { [weak self] _ in self?.refreshAssistantModelResourceState() }
+        .store(in: &cancellables)
+
+        appState.$assistantTaskFailureSignal
+            .compactMap { $0 }
+            .sink { [weak self] (signal: AssistantTaskFailureSignal) in
+                guard let self else { return }
+                assistantCoordinator.recordTaskFailure(
+                    signal.message,
+                    workbenchIsRecoverable: signal.workbenchIsRecoverable,
+                    workbenchRoute: signal.workbenchRoute
+                )
             }
             .store(in: &cancellables)
 
@@ -1016,17 +1146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             .store(in: &cancellables)
     }
 
-    private func applyWindowPreferences(_ preferences: AppPreferences? = nil) {
-        guard let window = floatingWindowController?.window as? FloatingWindow else {
-            return
-        }
-        let preferences = preferences ?? appState.preferences
-        window.autoCollapseAtScreenEdge = preferences.autoCollapseWidget
-        if preferences.widgetVisibleOnAllSpaces {
-            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .managed]
-        } else {
-            window.collectionBehavior = [.fullScreenAuxiliary, .managed]
-        }
+    private func refreshAssistantModelResourceState() {
+        assistantCoordinator.userModelActivityDidChange(appState.assistantUserModelWorkIsActive)
     }
 
     private func refreshLiveSubtitleWindow(for state: AppState.AppLiveSubtitleRunState) {
@@ -1169,14 +1290,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
     }
 
     private func applySelectionActionPreference(_ preferences: AppPreferences? = nil) {
-        let isEnabled = (preferences ?? appState.preferences).selectionActionEnabled
         let preferences = preferences ?? appState.preferences
+        let isEnabled = preferences.selectionActionEnabled
+        let assistantSelectionEnabled = assistantSelectionCaptureIsEnabled(preferences)
+        var triggerSources = selectionActionTriggerSources(for: preferences)
+        if assistantSelectionEnabled {
+            triggerSources.formUnion([.mouseDrag, .doubleClick])
+        }
         isSelectionActionEnabled = isEnabled
-        selectionActionService.setEnabledTriggerSources(selectionActionTriggerSources(for: preferences))
-        selectionActionService.setEnabled(isEnabled)
+        selectionActionService.setEnabledTriggerSources(triggerSources)
+        selectionActionService.setEnabled(isEnabled || assistantSelectionEnabled)
         if !isEnabled {
             closeSelectionAction()
         }
+    }
+
+    private func assistantSelectionCaptureIsEnabled(_ preferences: AppPreferences? = nil) -> Bool {
+        let preferences = (preferences ?? appState.preferences).desktopAssistant
+        return assistantCoordinator.lifecycle.allowsSelectionCapture(preferences: preferences)
+    }
+
+    private func shouldShowSelectionActionPanel(source: SelectionActionTriggerSource) -> Bool {
+        isSelectionActionEnabled && selectionActionTriggerSources(for: appState.preferences).contains(source)
+    }
+
+    private func shouldCaptureSelection(source: SelectionActionTriggerSource) -> Bool {
+        shouldShowSelectionActionPanel(source: source)
+            || assistantSelectionCaptureIsEnabled() && source != .selectAllShortcut
     }
 
     private func applyHotKeyPreferences(_ preferences: AppPreferences? = nil) {
@@ -1308,8 +1448,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
                     appState.appLiveSubtitlesAreRunning ? "Stop live subtitles" : "Start live subtitles",
                     language: appState.preferences.appLanguage
                 )
-            case #selector(openFloatingWidget):
-                item.title = L10n.text("Open Floating Widget", language: appState.preferences.appLanguage)
+            case #selector(showDesktopAssistant):
+                item.title = L10n.text(
+                    appState.preferences.desktopAssistant.isEnabled
+                        ? "Show Desktop Context Assistant"
+                        : "Enable Desktop Context Assistant",
+                    language: appState.preferences.appLanguage
+                )
             case #selector(openTextToSpeech):
                 item.title = appState.preferences.appLanguage == .chinese ? "文案转语音" : "Text to Speech"
             case #selector(openTTSVoiceManagement):
@@ -1573,7 +1718,6 @@ final class WindowController: NSWindowController {
         contentView: AnyView,
         pinState: WindowPinState? = nil,
         windowLevel: NSWindow.Level = .normal,
-        autoCollapseAtScreenEdge: Bool = false,
         windowKind: WindowKind = .regular,
         allowsResizing: Bool = false
     ) {
@@ -1603,9 +1747,6 @@ final class WindowController: NSWindowController {
             )
         }
         window.title = title
-        if let floatingWindow = window as? FloatingWindow {
-            floatingWindow.autoCollapseAtScreenEdge = autoCollapseAtScreenEdge
-        }
         window.center()
         window.contentView = hosting
         window.isReleasedWhenClosed = false
@@ -1723,14 +1864,10 @@ final class SelectionActionWindow: NSPanel {
 }
 
 class FloatingWindow: NSWindow {
-    var autoCollapseAtScreenEdge = false
     var onEscape: (() -> Void)?
     var onClose: (() -> Void)?
     var onKeyboardShortcut: ((KeyboardShortcutPreference) -> Bool)?
     var onCommandPaste: (() -> Bool)?
-    private var expandedWidth: CGFloat = 360
-    private let collapsedWidth: CGFloat = 42
-    private let edgeTolerance: CGFloat = 24
 
     override func close() {
         onClose?()
@@ -1808,68 +1945,4 @@ class FloatingWindow: NSWindow {
         return firstResponder?.tryToPerform(action, with: nil) == true
     }
 
-    override func setFrameOrigin(_ point: NSPoint) {
-        super.setFrameOrigin(point)
-        updateCollapseState()
-    }
-
-    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
-        super.setFrame(frameRect, display: flag)
-        if frameRect.width > collapsedWidth {
-            expandedWidth = frameRect.width
-        }
-        updateCollapseState()
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        if autoCollapseAtScreenEdge, frame.width <= collapsedWidth {
-            expandFromCollapsedState()
-            return
-        }
-        super.mouseDown(with: event)
-    }
-
-    private func updateCollapseState() {
-        guard autoCollapseAtScreenEdge, let screen else {
-            return
-        }
-
-        let visibleFrame = screen.visibleFrame
-        let frame = self.frame
-        let nearLeft = abs(frame.minX - visibleFrame.minX) <= edgeTolerance
-        let nearRight = abs(frame.maxX - visibleFrame.maxX) <= edgeTolerance
-
-        if nearLeft && frame.width > collapsedWidth {
-            setFrame(
-                NSRect(x: visibleFrame.minX, y: frame.minY, width: collapsedWidth, height: frame.height),
-                display: true,
-                animate: true
-            )
-        } else if nearRight && frame.width > collapsedWidth {
-            setFrame(
-                NSRect(x: visibleFrame.maxX - collapsedWidth, y: frame.minY, width: collapsedWidth, height: frame.height),
-                display: true,
-                animate: true
-            )
-        } else if !nearLeft && !nearRight && frame.width <= collapsedWidth {
-            expandFromCollapsedState()
-        }
-    }
-
-    private func expandFromCollapsedState() {
-        guard let screen else {
-            return
-        }
-
-        let visibleFrame = screen.visibleFrame
-        let frame = self.frame
-        let x = abs(frame.maxX - visibleFrame.maxX) <= edgeTolerance
-            ? visibleFrame.maxX - expandedWidth
-            : frame.minX
-        setFrame(
-            NSRect(x: x, y: frame.minY, width: expandedWidth, height: frame.height),
-            display: true,
-            animate: true
-        )
-    }
 }

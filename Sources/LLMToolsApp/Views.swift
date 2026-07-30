@@ -1964,6 +1964,7 @@ private struct OCRImagePreviewSheet: View {
 struct EditableTextView: NSViewRepresentable {
     @Binding var text: String
     var onSubmit: (() -> Void)? = nil
+    var autoFocus: Bool = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(text: $text, onSubmit: onSubmit)
@@ -2000,6 +2001,11 @@ struct EditableTextView: NSViewRepresentable {
 
         scrollView.documentView = textView
         context.coordinator.textView = textView
+        if autoFocus {
+            DispatchQueue.main.async {
+                textView.window?.makeFirstResponder(textView)
+            }
+        }
         return scrollView
     }
 
@@ -2922,6 +2928,16 @@ final class CommandFriendlyTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Tab), !hasMarkedText() {
+            // 多行文本仍把 Tab 交回窗口焦点链；输入法组合期间继续由 NSTextView 处理。
+            if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift) {
+                window?.selectPreviousKeyView(nil)
+            } else {
+                window?.selectNextKeyView(nil)
+            }
+            return
+        }
+
         if let onSubmit,
            event.keyCode == 36 || event.keyCode == 76,
            !event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.shift),
@@ -3127,155 +3143,6 @@ private extension NSTextField {
         default:
             return false
         }
-    }
-}
-
-struct FloatingWidgetView: View {
-    @ObservedObject var appState: AppState
-    @ObservedObject var pinState: WindowPinState
-
-    private var language: AppLanguage {
-        appState.preferences.appLanguage
-    }
-
-    private var displayedOutputText: String {
-        appState.displayedOutputText
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(L10n.text("Widget", language: language))
-                    .font(.headline)
-                Spacer()
-                Text(appState.statusMessage)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                WindowPinButton(pinState: pinState, language: language)
-            }
-
-            Picker(L10n.text("Task", language: language), selection: $appState.selectedTask) {
-                ForEach(TaskKind.interactiveCases) { task in
-                    Text(task.title(language: language)).tag(task)
-                }
-            }
-            .pickerStyle(.menu)
-
-            TaskOptionsView(appState: appState)
-            ModelPickerView(appState: appState)
-
-            if !appState.currentTextTaskIsReady {
-                ModelSetupRequiredBanner(
-                    message: L10n.text("Text tasks need a usable text model. Open model setup to download or add one.", language: language),
-                    language: language
-                )
-            }
-
-            EditableTextView(text: Binding(
-                get: { appState.inputText },
-                set: { newValue in
-                    appState.setInputText(newValue, origin: .manual, preserveOutput: true)
-                }
-            ))
-                .frame(height: 180)
-                .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.2)))
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-
-            HStack {
-                Button {
-                    if appState.isRunning {
-                        appState.cancelCurrentTask(unloadModel: true)
-                    } else {
-                        appState.runCurrentTask()
-                    }
-                } label: {
-                    Label(
-                        L10n.text(appState.isRunning ? "Cancel" : "Run", language: language),
-                        systemImage: appState.isRunning ? "stop.fill" : "play.fill"
-                    )
-                }
-                .disabled(!appState.isRunning && !appState.currentTextTaskIsReady)
-
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(displayedOutputText, forType: .string)
-                } label: {
-                    Label(L10n.text("Copy", language: language), systemImage: "doc.on.doc")
-                }
-                .disabled(displayedOutputText.isEmpty)
-
-                Spacer()
-            }
-
-            if displayedOutputText.isEmpty {
-                Text(L10n.text("Drop text or paste here.", language: language))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            } else {
-                ReadOnlyTextView(text: displayedOutputText)
-            }
-
-            if appState.hasDifferentRawOutput {
-                Button {
-                    appState.showsRawOutput.toggle()
-                } label: {
-                    Label(
-                        L10n.text(appState.showsRawOutput ? "Show result" : "Show raw output", language: language),
-                        systemImage: appState.showsRawOutput ? "text.badge.checkmark" : "curlybraces"
-                    )
-                }
-                .buttonStyle(.borderless)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onDrop(of: [.fileURL, .plainText, .text], isTargeted: nil) { providers in
-            handleDrop(providers)
-        }
-    }
-
-    private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
-        handleTextDrop(providers) || handleFileDrop(providers)
-    }
-
-    private func handleTextDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first(where: { $0.canLoadObject(ofClass: NSString.self) }) else {
-            return false
-        }
-        provider.loadObject(ofClass: NSString.self) { item, _ in
-            guard let text = item as? String else {
-                return
-            }
-            DispatchQueue.main.async {
-                appState.setInputText(text, origin: .manual, preserveOutput: true)
-                appState.statusMessage = L10n.text("Loaded dropped text", language: appState.preferences.appLanguage)
-            }
-        }
-        return true
-    }
-
-    private func handleFileDrop(_ providers: [NSItemProvider]) -> Bool {
-        guard let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) else {
-            return false
-        }
-        provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
-            let url: URL?
-            if let data = item as? Data {
-                url = URL(dataRepresentation: data, relativeTo: nil)
-            } else {
-                url = item as? URL
-            }
-            guard let url else {
-                return
-            }
-            DispatchQueue.main.async {
-                appState.loadInputFile(from: url)
-            }
-        }
-        return true
     }
 }
 
@@ -4618,6 +4485,7 @@ struct TaskOptionsView: View {
 
 enum SettingsTab: CaseIterable, Identifiable {
     case general
+    case assistant
     case shortcuts
     case models
     case defaults
@@ -4630,10 +4498,15 @@ enum SettingsTab: CaseIterable, Identifiable {
 
     var id: Self { self }
 
+    static let firstRow: [SettingsTab] = [.general, .assistant, .shortcuts, .models, .defaults, .ocr]
+    static let secondRow: [SettingsTab] = [.media, .meeting, .webPage, .prompts, .about]
+
     var systemImage: String {
         switch self {
         case .general:
             return "gearshape"
+        case .assistant:
+            return "sparkles"
         case .shortcuts:
             return "keyboard"
         case .models:
@@ -4659,6 +4532,8 @@ enum SettingsTab: CaseIterable, Identifiable {
         switch self {
         case .general:
             return L10n.text("General", language: language)
+        case .assistant:
+            return L10n.text("Assistant", language: language)
         case .shortcuts:
             return L10n.text("Shortcuts", language: language)
         case .models:
@@ -5028,6 +4903,7 @@ private let supportedModelDownloadSections: [SupportedModelDownloadSection] = [
 @MainActor
 final class SettingsNavigationState: ObservableObject {
     @Published var selectedTab: SettingsTab = .general
+    @Published var selectedModelSettingsPane: ModelSettingsPane = .setup
 }
 
 private enum ShortcutCaptureTarget: Identifiable, Hashable {
@@ -5082,7 +4958,7 @@ private enum WebPageDomainRuleKind {
     case neverTranslate
 }
 
-private enum ModelSettingsPane: String, CaseIterable, Identifiable {
+enum ModelSettingsPane: String, CaseIterable, Identifiable {
     case setup
     case settings
     case management
@@ -5126,6 +5002,7 @@ private enum ModelSetupRowState {
 struct SettingsView: View {
     @ObservedObject var appState: AppState
     @ObservedObject var navigation: SettingsNavigationState
+    @ObservedObject var assistantCoordinator: AssistantContextCoordinator
     @State private var providerDraftID: ModelProviderID = .siliconFlow
     @State private var providerDraftName = ""
     @State private var providerDraftModelID = ""
@@ -5140,7 +5017,10 @@ struct SettingsView: View {
     @State private var selectionLimitDraftLineCount = 2
     @State private var webPageDomainDraft = ""
     @State private var speakerDiarizationTokenDraft = ""
-    @State private var selectedModelSettingsPane: ModelSettingsPane = .setup
+    @State private var assistantExcludedBundleIDDraft = ""
+    @State private var showAssistantBehaviorClearChoices = false
+    @State private var assistantSourceHistoryClear: AssistantSource?
+    @State private var assistantDiagnosticsExpanded = false
 
     private var language: AppLanguage {
         appState.preferences.appLanguage
@@ -5180,6 +5060,47 @@ struct SettingsView: View {
                 addSelectionLineLimitRule(from: url)
             }
         }
+        .confirmationDialog(
+            localizedSettingsText(chinese: "清除助手行为记录", english: "Clear Assistant Behavior Records"),
+            isPresented: $showAssistantBehaviorClearChoices,
+            titleVisibility: .visible
+        ) {
+            Button(localizedSettingsText(chinese: "仅删除详细记录", english: "Delete Detailed Records Only"), role: .destructive) {
+                assistantCoordinator.clearBehaviorRecords(resetLearning: false)
+            }
+            Button(localizedSettingsText(chinese: "删除记录并重置学习偏好", english: "Delete Records and Reset Learning"), role: .destructive) {
+                assistantCoordinator.clearBehaviorRecords(resetLearning: true)
+            }
+            Button(L10n.text("Cancel", language: language), role: .cancel) {}
+        } message: {
+            Text(localizedSettingsText(
+                chinese: "请选择是否同时清除聚合偏好并轮换本地内容指纹密钥。",
+                english: "Choose whether to also clear aggregate preferences and rotate the local content-fingerprint key."
+            ))
+        }
+        .confirmationDialog(
+            localizedSettingsText(chinese: "关闭来源并清除历史？", english: "Disable Source and Clear History?"),
+            isPresented: Binding(
+                get: { assistantSourceHistoryClear != nil },
+                set: { if !$0 { assistantSourceHistoryClear = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            if let source = assistantSourceHistoryClear {
+                Button(localizedSettingsText(chinese: "关闭并清除 \(assistantSourceName(source)) 历史", english: "Disable and Clear \(assistantSourceName(source)) History"), role: .destructive) {
+                    assistantCoordinator.disableSourceAndClearHistory(source)
+                    assistantSourceHistoryClear = nil
+                }
+            }
+            Button(L10n.text("Cancel", language: language), role: .cancel) {
+                assistantSourceHistoryClear = nil
+            }
+        } message: {
+            Text(localizedSettingsText(
+                chinese: "未过期原始上下文会立即删除；该来源的脱敏详细记录也会清除，长期聚合学习保持不变。",
+                english: "Unexpired raw context is deleted immediately; detailed sanitized records for this source are also cleared while aggregate learning is retained."
+            ))
+        }
         .onAppear {
             refreshBrowserIntegrationStates()
             initializeProviderDraftIfNeeded()
@@ -5197,7 +5118,13 @@ struct SettingsView: View {
                 .frame(maxWidth: .infinity)
 
             HStack(spacing: 2) {
-                ForEach(SettingsTab.allCases) { tab in
+                ForEach(SettingsTab.firstRow) { tab in
+                    settingsTabButton(tab)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            HStack(spacing: 2) {
+                ForEach(SettingsTab.secondRow) { tab in
                     settingsTabButton(tab)
                 }
             }
@@ -5230,6 +5157,8 @@ struct SettingsView: View {
         switch selectedTab {
         case .general:
             generalSettingsPage
+        case .assistant:
+            assistantSettingsPage
         case .shortcuts:
             shortcutSettingsPage
         case .models:
@@ -5268,29 +5197,6 @@ struct SettingsView: View {
                 }
             }
 
-            settingRow(title: L10n.text("Interface", language: language)) {
-                VStack(alignment: .leading, spacing: 8) {
-                    checkboxLine(
-                        title: L10n.text("Widget visible on all Spaces", language: language),
-                        isOn: Binding(
-                            get: { appState.preferences.widgetVisibleOnAllSpaces },
-                            set: { newValue in
-                                appState.updatePreferences { $0.widgetVisibleOnAllSpaces = newValue }
-                            }
-                        )
-                    )
-                    checkboxLine(
-                        title: L10n.text("Auto-collapse widget at screen edge", language: language),
-                        isOn: Binding(
-                            get: { appState.preferences.autoCollapseWidget },
-                            set: { newValue in
-                                appState.updatePreferences { $0.autoCollapseWidget = newValue }
-                            }
-                        )
-                    )
-                }
-            }
-
             settingRow(title: L10n.text("Text", language: language)) {
                 checkboxLine(
                     title: L10n.text("Replace original text after processing", language: language),
@@ -5310,6 +5216,853 @@ struct SettingsView: View {
             settingRow(title: L10n.text("Language", language: language)) {
                 appLanguagePicker
             }
+        }
+    }
+
+    private var assistantSettingsPage: some View {
+        settingsForm(maxWidth: 620) {
+            settingRow(title: L10n.text("Assistant Status", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        statusBadge(
+                            assistantCoordinator.preferences.isEnabled
+                                ? L10n.text("Enabled", language: language)
+                                : L10n.text("Disabled", language: language),
+                            systemImage: assistantCoordinator.preferences.isEnabled ? "checkmark.circle" : "pause.circle"
+                        )
+                        if assistantCoordinator.lifecycle.mode == .paused {
+                            statusBadge(L10n.text("Paused", language: language), systemImage: "pause.fill")
+                        } else if assistantCoordinator.lifecycle.mode == .privacy {
+                            statusBadge(L10n.text("Privacy Mode", language: language), systemImage: "hand.raised.fill")
+                        }
+                        Spacer()
+                    }
+                    HStack {
+                        if assistantCoordinator.preferences.isEnabled {
+                            Button {
+                                assistantCoordinator.lifecycle.isVisible
+                                    ? assistantCoordinator.hide()
+                                    : assistantCoordinator.show()
+                            } label: {
+                                Label(
+                                    L10n.text(
+                                        assistantCoordinator.lifecycle.isVisible ? "Hide Assistant" : "Show Assistant",
+                                        language: language
+                                    ),
+                                    systemImage: assistantCoordinator.lifecycle.isVisible ? "eye.slash" : "eye"
+                                )
+                            }
+                            Button(role: .destructive, action: assistantCoordinator.disable) {
+                                Label(L10n.text("Disable Assistant", language: language), systemImage: "power")
+                            }
+                        } else {
+                            Button(action: assistantCoordinator.requestEnable) {
+                                Label(L10n.text("Enable Assistant", language: language), systemImage: "sparkles")
+                            }
+                        }
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "行为与主动程度", english: "Behavior and Proactivity")) {
+                assistantBehaviorControls
+            }
+
+            settingRow(title: L10n.text("Assistant Display", language: language)) {
+                VStack(alignment: .leading, spacing: 10) {
+                    checkboxLine(
+                        title: L10n.text("Show on all regular Spaces", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.showOnAllSpaces },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.showOnAllSpaces = value } }
+                        )
+                    )
+                    checkboxLine(
+                        title: L10n.text("Show over full-screen apps", language: language),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.showOverFullScreen },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.showOverFullScreen = value } }
+                        )
+                    )
+                    Picker(L10n.text("Toolbar trigger", language: language), selection: Binding(
+                        get: { appState.preferences.desktopAssistant.toolbarTrigger },
+                        set: { value in appState.updatePreferences { $0.desktopAssistant.toolbarTrigger = value } }
+                    )) {
+                        Text(L10n.text("Hover", language: language)).tag(AssistantToolbarTrigger.hover)
+                        Text(L10n.text("Click", language: language)).tag(AssistantToolbarTrigger.click)
+                    }
+                    .pickerStyle(.segmented)
+                    Button(action: assistantCoordinator.restoreDefaultPosition) {
+                        Label(localizedSettingsText(chinese: "恢复默认位置", english: "Restore Default Position"), systemImage: "arrow.counterclockwise")
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "上下文来源", english: "Context Sources")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label(localizedSettingsText(chinese: "应用隐私保护：始终启用", english: "App Privacy Guard: Always On"), systemImage: "checkmark.shield.fill")
+                            .font(.subheadline)
+                        Spacer()
+                        statusBadge(localizedSettingsText(chinese: "本地否决", english: "Local Filter"), systemImage: "lock.shield")
+                    }
+                    checkboxLine(
+                        title: localizedSettingsText(chinese: "使用前台应用元数据", english: "Use Foreground App Metadata"),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.foregroundApplicationContextEnabled },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.foregroundApplicationContextEnabled = value } }
+                        ),
+                        trailing: AnyView(assistantSourceControls(.foregroundApplication))
+                    )
+                    checkboxLine(
+                        title: localizedSettingsText(chinese: "增强窗口上下文（标题 + 本地截图）", english: "Enhanced Window Context (Title + Local Screenshot)"),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.enhancedWindowContextEnabled },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.enhancedWindowContextEnabled = value } }
+                        ),
+                        trailing: AnyView(assistantSourceControls(.windowContext)),
+                        toggleDisabled: !appState.preferences.desktopAssistant.foregroundApplicationContextEnabled
+                    )
+                    HStack {
+                        Text(localizedSettingsText(chinese: "剪贴板文本", english: "Clipboard Text"))
+                        Spacer()
+                        Picker("", selection: Binding(
+                            get: { appState.preferences.desktopAssistant.clipboardAuthorization },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.clipboardAuthorization = value } }
+                        )) {
+                            Text(localizedSettingsText(chinese: "允许", english: "Allow")).tag(AssistantClipboardAuthorization.allowed)
+                            Text(localizedSettingsText(chinese: "不允许", english: "Don't Allow")).tag(AssistantClipboardAuthorization.denied)
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(width: 180)
+                        assistantSourceControls(.clipboard)
+                    }
+                    checkboxLine(
+                        title: localizedSettingsText(chinese: "接入主动选区", english: "Use Explicit Selections"),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.selectionContextEnabled },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.selectionContextEnabled = value } }
+                        ),
+                        trailing: AnyView(assistantSourceControls(.selection))
+                    )
+                    HStack {
+                        Label(
+                            assistantCoordinator.accessibilityAuthorized
+                                ? localizedSettingsText(chinese: "辅助功能已授权", english: "Accessibility Authorized")
+                                : localizedSettingsText(chinese: "辅助功能未授权", english: "Accessibility Not Authorized"),
+                            systemImage: assistantCoordinator.accessibilityAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(assistantCoordinator.accessibilityAuthorized ? Color.secondary : Color.orange)
+                        Spacer()
+                        if !assistantCoordinator.accessibilityAuthorized {
+                            Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openAccessibilitySettings)
+                                .controlSize(.small)
+                        }
+                    }
+                    if appState.preferences.desktopAssistant.enhancedWindowContextEnabled {
+                        HStack {
+                            Label(
+                                assistantCoordinator.screenCaptureAuthorized
+                                    ? localizedSettingsText(chinese: "屏幕录制已授权", english: "Screen Recording Authorized")
+                                    : localizedSettingsText(chinese: "屏幕录制未授权", english: "Screen Recording Not Authorized"),
+                                systemImage: assistantCoordinator.screenCaptureAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(assistantCoordinator.screenCaptureAuthorized ? Color.secondary : Color.orange)
+                            Spacer()
+                            if !assistantCoordinator.screenCaptureAuthorized {
+                                Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openScreenRecordingSettings)
+                                    .controlSize(.small)
+                            }
+                        }
+                    }
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "应用排除", english: "Excluded Applications")) {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(appState.preferences.desktopAssistant.excludedApplicationBundleIDs, id: \.self) { bundleID in
+                        HStack {
+                            Text(bundleID).font(.caption.monospaced()).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            iconToolButton(
+                                systemImage: "trash",
+                                help: localizedSettingsText(chinese: "移除", english: "Remove"),
+                                role: .destructive
+                            ) {
+                                appState.updatePreferences { $0.desktopAssistant.excludedApplicationBundleIDs.removeAll { $0 == bundleID } }
+                            }
+                        }
+                    }
+                    HStack {
+                        CommandFriendlyTextField(
+                            text: $assistantExcludedBundleIDDraft,
+                            placeholder: "com.example.app"
+                        )
+                        Button {
+                            addAssistantExcludedBundleID()
+                        } label: {
+                            Label(localizedSettingsText(chinese: "添加", english: "Add"), systemImage: "plus")
+                        }
+                        .disabled(!assistantExcludedBundleIDIsValid)
+                    }
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "本地行为记录", english: "Local Behavior Records")) {
+                VStack(alignment: .leading, spacing: 9) {
+                    checkboxLine(
+                        title: localizedSettingsText(chinese: "使用行为记录优化助手", english: "Use Behavior Records to Improve the Assistant"),
+                        isOn: Binding(
+                            get: { appState.preferences.desktopAssistant.useBehaviorHistory },
+                            set: { value in appState.updatePreferences { $0.desktopAssistant.useBehaviorHistory = value } }
+                        )
+                    )
+                    assistantBehaviorSummaryView
+                    Button(role: .destructive) {
+                        showAssistantBehaviorClearChoices = true
+                    } label: {
+                        Label(localizedSettingsText(chinese: "清除行为记录", english: "Clear Behavior Records"), systemImage: "externaldrive.badge.xmark")
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            settingRow(title: L10n.text("Current Session", language: language)) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(L10n.text("Recent suggestions are kept only for this app session, up to 20 cards.", language: language))
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button(action: assistantCoordinator.clearShortTermContext) {
+                            Label(localizedSettingsText(chinese: "清除短期上下文", english: "Clear Short-Term Context"), systemImage: "timer")
+                        }
+                        Button(action: assistantCoordinator.openRecent) {
+                            Label(L10n.text("Recent Suggestions", language: language), systemImage: "clock.arrow.circlepath")
+                        }
+                        Button(role: .destructive, action: assistantCoordinator.clearCards) {
+                            Label(L10n.text("Clear Suggestions", language: language), systemImage: "trash")
+                        }
+                        .disabled(assistantCoordinator.cards.isEmpty)
+                    }
+                    .controlSize(.small)
+                    Button(action: assistantCoordinator.togglePrivacy) {
+                        Label(
+                            assistantCoordinator.lifecycle.mode == .privacy
+                                ? localizedSettingsText(chinese: "退出隐私模式", english: "Leave Privacy Mode")
+                                : localizedSettingsText(chinese: "进入隐私模式", english: "Enter Privacy Mode"),
+                            systemImage: "hand.raised.fill"
+                        )
+                    }
+                    .controlSize(.small)
+                }
+            }
+
+            settingRow(title: localizedSettingsText(chinese: "高级诊断", english: "Advanced Diagnostics")) {
+                DisclosureGroup(
+                    localizedSettingsText(chinese: "助手运行状态", english: "Assistant Runtime Status"),
+                    isExpanded: $assistantDiagnosticsExpanded
+                ) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        if let status = assistantCoordinator.diagnosticSnapshot {
+                            HStack(spacing: 6) {
+                                Image(systemName: "dot.radiowaves.left.and.right")
+                                    .foregroundStyle(Color.green)
+                                Text(localizedSettingsText(chinese: "实时更新", english: "Live"))
+                                Spacer()
+                                Text(status.diagnosticSnapshotAt.formatted(date: .omitted, time: .standard))
+                                    .monospacedDigit()
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "生命周期", english: "Lifecycle"),
+                                "\(status.lifecycleMode) · \(status.observationAllowed ? "observing" : "stopped")"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "观察器", english: "Observers"),
+                                "app \(assistantOnOff(status.foregroundObserverRunning)) · clipboard \(assistantOnOff(status.clipboardObserverRunning)) · permission \(assistantOnOff(status.permissionObserverRunning)) · selection \(assistantOnOff(status.selectionSourceEnabled))"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "用户状态", english: "User Presence"),
+                                "\(status.userPresent ? "present" : "away") · last \(assistantDiagnosticTime(status.lastUserActivityAt))"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "内存与队列", english: "Memory and Queues"),
+                                "events \(status.shortTermEventCount) · candidates \(status.candidateQueueCount) · cards \(status.cardCount)"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "截图流水线", english: "Capture Pipeline"),
+                                "observer \(assistantOnOff(status.visualCaptureObserverRunning)) · task \(assistantOnOff(status.visualCaptureTaskRunning)) · attempt \(assistantDiagnosticTime(status.lastVisualCaptureAttemptAt)) · captured \(assistantDiagnosticTime(status.lastVisualCaptureAt)) · next \(assistantDiagnosticTime(status.nextVisualCaptureAt))"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "思考流水线", english: "Thinking Pipeline"),
+                                "working \(assistantOnOff(status.assistantWorking)) · vision \(assistantOnOff(status.visualAnalysisRunning)) · aggregate \(assistantOnOff(status.contextAggregationRunning)) · judgment \(assistantOnOff(status.judgmentRunning))\(status.currentJudgmentPattern.map { " · \($0)" } ?? "")"
+                            )
+                            if let current = status.recentActivity.first {
+                                assistantDiagnosticLine(
+                                    localizedSettingsText(chinese: "最近阶段", english: "Latest Stage"),
+                                    "\(assistantDiagnosticStageName(current.stage)) · \(assistantDiagnosticStateName(current.state)) · \(assistantDiagnosticExplanation(current) ?? current.detail)"
+                                )
+                            }
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "本地模型资源", english: "Local Model Resources"),
+                                status.userModelWorkActive
+                                    ? localizedSettingsText(chinese: "正在让位于用户任务", english: "Yielding to a user task")
+                                    : "judgment \(assistantOnOff(status.judgmentRunning)) · qualification \(assistantOnOff(status.qualificationRunning)) · translation \(assistantOnOff(status.translationRunning))"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "判断资格", english: "Judgment Qualification"),
+                                "\(status.qualificationPhase) · qualified \(status.qualifiedJudgmentModelCount) · prompt v\(status.qualificationPromptVersion) · fixture v\(status.qualificationFixtureVersion)"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "判断门槛", english: "Judgment Threshold"),
+                                "confidence \(Int((status.judgmentConfidenceThreshold * 100).rounded()))% · \(status.judgmentConfidenceThresholdIsCustom ? "custom" : "automatic")"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "行为存储", english: "Behavior Store"),
+                                "\(status.behaviorStoreStatus) · schema \(status.behaviorSchemaVersion) · records \(status.behaviorRecordCount)"
+                            )
+                            assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "临时翻译", english: "Temporary Translation"),
+                                status.temporaryTranslationActive
+                                    ? localizedSettingsText(
+                                        chinese: "剩余 \(status.temporaryTranslationRemainingSeconds) 秒",
+                                        english: "\(status.temporaryTranslationRemainingSeconds) seconds remaining"
+                                    )
+                                    : localizedSettingsText(chinese: "未运行", english: "Inactive")
+                            )
+                            if !status.recentActivity.isEmpty {
+                                Divider()
+                                Text(localizedSettingsText(chinese: "最近活动", english: "Recent Activity"))
+                                    .font(.caption.weight(.semibold))
+                                ForEach(Array(status.recentActivity.prefix(10))) { event in
+                                    assistantDiagnosticEventRow(event)
+                                }
+                            }
+                        }
+                        HStack {
+                            Button {
+                                Task { await assistantCoordinator.refreshDiagnosticSnapshot() }
+                            } label: {
+                                Label(localizedSettingsText(chinese: "刷新", english: "Refresh"), systemImage: "arrow.clockwise")
+                            }
+                            Button {
+                                Task { await assistantCoordinator.exportDiagnosticJSON() }
+                            } label: {
+                                Label(localizedSettingsText(chinese: "导出诊断 JSON", english: "Export Diagnostics JSON"), systemImage: "square.and.arrow.up")
+                            }
+                        }
+                        .controlSize(.small)
+                        if let message = assistantCoordinator.diagnosticExportMessage {
+                            Text(message)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .padding(.top, 8)
+                }
+                .task(id: assistantDiagnosticsExpanded) {
+                    guard assistantDiagnosticsExpanded else { return }
+                    while !Task.isCancelled {
+                        await assistantCoordinator.refreshDiagnosticSnapshot()
+                        do {
+                            try await Task.sleep(for: .seconds(1))
+                        } catch {
+                            return
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func assistantDiagnosticLine(_ title: String, _ value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 108, alignment: .leading)
+            Text(value)
+                .font(.caption.monospaced())
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func assistantOnOff(_ value: Bool) -> String {
+        value ? "on" : "off"
+    }
+
+    private func assistantDiagnosticTime(_ date: Date?) -> String {
+        guard let date else { return localizedSettingsText(chinese: "从未", english: "never") }
+        return date.formatted(date: .omitted, time: .standard)
+    }
+
+    private func assistantDiagnosticStageName(_ stage: AssistantDiagnosticStage) -> String {
+        stage.localizedName(language: appState.preferences.appLanguage)
+    }
+
+    private func assistantDiagnosticStateName(_ state: AssistantDiagnosticState) -> String {
+        state.localizedName(language: appState.preferences.appLanguage)
+    }
+
+    private func assistantDiagnosticEventRow(_ event: AssistantDiagnosticEvent) -> some View {
+        let explanation = assistantDiagnosticExplanation(event)
+        return HStack(alignment: .top, spacing: 8) {
+            Circle()
+                .fill(assistantDiagnosticStateColor(event.state))
+                .frame(width: 7, height: 7)
+                .padding(.top, 4)
+            Text(event.occurredAt.formatted(date: .omitted, time: .standard))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 62, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(assistantDiagnosticStageName(event.stage)) · \(assistantDiagnosticStateName(event.state)) · \(explanation ?? event.detail)")
+                    .font(.caption2)
+                    .lineLimit(2)
+                if explanation != nil {
+                    Text(event.detail)
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func assistantDiagnosticExplanation(_ event: AssistantDiagnosticEvent) -> String? {
+        event.localizedExplanation(language: appState.preferences.appLanguage)
+    }
+
+    private func assistantDiagnosticStateColor(_ state: AssistantDiagnosticState) -> Color {
+        switch state {
+        case .succeeded: .green
+        case .scheduled, .queued, .running: .orange
+        case .failed: .red
+        case .skipped, .cancelled: .secondary
+        }
+    }
+
+    private var assistantBehaviorControls: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Picker(localizedSettingsText(chinese: "主动程度", english: "Proactivity"), selection: Binding(
+                get: { appState.preferences.desktopAssistant.proactivity },
+                set: { value in assistantCoordinator.requestProactivity(value) }
+            )) {
+                ForEach(AssistantProactivity.allCases) { value in
+                    Text(assistantProactivityName(value)).tag(value)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            if let requested = assistantCoordinator.pendingProactivity {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(
+                        localizedSettingsText(
+                            chinese: "切换到\(assistantProactivityName(requested))前，需要用 24 项本地 fixture 检查判断模型。检查期间保持安静。",
+                            english: "A 24-fixture local check is required before switching to \(assistantProactivityName(requested)). The assistant stays Quiet during the check."
+                        ),
+                        systemImage: "checkmark.shield"
+                    )
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Button(action: assistantCoordinator.startPendingQualification) {
+                            Label(localizedSettingsText(chinese: "开始检查", english: "Start Check"), systemImage: "play.fill")
+                        }
+                        .disabled(assistantCoordinator.assistantLocalTextModels.allSatisfy { !$0.isAvailableForUse })
+                        Button(localizedSettingsText(chinese: "保持安静", english: "Keep Quiet"), action: assistantCoordinator.keepQuietInsteadOfQualification)
+                    }
+                    .controlSize(.small)
+                }
+                .padding(8)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if assistantQualificationIsVisible {
+                assistantQualificationProgressView
+            }
+
+            HStack {
+                Text(localizedSettingsText(
+                    chinese: "本次会话实际：\(assistantProactivityName(assistantCoordinator.effectiveProactivity))",
+                    english: "Effective this session: \(assistantProactivityName(assistantCoordinator.effectiveProactivity))"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+                if assistantCoordinator.proactiveSuggestionsPaused {
+                    Button(localizedSettingsText(chinese: "恢复主动提示", english: "Resume Suggestions"), action: assistantCoordinator.resumeProactiveSuggestions)
+                        .controlSize(.small)
+                }
+            }
+            if assistantCoordinator.sessionProactivityWasDowngraded {
+                Label(
+                    localizedSettingsText(chinese: "本次会话已因连续负反馈自动降低主动性。", english: "Proactivity was reduced for this session after repeated negative feedback."),
+                    systemImage: "arrow.down.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            checkboxLine(
+                title: localizedSettingsText(chinese: "自定义价值判断门槛", english: "Customize Judgment Threshold"),
+                isOn: Binding(
+                    get: { appState.preferences.desktopAssistant.judgmentConfidenceThresholdOverride != nil },
+                    set: { enabled in
+                        appState.updatePreferences { preferences in
+                            preferences.desktopAssistant.judgmentConfidenceThresholdOverride = enabled
+                                ? AssistantJudgmentContract.minimumConfidence(
+                                    for: preferences.desktopAssistant.proactivity
+                                )
+                                : nil
+                        }
+                    }
+                )
+            )
+            if let threshold = appState.preferences.desktopAssistant.judgmentConfidenceThresholdOverride {
+                HStack(spacing: 10) {
+                    Text(localizedSettingsText(chinese: "通过置信度门槛", english: "Positive Confidence Floor"))
+                        .font(.caption)
+                    Slider(
+                        value: Binding(
+                            get: { appState.preferences.desktopAssistant.judgmentConfidenceThresholdOverride ?? threshold },
+                            set: { value in
+                                appState.updatePreferences {
+                                    $0.desktopAssistant.judgmentConfidenceThresholdOverride = value
+                                }
+                            }
+                        ),
+                        in: (AssistantJudgmentContract.minimumAdjustableConfidence
+                            ... AssistantJudgmentContract.maximumAdjustableConfidence),
+                        step: 0.05
+                    )
+                    Text("\(Int((threshold * 100).rounded()))%")
+                        .font(.caption.monospacedDigit())
+                        .frame(width: 36, alignment: .trailing)
+                }
+                Text(localizedSettingsText(
+                    chinese: "只影响模型已判断为“值得打断”的结果；不会把 not-high-value 或 user-typing 变成通过。证据、隐私、锁屏、全屏、安静时段和历史否决仍是硬规则。",
+                    english: "Only affects results the model already considers worth interrupting for; it cannot turn not-high-value or user-typing into a pass. Evidence, privacy, lock screen, full screen, quiet hours, and history vetoes remain hard rules."
+                ))
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            Picker(localizedSettingsText(chinese: "性格", english: "Personality"), selection: Binding(
+                get: { appState.preferences.desktopAssistant.personality },
+                set: { value in appState.updatePreferences { $0.desktopAssistant.personality = value } }
+            )) {
+                ForEach(AssistantPersonality.allCases) { value in
+                    Text(assistantPersonalityName(value)).tag(value)
+                }
+            }
+            .pickerStyle(.segmented)
+
+            checkboxLine(
+                title: localizedSettingsText(chinese: "启用安静时段", english: "Enable Quiet Hours"),
+                isOn: Binding(
+                    get: { appState.preferences.desktopAssistant.quietHours.isEnabled },
+                    set: { value in appState.updatePreferences { $0.desktopAssistant.quietHours.isEnabled = value } }
+                )
+            )
+            if appState.preferences.desktopAssistant.quietHours.isEnabled {
+                HStack {
+                    DatePicker(
+                        localizedSettingsText(chinese: "开始", english: "Start"),
+                        selection: assistantQuietStartBinding,
+                        displayedComponents: .hourAndMinute
+                    )
+                    DatePicker(
+                        localizedSettingsText(chinese: "结束", english: "End"),
+                        selection: assistantQuietEndBinding,
+                        displayedComponents: .hourAndMinute
+                    )
+                }
+                .datePickerStyle(.compact)
+            }
+            checkboxLine(
+                title: localizedSettingsText(chinese: "深夜工作提醒", english: "Late-night Work Reminder"),
+                isOn: Binding(
+                    get: { appState.preferences.desktopAssistant.lateNightReminderEnabled },
+                    set: { value in appState.updatePreferences { $0.desktopAssistant.lateNightReminderEnabled = value } }
+                )
+            )
+
+            Divider()
+
+            checkboxLine(
+                title: localizedSettingsText(chinese: "P-01 重复失败", english: "P-01 Repeated Failures"),
+                isOn: Binding(
+                    get: { appState.preferences.desktopAssistant.repeatedFailureEnabled },
+                    set: { value in appState.updatePreferences { $0.desktopAssistant.repeatedFailureEnabled = value } }
+                )
+            )
+            checkboxLine(
+                title: localizedSettingsText(chinese: "P-03 连续外语复制", english: "P-03 Repeated Foreign-language Copies"),
+                isOn: Binding(
+                    get: { appState.preferences.desktopAssistant.foreignClipboardEnabled },
+                    set: { value in appState.updatePreferences { $0.desktopAssistant.foreignClipboardEnabled = value } }
+                )
+            )
+            if !appState.preferences.desktopAssistant.suppressedForeignLanguages.isEmpty {
+                HStack {
+                    Text(localizedSettingsText(
+                        chinese: "已关闭建议：\(appState.preferences.desktopAssistant.suppressedForeignLanguages.joined(separator: ", "))",
+                        english: "Suggestions disabled for: \(appState.preferences.desktopAssistant.suppressedForeignLanguages.joined(separator: ", "))"
+                    ))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    Spacer()
+                    Button(localizedSettingsText(chinese: "全部恢复", english: "Restore All")) {
+                        appState.updatePreferences { $0.desktopAssistant.suppressedForeignLanguages.removeAll() }
+                    }
+                    .controlSize(.small)
+                }
+            }
+            if let expiresAt = assistantCoordinator.temporaryTranslationExpiresAt, expiresAt > .now {
+                Label(
+                    localizedSettingsText(
+                        chinese: "临时剪贴板翻译运行至 \(expiresAt.formatted(date: .omitted, time: .shortened))",
+                        english: "Temporary clipboard translation runs until \(expiresAt.formatted(date: .omitted, time: .shortened))"
+                    ),
+                    systemImage: "timer"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            HStack {
+                Label(
+                    assistantCoordinator.currentJudgmentModelName
+                        ?? localizedSettingsText(
+                            chinese: "没有合格判断模型；固定模式仅显示徽标，情境机会保持安静",
+                            english: "No qualified judgment model; fixed patterns use badges and context opportunities stay silent"
+                        ),
+                    systemImage: assistantCoordinator.currentJudgmentModelID == nil ? "exclamationmark.shield" : "checkmark.shield.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(assistantCoordinator.currentJudgmentModelID == nil ? Color.orange : Color.secondary)
+                Spacer()
+                Button(action: { assistantCoordinator.onOpenModelSettings?() }) {
+                    Label(localizedSettingsText(chinese: "模型设置", english: "Model Settings"), systemImage: "slider.horizontal.3")
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var assistantQualificationIsVisible: Bool {
+        assistantCoordinator.qualificationProgress.phase != .idle
+    }
+
+    private var assistantQualificationProgressView: some View {
+        let progress = assistantCoordinator.qualificationProgress
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text(progress.modelName ?? localizedSettingsText(chinese: "判断能力检查", english: "Judgment Capability Check"))
+                    .font(.caption.weight(.medium))
+                Spacer()
+                Text("\(progress.completedCount)/\(progress.totalCount)")
+                    .font(.caption.monospacedDigit())
+            }
+            ProgressView(value: Double(progress.completedCount), total: Double(max(progress.totalCount, 1)))
+            HStack {
+                if let message = progress.message {
+                    Text(message).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Spacer()
+                if [.preparing, .running, .paused].contains(progress.phase) {
+                    Button(localizedSettingsText(chinese: "取消", english: "Cancel")) {
+                        assistantCoordinator.cancelQualification()
+                    }
+                        .controlSize(.small)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func assistantProactivityName(_ value: AssistantProactivity) -> String {
+        switch value {
+        case .manual: return localizedSettingsText(chinese: "手动", english: "Manual")
+        case .quiet: return localizedSettingsText(chinese: "安静", english: "Quiet")
+        case .moderate: return localizedSettingsText(chinese: "适中", english: "Moderate")
+        case .active: return localizedSettingsText(chinese: "活跃", english: "Active")
+        }
+    }
+
+    private func assistantPersonalityName(_ value: AssistantPersonality) -> String {
+        switch value {
+        case .professional: return localizedSettingsText(chinese: "专业管家", english: "Professional")
+        case .gentle: return localizedSettingsText(chinese: "温和搭档", english: "Gentle")
+        case .lightTeasing: return localizedSettingsText(chinese: "轻度吐槽", english: "Light Teasing")
+        }
+    }
+
+    private var assistantQuietStartBinding: Binding<Date> {
+        assistantQuietTimeBinding(isStart: true)
+    }
+
+    private var assistantQuietEndBinding: Binding<Date> {
+        assistantQuietTimeBinding(isStart: false)
+    }
+
+    private func assistantQuietTimeBinding(isStart: Bool) -> Binding<Date> {
+        Binding(
+            get: {
+                let minute = isStart
+                    ? appState.preferences.desktopAssistant.quietHours.startMinute
+                    : appState.preferences.desktopAssistant.quietHours.endMinute
+                return Calendar.current.date(byAdding: .minute, value: minute, to: Calendar.current.startOfDay(for: .now)) ?? .now
+            },
+            set: { date in
+                let components = Calendar.current.dateComponents([.hour, .minute], from: date)
+                let minute = (components.hour ?? 0) * 60 + (components.minute ?? 0)
+                appState.updatePreferences { preferences in
+                    if isStart {
+                        preferences.desktopAssistant.quietHours.startMinute = minute
+                    } else {
+                        preferences.desktopAssistant.quietHours.endMinute = minute
+                    }
+                }
+            }
+        )
+    }
+
+    private func assistantSourceLastUse(_ source: AssistantSource) -> some View {
+        Group {
+            if let date = assistantCoordinator.lastSourceUse[source] {
+                Text(date.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(localizedSettingsText(chinese: "尚未使用", english: "Not Used"))
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func assistantSourceControls(_ source: AssistantSource) -> some View {
+        HStack(spacing: 6) {
+            assistantSourceLastUse(source)
+            iconToolButton(
+                systemImage: "trash",
+                help: localizedSettingsText(chinese: "关闭并清除该来源历史", english: "Disable and Clear Source History"),
+                role: .destructive
+            ) {
+                assistantSourceHistoryClear = source
+            }
+        }
+    }
+
+    private func assistantSourceName(_ source: AssistantSource) -> String {
+        switch source {
+        case .foregroundApplication:
+            return localizedSettingsText(chinese: "前台应用", english: "Foreground App")
+        case .windowContext:
+            return localizedSettingsText(chinese: "窗口上下文", english: "Window Context")
+        case .clipboard:
+            return localizedSettingsText(chinese: "剪贴板", english: "Clipboard")
+        case .selection:
+            return localizedSettingsText(chinese: "选区", english: "Selections")
+        case .droppedFile:
+            return localizedSettingsText(chinese: "拖入内容", english: "Dropped Content")
+        case .llmToolsTask:
+            return "llmTools"
+        case .inquiry:
+            return localizedSettingsText(chinese: "询问", english: "Inquiry")
+        }
+    }
+
+    private var assistantBehaviorSummaryView: some View {
+        let summary = assistantCoordinator.behaviorSummary
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 10) {
+                statusBadge(assistantBehaviorStatusText(summary.status), systemImage: assistantBehaviorStatusSymbol(summary.status))
+                Text(localizedSettingsText(
+                    chinese: "\(summary.recordCount) 条 · \(ByteCountFormatter.string(fromByteCount: Int64(summary.byteCount), countStyle: .file))",
+                    english: "\(summary.recordCount) records · \(ByteCountFormatter.string(fromByteCount: Int64(summary.byteCount), countStyle: .file))"
+                ))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            if let earliest = summary.earliestDate, let latest = summary.latestDate {
+                Text("\(earliest.formatted(date: .abbreviated, time: .omitted)) - \(latest.formatted(date: .abbreviated, time: .omitted))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            if !summary.patternCounts.isEmpty {
+                Text(localizedSettingsText(
+                    chinese: "重复失败 \(summary.patternCounts[.repeatedFailure, default: 0]) · 连续外语复制 \(summary.patternCounts[.foreignClipboard, default: 0])",
+                    english: "Repeated failures \(summary.patternCounts[.repeatedFailure, default: 0]) · Foreign clipboard \(summary.patternCounts[.foreignClipboard, default: 0])"
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var assistantExcludedBundleIDIsValid: Bool {
+        let value = assistantExcludedBundleIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.count <= 200
+            && value.range(of: #"^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$"#, options: .regularExpression) != nil
+    }
+
+    private func addAssistantExcludedBundleID() {
+        let value = assistantExcludedBundleIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard assistantExcludedBundleIDIsValid else { return }
+        appState.updatePreferences { preferences in
+            if !preferences.desktopAssistant.excludedApplicationBundleIDs.contains(value) {
+                preferences.desktopAssistant.excludedApplicationBundleIDs.append(value)
+                preferences.desktopAssistant.excludedApplicationBundleIDs.sort()
+            }
+        }
+        assistantExcludedBundleIDDraft = ""
+    }
+
+    private func openAccessibilitySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func openScreenRecordingSettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private func assistantBehaviorStatusText(_ status: AssistantBehaviorStoreStatus) -> String {
+        switch status {
+        case .ready: return localizedSettingsText(chinese: "存储正常", english: "Storage Ready")
+        case .recoveredFromCorruption: return localizedSettingsText(chinese: "已隔离损坏文件", english: "Corruption Quarantined")
+        case .futureSchemaReadOnly: return localizedSettingsText(chinese: "高版本只读", english: "Future Schema Read Only")
+        case .saveFailed: return localizedSettingsText(chinese: "保存失败，等待重试", english: "Save Failed; Retry Pending")
+        }
+    }
+
+    private func assistantBehaviorStatusSymbol(_ status: AssistantBehaviorStoreStatus) -> String {
+        switch status {
+        case .ready: return "checkmark.circle"
+        case .recoveredFromCorruption: return "exclamationmark.shield"
+        case .futureSchemaReadOnly: return "lock"
+        case .saveFailed: return "exclamationmark.triangle"
         }
     }
 
@@ -5537,7 +6290,7 @@ struct SettingsView: View {
 
     private var modelSettingsPage: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Picker("", selection: $selectedModelSettingsPane) {
+            Picker("", selection: $navigation.selectedModelSettingsPane) {
                 ForEach(ModelSettingsPane.allCases) { pane in
                     Text(pane.title(language: language)).tag(pane)
                 }
@@ -5546,7 +6299,7 @@ struct SettingsView: View {
             .pickerStyle(.segmented)
             .frame(width: 360, alignment: .leading)
 
-            switch selectedModelSettingsPane {
+            switch navigation.selectedModelSettingsPane {
             case .setup:
                 modelSetupPage
             case .settings:
@@ -5824,6 +6577,7 @@ struct SettingsView: View {
     private var modelConfigurationPage: some View {
         ScrollView {
             settingsForm(maxWidth: 620) {
+                assistantModelSettingsSection
                 languageRoutingSettingsSection
                 speakerDiarizationSettingsSection
                 fastTranslationSettingsSection
@@ -5831,6 +6585,126 @@ struct SettingsView: View {
             .padding(.bottom, 2)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private var assistantModelSettingsSection: some View {
+        settingRow(title: localizedSettingsText(chinese: "桌面情境助手", english: "Desktop Context Assistant")) {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker(localizedSettingsText(chinese: "助手判断模型", english: "Judgment Model"), selection: Binding(
+                    get: { appState.preferences.desktopAssistant.judgmentModelID },
+                    set: { value in assistantCoordinator.setJudgmentModelID(value) }
+                )) {
+                    Text(localizedSettingsText(chinese: "自动", english: "Automatic")).tag(UUID?.none)
+                    ForEach(assistantCoordinator.qualifiedJudgmentModels) { model in
+                        Text(model.name).tag(Optional(model.id))
+                    }
+                }
+
+                HStack {
+                    Label(
+                        assistantCoordinator.currentJudgmentModelName
+                            ?? localizedSettingsText(
+                                chinese: "无合格模型；固定模式仅显示徽标，情境机会保持安静",
+                                english: "No qualified model; fixed patterns use badges and context opportunities stay silent"
+                            ),
+                        systemImage: assistantCoordinator.currentJudgmentModelID == nil ? "exclamationmark.shield" : "checkmark.shield.fill"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(assistantCoordinator.currentJudgmentModelID == nil ? Color.orange : Color.secondary)
+                    Spacer()
+                }
+
+                if assistantCoordinator.assistantLocalTextModels.isEmpty {
+                    Text(localizedSettingsText(chinese: "尚未注册本地 GGUF 或 MLX 文本模型。", english: "No local GGUF or MLX text model is registered."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(assistantCoordinator.assistantLocalTextModels) { model in
+                            assistantQualificationModelRow(model)
+                            if model.id != assistantCoordinator.assistantLocalTextModels.last?.id { Divider() }
+                        }
+                    }
+                }
+
+                if assistantQualificationIsVisible {
+                    assistantQualificationProgressView
+                }
+
+                Divider()
+
+                Picker(localizedSettingsText(chinese: "助手评论模型", english: "Comment Model"), selection: Binding(
+                    get: { appState.preferences.desktopAssistant.commentModelID },
+                    set: { value in assistantCoordinator.setCommentModelID(value) }
+                )) {
+                    Text(localizedSettingsText(chinese: "自动复用已加载本地模型", english: "Reuse Loaded Local Model")).tag(UUID?.none)
+                    ForEach(assistantCoordinator.assistantLocalTextModels.filter(\.isAvailableForUse)) { model in
+                        Text(model.name).tag(Optional(model.id))
+                    }
+                }
+                Text(localizedSettingsText(
+                    chinese: "评论模型无需通过上方判断资格，只改表达；3 秒内不可用或输出不合法时使用确定性模板。",
+                    english: "The comment model does not require judgment qualification and only changes wording. A deterministic template is used after 3 seconds or on invalid output."
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func assistantQualificationModelRow(_ model: ModelDescriptor) -> some View {
+        let state = assistantCoordinator.qualificationStates[model.id] ?? .unchecked
+        let cached = appState.preferences.desktopAssistant.qualification(for: model.id)
+        return VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(model.name).font(.subheadline.weight(.medium)).lineLimit(1)
+                    Text("\(model.format.rawValue.uppercased()) · \(model.sizeClass)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                statusBadge(assistantQualificationStateName(state), systemImage: assistantQualificationStateSymbol(state))
+                Button {
+                    assistantCoordinator.startQualification(
+                        modelID: model.id,
+                        pendingProactivity: assistantCoordinator.pendingProactivity
+                    )
+                } label: {
+                    Image(systemName: "checkmark.shield")
+                }
+                .buttonStyle(.borderless)
+                .help(localizedSettingsText(chinese: "测试判断能力", english: "Test Judgment Capability"))
+                .accessibilityLabel(localizedSettingsText(chinese: "测试判断能力", english: "Test Judgment Capability"))
+                .disabled(!model.isAvailableForUse || [.preparing, .running, .paused].contains(assistantCoordinator.qualificationProgress.phase))
+            }
+            if let cached, state == cached.state, state != .unchecked {
+                Text("\(cached.checkedAt.formatted(date: .abbreviated, time: .shortened)) · \(cached.message)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.vertical, 7)
+    }
+
+    private func assistantQualificationStateName(_ state: AssistantQualificationState) -> String {
+        switch state {
+        case .unchecked: return localizedSettingsText(chinese: "未检查", english: "Unchecked")
+        case .qualified: return localizedSettingsText(chinese: "合格", english: "Qualified")
+        case .unqualified: return localizedSettingsText(chinese: "不合格", english: "Unqualified")
+        case .unavailable: return localizedSettingsText(chinese: "不可用", english: "Unavailable")
+        }
+    }
+
+    private func assistantQualificationStateSymbol(_ state: AssistantQualificationState) -> String {
+        switch state {
+        case .unchecked: return "questionmark.circle"
+        case .qualified: return "checkmark.circle.fill"
+        case .unqualified: return "xmark.circle"
+        case .unavailable: return "exclamationmark.triangle"
+        }
     }
 
     private var modelManagementPage: some View {
@@ -7270,7 +8144,7 @@ struct SettingsView: View {
                     HStack(spacing: 8) {
                         Button {
                             navigation.selectedTab = .models
-                            selectedModelSettingsPane = .settings
+                            navigation.selectedModelSettingsPane = .settings
                         } label: {
                             Label(L10n.text("Configure pyannote in Model Settings", language: language), systemImage: "slider.horizontal.3")
                         }
@@ -7525,7 +8399,7 @@ struct SettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                     Button {
                         navigation.selectedTab = .models
-                        selectedModelSettingsPane = .settings
+                        navigation.selectedModelSettingsPane = .settings
                     } label: {
                         Label(localizedSettingsText(chinese: "打开说话人分离设置", english: "Open Diarization Settings"), systemImage: "slider.horizontal.3")
                     }
@@ -8514,7 +9388,7 @@ struct SettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: 430)
             Button {
-                selectedModelSettingsPane = .setup
+                navigation.selectedModelSettingsPane = .setup
             } label: {
                 Label(L10n.text("Open Model Setup", language: language), systemImage: "list.bullet.clipboard")
             }
@@ -9058,13 +9932,16 @@ struct SettingsView: View {
     private func checkboxLine(
         title: String,
         isOn: Binding<Bool>,
-        trailing: AnyView? = nil
+        trailing: AnyView? = nil,
+        toggleDisabled: Bool = false
     ) -> some View {
         HStack(alignment: .center, spacing: 8) {
             Toggle(title, isOn: isOn)
                 .toggleStyle(.checkbox)
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
+                .disabled(toggleDisabled)
+                .opacity(toggleDisabled ? 0.5 : 1)
             if let trailing {
                 trailing
             }

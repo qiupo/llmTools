@@ -21,6 +21,14 @@ public enum AppPaths {
         applicationSupportDirectory.appendingPathComponent("history.json", isDirectory: false)
     }
 
+    public static var assistantBehaviorFileURL: URL {
+        applicationSupportDirectory.appendingPathComponent("assistant-behavior.json", isDirectory: false)
+    }
+
+    public static var assistantFingerprintKeyFileURL: URL {
+        applicationSupportDirectory.appendingPathComponent("assistant-fingerprint.key", isDirectory: false)
+    }
+
     public static var webPageBridgeStateFileURL: URL {
         applicationSupportDirectory.appendingPathComponent("web-page-bridge.json", isDirectory: false)
     }

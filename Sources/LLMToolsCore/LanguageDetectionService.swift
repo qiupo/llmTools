@@ -460,7 +460,7 @@ private final class LanguageDetectionProcessSession: @unchecked Sendable {
     }
 
     func waitUntilReady() async throws {
-        try await Task.detached(priority: .userInitiated) { [self] in
+        let task = Task.detached(priority: .userInitiated) { [self] in
             while true {
                 let event = try readEvent()
                 switch event.type {
@@ -472,13 +472,25 @@ private final class LanguageDetectionProcessSession: @unchecked Sendable {
                     continue
                 }
             }
-        }.value
+        }
+        try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+            self.stop()
+        }
     }
 
     func detect(text: String, preferences: LanguageRoutingPreferences) async throws -> LanguageDetectionResult {
-        try await Task.detached(priority: .userInitiated) { [self] in
+        let task = Task.detached(priority: .userInitiated) { [self] in
             try detectSync(text: text, preferences: preferences)
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+            self.stop()
+        }
     }
 
     private func detectSync(text: String, preferences: LanguageRoutingPreferences) throws -> LanguageDetectionResult {

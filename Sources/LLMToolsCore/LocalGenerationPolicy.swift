@@ -20,11 +20,16 @@ public enum LocalGenerationPolicy {
         }
     }
 
-    public static func maxTokens(for task: TaskKind, thinkingModeEnabled: Bool) -> Int {
+    public static func maxTokens(
+        for task: TaskKind,
+        thinkingModeEnabled: Bool,
+        override: Int? = nil
+    ) -> Int {
         let regularLimit = maxTokens(for: task)
-        guard thinkingModeEnabled else { return regularLimit }
+        let requestedLimit = override.map { min(max(1, $0), regularLimit) } ?? regularLimit
+        guard thinkingModeEnabled else { return requestedLimit }
         // 小模型可能把全部预算耗在隐藏思考里；限制首轮预算，未产出正文时由 runner 关闭思考重试。
-        return min(regularLimit, maximumThinkingTokens)
+        return min(requestedLimit, maximumThinkingTokens)
     }
 
     public static func shouldRetryThinkingGeneration(
@@ -43,11 +48,19 @@ public enum LocalGenerationPolicy {
         }
     }
 
-    static func parameters(for task: TaskKind, thinkingModeEnabled: Bool = false) -> GenerateParameters {
+    static func parameters(
+        for task: TaskKind,
+        thinkingModeEnabled: Bool = false,
+        maxTokensOverride: Int? = nil
+    ) -> GenerateParameters {
         if task == .ocr {
             return parameters(for: .structured, thinkingModeEnabled: thinkingModeEnabled)
         }
-        let maxTokens = maxTokens(for: task, thinkingModeEnabled: thinkingModeEnabled)
+        let maxTokens = maxTokens(
+            for: task,
+            thinkingModeEnabled: thinkingModeEnabled,
+            override: maxTokensOverride
+        )
         return GenerateParameters(maxTokens: maxTokens, temperature: 0)
     }
 

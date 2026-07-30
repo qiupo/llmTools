@@ -24,6 +24,12 @@ struct LLMToolsChecks {
         try await checkPhase1InteractiveNativeTasks()
         try await checkPerTaskDefaultModelRouting()
         try checkPreferenceDefaultsDecodeFromOlderRegistry()
+        try await checkDesktopAssistantStageAContracts()
+        try await checkDesktopAssistantLocalPromptBoundary()
+        try await checkDesktopAssistantPrivacyAndContextBuffer()
+        try await checkDesktopAssistantBehaviorStore()
+        try checkDesktopAssistantDropClassifier()
+        try await checkDesktopAssistantIntelligenceContracts()
         try checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry()
         try checkPhase4XFoundationTypesAndPreferences()
         try await checkLiveMeetingTranscriptionFixtures()
@@ -43,7 +49,7 @@ struct LLMToolsChecks {
         try checkFastMTPreferencesMigration()
         try checkTranslationRoutingDecisionTable()
         try await checkTextTranslateFastMTPipeline()
-        try await checkPersistentSidecarStopInterruptsBlockedRequest()
+        try await checkPersistentSidecarCancellationInterruptsBlockedRequest()
         try await checkSubtitleFastMTPipeline()
         try await checkWebPageFastMTRouting()
         try checkTextTaskModePreferencesAndPrompts()
@@ -1326,6 +1332,2237 @@ struct LLMToolsChecks {
         try require(clampedWebPagePreferences.localConcurrentTranslationRequests == WebPageTranslationPreferences.maximumLocalConcurrentTranslationRequests, "Expected local concurrency to clamp to the maximum.")
     }
 
+    private static func checkDesktopAssistantStageAContracts() async throws {
+        let legacyJSON = """
+        {
+          "autoCollapseWidget": false,
+          "widgetVisibleOnAllSpaces": false
+        }
+        """
+        let migrated = try JSONDecoder().decode(AppPreferences.self, from: Data(legacyJSON.utf8))
+        try require(!migrated.desktopAssistant.isEnabled, "The new assistant must not inherit the old widget's enabled state.")
+        try require(!migrated.desktopAssistant.hasCompletedCurrentOnboarding, "The new assistant must require its own onboarding.")
+        try require(migrated.desktopAssistant.showOnAllSpaces, "The assistant should default to ordinary Spaces.")
+        try require(!migrated.desktopAssistant.showOverFullScreen, "The assistant should stay hidden over full-screen apps by default.")
+        try require(
+            migrated.desktopAssistant.toolbarTrigger == .hover
+                && migrated.desktopAssistant.proactivity == .moderate
+                && migrated.desktopAssistant.personality == .gentle
+                && !migrated.desktopAssistant.quietHours.isEnabled
+                && !migrated.desktopAssistant.lateNightReminderEnabled,
+            "Assistant interaction, Moderate proactivity, personality, quiet-hours, and late-night defaults must match the approved first-run behavior."
+        )
+        var utcCalendar = Calendar(identifier: .gregorian)
+        utcCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let overnightQuietHours = AssistantQuietHours(isEnabled: true, startMinute: 22 * 60, endMinute: 8 * 60)
+        let beforeStart = utcCalendar.date(from: DateComponents(year: 2027, month: 1, day: 1, hour: 21, minute: 59))!
+        let atStart = utcCalendar.date(from: DateComponents(year: 2027, month: 1, day: 1, hour: 22))!
+        let beforeEnd = utcCalendar.date(from: DateComponents(year: 2027, month: 1, day: 2, hour: 7, minute: 59))!
+        let atEnd = utcCalendar.date(from: DateComponents(year: 2027, month: 1, day: 2, hour: 8))!
+        try require(
+            !overnightQuietHours.contains(beforeStart, calendar: utcCalendar)
+                && overnightQuietHours.contains(atStart, calendar: utcCalendar)
+                && overnightQuietHours.contains(beforeEnd, calendar: utcCalendar)
+                && !overnightQuietHours.contains(atEnd, calendar: utcCalendar),
+            "Overnight quiet hours must include the start minute, cross midnight, and exclude the end minute."
+        )
+        var persistedControls = migrated
+        persistedControls.desktopAssistant.personality = .lightTeasing
+        persistedControls.desktopAssistant.lateNightReminderEnabled = true
+        let restoredControls = try JSONDecoder().decode(
+            AppPreferences.self,
+            from: JSONEncoder().encode(persistedControls)
+        )
+        try require(
+            restoredControls.desktopAssistant.personality == .lightTeasing
+                && restoredControls.desktopAssistant.lateNightReminderEnabled,
+            "The optional late-night reminder must persist independently from assistant personality."
+        )
+        var explicitlyQuiet = migrated
+        explicitlyQuiet.desktopAssistant.proactivity = .quiet
+        let restoredQuiet = try JSONDecoder().decode(
+            AppPreferences.self,
+            from: JSONEncoder().encode(explicitlyQuiet)
+        )
+        try require(
+            restoredQuiet.desktopAssistant.proactivity == .quiet,
+            "Changing the first-run default must not migrate an existing user's explicit Quiet choice."
+        )
+        var manualOnly = migrated.desktopAssistant
+        manualOnly.foregroundApplicationContextEnabled = false
+        manualOnly.enhancedWindowContextEnabled = false
+        manualOnly.clipboardAuthorization = .denied
+        manualOnly.selectionContextEnabled = false
+        try require(
+            manualOnly.isManualOnly && !manualOnly.hasAnyBackgroundSource,
+            "The manual-only preset must require no workspace, clipboard, selection, or permission observer."
+        )
+        var dormantEnhancedSource = DesktopAssistantPreferences(
+            foregroundApplicationContextEnabled: false,
+            enhancedWindowContextEnabled: true,
+            clipboardAuthorization: .denied,
+            selectionContextEnabled: false
+        )
+        try require(
+            dormantEnhancedSource.enhancedWindowContextEnabled && dormantEnhancedSource.isManualOnly,
+            "Enhanced-window preference must be retained but stay dormant without its foreground-app source."
+        )
+        dormantEnhancedSource.enhancedWindowContextEnabled = true
+        try require(
+            dormantEnhancedSource.isManualOnly,
+            "A dormant enhanced-window preference must not create a background observer by itself."
+        )
+        try require(
+            !AssistantProactivity.manual.requiresQualifiedJudgment
+                && !AssistantProactivity.quiet.requiresQualifiedJudgment
+                && AssistantProactivity.moderate.requiresQualifiedJudgment
+                && AssistantProactivity.active.requiresQualifiedJudgment,
+            "Only Moderate and Active proactivity may require a qualified local judgment model."
+        )
+
+        let encoded = try JSONEncoder().encode(migrated)
+        let encodedText = String(decoding: encoded, as: UTF8.self)
+        try require(encodedText.contains("desktopAssistant"), "Expected the new assistant preferences to persist.")
+        try require(!encodedText.contains("autoCollapseWidget") && !encodedText.contains("widgetVisibleOnAllSpaces"), "Legacy widget keys must not be written.")
+
+        var cancelledLifecycle = AssistantLifecycleMachine(preferences: migrated.desktopAssistant)
+        cancelledLifecycle.apply(.requestEnable)
+        cancelledLifecycle.apply(.cancelOnboarding)
+        try require(
+            cancelledLifecycle.mode == .disabled
+                && !cancelledLifecycle.isVisible
+                && !cancelledLifecycle.observationIsAllowed,
+            "Cancelling first onboarding must leave the assistant disabled, hidden, and unable to observe."
+        )
+
+        var lifecycle = AssistantLifecycleMachine(preferences: migrated.desktopAssistant)
+        lifecycle.apply(.requestEnable)
+        try require(lifecycle.mode == .onboarding && !lifecycle.isVisible, "First enable should open onboarding before showing the orb.")
+        lifecycle.apply(.finishOnboarding)
+        lifecycle.apply(.hide)
+        try require(lifecycle.mode == .idle && lifecycle.observationIsAllowed && !lifecycle.isVisible, "Hiding the orb must not silently disable observation.")
+        var selectionDisabledPreferences = migrated.desktopAssistant
+        selectionDisabledPreferences.selectionContextEnabled = false
+        try require(
+            lifecycle.allowsSelectionCapture(preferences: migrated.desktopAssistant)
+                && !lifecycle.allowsSelectionCapture(preferences: selectionDisabledPreferences),
+            "Automatic selection capture must require both active observation and explicit source authorization."
+        )
+        try require(
+            lifecycle.resolvedPresentation(requested: .peek, hardPolicyAllowsPeek: true) == .badge,
+            "Hidden assistant windows must accumulate a badge instead of reopening for a proactive peek."
+        )
+        lifecycle.apply(.show)
+        try require(
+            lifecycle.resolvedPresentation(requested: .peek, hardPolicyAllowsPeek: true) == .peek
+                && lifecycle.resolvedPresentation(requested: .peek, hardPolicyAllowsPeek: false) == .badge,
+            "Visible assistant windows may peek only while the final hard policy still allows it."
+        )
+        try require(
+            lifecycle.allowsWindowPresentation(showOverFullScreen: false, frontmostApplicationIsFullScreen: false)
+                && !lifecycle.allowsWindowPresentation(showOverFullScreen: false, frontmostApplicationIsFullScreen: true)
+                && lifecycle.allowsWindowPresentation(showOverFullScreen: true, frontmostApplicationIsFullScreen: true),
+            "Full-screen Spaces must hide assistant windows by default and show them only after explicit opt-in."
+        )
+        lifecycle.apply(.hide)
+        try require(
+            !lifecycle.allowsWindowPresentation(showOverFullScreen: true, frontmostApplicationIsFullScreen: false),
+            "A user-hidden assistant must stay hidden regardless of full-screen preferences."
+        )
+        lifecycle.apply(.show)
+        let expiredAttachmentCard = AssistantCard(
+            createdAt: Date(timeIntervalSince1970: 10),
+            source: .clipboard,
+            comment: "expired",
+            evidence: AssistantCardEvidence(sources: [.clipboard], capability: "test"),
+            expiresAt: Date(timeIntervalSince1970: 20)
+        )
+        try require(
+            !expiredAttachmentCard.isAvailableForExplicitContext(now: Date(timeIntervalSince1970: 21)),
+            "Expired cards must not be eligible for explicit inquiry attachment."
+        )
+        let companionBubbleCard = AssistantCard(
+            source: .windowContext,
+            patternType: .contextualOpportunity,
+            presentation: .peek,
+            comment: "A grounded companion observation.",
+            evidence: AssistantCardEvidence(sources: [.windowContext], capability: "contextualOpportunity")
+        )
+        var actionableOpportunityCard = companionBubbleCard
+        actionableOpportunityCard.actionIDs = [.openQuickAction]
+        try require(
+            companionBubbleCard.prefersSpeechBubblePresentation
+                && !actionableOpportunityCard.prefersSpeechBubblePresentation
+                && !companionBubbleCard.requiresUserAction
+                && actionableOpportunityCard.requiresUserAction
+                && AssistantWindowGeometry.speechBubbleWidth < AssistantWindowGeometry.peekSize.width,
+            "Only actionless P-06 comments should use the compact speech bubble and stay out of the action badge."
+        )
+        let badgeStore = AssistantCardStore()
+        _ = await badgeStore.add(companionBubbleCard)
+        _ = await badgeStore.add(actionableOpportunityCard)
+        let badgeUnreadCount = await badgeStore.unreadCount()
+        let latestActionableUnread = await badgeStore.latestUnread()
+        try require(
+            badgeUnreadCount == 1 && latestActionableUnread?.id == actionableOpportunityCard.id,
+            "Only unread cards with actions should contribute to the orb badge and latest-action lookup."
+        )
+        var diagnosticTimeline = AssistantDiagnosticTimeline()
+        let diagnosticBase = Date(timeIntervalSince1970: 100)
+        for index in 0...AssistantDiagnosticTimeline.maximumEventCount {
+            diagnosticTimeline.append(
+                stage: .capture,
+                state: .scheduled,
+                detail: "event-\(index)",
+                occurredAt: diagnosticBase.addingTimeInterval(Double(index))
+            )
+        }
+        try require(
+            diagnosticTimeline.events.count == AssistantDiagnosticTimeline.maximumEventCount
+                && diagnosticTimeline.events.first?.detail == "event-\(AssistantDiagnosticTimeline.maximumEventCount)"
+                && diagnosticTimeline.events.last?.detail == "event-1",
+            "The live assistant diagnostic timeline must retain only the newest bounded status events."
+        )
+        var refreshedScheduleTimeline = AssistantDiagnosticTimeline()
+        let firstScheduleAt = diagnosticBase.addingTimeInterval(40)
+        refreshedScheduleTimeline.refreshScheduled(
+            stage: .capture,
+            detail: "trigger=user-interaction delay=3.0s reset=false cooldown=false",
+            occurredAt: firstScheduleAt
+        )
+        let firstScheduleID = refreshedScheduleTimeline.events.first?.id
+        refreshedScheduleTimeline.append(
+            stage: .context,
+            state: .running,
+            detail: "other-stage",
+            occurredAt: firstScheduleAt.addingTimeInterval(1)
+        )
+        let refreshedScheduleAt = firstScheduleAt.addingTimeInterval(2)
+        refreshedScheduleTimeline.refreshScheduled(
+            stage: .capture,
+            detail: "trigger=user-interaction delay=3.0s reset=true cooldown=false",
+            occurredAt: refreshedScheduleAt
+        )
+        try require(
+            refreshedScheduleTimeline.events.filter { $0.stage == .capture && $0.state == .scheduled }.count == 1
+                && refreshedScheduleTimeline.events.first?.id == firstScheduleID
+                && refreshedScheduleTimeline.events.first?.occurredAt == refreshedScheduleAt
+                && refreshedScheduleTimeline.events.first?.detail.contains("reset=true") == true,
+            "A pending capture schedule must refresh in place with the latest debounce time."
+        )
+        let readableDiagnostic = try requireNonNil(
+            refreshedScheduleTimeline.events.first,
+            "Expected a refreshed capture diagnostic event."
+        ).localizedSummary(language: .chinese)
+        try require(
+            readableDiagnostic.contains("截图 · 已计划")
+                && readableDiagnostic.contains("重置为 3.0s"),
+            "Exported and on-screen assistant activity must share the same readable diagnostic explanation."
+        )
+        let resumeAt = Date(timeIntervalSince1970: 200)
+        lifecycle.apply(.pause(until: resumeAt))
+        lifecycle.apply(.tick(Date(timeIntervalSince1970: 199)))
+        try require(
+            lifecycle.mode == .paused
+                && !lifecycle.observationIsAllowed
+                && !lifecycle.allowsSelectionCapture(preferences: migrated.desktopAssistant),
+            "A timed pause should block observation and automatic selection capture."
+        )
+        lifecycle.apply(.tick(resumeAt))
+        try require(
+            lifecycle.mode == .idle
+                && lifecycle.observationIsAllowed
+                && lifecycle.allowsSelectionCapture(preferences: migrated.desktopAssistant),
+            "A timed pause should resume observation and authorized selection capture deterministically."
+        )
+        let laterResume = Date(timeIntervalSince1970: 400)
+        lifecycle.apply(.pause(until: laterResume))
+        lifecycle.apply(.setPrivacy(true))
+        try require(lifecycle.mode == .privacy && !lifecycle.observationIsAllowed, "Privacy mode must block observation.")
+        lifecycle.apply(.setPrivacy(false))
+        try require(lifecycle.mode == .paused && lifecycle.pauseUntil == laterResume, "Leaving privacy mode must restore an active timed pause.")
+        lifecycle.apply(.tick(laterResume))
+        try require(lifecycle.mode == .idle, "A pause restored after privacy mode should still expire normally.")
+        lifecycle.apply(.disable)
+        try require(lifecycle.mode == .disabled && !lifecycle.isVisible, "Disabling should close the assistant.")
+        lifecycle.apply(.requestEnable)
+        try require(
+            lifecycle.mode == .idle && lifecycle.isVisible && lifecycle.observationIsAllowed,
+            "Re-enabling after completed onboarding must restore the assistant without repeating first onboarding."
+        )
+
+        let store = AssistantCardStore()
+        let baseDate = Date(timeIntervalSince1970: 1_000)
+        for index in 0..<22 {
+            _ = await store.add(AssistantCard(
+                createdAt: baseDate.addingTimeInterval(Double(index)),
+                source: .inquiry,
+                comment: "card-\(index)",
+                evidence: AssistantCardEvidence(sources: [.inquiry], capability: "test"),
+                actionIDs: [.openSettings]
+            ))
+        }
+        var cards = await store.snapshot()
+        try require(cards.count == AssistantCardStore.maximumCardCount, "The recent-card store must keep at most 20 cards.")
+        let sensitiveCard = AssistantCard(
+            source: .inquiry,
+            comment: "secret response",
+            evidenceSummary: "password=secret",
+            evidence: AssistantCardEvidence(sources: [.inquiry], capability: "sensitive-inquiry"),
+            sensitivity: .sensitive
+        )
+        let cardsAfterSensitive = await store.add(sensitiveCard)
+        try require(!cardsAfterSensitive.contains(where: { $0.id == sensitiveCard.id }), "Sensitive cards must never enter recent-card storage.")
+        try require(cards.first?.comment == "card-21" && cards.last?.comment == "card-2", "The card store should retain the newest cards in reverse chronology.")
+        if let latestID = cards.first?.id {
+            cards = await store.markViewed(id: latestID)
+            try require(cards.first?.state == .viewed, "Opening a card should clear only that card's unread state.")
+            cards = await store.update(id: latestID, feedback: .useful)
+            cards = await store.update(id: latestID, state: .unread)
+            try require(
+                cards.first?.state == .unread && cards.first?.feedback == .useful,
+                "A timed-out proactive card must become unread again without erasing existing feedback."
+            )
+            cards = await store.markViewed(id: latestID)
+        }
+        let unreadCount = await store.unreadCount()
+        try require(unreadCount == 19, "Viewing one card should leave the other cards unread.")
+        let rollbackStore = AssistantCardStore()
+        let retainedCard = AssistantCard(
+            source: .inquiry,
+            comment: "retained",
+            evidence: AssistantCardEvidence(sources: [.inquiry], capability: "rollback-fixture")
+        )
+        let staleCard = AssistantCard(
+            source: .clipboard,
+            comment: "stale",
+            evidence: AssistantCardEvidence(sources: [.clipboard], capability: "rollback-fixture")
+        )
+        _ = await rollbackStore.add(retainedCard)
+        _ = await rollbackStore.add(staleCard)
+        let cardsAfterRollback = await rollbackStore.remove(id: staleCard.id)
+        try require(
+            cardsAfterRollback.map(\.id) == [retainedCard.id],
+            "A privacy epoch rollback must remove only the stale card inserted during an actor hop."
+        )
+        try require(
+            AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+                isAssistantHandoff: true,
+                isRemoteModel: true,
+                alreadyAcknowledged: false,
+                localOnly: false
+            ),
+            "The first remote Quick Action run with assistant context must require disclosure."
+        )
+        try require(
+            !AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+                isAssistantHandoff: true,
+                isRemoteModel: true,
+                alreadyAcknowledged: true,
+                localOnly: false
+            ) && !AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+                isAssistantHandoff: true,
+                isRemoteModel: true,
+                alreadyAcknowledged: false,
+                localOnly: true
+            ) && !AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+                isAssistantHandoff: false,
+                isRemoteModel: true,
+                alreadyAcknowledged: false,
+                localOnly: false
+            ) && !AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+                isAssistantHandoff: true,
+                isRemoteModel: false,
+                alreadyAcknowledged: false,
+                localOnly: false
+            ),
+            "Acknowledged, explicitly local, non-assistant, or local-model runs must not show the remote disclosure."
+        )
+
+        let visibleFrame = CGRect(x: -200, y: 40, width: 1_000, height: 800)
+        let defaultFrame = AssistantWindowGeometry.defaultOrbFrame(in: visibleFrame)
+        try require(defaultFrame.size == CGSize(width: 48, height: 48) && visibleFrame.contains(defaultFrame), "The orb must be 48pt and start inside the visible frame.")
+        let clamped = AssistantWindowGeometry.clampedOrbFrame(CGRect(x: -9_999, y: 9_999, width: 48, height: 48), in: visibleFrame)
+        try require(visibleFrame.contains(clamped), "Dragging must clamp the orb to the current display.")
+        let restored = AssistantWindowGeometry.restoredOrbFrame(
+            from: AssistantWindowGeometry.storedPosition(for: defaultFrame, in: visibleFrame),
+            in: visibleFrame
+        )
+        try require(abs(restored.midX - defaultFrame.midX) < 0.01 && abs(restored.midY - defaultFrame.midY) < 0.01, "Normalized display positions should round-trip.")
+
+        let edgeCases: [(CGRect, AssistantAccessoryPlacement)] = [
+            (CGRect(x: visibleFrame.minX + 8, y: visibleFrame.midY, width: 48, height: 48), .right),
+            (CGRect(x: visibleFrame.maxX - 56, y: visibleFrame.midY, width: 48, height: 48), .left),
+            (CGRect(x: visibleFrame.midX, y: visibleFrame.minY + 8, width: 48, height: 48), .above),
+            (CGRect(x: visibleFrame.midX, y: visibleFrame.maxY - 56, width: 48, height: 48), .below)
+        ]
+        for (orbFrame, expectedPlacement) in edgeCases {
+            let layout = AssistantWindowGeometry.accessoryLayout(orbFrame: orbFrame, visibleFrame: visibleFrame)
+            try require(layout.placement == expectedPlacement, "Accessory placement should prefer the largest available side.")
+            try require(visibleFrame.contains(layout.toolbarFrame) && visibleFrame.contains(layout.peekFrame), "Assistant accessory windows must remain fully visible.")
+        }
+        let compactPeek = AssistantWindowGeometry.accessoryLayout(
+            orbFrame: defaultFrame,
+            visibleFrame: visibleFrame,
+            peekSize: CGSize(width: 320, height: 166)
+        )
+        try require(
+            compactPeek.peekFrame.size == CGSize(width: 320, height: 166) && visibleFrame.contains(compactPeek.peekFrame),
+            "Content-sized peek cards must retain their frozen width and remain on-screen."
+        )
+        let speechBubble = AssistantWindowGeometry.accessoryLayout(
+            orbFrame: defaultFrame,
+            visibleFrame: visibleFrame,
+            peekSize: CGSize(
+                width: AssistantWindowGeometry.speechBubbleWidth,
+                height: AssistantWindowGeometry.speechBubbleMinimumHeight
+            )
+        )
+        try require(
+            visibleFrame.contains(speechBubble.peekFrame)
+                && speechBubble.peekFrame.width == AssistantWindowGeometry.speechBubbleWidth,
+            "Companion speech bubbles must remain compact and fully visible beside the orb."
+        )
+        try require(
+            AssistantWindowGeometry.allowsPassiveToolbar(peekIsVisible: false, dropTargetIsActive: false)
+                && !AssistantWindowGeometry.allowsPassiveToolbar(peekIsVisible: true, dropTargetIsActive: false)
+                && !AssistantWindowGeometry.allowsPassiveToolbar(peekIsVisible: false, dropTargetIsActive: true),
+            "Passive hover must never replace an open card or active drop target with the toolbar."
+        )
+    }
+
+    private static func checkDesktopAssistantLocalPromptBoundary() async throws {
+        let root = try makeTemporaryDirectory(name: "assistant-local-prompt")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let localDirectory = root.appendingPathComponent("local-model", isDirectory: true)
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        for name in ["config.json", "tokenizer.json", "model.safetensors"] {
+            FileManager.default.createFile(atPath: localDirectory.appendingPathComponent(name).path, contents: Data("{}".utf8))
+        }
+        let localID = UUID()
+        let remoteID = UUID()
+        let local = ModelDescriptor(
+            id: localID,
+            name: "Local",
+            sourcePath: localDirectory,
+            resolvedPath: localDirectory,
+            format: .mlx,
+            sizeClass: "1b",
+            role: .default,
+            contextLength: 4_096,
+            enabled: true,
+            validationState: .valid,
+            capabilities: .textOnly(source: .manual)
+        )
+        let remote = ModelDescriptor(
+            id: remoteID,
+            name: "Remote",
+            sourcePath: URL(string: "https://example.com/v1")!,
+            format: .openAICompatible,
+            sizeClass: "remote",
+            role: .default,
+            contextLength: 4_096,
+            enabled: true,
+            validationState: .valid,
+            providerConfiguration: ProviderConfiguration(
+                providerID: .openAI,
+                apiStyle: .openAICompatible,
+                baseURL: URL(string: "https://example.com/v1"),
+                apiKey: "test",
+                modelID: "remote"
+            )
+        )
+        let runner = StubRunner(output: "local answer")
+        let engine = TaskEngine(
+            registryStore: RegistryStore(fileURL: root.appendingPathComponent("registry.json")),
+            historyStore: HistoryStore(fileURL: root.appendingPathComponent("history.json")),
+            runners: [.mlx: runner]
+        )
+        try await engine.addModelDescriptorForTesting(remote)
+        try await engine.addModelDescriptorForTesting(local)
+        try await engine.updatePreferences { $0.defaultModelID = remoteID }
+        let request = TaskRequest(
+            task: .explain,
+            inputText: "ignored",
+            systemPromptOverride: "assistant system",
+            userPromptOverride: "assistant question"
+        )
+        let result = try await engine.runLocalText(request: request, modelID: remoteID)
+        try require(result.text == "local answer", "Assistant text should fall back to a local model when a remote model is requested.")
+        let loadedModelID = await runner.loadedModelID()
+        try require(loadedModelID == localID, "Assistant text must never load the configured remote provider.")
+        do {
+            _ = try await engine.runExactLocalText(request: request, modelID: remoteID)
+            try require(false, "Exact assistant model execution must reject a remote model instead of falling back.")
+        } catch let error as RunnerError {
+            guard case .unsupportedConfiguration = error else { throw error }
+        }
+        do {
+            _ = try AssistantModelFingerprint.fingerprint(for: remote)
+            try require(false, "Remote providers must never acquire a desktop-assistant qualification fingerprint.")
+        } catch let error as RunnerError {
+            guard case .unsupportedConfiguration = error else { throw error }
+        }
+        var invalidLocal = local
+        invalidLocal.id = UUID()
+        invalidLocal.name = "Invalid Local"
+        invalidLocal.validationState = .failed
+        try await engine.addModelDescriptorForTesting(invalidLocal)
+        do {
+            _ = try await engine.runExactLocalText(request: request, modelID: invalidLocal.id)
+            try require(false, "Exact assistant model execution must reject a failed local model even when its files exist.")
+        } catch let error as RunnerError {
+            guard case .unsupportedConfiguration = error else { throw error }
+        }
+        let exactResult = try await engine.runExactLocalText(request: request, modelID: localID)
+        try require(exactResult.text == "result ignored", "Exact assistant execution should run the selected local model.")
+        let reportedLoadedModelID = await engine.loadedLocalTextModelID()
+        try require(reportedLoadedModelID == localID, "TaskEngine should report the currently loaded local text model for comment reuse.")
+        try require(PromptTemplates.systemPrompt(for: request, preferences: .init()) == "assistant system", "Assistant system prompt override should reach every runner.")
+        try require(PromptTemplates.userPrompt(for: request, preferences: .init()) == "assistant question", "Assistant user prompt override should reach every runner.")
+        let history = await engine.recentHistory()
+        try require(history.isEmpty, "Assistant inquiries must not enter ordinary task history.")
+    }
+
+    private static func checkDesktopAssistantPrivacyAndContextBuffer() async throws {
+        let root = try makeTemporaryDirectory(name: "assistant-context")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let keyURL = root.appendingPathComponent("assistant-fingerprint.key")
+        let fingerprintStore = AssistantFingerprintStore(fileURL: keyURL)
+
+        try await fingerprintStore.ensureKey()
+        try require(FileManager.default.fileExists(atPath: keyURL.path), "Completing assistant onboarding must be able to create the fingerprint key before the first event.")
+
+        let normalizedA = try await fingerprintStore.fingerprint(text: "line one\r\nline two")
+        let normalizedB = try await fingerprintStore.fingerprint(text: "line one\nline two")
+        try require(normalizedA == normalizedB, "Assistant fingerprints should normalize Unicode newlines without lowercasing content.")
+        let caseChanged = try await fingerprintStore.fingerprint(text: "Line one\nline two")
+        try require(caseChanged != normalizedA, "Assistant fingerprints must preserve letter case.")
+        let beforeRotation = try await fingerprintStore.fingerprint(text: "assistant-key-verification")
+        let rotated = try await fingerprintStore.rotate()
+        try require(rotated != beforeRotation, "Fingerprint rotation must break linkage to values created with the old key.")
+        let keyPermissions = try FileManager.default.attributesOfItem(atPath: keyURL.path)[.posixPermissions] as? NSNumber
+        try require(keyPermissions?.intValue == 0o600, "Assistant fingerprint key must use 0600 permissions.")
+
+        let policy = AssistantPrivacyPolicy(excludedApplicationBundleIDs: ["com.example.secret"])
+        try require(policy.sensitivity(text: "ordinary note", bundleID: "COM.EXAMPLE.SECRET") == .excludedApplication, "Excluded apps must be rejected case-insensitively before event creation.")
+        try require(
+            DesktopAssistantPreferences().excludedApplicationBundleIDs.contains("com.apple.passwords"),
+            "The system Passwords app must be excluded by default."
+        )
+        try require(policy.sensitivity(text: "api_key=sk-abcdefghijklmnop", bundleID: "com.example.editor") == .sensitive, "API keys must be treated as sensitive.")
+        try require(policy.sensitivity(text: "ordinary note", bundleID: "com.example.editor") == .normal, "Normal text should remain available to authorized local processing.")
+        try require(
+            AssistantPrivacyPolicy.containsWebURL("Please review https://example.com/report before launch")
+                && AssistantPrivacyPolicy.containsWebURL("See www.example.com/report for details")
+                && !AssistantPrivacyPolicy.containsWebURL("ordinary local release notes"),
+            "P-06 evidence must detect links embedded in prose without changing whole-value URL classification."
+        )
+        let cleanedTitle = policy.sanitizeWindowTitle("Draft /Users/alice/project/private.txt alice@example.com 123456789") ?? ""
+        try require(!cleanedTitle.contains("alice") && !cleanedTitle.contains("123456789"), "Window-title cleaning must remove paths, email addresses, and long identifiers.")
+        let cleanedSummary = policy.sanitizeEvidenceSummary("Build failed at /tmp/private.swift token=secret-value") ?? ""
+        try require(!cleanedSummary.contains("private.swift") && !cleanedSummary.contains("secret-value"), "Evidence cleaning must remove paths and credentials.")
+
+        let oversizedText = "front-marker " + String(repeating: "neutral context ", count: 1_000) + " tail-marker"
+        let oversizedBuffer = AssistantContextBuffer()
+        let oversizedEvent = await oversizedBuffer.append(
+            AssistantActivityEvent(
+                occurredAt: Date(timeIntervalSince1970: 1_000),
+                type: .clipboardChanged,
+                source: .clipboard,
+                contentType: .text,
+                contentFingerprint: "oversized-fingerprint"
+            ),
+            rawText: oversizedText,
+            now: Date(timeIntervalSince1970: 1_000)
+        )
+        let oversizedSummary = oversizedEvent.sanitizedSummary ?? ""
+        try require(
+            oversizedEvent.ephemeralContextReference == nil
+                && oversizedSummary.count <= 240
+                && oversizedSummary.contains("front-marker")
+                && oversizedSummary.contains("tail-marker"),
+            "Text over 12,000 characters must retain only a bounded, sanitized front-and-back summary."
+        )
+
+        let buffer = AssistantContextBuffer()
+        let base = Date(timeIntervalSince1970: 10_000)
+        let first = AssistantActivityEvent(
+            occurredAt: base,
+            type: .clipboardChanged,
+            source: .clipboard,
+            appIdentity: "com.example.editor",
+            contentType: .text,
+            contentFingerprint: normalizedA
+        )
+        let storedFirst = await buffer.append(first, rawText: "first raw text", now: base)
+        let firstRawText = await buffer.rawText(for: storedFirst.ephemeralContextReference, now: base)
+        try require(firstRawText == "first raw text", "Authorized raw context should remain available during its 10-minute TTL.")
+        let duplicate = AssistantActivityEvent(
+            occurredAt: base.addingTimeInterval(1),
+            type: .clipboardChanged,
+            source: .clipboard,
+            appIdentity: "com.example.editor",
+            contentType: .text,
+            contentFingerprint: normalizedA
+        )
+        let merged = await buffer.append(duplicate, rawText: "new raw text", now: base.addingTimeInterval(1))
+        try require(merged.occurrenceCount == 2, "Duplicate source/app/fingerprint events should merge into one counter.")
+        let mergedEvents = await buffer.snapshot(now: base.addingTimeInterval(1))
+        try require(mergedEvents.count == 1, "Merged activity events should occupy one queue slot.")
+        let expiredRawText = await buffer.rawText(for: merged.ephemeralContextReference, now: base.addingTimeInterval(601))
+        try require(expiredRawText == nil, "Raw context must expire after 10 minutes even while the activity counter remains.")
+
+        let sensitive = AssistantActivityEvent(
+            occurredAt: base.addingTimeInterval(700),
+            type: .clipboardChanged,
+            source: .clipboard,
+            contentFingerprint: nil,
+            sensitivity: .sensitive
+        )
+        let sensitiveStored = await buffer.append(sensitive, rawText: "password=secret", now: base.addingTimeInterval(700))
+        try require(sensitiveStored.ephemeralContextReference == nil, "Sensitive content must never receive a raw-context reference.")
+
+        for index in 0..<2_005 {
+            let date = base.addingTimeInterval(800 + Double(index))
+            _ = await buffer.append(
+                AssistantActivityEvent(
+                    occurredAt: date,
+                    type: .selectionCaptured,
+                    source: .selection,
+                    contentFingerprint: "selection-\(index)"
+                ),
+                now: date
+            )
+        }
+        let bounded = await buffer.snapshot(now: base.addingTimeInterval(2_805))
+        try require(bounded.count == AssistantContextBuffer.maximumEventCount, "Activity memory must enforce its 2,000-event upper bound.")
+        await buffer.clear(source: .selection)
+        let afterSourceClear = await buffer.snapshot(now: base.addingTimeInterval(2_805))
+        try require(afterSourceClear.allSatisfy { $0.source != .selection }, "Revoking one source must remove its unexpired context without affecting other sources.")
+        await buffer.clear()
+        let afterFullClear = await buffer.snapshot(now: base.addingTimeInterval(2_805))
+        try require(afterFullClear.isEmpty, "Pause, privacy, disable, and exit must be able to clear all in-memory context.")
+
+        let epochBuffer = AssistantContextBuffer()
+        let staleEvent = AssistantActivityEvent(
+            occurredAt: base,
+            type: .clipboardChanged,
+            source: .clipboard,
+            contentFingerprint: "stale"
+        )
+        await epochBuffer.advanceEpochAndClear(to: 1)
+        let staleAppend = await epochBuffer.appendIfCurrent(staleEvent, rawText: "must not return", expectedEpoch: 0, now: base)
+        try require(staleAppend == nil, "A delayed observer task must not repopulate context after an epoch privacy barrier.")
+        let staleDrop = await epochBuffer.appendIfCurrent(
+            AssistantActivityEvent(occurredAt: base, type: .fileDropped, source: .droppedFile),
+            expectedEpoch: 0,
+            now: base
+        )
+        try require(staleDrop == nil, "A delayed drop task must not repopulate context after a lifecycle clear.")
+        let currentAppend = await epochBuffer.appendIfCurrent(staleEvent, rawText: "current", expectedEpoch: 1, now: base)
+        try require(currentAppend != nil, "Current-epoch observer work should still append normally.")
+        let selectionEvent = AssistantActivityEvent(
+            occurredAt: base,
+            type: .selectionCaptured,
+            source: .selection,
+            contentFingerprint: "selection"
+        )
+        _ = await epochBuffer.appendIfCurrent(selectionEvent, rawText: "selection raw", expectedEpoch: 1, now: base)
+        await epochBuffer.advanceEpochAndClear(to: 3, source: .clipboard)
+        await epochBuffer.advanceEpochAndClear(to: 2, source: .selection)
+        let afterOutOfOrderClear = await epochBuffer.snapshot(now: base)
+        try require(
+            afterOutOfOrderClear.isEmpty,
+            "Out-of-order privacy barriers must still execute every requested source clear."
+        )
+        let appBuffer = AssistantContextBuffer()
+        _ = await appBuffer.append(
+            AssistantActivityEvent(
+                occurredAt: base,
+                type: .clipboardChanged,
+                source: .clipboard,
+                appIdentity: "Com.Example.Secret",
+                contentType: .text
+            ),
+            rawText: "private source text",
+            now: base
+        )
+        await appBuffer.clear(appIdentity: "com.example.secret")
+        let appContextAfterClear = await appBuffer.snapshot(now: base)
+        try require(
+            appContextAfterClear.isEmpty,
+            "Excluded-app context clearing must compare normalized bundle IDs case-insensitively."
+        )
+    }
+
+    private static func checkDesktopAssistantBehaviorStore() async throws {
+        let root = try makeTemporaryDirectory(name: "assistant-behavior")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let fileURL = root.appendingPathComponent("assistant-behavior.json")
+        let keyURL = root.appendingPathComponent("assistant-fingerprint.key")
+        let fingerprintStore = AssistantFingerprintStore(fileURL: keyURL)
+        let store = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        let now = Date(timeIntervalSince1970: 50_000)
+
+        let empty = await store.load(now: now)
+        try require(empty.records.isEmpty && !FileManager.default.fileExists(atPath: fileURL.path), "Loading before onboarding must not create a behavior file.")
+        let oldFingerprint = try await fingerprintStore.fingerprint(text: "same content")
+        let normalID = UUID()
+        let saved = await store.append(
+            AssistantBehaviorRecord(
+                id: normalID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.selection, .llmToolsTask],
+                appIdentity: "com.example.editor",
+                appCategory: "development",
+                evidenceFeatures: ["count": 3, "durationSeconds": 120],
+                sanitizedEvidenceSummary: "Build failed at /tmp/private.swift token=secret-value",
+                contentFingerprint: oldFingerprint,
+                assistantDecision: .badge,
+                presentationResult: .badged
+            ),
+            now: now
+        )
+        try require(saved, "A normal behavior record should save atomically.")
+        let related = await store.records(
+            pattern: .repeatedFailure,
+            source: .llmToolsTask,
+            appCategory: "development",
+            now: now
+        )
+        try require(related.map(\.id) == [normalID], "Behavior lookup must filter related history by pattern, source, and app category.")
+        let unrelated = await store.records(
+            pattern: .repeatedFailure,
+            source: .clipboard,
+            appCategory: "development",
+            now: now
+        )
+        try require(unrelated.isEmpty, "Behavior lookup must not feed unrelated source history to the judgment model.")
+        let aggregateBeforeSourceClear = await store.aggregate(for: .repeatedFailure)
+        let sourceHistoryCleared = await store.clearDetailedRecords(source: .selection, now: now)
+        let taskRecordsAfterClear = await store.records(source: .llmToolsTask, now: now)
+        let aggregateAfterSourceClear = await store.aggregate(for: .repeatedFailure)
+        try require(sourceHistoryCleared, "Source history clear should save atomically.")
+        try require(
+            taskRecordsAfterClear.isEmpty,
+            "Clearing one source must remove its detailed behavior records."
+        )
+        try require(
+            aggregateAfterSourceClear == aggregateBeforeSourceClear,
+            "Source history clear must retain long-term aggregate learning."
+        )
+        _ = await store.append(
+            AssistantBehaviorRecord(
+                occurredAt: now,
+                patternType: .foreignClipboard,
+                sourceTypes: [.clipboard],
+                appIdentity: "com.example.reader",
+                appCategory: "browser",
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            ),
+            now: now
+        )
+        _ = await store.clearDetailedRecords(source: .foregroundApplication, now: now)
+        let appIdentityRecordsAfterClear = await store.records(source: .clipboard, now: now)
+        try require(
+            appIdentityRecordsAfterClear.isEmpty,
+            "Clearing foreground-app history must remove records enriched with that app identity."
+        )
+        _ = await store.clearDetailedRecords(clearAggregatePreferences: true, now: now)
+        _ = await store.append(
+            AssistantBehaviorRecord(
+                id: normalID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .badge,
+                presentationResult: .badged
+            ),
+            now: now
+        )
+        let fileText = try String(contentsOf: fileURL, encoding: .utf8)
+        try require(!fileText.contains("private.swift") && !fileText.contains("secret-value"), "Behavior JSON must not contain unsanitized evidence.")
+        let filePermissions = try FileManager.default.attributesOfItem(atPath: fileURL.path)[.posixPermissions] as? NSNumber
+        let directoryPermissions = try FileManager.default.attributesOfItem(atPath: root.path)[.posixPermissions] as? NSNumber
+        try require(filePermissions?.intValue == 0o600 && directoryPermissions?.intValue == 0o700, "Assistant behavior storage must use 0700/0600 permissions.")
+        _ = await store.append(
+            AssistantBehaviorRecord(
+                id: normalID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .badge,
+                presentationResult: .badged
+            ),
+            now: now
+        )
+        let replacedSnapshot = await store.load(now: now)
+        try require(
+            replacedSnapshot.aggregatePreferences[.repeatedFailure]?.detectedCount == 1,
+            "Replacing one behavior record must not double-count its aggregate."
+        )
+
+        let aggregateFileURL = root.appendingPathComponent("assistant-aggregate-retention.json")
+        let aggregateStore = AssistantBehaviorStore(fileURL: aggregateFileURL, fingerprintStore: fingerprintStore)
+        let retainedID = UUID()
+        _ = await aggregateStore.append(
+            AssistantBehaviorRecord(
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .badge,
+                presentationResult: .badged
+            ),
+            now: now
+        )
+        _ = await aggregateStore.clearDetailedRecords(clearAggregatePreferences: false, now: now)
+        _ = await aggregateStore.append(
+            AssistantBehaviorRecord(
+                id: retainedID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .peek,
+                presentationResult: .presented
+            ),
+            now: now
+        )
+        _ = await aggregateStore.update(id: retainedID, feedback: .irrelevant, now: now)
+        _ = await aggregateStore.update(id: retainedID, outcome: .acted, now: now)
+        let actedAggregate = await aggregateStore.aggregate(for: .repeatedFailure)
+        try require(
+            actedAggregate.presentedCount == 1 && actedAggregate.actedCount == 1,
+            "A proactively presented record must retain its exposure after an action."
+        )
+        _ = await aggregateStore.update(id: retainedID, outcome: .dismissed, now: now)
+        let badgeViewedID = UUID()
+        _ = await aggregateStore.append(
+            AssistantBehaviorRecord(
+                id: badgeViewedID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .badge,
+                presentationResult: .badged
+            ),
+            now: now
+        )
+        _ = await aggregateStore.update(id: badgeViewedID, outcome: .viewed, now: now)
+        let aggregateSnapshot = await aggregateStore.load(now: now)
+        try require(
+            aggregateSnapshot.aggregatePreferences[.repeatedFailure]?.detectedCount == 3
+                && aggregateSnapshot.aggregatePreferences[.repeatedFailure]?.presentedCount == 1
+                && aggregateSnapshot.aggregatePreferences[.repeatedFailure]?.actedCount == 0
+                && aggregateSnapshot.aggregatePreferences[.repeatedFailure]?.irrelevantCount == 1,
+            "Exposure must follow the original peek decision; later dismissal and badge viewing must not rewrite it."
+        )
+
+        let sensitiveID = UUID()
+        _ = await store.append(
+            AssistantBehaviorRecord(
+                id: sensitiveID,
+                occurredAt: now.addingTimeInterval(1),
+                patternType: .foreignClipboard,
+                sourceTypes: [.clipboard],
+                appIdentity: "com.example.editor",
+                appCategory: "productivity",
+                evidenceFeatures: ["count": 3],
+                sanitizedEvidenceSummary: "private text",
+                contentFingerprint: oldFingerprint,
+                sensitivity: .sensitive,
+                assistantDecision: .peek,
+                judgmentModelID: UUID(),
+                judgmentConfidence: 1,
+                presentationResult: .presented
+            ),
+            now: now.addingTimeInterval(1)
+        )
+        let sensitiveRecord = await store.records(limit: 5, now: now.addingTimeInterval(1)).first { $0.id == sensitiveID }
+        try require(
+            sensitiveRecord?.patternType == nil
+                && sensitiveRecord?.sourceTypes.isEmpty == true
+                && sensitiveRecord?.appIdentity == nil
+                && sensitiveRecord?.sanitizedEvidenceSummary == nil
+                && sensitiveRecord?.contentFingerprint == nil
+                && sensitiveRecord?.suppressionReason == .sensitiveContent,
+            "Sensitive behavior persistence must contain only the suppression state and timestamp."
+        )
+        let excludedSaved = await store.append(
+            AssistantBehaviorRecord(
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.selection],
+                sensitivity: .excludedApplication,
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            ),
+            now: now
+        )
+        try require(!excludedSaved, "Completely excluded applications must not create behavior records.")
+
+        _ = await store.append(
+            AssistantBehaviorRecord(
+                occurredAt: now.addingTimeInterval(-AssistantBehaviorStore.retentionInterval - 1),
+                patternType: .repeatedFailure,
+                sourceTypes: [.selection],
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            ),
+            now: now
+        )
+        let retainedSummary = await store.summary(now: now)
+        try require(retainedSummary.recordCount == 2, "Behavior records older than 30 days must be removed before saving.")
+
+        let reloadedStore = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        let reloaded = await reloadedStore.load(now: now.addingTimeInterval(2))
+        try require(reloaded.records.count == 2, "The behavior snapshot should round-trip through its independent JSON file.")
+
+        var staleSnapshot = reloaded
+        staleSnapshot.records.append(AssistantBehaviorRecord(
+            occurredAt: now.addingTimeInterval(-AssistantBehaviorStore.retentionInterval - 10),
+            patternType: .repeatedFailure,
+            sourceTypes: [.selection],
+            assistantDecision: .silent,
+            presentationResult: .suppressed
+        ))
+        let staleEncoder = JSONEncoder()
+        staleEncoder.dateEncodingStrategy = .iso8601
+        try staleEncoder.encode(staleSnapshot).write(to: fileURL, options: .atomic)
+        let pruningStore = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        _ = await pruningStore.load(now: now)
+        let staleDecoder = JSONDecoder()
+        staleDecoder.dateDecodingStrategy = .iso8601
+        let prunedDiskSnapshot = try staleDecoder.decode(AssistantBehaviorSnapshot.self, from: Data(contentsOf: fileURL))
+        try require(
+            prunedDiskSnapshot.records.allSatisfy { $0.occurredAt >= now.addingTimeInterval(-AssistantBehaviorStore.retentionInterval) },
+            "Startup retention pruning must be written back to the private behavior file."
+        )
+
+        let liveRetentionURL = root.appendingPathComponent("assistant-live-retention.json")
+        let liveRetentionStore = AssistantBehaviorStore(fileURL: liveRetentionURL, fingerprintStore: fingerprintStore)
+        _ = await liveRetentionStore.append(
+            AssistantBehaviorRecord(
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.selection],
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            ),
+            now: now
+        )
+        let expiredSummary = await liveRetentionStore.summary(
+            now: now.addingTimeInterval(AssistantBehaviorStore.retentionInterval + 1)
+        )
+        let liveRetentionDisk = try staleDecoder.decode(
+            AssistantBehaviorSnapshot.self,
+            from: Data(contentsOf: liveRetentionURL)
+        )
+        try require(
+            expiredSummary.recordCount == 0 && liveRetentionDisk.records.isEmpty,
+            "A continuously running app must remove 30-day details from both summary and disk."
+        )
+
+        let limitEncoder = JSONEncoder()
+        limitEncoder.dateEncodingStrategy = .iso8601
+        limitEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let countLimitURL = root.appendingPathComponent("assistant-count-limit.json")
+        let countRecords = (0...AssistantBehaviorStore.maximumRecordCount).map { index in
+            AssistantBehaviorRecord(
+                occurredAt: now.addingTimeInterval(Double(index)),
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                evidenceFeatures: ["index": Double(index)],
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            )
+        }
+        try limitEncoder.encode(AssistantBehaviorSnapshot(records: countRecords, updatedAt: now))
+            .write(to: countLimitURL, options: .atomic)
+        let countLimitStore = AssistantBehaviorStore(fileURL: countLimitURL, fingerprintStore: fingerprintStore)
+        let countLimitedSnapshot = await countLimitStore.load(
+            now: now.addingTimeInterval(Double(AssistantBehaviorStore.maximumRecordCount + 1))
+        )
+        try require(
+            countLimitedSnapshot.records.count == AssistantBehaviorStore.maximumRecordCount
+                && countLimitedSnapshot.records.first?.evidenceFeatures["index"] == 1
+                && countLimitedSnapshot.records.last?.evidenceFeatures["index"] == Double(AssistantBehaviorStore.maximumRecordCount),
+            "Behavior loading must keep exactly the newest 5,000 valid records."
+        )
+
+        let byteLimitURL = root.appendingPathComponent("assistant-byte-limit.json")
+        let denseFeatures = Dictionary(uniqueKeysWithValues: (0..<16).map { index in
+            ("feature-\(index)-" + String(repeating: "x", count: 48), Double(index))
+        })
+        let denseRecords = (0..<AssistantBehaviorStore.maximumRecordCount).map { index in
+            AssistantBehaviorRecord(
+                occurredAt: now.addingTimeInterval(Double(index)),
+                patternType: .foreignClipboard,
+                sourceTypes: [.clipboard],
+                appIdentity: "com.example.dense-record",
+                appCategory: String(repeating: "c", count: 64),
+                evidenceFeatures: denseFeatures,
+                sanitizedEvidenceSummary: String(repeating: "s", count: 240),
+                contentFingerprint: String(repeating: "f", count: 64),
+                assistantDecision: .silent,
+                judgmentModelID: UUID(),
+                judgmentConfidence: 0.75,
+                presentationResult: .suppressed
+            )
+        }
+        let oversizedSnapshotData = try limitEncoder.encode(
+            AssistantBehaviorSnapshot(records: denseRecords, updatedAt: now)
+        )
+        try require(
+            oversizedSnapshotData.count > AssistantBehaviorStore.maximumByteCount,
+            "The byte-limit fixture must exceed 10MB before loading."
+        )
+        try oversizedSnapshotData.write(to: byteLimitURL, options: .atomic)
+        let byteLimitStore = AssistantBehaviorStore(fileURL: byteLimitURL, fingerprintStore: fingerprintStore)
+        _ = await byteLimitStore.load(
+            now: now.addingTimeInterval(Double(AssistantBehaviorStore.maximumRecordCount))
+        )
+        let byteLimitedData = try Data(contentsOf: byteLimitURL)
+        try require(
+            byteLimitedData.count <= AssistantBehaviorStore.maximumByteCount,
+            "Behavior loading must rewrite an oversized valid snapshot to at most 10MB."
+        )
+
+        let futureData = Data(#"{"schemaVersion":99,"records":[],"aggregatePreferences":{},"updatedAt":"2026-01-01T00:00:00Z"}"#.utf8)
+        try futureData.write(to: fileURL, options: .atomic)
+        let futureStore = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        _ = await futureStore.load(now: now)
+        let futureSummary = await futureStore.summary()
+        try require(futureSummary.status == .futureSchemaReadOnly && futureSummary.schemaVersion == 99, "A future behavior schema must enter read-only mode with the real version visible.")
+        let futureAppend = await futureStore.append(
+            AssistantBehaviorRecord(
+                patternType: .repeatedFailure,
+                sourceTypes: [.selection],
+                assistantDecision: .silent,
+                presentationResult: .suppressed
+            ),
+            now: now
+        )
+        let futureDataAfterAppend = try Data(contentsOf: fileURL)
+        try require(!futureAppend && futureDataAfterAppend == futureData, "An older app must never overwrite a newer behavior schema.")
+
+        try Data("not-json-one".utf8).write(to: fileURL, options: .atomic)
+        let corruptStore = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        _ = await corruptStore.load(now: now)
+        try Data("not-json-two".utf8).write(to: fileURL, options: .atomic)
+        _ = await corruptStore.load(now: now)
+        let quarantinePrefix = "\(fileURL.lastPathComponent).corrupt-"
+        let quarantines = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(quarantinePrefix) }
+        try require(quarantines.count == 1, "Repeated corruption recovery must keep only the latest quarantine file.")
+        let quarantinePermissions = try FileManager.default.attributesOfItem(atPath: quarantines[0].path)[.posixPermissions] as? NSNumber
+        try require(quarantinePermissions?.intValue == 0o600, "Corrupt behavior quarantine must remain private.")
+
+        let deleted = await corruptStore.deleteAllFilesAndRotateKey(now: now)
+        try require(deleted, "Clearing all behavior data should report success only after file deletion and key rotation.")
+        let newFingerprint = try await fingerprintStore.fingerprint(text: "same content")
+        try require(newFingerprint != oldFingerprint, "Clearing all behavior data must rotate the HMAC key.")
+        let remainingFiles = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)
+        try require(
+            !remainingFiles.contains { $0.lastPathComponent == fileURL.lastPathComponent || $0.lastPathComponent.hasPrefix(quarantinePrefix) },
+            "Clearing all behavior data must remove the main and quarantine files."
+        )
+        let raceID = UUID()
+        _ = await corruptStore.append(
+            AssistantBehaviorRecord(
+                id: raceID,
+                occurredAt: now,
+                patternType: .repeatedFailure,
+                sourceTypes: [.llmToolsTask],
+                assistantDecision: .peek,
+                presentationResult: .presented
+            ),
+            now: now
+        )
+        let racingDelete = Task { await corruptStore.deleteAllFilesAndRotateKey(now: now.addingTimeInterval(1)) }
+        let racingUpdates = Task {
+            for _ in 0..<100 {
+                _ = await corruptStore.update(id: raceID, outcome: .acted, now: now.addingTimeInterval(1))
+            }
+        }
+        let racingDeleteSucceeded = await racingDelete.value
+        await racingUpdates.value
+        let postDeleteStore = AssistantBehaviorStore(fileURL: fileURL, fingerprintStore: fingerprintStore)
+        let postDeleteSnapshot = await postDeleteStore.load(now: now.addingTimeInterval(2))
+        try require(
+            racingDeleteSucceeded && postDeleteSnapshot.records.isEmpty,
+            "Concurrent updates must not resurrect records while all behavior data is being deleted."
+        )
+        let failingStore = AssistantBehaviorStore(
+            fileURL: URL(fileURLWithPath: "/dev/null/assistant-behavior.json"),
+            fingerprintStore: AssistantFingerprintStore(fileURL: URL(fileURLWithPath: "/dev/null/assistant-fingerprint.key"))
+        )
+        let failedDelete = await failingStore.deleteAllFilesAndRotateKey(now: now)
+        let failedSummary = await failingStore.summary()
+        try require(!failedDelete && failedSummary.status == .saveFailed, "A failed data/key deletion must not be reported as ready.")
+        let failedDetailedClear = await failingStore.clearDetailedRecords(clearAggregatePreferences: false, now: now)
+        let failedDetailedSummary = await failingStore.summary()
+        try require(
+            !failedDetailedClear && failedDetailedSummary.status == .saveFailed,
+            "A failed detailed-record clear must not be reported as successful."
+        )
+
+        let failedRotationStore = AssistantBehaviorStore(
+            fileURL: root.appendingPathComponent("rotation-failure.json"),
+            fingerprintStore: AssistantFingerprintStore(fileURL: URL(fileURLWithPath: "/dev/null/assistant-fingerprint.key"))
+        )
+        let failedRotationClear = await failedRotationStore.clearDetailedRecords(clearAggregatePreferences: true, now: now)
+        let failedRotationSummary = await failedRotationStore.summary()
+        try require(
+            !failedRotationClear && failedRotationSummary.status == .saveFailed,
+            "A failed fingerprint-key rotation must remain visible after detailed records are saved."
+        )
+
+        let unlistableRoot = root.appendingPathComponent("unlistable")
+        try FileManager.default.createDirectory(at: unlistableRoot, withIntermediateDirectories: false)
+        let unlistableURL = unlistableRoot.appendingPathComponent("assistant-behavior.json")
+        let unlistableQuarantine = unlistableRoot.appendingPathComponent("assistant-behavior.json.corrupt-fixture")
+        FileManager.default.createFile(atPath: unlistableQuarantine.path, contents: Data("private".utf8))
+        let unlistableStore = AssistantBehaviorStore(
+            fileURL: unlistableURL,
+            fingerprintStore: AssistantFingerprintStore(fileURL: unlistableRoot.appendingPathComponent("assistant-fingerprint.key"))
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o300], ofItemAtPath: unlistableRoot.path)
+        let unlistableDelete = await unlistableStore.deleteAllFilesAndRotateKey(now: now)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: unlistableRoot.path)
+        try require(
+            !unlistableDelete && FileManager.default.fileExists(atPath: unlistableQuarantine.path),
+            "A quarantine enumeration failure must not be reported as successful deletion."
+        )
+    }
+
+    private static func checkDesktopAssistantDropClassifier() throws {
+        let root = try makeTemporaryDirectory(name: "assistant-drop")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let textFile = root.appendingPathComponent("note.md")
+        let imageFile = root.appendingPathComponent("image.png")
+        let mediaFile = root.appendingPathComponent("clip.mp4")
+        let unsupportedFile = root.appendingPathComponent("document.pdf")
+        for file in [textFile, imageFile, mediaFile, unsupportedFile] {
+            FileManager.default.createFile(atPath: file.path, contents: Data("fixture".utf8))
+        }
+
+        try require(AssistantDropClassifier.classify(text: "hello").kind == .text, "Plain text should enter text task selection.")
+        let url = AssistantDropClassifier.classify(text: "https://example.com/path?q=1")
+        try require(url.kind == .url && url.isSupported, "A standalone HTTP URL should expose only URL actions.")
+        try require(AssistantDropClassifier.classify(fileURL: textFile).kind == .textFile, "TXT and Markdown files should use text task routing.")
+        try require(AssistantDropClassifier.classify(fileURL: imageFile).kind == .image, "Image files should route to OCR.")
+        try require(AssistantDropClassifier.classify(fileURL: mediaFile).kind == .media, "Audio and video files should route to media subtitles.")
+        try require(!AssistantDropClassifier.classify(fileURL: unsupportedFile).isSupported, "PDF and other unsupported files must be rejected before release.")
+        try require(!AssistantDropClassifier.classify(fileURL: root).isSupported, "Directories must be rejected before release.")
+        try require(AssistantDropClassifier.multipleItems.kind == .multipleItems && !AssistantDropClassifier.multipleItems.isSupported, "Multiple or mixed pasteboard items must be rejected as a whole.")
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.file-url", "public.utf8-plain-text"]) == .file,
+            "A file URL with a string fallback must not be read as clipboard text."
+        )
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.rtf", "public.utf8-plain-text"]) == .richText,
+            "Rich text with a string fallback must remain type-only context."
+        )
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.html", "public.utf8-plain-text"]) == .plainText,
+            "Browser clipboard content with a standard plain-text representation must enter text observation."
+        )
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.html"]) == .richText,
+            "HTML-only clipboard content must remain type-only context."
+        )
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.png", "public.utf8-plain-text"]) == .image,
+            "Image payloads with a string fallback must remain type-only context."
+        )
+        try require(
+            AssistantClipboardClassifier.classify(typeIdentifiers: ["public.utf8-plain-text"]) == .plainText,
+            "A plain-text-only pasteboard item should be readable after authorization."
+        )
+    }
+
+    private static func checkDesktopAssistantIntelligenceContracts() async throws {
+        let detector = AssistantPatternDetector()
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let fingerprint = "fixture-error-fingerprint"
+        func failureEvent(offset: TimeInterval, source: AssistantSource) -> AssistantActivityEvent {
+            AssistantActivityEvent(
+                occurredAt: base.addingTimeInterval(offset),
+                type: source == .llmToolsTask ? .taskFailed : .selectionCaptured,
+                source: source,
+                appIdentity: "com.example.editor",
+                contentType: .text,
+                contentFingerprint: fingerprint,
+                ephemeralContextReference: UUID()
+            )
+        }
+        let firstFailure = await detector.ingestFailure(failureEvent(offset: 0, source: .selection), now: base)
+        try require(firstFailure == nil, "P-01 must not trigger on its first occurrence.")
+        let secondFailure = await detector.ingestFailure(
+            failureEvent(offset: 120, source: .llmToolsTask),
+            now: base.addingTimeInterval(120)
+        )
+        try require(secondFailure == nil, "P-01 must not trigger before the third matching error.")
+        let repeated = await detector.ingestFailure(
+            failureEvent(offset: 300, source: .llmToolsTask),
+            workbenchIsRecoverable: true,
+            now: base.addingTimeInterval(300)
+        )
+        try require(repeated?.patternType == .repeatedFailure && repeated?.evidenceCount == 3, "P-01 must combine matching explicit sources within 10 minutes.")
+        try require(
+            repeated?.sourceTypes == [.llmToolsTask, .selection],
+            "P-01 must retain every evidence source for explanation and source-history deletion."
+        )
+        try require(repeated?.evidenceContextReferences.count == 3, "P-01 must retain bounded ephemeral evidence references for semantic judgment.")
+        try require(repeated?.appIdentity == "com.example.editor" && repeated?.appCategory == "other", "P-01 must carry only the allowed app identity and coarse category into related-history filtering.")
+        try require(repeated?.actionIDs == [.explainError, .returnToWorkbench], "Recoverable llmTools failures should expose both frozen P-01 actions.")
+        let mixedDetector = AssistantPatternDetector()
+        let recoverableTask = failureEvent(offset: 0, source: .llmToolsTask)
+        _ = await mixedDetector.ingestFailure(recoverableTask, workbenchIsRecoverable: true, now: base)
+        _ = await mixedDetector.ingestFailure(failureEvent(offset: 1, source: .selection), now: base.addingTimeInterval(1))
+        let mixedFailure = await mixedDetector.ingestFailure(
+            failureEvent(offset: 2, source: .selection),
+            now: base.addingTimeInterval(2)
+        )
+        try require(
+            mixedFailure?.source == .selection
+                && mixedFailure?.sourceTypes == [.llmToolsTask, .selection]
+                && mixedFailure?.workbenchContextReference == recoverableTask.ephemeralContextReference
+                && mixedFailure?.actionIDs == [.explainError, .returnToWorkbench]
+                && mixedFailure?.isTaskFailure == true,
+            "P-01 must retain a recoverable llmTools workbench route even when later matching evidence comes from selections."
+        )
+        let failureDuringCooldown = await detector.ingestFailure(
+            failureEvent(offset: 301, source: .llmToolsTask),
+            now: base.addingTimeInterval(301)
+        )
+        try require(failureDuringCooldown == nil, "P-01 must enforce its 30-minute fingerprint cooldown.")
+        try require(AssistantPatternRules.looksLikeError("Fatal error: port already in use"), "Explicit error text should pass P-01 prefiltering.")
+        try require(!AssistantPatternRules.looksLikeError("A normal paragraph about today's project notes."), "Ordinary text must not enter P-01 detection.")
+
+        let p03Detector = AssistantPatternDetector()
+        func foreignEvent(_ id: String, offset: TimeInterval, confidence: Double = 0.95) -> AssistantActivityEvent {
+            AssistantActivityEvent(
+                occurredAt: base.addingTimeInterval(offset),
+                type: .foreignTextDetected,
+                source: .clipboard,
+                appIdentity: "com.apple.Safari",
+                contentType: .text,
+                contentFingerprint: id,
+                confidence: confidence,
+                ephemeralContextReference: UUID()
+            )
+        }
+        let firstForeign = await p03Detector.ingestForeignClipboard(
+            foreignEvent("a", offset: 0),
+            language: "en-US",
+            effectiveCharacterCount: 30,
+            now: base
+        )
+        try require(firstForeign == nil, "P-03 must wait for three distinct texts.")
+        let duplicateForeign = await p03Detector.ingestForeignClipboard(
+            foreignEvent("a", offset: 30),
+            language: "en-US",
+            effectiveCharacterCount: 30,
+            now: base.addingTimeInterval(30)
+        )
+        try require(duplicateForeign == nil, "P-03 must not count a duplicate clipboard fingerprint twice.")
+        _ = await p03Detector.ingestForeignClipboard(foreignEvent("b", offset: 60), language: "en", effectiveCharacterCount: 30, now: base.addingTimeInterval(60))
+        let foreign = await p03Detector.ingestForeignClipboard(foreignEvent("c", offset: 90), language: "en", effectiveCharacterCount: 30, now: base.addingTimeInterval(90))
+        try require(foreign?.patternType == .foreignClipboard && foreign?.evidenceCount == 3, "P-03 must trigger at three distinct same-language texts.")
+        try require(foreign?.evidenceContextReferences.count == 3, "P-03 must give the value judge all three distinct ephemeral texts.")
+        try require(foreign?.appCategory == "browser", "P-03 must retain the coarse app category for related-history filtering.")
+        let foreignDuringCooldown = await p03Detector.ingestForeignClipboard(
+            foreignEvent("d", offset: 120),
+            language: "en",
+            effectiveCharacterCount: 30,
+            now: base.addingTimeInterval(120)
+        )
+        try require(foreignDuringCooldown == nil, "P-03 must enforce its 60-minute language cooldown.")
+        let lowConfidenceDetector = AssistantPatternDetector()
+        let lowConfidence = await lowConfidenceDetector.ingestForeignClipboard(
+            foreignEvent("low", offset: 0, confidence: 0.79),
+            language: "fr",
+            effectiveCharacterCount: 100,
+            now: base
+        )
+        try require(lowConfidence == nil, "P-03 must reject language confidence below 0.80.")
+
+        let isolatedFailureDetector = AssistantPatternDetector()
+        _ = await isolatedFailureDetector.ingestFailure(failureEvent(offset: 0, source: .selection), now: base)
+        _ = await isolatedFailureDetector.ingestFailure(failureEvent(offset: 1, source: .selection), now: base.addingTimeInterval(1))
+        await isolatedFailureDetector.clear(pattern: .foreignClipboard)
+        let failureAfterForeignClear = await isolatedFailureDetector.ingestFailure(
+            failureEvent(offset: 2, source: .selection),
+            now: base.addingTimeInterval(2)
+        )
+        try require(failureAfterForeignClear != nil, "Clearing P-03 state must preserve pending P-01 evidence.")
+
+        let isolatedForeignDetector = AssistantPatternDetector()
+        _ = await isolatedForeignDetector.ingestForeignClipboard(foreignEvent("isolation-a", offset: 0), language: "fr", effectiveCharacterCount: 30, now: base)
+        _ = await isolatedForeignDetector.ingestForeignClipboard(foreignEvent("isolation-b", offset: 1), language: "fr", effectiveCharacterCount: 30, now: base.addingTimeInterval(1))
+        await isolatedForeignDetector.clear(pattern: .repeatedFailure)
+        let foreignAfterFailureClear = await isolatedForeignDetector.ingestForeignClipboard(
+            foreignEvent("isolation-c", offset: 2),
+            language: "fr",
+            effectiveCharacterCount: 30,
+            now: base.addingTimeInterval(2)
+        )
+        try require(foreignAfterFailureClear != nil, "Clearing P-01 state must preserve pending P-03 evidence.")
+
+        let p06Detector = AssistantPatternDetector()
+        func contextEvent(
+            _ id: String,
+            offset: TimeInterval,
+            source: AssistantSource,
+            appIdentity: String? = "com.example.editor"
+        ) -> AssistantActivityEvent {
+            let type: AssistantActivityType = switch source {
+            case .clipboard: .clipboardChanged
+            case .selection: .selectionCaptured
+            case .windowContext: .windowContextChanged
+            default: .applicationActivated
+            }
+            return AssistantActivityEvent(
+                occurredAt: base.addingTimeInterval(offset),
+                type: type,
+                source: source,
+                appIdentity: appIdentity,
+                contentType: source == .windowContext ? .metadata : .text,
+                contentFingerprint: id,
+                ephemeralContextReference: source == .foregroundApplication ? nil : UUID()
+            )
+        }
+        let acceptedForegroundMetadata = await p06Detector.ingestContextOpportunity(
+            contextEvent("metadata", offset: 0, source: .foregroundApplication),
+            now: base
+        )
+        try require(!acceptedForegroundMetadata, "P-06 must never trigger from foreground-application metadata alone.")
+        let acceptedClipboardContext = await p06Detector.ingestContextOpportunity(
+            contextEvent("clipboard", offset: 0, source: .clipboard),
+            now: base
+        )
+        let acceptedWindowContext = await p06Detector.ingestContextOpportunity(
+            contextEvent("window", offset: 7, source: .windowContext),
+            now: base.addingTimeInterval(7)
+        )
+        try require(
+            acceptedClipboardContext && acceptedWindowContext,
+            "P-06 must accept only authorized semantic sources with ephemeral evidence."
+        )
+        let contextualOpportunity = await p06Detector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(7),
+            now: base.addingTimeInterval(15)
+        )
+        try require(
+            contextualOpportunity?.patternType == .contextualOpportunity
+                && contextualOpportunity?.evidenceCount == 2
+                && contextualOpportunity?.sourceTypes == [.clipboard, .windowContext]
+                && contextualOpportunity?.actionIDs == [.openQuickAction]
+                && contextualOpportunity?.availableTaskKinds == TaskKind.interactiveCases.sorted { $0.rawValue < $1.rawValue },
+            "P-06 must merge the last eight seconds and route only through existing Quick Action tasks."
+        )
+        try require(
+            AssistantPatternType.contextualOpportunity.conservativeFallbackPresentation == .silent
+                && AssistantPatternType.repeatedFailure.conservativeFallbackPresentation == .badge
+                && AssistantPatternType.foreignClipboard.conservativeFallbackPresentation == .badge,
+            "P-06 must stay silent when local semantic judgment is unavailable or invalid."
+        )
+        let emptyWindowDetector = AssistantPatternDetector()
+        let emptyWindowResult = await emptyWindowDetector.flushContextOpportunityResult(windowEnd: base, now: base)
+        try require(
+            { if case .noEvidence = emptyWindowResult { return true }; return false }(),
+            "P-06 diagnostics must distinguish an empty aggregation window."
+        )
+        let delayedWakeDetector = AssistantPatternDetector()
+        _ = await delayedWakeDetector.ingestContextOpportunity(
+            contextEvent("delayed-wakeup", offset: 0, source: .windowContext),
+            now: base
+        )
+        let delayedWakeResult = await delayedWakeDetector.flushContextOpportunityResult(
+            windowEnd: base.addingTimeInterval(8),
+            now: base.addingTimeInterval(8.2)
+        )
+        try require(
+            { if case .candidate(let candidate) = delayedWakeResult { return candidate.evidenceCount == 1 }; return false }(),
+            "A slightly late aggregation task must keep evidence on its fixed eight-second boundary."
+        )
+        _ = await p06Detector.ingestContextOpportunity(contextEvent("clipboard", offset: 60, source: .clipboard), now: base.addingTimeInterval(60))
+        _ = await p06Detector.ingestContextOpportunity(contextEvent("window", offset: 67, source: .windowContext), now: base.addingTimeInterval(67))
+        let contextualDuringCooldown = await p06Detector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(67),
+            now: base.addingTimeInterval(67)
+        )
+        try require(contextualDuringCooldown == nil, "P-06 must enforce a ten-minute cooldown for the same context combination.")
+        _ = await p06Detector.ingestContextOpportunity(contextEvent("different", offset: 68, source: .selection), now: base.addingTimeInterval(68))
+        let differentContext = await p06Detector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(68),
+            now: base.addingTimeInterval(68)
+        )
+        try require(differentContext != nil, "A different P-06 context must remain eligible during another context's cooldown.")
+        _ = await p06Detector.ingestContextOpportunity(contextEvent("clipboard", offset: 615, source: .clipboard), now: base.addingTimeInterval(615))
+        _ = await p06Detector.ingestContextOpportunity(contextEvent("window", offset: 622, source: .windowContext), now: base.addingTimeInterval(622))
+        let contextualAfterCooldown = await p06Detector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(622),
+            now: base.addingTimeInterval(622)
+        )
+        try require(contextualAfterCooldown != nil, "P-06 must become eligible again at the ten-minute cooldown boundary.")
+
+        let p06CooldownDetector = AssistantPatternDetector()
+        _ = await p06CooldownDetector.ingestContextOpportunity(contextEvent("stable", offset: 0, source: .clipboard), now: base)
+        let initialCooldownCandidate = await p06CooldownDetector.flushContextOpportunity(windowEnd: base, now: base)
+        try require(
+            initialCooldownCandidate != nil,
+            "Expected an initial P-06 candidate before testing source revocation."
+        )
+        await p06CooldownDetector.clearContextOpportunitySamples()
+        _ = await p06CooldownDetector.ingestContextOpportunity(
+            contextEvent("stable", offset: 30, source: .clipboard),
+            now: base.addingTimeInterval(30)
+        )
+        let revokedCooldownResult = await p06CooldownDetector.flushContextOpportunityResult(
+            windowEnd: base.addingTimeInterval(30),
+            now: base.addingTimeInterval(30)
+        )
+        try require(
+            { if case .duplicateCooldown = revokedCooldownResult { return true }; return false }(),
+            "Clearing revoked-source samples must preserve and report the ten-minute cooldown."
+        )
+
+        let p06WindowDetector = AssistantPatternDetector()
+        _ = await p06WindowDetector.ingestContextOpportunity(contextEvent("old", offset: 0, source: .selection), now: base)
+        _ = await p06WindowDetector.ingestContextOpportunity(contextEvent("new", offset: 9, source: .clipboard), now: base.addingTimeInterval(9))
+        let boundedContext = await p06WindowDetector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(9),
+            now: base.addingTimeInterval(9)
+        )
+        try require(
+            boundedContext?.evidenceCount == 1 && boundedContext?.source == .clipboard,
+            "P-06 must exclude evidence older than its eight-second aggregation window."
+        )
+        let p06LateFlushDetector = AssistantPatternDetector()
+        _ = await p06LateFlushDetector.ingestContextOpportunity(
+            contextEvent("first-window", offset: 0, source: .selection),
+            now: base
+        )
+        _ = await p06LateFlushDetector.ingestContextOpportunity(
+            contextEvent("next-window", offset: 9, source: .clipboard),
+            now: base.addingTimeInterval(9)
+        )
+        let firstWindow = await p06LateFlushDetector.flushContextOpportunity(
+            windowEnd: base,
+            now: base.addingTimeInterval(9)
+        )
+        let nextWindow = await p06LateFlushDetector.flushContextOpportunity(
+            windowEnd: base.addingTimeInterval(9),
+            now: base.addingTimeInterval(9)
+        )
+        try require(
+            firstWindow?.source == .selection && nextWindow?.source == .clipboard,
+            "A late P-06 debounce flush must consume only its own window and preserve newer samples."
+        )
+        let p06WindowOnlyDetector = AssistantPatternDetector()
+        _ = await p06WindowOnlyDetector.ingestContextOpportunity(
+            contextEvent("actionable-window-title", offset: 0, source: .windowContext),
+            now: base
+        )
+        let windowOnlyContext = await p06WindowOnlyDetector.flushContextOpportunity(windowEnd: base, now: base)
+        try require(
+            windowOnlyContext?.sourceTypes == [.windowContext]
+                && windowOnlyContext?.evidenceCount == 1,
+            "P-06 may qualify an authorized sanitized window-title change, while foreground-app metadata remains ineligible."
+        )
+
+        var queue = AssistantCandidateQueue()
+        func candidate(_ pattern: AssistantPatternType, offset: TimeInterval, source: AssistantSource) -> AssistantPatternCandidate {
+            AssistantPatternCandidate(
+                createdAt: base.addingTimeInterval(offset),
+                expiresAt: base.addingTimeInterval(600),
+                patternType: pattern,
+                source: source,
+                evidenceSummary: "fixture",
+                evidenceCount: 3,
+                durationSeconds: 100,
+                confidence: 1,
+                actionIDs: pattern == .repeatedFailure ? [.explainError] : [.enableClipboardTranslation]
+            )
+        }
+        try require(queue.enqueue(candidate(.foreignClipboard, offset: 0, source: .clipboard), now: base), "Expected queue insertion.")
+        try require(queue.enqueue(candidate(.foreignClipboard, offset: 1, source: .clipboard), now: base), "Expected queue insertion.")
+        try require(queue.enqueue(candidate(.foreignClipboard, offset: 2, source: .clipboard), now: base), "Expected queue insertion.")
+        try require(!queue.enqueue(candidate(.foreignClipboard, offset: 3, source: .clipboard), now: base), "The judgment queue must stop at three candidates.")
+        let replacement = queue.enqueueReportingRemovals(candidate(.repeatedFailure, offset: 4, source: .llmToolsTask), now: base)
+        try require(replacement.inserted && replacement.removed.count == 1, "A task failure should report the lower-priority candidate it replaces.")
+        try require(queue.count == 3 && queue.popNext(now: base)?.isTaskFailure == true, "Task failures must run before clipboard candidates.")
+
+        var session = AssistantSessionProactivityState(configured: .active)
+        try require(!session.apply(.explicitNegative) && session.effective == .active, "One negative response must not lower proactivity.")
+        try require(session.apply(.explicitNegative) && session.effective == .moderate, "Two consecutive explicit negatives must lower one level.")
+        _ = session.apply(.noInteractionTimeout)
+        _ = session.apply(.unfunny)
+        _ = session.apply(.noInteractionTimeout)
+        try require(!session.apply(.unopenedBadge), "An unopened badge must not count as ignored proactive content.")
+        try require(session.apply(.noInteractionTimeout) && session.effective == .quiet, "Three no-interaction timeouts must lower one level.")
+        try require(!session.apply(.explicitNegative) && !session.apply(.explicitNegative) && session.effective == .quiet, "Session lowering must stop at quiet.")
+        session.updateConfigured(.active)
+        _ = session.apply(.explicitNegative)
+        _ = session.apply(.positive)
+        try require(!session.apply(.explicitNegative) && session.effective == .active, "Positive interaction must reset consecutive negative counters.")
+
+        var arbiter = AssistantBackgroundWorkArbiter()
+        let judgmentLease = try requireNonNil(arbiter.claim(.judgment), "The first background model workflow should acquire the single lease.")
+        try require(arbiter.claim(.qualification) == nil && arbiter.claim(.translation) == nil, "Qualification, judgment, and translation must share one background lease.")
+        try require(!arbiter.release(AssistantBackgroundWorkLease(id: UUID(), kind: .judgment)), "A stale lease must not release active background work.")
+        try require(arbiter.release(judgmentLease) && arbiter.claim(.translation) != nil, "Releasing the exact lease should unblock the next workflow.")
+
+        var qualificationFlow = AssistantQualificationProgress()
+        qualificationFlow.start(modelID: UUID(), modelName: "deterministic-fixture-model")
+        qualificationFlow.beginRunning()
+        for completed in 1...12 { qualificationFlow.recordCompleted(completed) }
+        qualificationFlow.pause(message: "preempted by user task")
+        try require(
+            qualificationFlow.phase == .paused && qualificationFlow.completedCount == 12,
+            "Qualification must retain completed fixtures when a user task preempts it."
+        )
+        qualificationFlow.prepare()
+        qualificationFlow.beginRunning()
+        for completed in 13...AssistantJudgmentFixtures.all.count { qualificationFlow.recordCompleted(completed) }
+        qualificationFlow.finish(state: .qualified, message: "qualified")
+        try require(
+            qualificationFlow.phase == .qualified
+                && qualificationFlow.completedCount == AssistantJudgmentFixtures.all.count,
+            "The resumed deterministic qualification flow must reach 24/24 before becoming qualified."
+        )
+        var failedQualification = AssistantQualificationProgress()
+        failedQualification.start(modelID: UUID(), modelName: "failing-fixture-model")
+        failedQualification.fail(message: "local runner unavailable")
+        try require(
+            failedQualification.phase == .failed && failedQualification.completedCount == 0,
+            "A failed qualification flow must not manufacture completed fixtures or qualified state."
+        )
+        var proactivityFlow = AssistantQualificationProactivityState()
+        try require(
+            proactivityFlow.request(.active, hasQualifiedJudgment: false) == .quiet
+                && proactivityFlow.pendingProactivity == .active,
+            "An unqualified Active request must remain pending while the effective setting stays Quiet."
+        )
+        let firstRunID = proactivityFlow.beginRun()
+        _ = proactivityFlow.request(.moderate, hasQualifiedJudgment: false)
+        try require(
+            proactivityFlow.runningProactivity == .moderate
+                && proactivityFlow.finishRun(id: firstRunID, state: .qualified) == .moderate,
+            "A qualification run must apply the user's latest requested level, not its stale starting level."
+        )
+        _ = proactivityFlow.request(.active, hasQualifiedJudgment: false)
+        let cancelledRunID = proactivityFlow.beginRun()
+        proactivityFlow.cancelRun(clearPendingProactivity: true)
+        try require(
+            proactivityFlow.pendingProactivity == nil
+                && proactivityFlow.finishRun(id: cancelledRunID, state: .qualified) == nil,
+            "Cancelling or keeping Quiet must prevent a late successful run from restoring a pending level."
+        )
+        let failedRunID = proactivityFlow.beginRun()
+        _ = proactivityFlow.request(.active, hasQualifiedJudgment: false)
+        try require(
+            proactivityFlow.finishRun(id: failedRunID, state: .unqualified) == .quiet,
+            "A failed qualification must conservatively resolve a pending request to Quiet."
+        )
+        _ = proactivityFlow.request(.active, hasQualifiedJudgment: false)
+        let staleRunID = proactivityFlow.beginRun()
+        proactivityFlow.cancelRun(clearPendingProactivity: false)
+        let replacementRunID = proactivityFlow.beginRun(pendingProactivity: .moderate)
+        try require(
+            proactivityFlow.finishRun(id: staleRunID, state: .unqualified) == nil
+                && proactivityFlow.runID == replacementRunID
+                && proactivityFlow.runningProactivity == .moderate,
+            "A stale completion must not consume a replacement qualification run."
+        )
+        _ = proactivityFlow.finishRun(id: replacementRunID, state: .qualified)
+        try require(
+            proactivityFlow.request(.active, hasQualifiedJudgment: true) == .active
+                && proactivityFlow.pendingProactivity == nil,
+            "A currently qualified model must apply Moderate or Active without another pending check."
+        )
+
+        let unfunny = AssistantFeedbackTransition.resolve(wasProactivelyPresented: true, previous: nil, new: .unfunny)
+        try require(unfunny.interaction == .unfunny && unfunny.retainsProactiveAttribution, "Unfunny feedback must affect wording without consuming proactive attribution.")
+        let unfunnyThenIrrelevant = AssistantFeedbackTransition.resolve(wasProactivelyPresented: true, previous: .unfunny, new: .irrelevant)
+        try require(unfunnyThenIrrelevant.interaction == .explicitNegative, "Unfunny followed by irrelevant must still count as explicit negative feedback.")
+        let usefulThenIrrelevant = AssistantFeedbackTransition.resolve(wasProactivelyPresented: true, previous: .useful, new: .irrelevant)
+        try require(usefulThenIrrelevant.interaction == .explicitNegative, "Changing useful to irrelevant must update the session outcome.")
+
+        try require(AssistantJudgmentFixtures.all.count == 24, "The runtime fixture catalog must contain exactly 24 cases.")
+        try require(AssistantJudgmentFixtures.all.filter(\.expectsPeek).count == 12, "The fixture catalog must contain 12 positive cases.")
+        try require(AssistantJudgmentFixtures.all.filter { !$0.expectsPeek }.count == 12, "The fixture catalog must contain 12 negative cases.")
+        let hasAppSwitchFixture = AssistantJudgmentFixtures.all.contains { $0.id == "n-normal-app-switch" }
+        let hasVideoFixture = AssistantJudgmentFixtures.all.contains { $0.id == "n-watching-video" }
+        let typingFixture = AssistantJudgmentFixtures.all.first { $0.id == "n-typing" }
+        let longReadingFixture = AssistantJudgmentFixtures.all.first { $0.id == "n-history-irrelevant" }
+        let hasLongReadingFixture = longReadingFixture?.input.ephemeralEvidenceTexts.count == 1
+            && longReadingFixture?.input.historicalAggregate?.irrelevantCount == 5
+        let contextualOpportunityPositives = AssistantJudgmentFixtures.all.filter {
+            $0.expectsPeek && $0.input.patternType == .contextualOpportunity
+        }
+        let passiveReadingFixture = AssistantJudgmentFixtures.all.first { $0.id == "n-passive-reading" }
+        let embeddedURLFixture = AssistantJudgmentFixtures.all.first { $0.id == "n-code-copy" }
+        let explicitTaskVerbs = ["summarize", "explain", "translate", "turn", "extract"]
+        let p06UsesImplicitEvidence = contextualOpportunityPositives.allSatisfy { fixture in
+            fixture.input.ephemeralEvidenceTexts.allSatisfy { text in
+                let lower = text.lowercased()
+                return !explicitTaskVerbs.contains { lower.hasPrefix("\($0) ") }
+            }
+        }
+        try require(
+            hasAppSwitchFixture
+                && hasVideoFixture
+                && typingFixture?.input.userIsTyping == true
+                && typingFixture?.isHardNegative == true
+                && hasLongReadingFixture
+                && contextualOpportunityPositives.count == 4
+                && p06UsesImplicitEvidence
+                && contextualOpportunityPositives.allSatisfy {
+                    !$0.input.allowedEvidenceQuotes.isEmpty
+                        && !$0.input.availableTaskKinds.isEmpty
+                        && $0.input.availableActionIDs == [.openQuickAction]
+                }
+                && passiveReadingFixture?.input.historicalAggregate == nil
+                && passiveReadingFixture?.input.containsURL == false
+                && passiveReadingFixture?.input.containsCode == false
+                && embeddedURLFixture?.input.containsURL == true,
+            "Qualification fixtures must cover app switching, video watching, typing, passive reading, feedback, embedded URLs, and four implicit grounded P-06 positives."
+        )
+        try require(
+            AssistantJudgmentFixtures.all.filter(\.expectsPeek).allSatisfy { !$0.input.ephemeralEvidenceTexts.isEmpty },
+            "Every positive qualification fixture must require semantic evidence instead of threshold metadata alone."
+        )
+        let goodSamples = try AssistantJudgmentFixtures.all.map { fixture -> AssistantQualificationSample in
+            let isContextualOpportunity = fixture.input.patternType == .contextualOpportunity
+            let shouldLockContext = fixture.expectsPeek && isContextualOpportunity
+            let output = AssistantJudgmentOutput(
+                isHighValue: fixture.expectsPeek,
+                valueScore: fixture.expectsPeek ? 0.9 : 0.1,
+                confidence: fixture.expectsPeek ? 0.9 : 0.95,
+                reason: fixture.expectsPeek ? "Evidence and action are sufficient." : "Conservative policy blocks proactive display.",
+                evidenceSufficient: fixture.expectsPeek,
+                recommendedPresentation: fixture.expectsPeek ? .peek : .silent,
+                suggestedActionIDs: fixture.expectsPeek ? Array(fixture.input.availableActionIDs.prefix(1)) : [],
+                lockedEvidenceQuote: shouldLockContext ? fixture.input.allowedEvidenceQuotes[0] : "",
+                suggestedTask: shouldLockContext ? fixture.input.availableTaskKinds[0] : nil
+            )
+            let data = try JSONEncoder().encode(output)
+            return AssistantQualificationSample(
+                fixtureID: fixture.id,
+                output: String(decoding: data, as: UTF8.self),
+                latencyMilliseconds: 100
+            )
+        }
+        let modelID = UUID()
+        let qualified = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: goodSamples,
+            checkedAt: base
+        )
+        try require(
+            qualified.state == .qualified
+                && qualified.validJSONCount == 24
+                && qualified.positivePassCount == 12
+                && qualified.message.contains("P06 4/4"),
+            "A conforming deterministic judge must qualify across P-01, P-03, and at least three P-06 positives."
+        )
+        let p06FixtureIndexes = goodSamples.indices.filter { index in
+            let fixtureID = goodSamples[index].fixtureID
+            return AssistantJudgmentFixtures.all.first(where: { $0.id == fixtureID })?.input.patternType == .contextualOpportunity
+                && AssistantJudgmentFixtures.all.first(where: { $0.id == fixtureID })?.expectsPeek == true
+        }
+        let conservativeNegative = AssistantJudgmentOutput(
+            isHighValue: false,
+            valueScore: 0.1,
+            confidence: 0.95,
+            reason: "The evidence does not justify an interruption.",
+            evidenceSufficient: false,
+            recommendedPresentation: .silent,
+            suggestedActionIDs: []
+        )
+        var threeOfFourP06Samples = goodSamples
+        threeOfFourP06Samples[p06FixtureIndexes[0]].output = String(
+            decoding: try JSONEncoder().encode(conservativeNegative),
+            as: UTF8.self
+        )
+        let threeOfFourP06 = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: threeOfFourP06Samples,
+            checkedAt: base
+        )
+        try require(threeOfFourP06.state == .qualified && threeOfFourP06.message.contains("P06 3/4"), "Three of four grounded P-06 positives should satisfy the frozen family floor.")
+        var twoOfFourP06Samples = threeOfFourP06Samples
+        twoOfFourP06Samples[p06FixtureIndexes[1]].output = String(
+            decoding: try JSONEncoder().encode(conservativeNegative),
+            as: UTF8.self
+        )
+        let twoOfFourP06 = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: twoOfFourP06Samples,
+            checkedAt: base
+        )
+        try require(
+            twoOfFourP06.validJSONCount == 24
+                && twoOfFourP06.positivePassCount >= 9
+                && twoOfFourP06.message.contains("P06 2/4")
+                && twoOfFourP06.state == .unqualified,
+            "A model that misses half of P-06 must fail even when its aggregate positive score would otherwise pass."
+        )
+        try require(qualified.isCurrent(modelFingerprint: "fingerprint-v1") && !qualified.isCurrent(modelFingerprint: "changed"), "Qualification cache must bind model, prompt, and fixture identity.")
+        var hardFailureSamples = goodSamples
+        let hardFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: {
+                $0.isHardNegative
+                    && $0.input.patternType == .contextualOpportunity
+                    && !$0.input.allowedEvidenceQuotes.isEmpty
+                    && !$0.input.availableTaskKinds.isEmpty
+            }),
+            "Expected a grounded P-06 hard negative fixture."
+        )
+        let illegalPeek = AssistantJudgmentOutput(
+            isHighValue: true,
+            valueScore: 0.9,
+            confidence: 0.9,
+            reason: "Incorrect proactive display.",
+            evidenceSufficient: true,
+            recommendedPresentation: .peek,
+            suggestedActionIDs: Array(hardFixture.input.availableActionIDs.prefix(1)),
+            lockedEvidenceQuote: hardFixture.input.allowedEvidenceQuotes[0],
+            suggestedTask: hardFixture.input.availableTaskKinds[0]
+        )
+        hardFailureSamples[hardFailureSamples.firstIndex { $0.fixtureID == hardFixture.id }!] = AssistantQualificationSample(
+            fixtureID: hardFixture.id,
+            output: String(decoding: try JSONEncoder().encode(illegalPeek), as: UTF8.self),
+            latencyMilliseconds: 100
+        )
+        let unqualified = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: hardFailureSamples,
+            checkedAt: base
+        )
+        try require(unqualified.state == .unqualified && unqualified.hardFailureCount == 1, "A single hard-negative proactive error must fail qualification.")
+        let partialQualification = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: Array(goodSamples.prefix(5)),
+            checkedAt: base
+        )
+        try require(
+            partialQualification.validJSONCount == 5
+                && partialQualification.positivePassCount == 5
+                && partialQualification.maximumLatencyMilliseconds == 100
+                && partialQualification.message.contains("JSON 5/24"),
+            "A partially failed qualification must retain real structure, positive, and latency metrics."
+        )
+        var timeoutSamples = Array(goodSamples.prefix(5))
+        timeoutSamples[4].output = nil
+        timeoutSamples[4].latencyMilliseconds = 5_000
+        let timedOutQualification = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: timeoutSamples,
+            checkedAt: base
+        )
+        try require(
+            timedOutQualification.validJSONCount == 4
+                && timedOutQualification.maximumLatencyMilliseconds == 5_000
+                && timedOutQualification.message.contains("max 5000ms"),
+            "A timed-out hot fixture must retain its failed structure and real five-second latency."
+        )
+        try require(
+            unqualified.matchesCurrentCacheKey(modelFingerprint: "fingerprint-v1")
+                && !unqualified.isCurrent(modelFingerprint: "fingerprint-v1"),
+            "A current unqualified cache entry must remain reusable without becoming an eligible judgment model."
+        )
+        let malformed = "{\"isHighValue\":true,\"suggestedActionIDs\":[\"openURL\"]}"
+        try require(AssistantJudgmentContract.parse(malformed, input: AssistantJudgmentFixtures.all[0].input) == nil, "Judgment parsing must reject incomplete or invented actions.")
+        let fenced = "```json\n\(goodSamples[0].output!)\n```"
+        try require(AssistantJudgmentContract.parse(fenced, input: AssistantJudgmentFixtures.all[0].input) == nil, "Judgment parsing must reject fenced or trailing model prose.")
+        let overlongReason = AssistantJudgmentOutput(
+            isHighValue: false,
+            valueScore: 0,
+            confidence: 1,
+            reason: String(repeating: "x", count: 121),
+            evidenceSufficient: false,
+            recommendedPresentation: .silent,
+            suggestedActionIDs: []
+        )
+        let overlongReasonText = String(decoding: try JSONEncoder().encode(overlongReason), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(
+                overlongReasonText,
+                input: AssistantJudgmentFixtures.all.first { !$0.expectsPeek }!.input
+            ) == nil,
+            "Judgment parsing must enforce the same 120-character reason limit advertised by the prompt."
+        )
+        try require(
+            AssistantJudgmentContract.promptVersion == 19
+                && AssistantJudgmentFixtures.version == 9
+                && AssistantJudgmentContract.systemPrompt.contains("Return exactly one JSON object")
+                && AssistantJudgmentContract.systemPrompt.contains("no longer than 120 characters")
+                && AssistantJudgmentContract.systemPrompt.contains("Never force a tool")
+                && AssistantJudgmentContract.systemPrompt.contains("authoritative upstream facts")
+                && AssistantJudgmentContract.systemPrompt.contains("rules and actions for other pattern types do not apply"),
+            "The qualification cache version and strict structured-output contract must change together."
+        )
+        let p06PositiveFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: {
+                $0.expectsPeek && $0.input.patternType == .contextualOpportunity
+            }),
+            "Expected a positive P-06 qualification fixture."
+        )
+        let p01PromptRecipe = AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[0].input)
+        let p03PromptRecipe = AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[4].input)
+        let p06PromptRecipe = AssistantJudgmentContract.userPrompt(for: p06PositiveFixture.input)
+        try require(
+            p01PromptRecipe.contains("evidenceCount, not evidenceTextCount")
+                && p01PromptRecipe.contains("intentional tutorial/example")
+                && p03PromptRecipe.contains("English may be foreign")
+                && p03PromptRecipe.contains("weather, software news, and cooking")
+                && p06PromptRecipe.contains("do not require an explicit request, error, tool, or next step")
+                && p06PromptRecipe.contains("multiple blockers/tasks without owners")
+                && p06PromptRecipe.contains("visible progress or a completed milestone")
+                && p06PromptRecipe.contains("clear transition between work stages")
+                && p06PromptRecipe.contains("never use an action from another pattern")
+                && p06PromptRecipe.contains("FALSE RECIPE"),
+            "Each pattern prompt must end with its exact action/field recipe and the shared false-output invariant."
+        )
+        try require(
+            AssistantJudgmentFixtures.all.contains(where: { $0.id == "p06-progress" && $0.expectsPeek })
+                && AssistantJudgmentFixtures.all.contains(where: { $0.id == "p06-transition" && $0.expectsPeek }),
+            "Qualification must verify companion comments about grounded progress and work-stage transitions."
+        )
+        let p06ProgressFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "p06-progress" }),
+            "Expected the grounded progress fixture."
+        )
+        let groundedP06Output = AssistantJudgmentOutput(
+            isHighValue: true,
+            valueScore: 0.9,
+            confidence: 0.9,
+            reason: "A supplied Quick Action task is useful now.",
+            evidenceSufficient: true,
+            recommendedPresentation: .peek,
+            suggestedActionIDs: [.openQuickAction],
+            lockedEvidenceQuote: p06PositiveFixture.input.allowedEvidenceQuotes[0],
+            suggestedTask: p06PositiveFixture.input.availableTaskKinds[0]
+        )
+        let groundedP06Text = String(decoding: try JSONEncoder().encode(groundedP06Output), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(groundedP06Text, input: p06PositiveFixture.input) != nil,
+            "P-06 must accept a quote, task, and action locked to supplied local evidence."
+        )
+        let actionlessP06Output = AssistantJudgmentOutput(
+            isHighValue: true,
+            valueScore: 0.86,
+            confidence: 0.9,
+            reason: "A grounded social observation is worthwhile.",
+            evidenceSufficient: true,
+            recommendedPresentation: .peek,
+            suggestedActionIDs: [],
+            lockedEvidenceQuote: "",
+            suggestedTask: nil
+        )
+        let actionlessP06Text = String(decoding: try JSONEncoder().encode(actionlessP06Output), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(actionlessP06Text, input: p06PositiveFixture.input) != nil
+                && AssistantJudgmentContract.permitsPeek(
+                    actionlessP06Output,
+                    proactivity: .moderate,
+                    input: p06PositiveFixture.input
+                )
+                && !AssistantJudgmentContract.permitsPeek(actionlessP06Output, proactivity: .moderate),
+            "Only grounded P-06 context may present an actionless social comment."
+        )
+        var redundantActionlessP06Output = actionlessP06Output
+        redundantActionlessP06Output.lockedEvidenceQuote = p06PositiveFixture.input.ephemeralEvidenceTexts[0]
+        redundantActionlessP06Output.suggestedTask = p06PositiveFixture.input.availableTaskKinds[0]
+        let redundantActionlessP06Text = String(
+            decoding: try JSONEncoder().encode(redundantActionlessP06Output),
+            as: UTF8.self
+        )
+        let normalizedActionlessP06 = AssistantJudgmentContract.parse(
+            redundantActionlessP06Text,
+            input: p06PositiveFixture.input
+        )
+        try require(
+            normalizedActionlessP06?.lockedEvidenceQuote == ""
+                && normalizedActionlessP06?.suggestedTask == nil
+                && normalizedActionlessP06?.suggestedActionIDs.isEmpty == true,
+            "Grounded redundant fields on an actionless P-06 result must be discarded, never made actionable."
+        )
+        var structuredContextP06Output = actionlessP06Output
+        structuredContextP06Output.lockedEvidenceQuote = "The build panel shows all 24 checks passing beside the current editor"
+        let structuredContextP06Text = String(
+            decoding: try JSONEncoder().encode(structuredContextP06Output),
+            as: UTF8.self
+        )
+        try require(
+            AssistantJudgmentContract.parse(
+                structuredContextP06Text,
+                input: p06ProgressFixture.input
+            )?.lockedEvidenceQuote == "",
+            "An actionless P-06 quote grounded inside a structured visual summary must be accepted and discarded."
+        )
+        let validSceneJSON = """
+        {"activity":"coding","observation":"A build result is visible beside the current editor.","visibleText":["Build succeeded"],"signal":"success","confidence":0.91}
+        """
+        try require(
+            AssistantSceneContract.parse(validSceneJSON)?.signal == "success"
+                && AssistantSceneContract.parse(
+                    "{\"activity\":\"form\",\"observation\":\"password=secret\",\"visibleText\":[],\"signal\":\"none\",\"confidence\":0.9}"
+                ) == nil,
+            "Visual context must accept bounded grounded JSON and reject sensitive summaries."
+        )
+        let hardVetoFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "n-code-copy" }),
+            "Expected the embedded URL and code qualification fixture."
+        )
+        var hardVetoPositive = groundedP06Output
+        hardVetoPositive.lockedEvidenceQuote = hardVetoFixture.input.allowedEvidenceQuotes[0]
+        hardVetoPositive.suggestedTask = hardVetoFixture.input.availableTaskKinds[0]
+        let hardVetoPositiveText = String(decoding: try JSONEncoder().encode(hardVetoPositive), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(hardVetoPositiveText, input: hardVetoFixture.input) == nil,
+            "Mandatory code and URL vetoes must be enforced after model output parsing."
+        )
+        var fullEvidenceP06Output = groundedP06Output
+        fullEvidenceP06Output.lockedEvidenceQuote = p06PositiveFixture.input.ephemeralEvidenceTexts[0]
+        let fullEvidenceP06Text = String(decoding: try JSONEncoder().encode(fullEvidenceP06Output), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(fullEvidenceP06Text, input: p06PositiveFixture.input)?.lockedEvidenceQuote
+                == p06PositiveFixture.input.allowedEvidenceQuotes[0],
+            "An exact full supplied P-06 value may be shortened, but invented or altered evidence must still fail."
+        )
+        let longP06Fixture = try requireNonNil(
+            contextualOpportunityPositives.first(where: {
+                $0.input.ephemeralEvidenceTexts[0].count > $0.input.allowedEvidenceQuotes[0].count
+            }),
+            "Expected a P-06 fixture whose frozen quote truncates a longer authorized value."
+        )
+        var extendedPrefixOutput = groundedP06Output
+        extendedPrefixOutput.lockedEvidenceQuote = String(
+            longP06Fixture.input.ephemeralEvidenceTexts[0]
+                .prefix(longP06Fixture.input.allowedEvidenceQuotes[0].count + 1)
+        )
+        extendedPrefixOutput.suggestedTask = longP06Fixture.input.availableTaskKinds[0]
+        let extendedPrefixText = String(decoding: try JSONEncoder().encode(extendedPrefixOutput), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(extendedPrefixText, input: longP06Fixture.input)?.lockedEvidenceQuote
+                == longP06Fixture.input.allowedEvidenceQuotes[0],
+            "A model-completed quote boundary may normalize only when it remains an anchored prefix of the exact evidence."
+        )
+        var groundedFalseP06Output = fullEvidenceP06Output
+        groundedFalseP06Output.isHighValue = false
+        groundedFalseP06Output.valueScore = 0
+        groundedFalseP06Output.recommendedPresentation = .silent
+        groundedFalseP06Output.suggestedActionIDs = []
+        groundedFalseP06Output.suggestedTask = nil
+        let groundedFalseP06Text = String(decoding: try JSONEncoder().encode(groundedFalseP06Output), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(groundedFalseP06Text, input: p06PositiveFixture.input)?.lockedEvidenceQuote == "",
+            "A fully silent false result may discard an exact supplied redundant quote without making it actionable."
+        )
+        let passiveMediaFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "n-watching-video" }),
+            "Expected the passive-media negative fixture."
+        )
+        var groundedFragmentFalseOutput = conservativeNegative
+        groundedFragmentFalseOutput.lockedEvidenceQuote = "no translation task was requested"
+        let groundedFragmentFalseText = String(
+            decoding: try JSONEncoder().encode(groundedFragmentFalseOutput),
+            as: UTF8.self
+        )
+        try require(
+            AssistantJudgmentContract.parse(
+                groundedFragmentFalseText,
+                input: passiveMediaFixture.input
+            )?.lockedEvidenceQuote == "",
+            "A fully silent false result may discard a grounded input fragment, but it must remain non-actionable."
+        )
+        var inventedQuoteOutput = groundedP06Output
+        inventedQuoteOutput.lockedEvidenceQuote = "This sentence was never observed."
+        let inventedQuoteText = String(decoding: try JSONEncoder().encode(inventedQuoteOutput), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(inventedQuoteText, input: p06PositiveFixture.input) == nil,
+            "P-06 must reject a model observation that is not an exact supplied evidence quote."
+        )
+        var invalidTaskOutput = groundedP06Output
+        invalidTaskOutput.suggestedTask = .ocr
+        let invalidTaskText = String(decoding: try JSONEncoder().encode(invalidTaskOutput), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(invalidTaskText, input: p06PositiveFixture.input) == nil,
+            "P-06 must reject tasks outside the existing interactive Quick Action set."
+        )
+        var lowModerateConfidence = groundedP06Output
+        lowModerateConfidence.confidence = 0.84
+        try require(
+            !AssistantJudgmentContract.permitsPeek(lowModerateConfidence, proactivity: .moderate)
+                && AssistantJudgmentContract.permitsPeek(lowModerateConfidence, proactivity: .active)
+                && AssistantJudgmentContract.permitsPeek(
+                    lowModerateConfidence,
+                    proactivity: .moderate,
+                    minimumConfidenceOverride: 0.80
+                )
+                && AssistantJudgmentContract.minimumConfidence(for: .active, override: 0.10) == 0.50
+                && AssistantJudgmentContract.minimumConfidence(for: .active, override: 1.00) == 0.95,
+            "Moderate and Active defaults must stay frozen while a custom confidence floor remains bounded."
+        )
+        let customThresholdSystemPrompt = AssistantJudgmentContract.runtimeSystemPrompt(
+            minimumConfidenceOverride: 0.60
+        )
+        let customThresholdUserPrompt = AssistantJudgmentContract.userPrompt(
+            for: p06PositiveFixture.input,
+            minimumConfidenceOverride: 0.60
+        )
+        try require(
+            AssistantJudgmentContract.runtimeSystemPrompt(minimumConfidenceOverride: nil)
+                == AssistantJudgmentContract.systemPrompt
+                && customThresholdSystemPrompt.contains("confidence>=0.60")
+                && customThresholdSystemPrompt.contains("replaces the moderate and active defaults")
+                && customThresholdUserPrompt.contains("confidence>=0.60"),
+            "A custom confidence floor must reach both runtime prompts without changing the qualification prompt."
+        )
+        var falseBadgeOutput = conservativeNegative
+        falseBadgeOutput.recommendedPresentation = .badge
+        let falseBadgeText = String(decoding: try JSONEncoder().encode(falseBadgeOutput), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(falseBadgeText, input: p06PositiveFixture.input) == nil,
+            "A rejected judgment must be structurally silent rather than fabricating a fallback badge."
+        )
+        var extraFieldObject = try JSONSerialization.jsonObject(with: Data(groundedP06Text.utf8)) as! [String: Any]
+        extraFieldObject["unexpected"] = true
+        let extraFieldText = String(decoding: try JSONSerialization.data(withJSONObject: extraFieldObject), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(extraFieldText, input: p06PositiveFixture.input) == nil,
+            "The P-06 judgment boundary must reject extra model fields."
+        )
+        let fullScreenFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "n-fullscreen" }),
+            "Expected the fullscreen qualification fixture."
+        )
+        try require(
+            AssistantJudgmentContract.userPrompt(for: fullScreenFixture.input)
+                .contains("mandatoryVetoReasons=isFullScreen")
+                && AssistantJudgmentContract.userPrompt(for: fullScreenFixture.input)
+                    .contains("MANDATORY VETO isFullScreen"),
+            "Mandatory presentation vetoes must be salient in the production judgment prompt."
+        )
+        try require(
+            AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[0].input)
+                .contains("mandatoryVetoReasons=none"),
+            "Eligible semantic candidates must not acquire a fabricated mandatory veto."
+        )
+        let irrelevantHistoryFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "n-history-irrelevant" }),
+            "Expected the irrelevant-history qualification fixture."
+        )
+        let irrelevantHistoryPrompt = AssistantJudgmentContract.userPrompt(for: irrelevantHistoryFixture.input)
+        try require(
+            irrelevantHistoryFixture.input.suppressesRepeatedlyIrrelevantFeedback
+                && irrelevantHistoryPrompt.contains("evidenceTextCount=1")
+                && irrelevantHistoryPrompt.contains("historicalIrrelevantCount=5")
+                && irrelevantHistoryPrompt.contains("historicalActedCount=0")
+                && irrelevantHistoryPrompt.contains("historyPolicy=suppressRepeatedlyIrrelevant")
+                && irrelevantHistoryPrompt.contains("HISTORY VETO"),
+            "Production judgment prompts must make semantic evidence count and repeated negative feedback salient."
+        )
+        let appSwitchPrompt = AssistantJudgmentContract.userPrompt(
+            for: AssistantJudgmentFixtures.all.first(where: { $0.id == "n-normal-app-switch" })!.input
+        )
+        try require(
+            appSwitchPrompt.contains("ineligibleSourceTypes"),
+            "Foreground-application metadata without an authorized semantic source must be a deterministic P-06 veto."
+        )
+        let boundedJudgmentRequest = TaskRequest(
+            task: .explain,
+            inputText: "same error",
+            systemPromptOverride: AssistantJudgmentContract.systemPrompt,
+            thinkingModeOverride: false,
+            maxOutputTokensOverride: 256
+        )
+        try require(
+            boundedJudgmentRequest.thinkingModeOverride == false
+                && boundedJudgmentRequest.maxOutputTokensOverride == 256
+                && LocalGenerationPolicy.maxTokens(
+                    for: .explain,
+                    thinkingModeEnabled: false,
+                    override: boundedJudgmentRequest.maxOutputTokensOverride
+                ) == 256,
+            "Strictly timed assistant judgment requests must disable thinking and tighten output without changing normal task limits."
+        )
+
+        let sanitizedHistoryInput = AssistantJudgmentInput(
+            patternType: .repeatedFailure,
+            evidenceSummary: "same error",
+            ephemeralEvidenceTexts: [
+                "Error at /Users/example/private/project token=do-not-keep-this " + String(repeating: "detail ", count: 300)
+            ],
+            sourceTypes: [.selection],
+            appCategory: "development",
+            evidenceCount: 3,
+            durationSeconds: 60,
+            recentBehaviorSummaries: [
+                "password=do-not-keep-this", "one", "two", "three", "four", "five", "six"
+            ],
+            availableActionIDs: [.explainError]
+        )
+        try require(sanitizedHistoryInput.recentBehaviorSummaries.count == 5, "Judgment history must be capped at five sanitized summaries.")
+        try require(
+            !sanitizedHistoryInput.recentBehaviorSummaries.joined().contains("do-not-keep-this")
+                && sanitizedHistoryInput.recentBehaviorSummaries.allSatisfy { $0.count <= 240 },
+            "Judgment history must redact secrets and enforce the evidence length bound."
+        )
+        let judgmentPrompt = AssistantJudgmentContract.userPrompt(for: sanitizedHistoryInput)
+        try require(
+            judgmentPrompt.contains("ephemeralEvidenceTexts")
+                && judgmentPrompt.contains("appCategory")
+                && !judgmentPrompt.contains("/Users/example")
+                && !judgmentPrompt.contains("do-not-keep-this"),
+            "Production judgment prompts must carry sanitized semantic evidence and coarse app category without paths or secrets."
+        )
+
+        let commentInput = AssistantCommentInput(
+            patternType: .repeatedFailure,
+            personality: .gentle,
+            language: "zh-Hans",
+            evidenceCount: 3,
+            durationSeconds: 120,
+            allowedActionIDs: [.explainError]
+        )
+        let validComment = AssistantCommentOutput(
+            comment: AssistantCommentTemplates.options(for: commentInput)[1],
+            suggestedActionIDs: [.explainError],
+            includesJoke: false
+        )
+        let validCommentText = String(decoding: try JSONEncoder().encode(validComment), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(validCommentText, input: commentInput) != nil,
+            "A factual comment using an allowed action should parse."
+        )
+        let inventedComment = AssistantCommentOutput(comment: "网络已经断开，文件已经损坏。", suggestedActionIDs: [.explainError], includesJoke: false)
+        let inventedCommentText = String(decoding: try JSONEncoder().encode(inventedComment), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(inventedCommentText, input: commentInput) == nil,
+            "Comments must not invent facts even when they contain no names or numbers."
+        )
+        for comment in ["Ask Alice to inspect the same error.", "请在 Chrome 中处理这条错误。"] {
+            let output = AssistantCommentOutput(comment: comment, suggestedActionIDs: [.explainError], includesJoke: false)
+            let encoded = String(decoding: try JSONEncoder().encode(output), as: UTF8.self)
+            try require(
+                AssistantCommentContract.parse(encoded, input: commentInput) == nil,
+                "Comments must not invent people or application names."
+            )
+        }
+        try require(!AssistantCommentTemplates.comment(for: commentInput).isEmpty, "Every personality needs a deterministic comment fallback.")
+        try require(
+            AssistantCommentTemplates.options(for: commentInput).allSatisfy { !$0.contains("input.evidenceCount") },
+            "Deterministic comment options must interpolate their structured count."
+        )
+        let p06CommentInput = AssistantCommentInput(
+            patternType: .contextualOpportunity,
+            personality: .gentle,
+            language: "zh-Hans",
+            evidenceCount: 2,
+            durationSeconds: 8,
+            evidenceQuote: p06PositiveFixture.input.allowedEvidenceQuotes[0],
+            suggestedTask: .summarize,
+            allowedActionIDs: [.openQuickAction]
+        )
+        let p06CommentOptions = AssistantCommentTemplates.options(for: p06CommentInput)
+        try require(
+            p06CommentOptions.count == 2
+                && p06CommentOptions.allSatisfy {
+                    !$0.contains(p06PositiveFixture.input.allowedEvidenceQuotes[0])
+                        && $0.contains("总结")
+                },
+            "P-06 card comments must preserve the locked task without persisting the raw evidence quote."
+        )
+        let validP06Comment = AssistantCommentOutput(
+            comment: p06CommentOptions[1],
+            suggestedActionIDs: [.openQuickAction],
+            includesJoke: false
+        )
+        let validP06CommentText = String(decoding: try JSONEncoder().encode(validP06Comment), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(validP06CommentText, input: p06CommentInput) != nil,
+            "The comment model must be able to select, but not rewrite, a grounded P-06 template."
+        )
+        let socialCommentInput = AssistantCommentInput(
+            patternType: .contextualOpportunity,
+            personality: .lightTeasing,
+            language: "zh-Hans",
+            evidenceCount: 1,
+            durationSeconds: 0,
+            allowedActionIDs: [],
+            contextSummary: "activity=coding; signal=success; observation=构建结果已经通过"
+        )
+        let socialComment = AssistantCommentOutput(
+            comment: "构建终于点头了，这次我先不替它鼓掌。",
+            suggestedActionIDs: [],
+            includesJoke: true
+        )
+        let socialCommentText = String(decoding: try JSONEncoder().encode(socialComment), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(socialCommentText, input: socialCommentInput) != nil,
+            "An actionless visual observation should support personality-driven wording."
+        )
+        var inventedP06Comment = validP06Comment
+        inventedP06Comment.comment = "系统已自动修复并发布。"
+        let inventedP06CommentText = String(decoding: try JSONEncoder().encode(inventedP06Comment), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(inventedP06CommentText, input: p06CommentInput) == nil,
+            "P-06 comments must reject facts outside the deterministic grounded options."
+        )
+        let teasingInput = AssistantCommentInput(
+            patternType: .foreignClipboard,
+            personality: .lightTeasing,
+            language: "zh-Hans",
+            evidenceCount: 3,
+            durationSeconds: 120,
+            allowedActionIDs: [.enableClipboardTranslation]
+        )
+        let falseJokeFlag = AssistantCommentOutput(
+            comment: AssistantCommentTemplates.comment(for: teasingInput),
+            suggestedActionIDs: teasingInput.allowedActionIDs,
+            includesJoke: false
+        )
+        let falseJokeFlagText = String(decoding: try JSONEncoder().encode(falseJokeFlag), as: UTF8.self)
+        try require(
+            AssistantCommentContract.parse(falseJokeFlagText, input: teasingInput) == nil,
+            "A teasing comment must not hide its unfunny-feedback affordance with a false model flag."
+        )
+
+        let fingerprintRoot = try makeTemporaryDirectory(name: "assistant-model-fingerprint")
+        defer { try? FileManager.default.removeItem(at: fingerprintRoot) }
+        let weight = fingerprintRoot.appendingPathComponent("model.gguf")
+        try Data("first model payload".utf8).write(to: weight)
+        let firstFingerprint = try AssistantModelFingerprint.fingerprint(at: weight)
+        try Data("changed model payload".utf8).write(to: weight)
+        let secondFingerprint = try AssistantModelFingerprint.fingerprint(at: weight)
+        try require(firstFingerprint != secondFingerprint, "Changing local model bytes must invalidate the qualification fingerprint.")
+
+        var translationSession = AssistantTemporaryTranslationSession()
+        translationSession.start(language: "en-US", now: base)
+        try require(!translationSession.accepts(language: "en", occurredAt: base.addingTimeInterval(-1), now: base), "A temporary translation session must not process historical clipboard content.")
+        try require(translationSession.accepts(language: "en-GB", occurredAt: base.addingTimeInterval(1), now: base.addingTimeInterval(1)), "A temporary session should accept future text in the same base language.")
+        try require(!translationSession.accepts(language: "fr", occurredAt: base.addingTimeInterval(2), now: base.addingTimeInterval(2)), "A temporary session must reject a different language.")
+        try require(!translationSession.accepts(language: "en", occurredAt: base.addingTimeInterval(1_801), now: base.addingTimeInterval(1_801)), "A temporary session must expire after 30 minutes.")
+        translationSession.start(language: "en", now: base)
+        translationSession.fail()
+        try require(!translationSession.accepts(language: "en", occurredAt: base.addingTimeInterval(1), now: base.addingTimeInterval(1)), "A local translation failure must end the temporary session.")
+    }
+
     private static func checkMediaSubtitlePreferenceDefaultsDecodeFromOlderRegistry() throws {
         let preferences = try JSONDecoder().decode(AppPreferences.self, from: Data("{}".utf8))
         try require(preferences.mediaSubtitles.isEnabled, "Expected media subtitles to default on.")
@@ -2368,6 +4605,61 @@ struct LLMToolsChecks {
             preferences: preferences
         )
         try require(inlineFixture.language == "zh-Hans", "Expected inline LID fixture JSON to decode and normalize.")
+
+        unsetenv(Phase4XFixtureEnvironment.languageIDJSON)
+        let scriptURL = root.appendingPathComponent("blocking-lid-sidecar.zsh")
+        let pidURL = root.appendingPathComponent("lid-pid")
+        let requestURL = root.appendingPathComponent("lid-request-started")
+        let blockFIFOURL = root.appendingPathComponent("lid-block.fifo")
+        guard mkfifo(blockFIFOURL.path, 0o600) == 0 else {
+            throw CheckError("Could not create language detection blocking FIFO.")
+        }
+        try """
+        #!/bin/zsh
+        print -r -- $$ > "$1"
+        print -r -- '{"protocol":"llmtools.lid/v1","type":"ready","model":"lifecycle-fixture"}'
+        while IFS= read -r request; do
+            print -r -- started > "$2"
+            IFS= read -r blocked < "$3"
+        done
+        """.write(to: scriptURL, atomically: true, encoding: .utf8)
+        let escapedLIDArguments = [scriptURL, pidURL, requestURL, blockFIFOURL].map {
+            "'" + $0.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        let blockingPreferences = LanguageRoutingPreferences(
+            enabled: true,
+            shortTextMinimumCharactersLatin: 1,
+            commandTemplate: "/bin/zsh \(escapedLIDArguments.joined(separator: " "))"
+        )
+        let blockingService = LanguageDetectionService()
+        let blockingTask = Task {
+            try await blockingService.detect(text: "blocked language request", preferences: blockingPreferences)
+        }
+        let requestDeadline = Date(timeIntervalSinceNow: 2)
+        while !FileManager.default.fileExists(atPath: requestURL.path), Date() < requestDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        guard FileManager.default.fileExists(atPath: requestURL.path) else {
+            await blockingService.stop()
+            throw CheckError("Expected the language detection request to block.")
+        }
+        blockingTask.cancel()
+        let processIdentifier = try requireNonNil(
+            Int32(String(contentsOf: pidURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)),
+            "Language detection fixture did not record a valid PID."
+        )
+        let exitDeadline = Date(timeIntervalSinceNow: 4)
+        while Darwin.kill(processIdentifier, 0) == 0, Date() < exitDeadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        if Darwin.kill(processIdentifier, 0) == 0 { await blockingService.stop() }
+        try require(
+            Darwin.kill(processIdentifier, 0) != 0,
+            "Cancelling language detection must terminate its blocked sidecar."
+        )
+        guard case .failure = await blockingTask.result else {
+            throw CheckError("Cancelled language detection must fail instead of returning a stale result.")
+        }
     }
 
     private static func checkLanguageRoutingCallerWiring() async throws {
@@ -3128,7 +5420,7 @@ struct LLMToolsChecks {
         try require(polishedRequestCount == 1, "Expected only non-translation text task to use LLM runner.")
     }
 
-    private static func checkPersistentSidecarStopInterruptsBlockedRequest() async throws {
+    private static func checkPersistentSidecarCancellationInterruptsBlockedRequest() async throws {
         let root = try makeTemporaryDirectory(name: "persistent-sidecar-stop")
         defer { try? FileManager.default.removeItem(at: root) }
         let scriptURL = root.appendingPathComponent("blocking-sidecar.zsh")
@@ -3175,12 +5467,7 @@ struct LLMToolsChecks {
             throw CheckError("Expected the persistent sidecar request to block.")
         }
 
-        let stopStarted = Date()
-        await runner.stop()
-        try require(
-            Date().timeIntervalSince(stopStarted) < 0.5,
-            "Persistent sidecar stop must not wait for the request lock."
-        )
+        task.cancel()
         let pidText = try String(contentsOf: pidURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let processIdentifier = Int32(pidText) else {
@@ -3192,7 +5479,7 @@ struct LLMToolsChecks {
         }
         try require(
             Darwin.kill(processIdentifier, 0) != 0,
-            "Persistent sidecar must exit after graceful close or forced termination."
+            "Cancelling FastTranslation must terminate its blocked sidecar."
         )
         guard case .failure = await task.result else {
             throw CheckError("Blocked sidecar request must fail after the process stops.")

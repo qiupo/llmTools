@@ -587,6 +587,15 @@ public actor TaskEngine {
         }
     }
 
+    public func warmUpLocalTextModel(id: UUID) async throws {
+        let model = try resolveExactLocalTextModel(id: id)
+        let runner = try runner(for: model)
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+    }
+
     public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
         let routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
         if let fastResult = try await translateTextWithFastMTIfSelected(routedRequest) {
@@ -615,6 +624,128 @@ public actor TaskEngine {
         if persistHistory {
             appendHistory(result: result, request: routedRequest)
         }
+        return result
+    }
+
+    public func runLocalText(request: TaskRequest, modelID: UUID? = nil) async throws -> TaskResult {
+        // 助手后台和小型询问共用这个硬边界，任何远程 provider 都不能进入候选集。
+        let model = try resolveLocalTextModel(for: modelID)
+        try validateInputSize(request, for: model)
+        let runner = try runner(for: model)
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+        return try await runner.generate(request: request, preferences: snapshot.preferences)
+    }
+
+    public func runExactLocalText(request: TaskRequest, modelID: UUID) async throws -> TaskResult {
+        // 资格检查必须测试指定模型本身，不能静默回退到另一个本地模型后误标为通过。
+        let model = try resolveExactLocalTextModel(id: modelID)
+        try validateInputSize(request, for: model)
+        let runner = try runner(for: model)
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+        return try await runner.generate(request: request, preferences: snapshot.preferences)
+    }
+
+    public func runDesktopAssistantVision(
+        image: OCRImageInput,
+        modelID: UUID? = nil
+    ) async throws -> AssistantSceneSummary {
+        let model = try resolveDesktopAssistantVisionModel(id: modelID)
+        let runner = try runner(for: model, requiringVision: true)
+        guard let visionRunner = runner as? any VisionModelRunner else {
+            throw OCRTaskError.unsupportedVisionRunner(model.name)
+        }
+        if await runner.loadedModelID() != model.id {
+            await runner.unload()
+            try await runner.load(model: model)
+        }
+
+        do {
+            // 视觉结果只保留结构化摘要；截图不会进入历史记录或磁盘。
+            let result = try await visionRunner.generateOCR(
+                request: OCRTaskRequest(
+                    image: image,
+                    mode: .explainImage,
+                    prompt: AssistantSceneContract.systemPrompt
+                ),
+                preferences: snapshot.preferences
+            )
+            guard let summary = AssistantSceneContract.parse(result.text) else {
+                throw RunnerError.unsupportedConfiguration("Desktop assistant vision returned an invalid scene summary.")
+            }
+            await runner.unloadIfLoaded(modelID: model.id)
+            return summary
+        } catch {
+            await runner.unloadIfLoaded(modelID: model.id)
+            throw error
+        }
+    }
+
+    public func loadedLocalTextModelID() async -> UUID? {
+        let candidates = snapshot.models.filter(isLocalTextCandidate)
+        for runner in runners.values {
+            guard let id = await runner.loadedModelID(), candidates.contains(where: { $0.id == id }) else { continue }
+            return id
+        }
+        return nil
+    }
+
+    public func detectAssistantLanguage(text: String) async throws -> LanguageDetectionResult {
+        var preferences = snapshot.preferences.languageRouting
+        preferences.enabled = true
+        return try await languageDetectionService.detect(text: text, preferences: preferences)
+    }
+
+    public func runAssistantLocalTranslation(
+        text: String,
+        sourceLanguage: String,
+        targetLanguage: String,
+        modelID: UUID? = nil
+    ) async throws -> TaskResult {
+        guard let pair = fastTranslationPair(sourceLanguage: sourceLanguage, targetLanguage: targetLanguage) else {
+            throw FastTranslationError.unsupportedLanguagePair(LanguagePair(source: sourceLanguage, target: targetLanguage))
+        }
+        let preferences = snapshot.preferences.fastTranslation
+        if !preferences.forceLLM {
+            let supportedPairs = await fastTranslationService.supportedPairs(preferences: preferences)
+            if supportedPairs.contains(pair) {
+                do {
+                    let translated = try await fastTranslationService.translate(
+                        batch: [FastTranslationSegment(id: "assistant", text: text)],
+                        pair: pair,
+                        preferences: preferences
+                    )
+                    if let first = translated.first, !first.translation.isEmpty {
+                        return TaskResult(
+                            text: first.translation,
+                            rawText: first.translation,
+                            modelName: fastTranslationDisplayName(for: first.engineID),
+                            task: .translate,
+                            sourceLanguage: pair.source
+                        )
+                    }
+                } catch {
+                    if Task.isCancelled { throw CancellationError() }
+                    // Fast MT 不可用时仅回退到本地文本模型，绝不进入普通远程路由。
+                }
+            }
+        }
+        var result = try await runLocalText(
+            request: TaskRequest(
+                task: .translate,
+                inputText: text,
+                sourceLanguage: pair.source,
+                targetLanguage: pair.target,
+                translationOutputMode: .plain
+            ),
+            modelID: modelID
+        )
+        result.sourceLanguage = pair.source
         return result
     }
 
@@ -1953,6 +2084,34 @@ public actor TaskEngine {
         throw RunnerError.unsupportedConfiguration("No enabled model is registered.")
     }
 
+    private func resolveLocalTextModel(for modelID: UUID?) throws -> ModelDescriptor {
+        if let modelID, let model = snapshot.models.first(where: { $0.id == modelID && isLocalTextCandidate($0) }) {
+            return model
+        }
+        if let preferred = snapshot.preferences.defaultModelID,
+           let model = snapshot.models.first(where: { $0.id == preferred && isLocalTextCandidate($0) }) {
+            return model
+        }
+        if let model = snapshot.models.first(where: isLocalTextCandidate) {
+            return model
+        }
+        throw RunnerError.unsupportedConfiguration("No usable local text model is configured.")
+    }
+
+    private func resolveExactLocalTextModel(id: UUID) throws -> ModelDescriptor {
+        guard let model = snapshot.models.first(where: { $0.id == id && isLocalTextCandidate($0) }) else {
+            throw RunnerError.unsupportedConfiguration("The selected assistant model is not an available local text model.")
+        }
+        return model
+    }
+
+    private func isLocalTextCandidate(_ model: ModelDescriptor) -> Bool {
+        model.isAvailableForUse
+            && model.capabilities.supportsText
+            && !model.isRemoteProvider
+            && (model.format == .gguf || model.format == .mlx)
+    }
+
     private func resolveSpeechModel(for modelID: UUID?, mode: SpeechRuntimeMode) throws -> ModelDescriptor {
         let supportsRequestedMode: (ModelDescriptor) -> Bool = { model in
             guard model.isAvailableForUse, model.capabilities.supportsSpeech else {
@@ -2020,6 +2179,24 @@ public actor TaskEngine {
         if let preferred = snapshot.preferences.ocr.modelID,
            let model = snapshot.models.first(where: { $0.id == preferred && $0.isAvailableForUse }) {
             return model
+        }
+        throw OCRTaskError.missingVisionModel
+    }
+
+    private func resolveDesktopAssistantVisionModel(id: UUID?) throws -> ModelDescriptor {
+        let isUsable: (ModelDescriptor) -> Bool = { model in
+            model.isAvailableForUse
+                && !model.isRemoteProvider
+                && model.format == .mlx
+                && model.capabilities.supportsText
+                && model.capabilities.supportsImage
+                && !ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
+        }
+        if let id, let selected = snapshot.models.first(where: { $0.id == id && isUsable($0) }) {
+            return selected
+        }
+        if let preferred = ModelRecommendationPolicy.preferredVisionModel(in: snapshot.models.filter(isUsable)) {
+            return preferred
         }
         throw OCRTaskError.missingVisionModel
     }
@@ -2866,6 +3043,18 @@ public actor TaskEngine {
                $0.id == modelID && $0.capabilities.supportsText && !$0.isRemoteProvider && ($0.format == .gguf || $0.format == .mlx)
            }) {
             preferences.liveMeeting.notesModelID = nil
+        }
+        if let modelID = preferences.desktopAssistant.judgmentModelID,
+           !models.contains(where: { $0.id == modelID && isLocalTextCandidate($0) }) {
+            preferences.desktopAssistant.judgmentModelID = nil
+        }
+        if let modelID = preferences.desktopAssistant.commentModelID,
+           !models.contains(where: { $0.id == modelID && isLocalTextCandidate($0) }) {
+            preferences.desktopAssistant.commentModelID = nil
+        }
+        let localModelIDs = Set(models.filter(isLocalTextCandidate).map { $0.id.uuidString })
+        preferences.desktopAssistant.qualificationCache = preferences.desktopAssistant.qualificationCache.filter {
+            localModelIDs.contains($0.key)
         }
         if !preferences.liveMeeting.defaultAudioSource.isLiveCapture {
             preferences.liveMeeting.defaultAudioSource = .microphone

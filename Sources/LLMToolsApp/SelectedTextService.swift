@@ -22,6 +22,8 @@ enum SelectedTextService {
     private static var lastCapturedAccessibilitySelection: CapturedAccessibilitySelection?
     private static var captureRevision = 0
     private static var clipboardCaptureOwner: UUID?
+    private static var internallyOwnedPasteboardChanges: [Int: Date] = [:]
+    private static var lastCapturedSourceBundleID: String?
     private static var pasteboardOwnershipEventMonitor: Any?
     private static var lastUserInteractionDate = Date.distantPast
     private static var lastUserCopyShortcutDate = Date.distantPast
@@ -121,6 +123,7 @@ enum SelectedTextService {
         near screenPoint: NSPoint? = nil,
         preserveNonTextClipboardPayloads: Bool = true
     ) async -> String? {
+        lastCapturedSourceBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         guard isAccessibilityTrusted else {
             requestAccessibilityPermission()
             return nil
@@ -130,6 +133,7 @@ enum SelectedTextService {
         let revision = captureRevision
         lastCapturedAccessibilitySelection = nil
         if let selection = captureSelectedTextFromAccessibility(near: screenPoint) {
+            lastCapturedSourceBundleID = NSRunningApplication(processIdentifier: selection.processIdentifier)?.bundleIdentifier
             lastCapturedAccessibilitySelection = CapturedAccessibilitySelection(
                 id: UUID(),
                 processIdentifier: selection.processIdentifier,
@@ -163,6 +167,7 @@ enum SelectedTextService {
         pasteboard.clearContents()
         pasteboard.setString(marker, forType: .string)
         let markerChangeCount = pasteboard.changeCount
+        noteInternalPasteboardWrite(changeCount: markerChangeCount)
         sendCopyShortcut()
         await waitForSyntheticCopy()
 
@@ -180,11 +185,15 @@ enum SelectedTextService {
         await yieldPasteboardOwnershipCheck()
         let pasteboardStillOwned = pasteboard.changeCount == capturedChangeCount
             && (markerStillOwned || syntheticCopyStillOwned)
+        if !userCopiedDuringCapture {
+            noteInternalPasteboardWrite(changeCount: capturedChangeCount)
+        }
         if !userCopiedDuringCapture,
            !userInteractedDuringCapture,
            pasteboardStillOwned,
            !hasNonTextPayload {
             originalSnapshot.restore(to: pasteboard)
+            noteInternalPasteboardWrite(changeCount: pasteboard.changeCount)
         }
         // 等待期间用户主动复制的内容属于用户，不得被当成本次选区捕获结果继续处理。
         guard !userCopiedDuringCapture,
@@ -207,10 +216,25 @@ enum SelectedTextService {
     static func clearCapturedSelectionSource() {
         captureRevision += 1
         lastCapturedAccessibilitySelection = nil
+        lastCapturedSourceBundleID = nil
     }
 
     static var currentCapturedSelectionID: UUID? {
         lastCapturedAccessibilitySelection?.id
+    }
+
+    static var currentCapturedSourceBundleID: String? {
+        lastCapturedSourceBundleID
+    }
+
+    static func noteInternalPasteboardWrite(changeCount: Int, now: Date = .now) {
+        pruneInternalPasteboardWrites(now: now)
+        internallyOwnedPasteboardChanges[changeCount] = now.addingTimeInterval(2)
+    }
+
+    static func shouldIgnorePasteboardChange(_ changeCount: Int, now: Date = .now) -> Bool {
+        pruneInternalPasteboardWrites(now: now)
+        return clipboardCaptureOwner != nil || internallyOwnedPasteboardChanges[changeCount] != nil
     }
 
     static func isSyntheticShortcutEvent(_ event: NSEvent) -> Bool {
@@ -219,6 +243,10 @@ enum SelectedTextService {
 
     static func noteUserCopyShortcut() {
         lastUserCopyShortcutDate = Date()
+    }
+
+    private static func pruneInternalPasteboardWrites(now: Date) {
+        internallyOwnedPasteboardChanges = internallyOwnedPasteboardChanges.filter { $0.value > now }
     }
 
     private static func captureSelectedTextFromAccessibility(near screenPoint: NSPoint?) -> AccessibilitySelection? {

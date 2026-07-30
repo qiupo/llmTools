@@ -30,6 +30,19 @@ struct PendingQuickTranslationSpeech {
     var target: QuickTranslationSpeechTarget
 }
 
+enum AssistantWorkbenchRoute: Equatable {
+    case text
+    case image
+    case media
+}
+
+struct AssistantTaskFailureSignal: Identifiable, Equatable {
+    let id = UUID()
+    let message: String
+    let workbenchIsRecoverable: Bool
+    let workbenchRoute: AssistantWorkbenchRoute
+}
+
 @MainActor
 final class AppState: ObservableObject {
     private static let modelIdleUnloadDelayNanoseconds: UInt64 = 30 * 1_000_000_000
@@ -218,6 +231,7 @@ final class AppState: ObservableObject {
     @Published var isRunning: Bool = false
     @Published var isPreparingOCRImage: Bool = false
     @Published var validationError: String?
+    @Published private(set) var assistantTaskFailureSignal: AssistantTaskFailureSignal?
     @Published var providerTestModelID: UUID?
     @Published var visionProbeModelID: UUID?
     @Published var ocrImageInput: OCRImageInput?
@@ -304,6 +318,7 @@ final class AppState: ObservableObject {
     private var preferenceSaveRevision = 0
     private var currentRunTask: Task<Void, Never>?
     private var runRevision = 0
+    private var desktopAssistantWorkbenchHandoffPending = false
     private var ocrPreparationTask: Task<Void, Never>?
     private var ocrPreparationRevision = 0
     private var activeExternalModelUseCount = 0
@@ -760,7 +775,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    func loadOCRImageFile(from url: URL) {
+    func loadOCRImageFile(from url: URL, autoRunDefaultRecognition: Bool = true) {
         beginQuickActionInputChange()
         do {
             let resourceAccess = url.startAccessingSecurityScopedResource()
@@ -774,14 +789,23 @@ final class AppState: ObservableObject {
                 at: url,
                 preferences: preferences.ocr
             )
-            finishLoadingOCRImage(image, statusMessage: "\(t("Loaded")) \(url.lastPathComponent)")
+            finishLoadingOCRImage(
+                image,
+                statusMessage: "\(t("Loaded")) \(url.lastPathComponent)",
+                autoRunDefaultRecognition: autoRunDefaultRecognition
+            )
         } catch {
             validationError = error.localizedDescription
             statusMessage = t("Failed to load image")
         }
     }
 
-    func loadOCRImageData(_ data: Data, fileName: String? = nil, sourceDescription: String = "Image") {
+    func loadOCRImageData(
+        _ data: Data,
+        fileName: String? = nil,
+        sourceDescription: String = "Image",
+        autoRunDefaultRecognition: Bool = true
+    ) {
         beginQuickActionInputChange()
         do {
             let image = try OCRImagePreprocessor.normalizeImageData(
@@ -790,7 +814,11 @@ final class AppState: ObservableObject {
                 fileName: fileName,
                 sourceDescription: sourceDescription
             )
-            finishLoadingOCRImage(image, statusMessage: t("Loaded image"))
+            finishLoadingOCRImage(
+                image,
+                statusMessage: t("Loaded image"),
+                autoRunDefaultRecognition: autoRunDefaultRecognition
+            )
         } catch {
             validationError = error.localizedDescription
             statusMessage = t("Failed to load image")
@@ -1315,7 +1343,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    func runCurrentTask() {
+    func runCurrentTask(localOnly: Bool = false) {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             validationError = t("Please paste or type some text first.")
@@ -1351,6 +1379,10 @@ final class AppState: ObservableObject {
         let modelID = request.translationOutputMode == .detailed
             ? resolvedDetailedTranslationModelID()
             : selectedModelID
+        let selectedModel = models.first { $0.id == modelID }
+        guard confirmDesktopAssistantRemoteWorkbenchHandoff(using: selectedModel, localOnly: localOnly) else {
+            return
+        }
         let selectionCaptureID = inputOrigin == .selection
             ? SelectedTextService.currentCapturedSelectionID
             : nil
@@ -1361,10 +1393,11 @@ final class AppState: ObservableObject {
         statusMessage = "\(t("Running")) \(selectedTask.title(language: preferences.appLanguage))..."
         currentRunTask = Task {
             do {
-                let result = try await engine.run(
-                    request: request,
-                    modelID: modelID
-                )
+                let result = if localOnly {
+                    try await engine.runLocalText(request: request, modelID: modelID)
+                } else {
+                    try await engine.run(request: request, modelID: modelID)
+                }
                 try Task.checkCancellation()
                 await MainActor.run {
                     guard revision == runRevision else {
@@ -1402,6 +1435,7 @@ final class AppState: ObservableObject {
                     guard revision == runRevision else {
                         return
                     }
+                    publishAssistantTaskFailure(error, workbenchRoute: .text)
                     if let runnerError = error as? RunnerError, case .emptyResult = runnerError {
                         validationError = nil
                         outputText = t("The model returned an empty result. Try regenerate.")
@@ -1420,6 +1454,21 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func publishAssistantTaskFailure(
+        _ error: Error,
+        workbenchIsRecoverable: Bool = true,
+        workbenchRoute: AssistantWorkbenchRoute
+    ) {
+        let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { return }
+        // 只从真实执行异常发布，避免把全局 validationError 中的输入或设置错误误判为重复失败。
+        assistantTaskFailureSignal = AssistantTaskFailureSignal(
+            message: message,
+            workbenchIsRecoverable: workbenchIsRecoverable,
+            workbenchRoute: workbenchRoute
+        )
+    }
+
     func runCurrentOCR() {
         guard let image = ocrImageInput else {
             validationError = OCRTaskError.missingImage.localizedDescription
@@ -1430,9 +1479,19 @@ final class AppState: ObservableObject {
             statusMessage = t("Failed")
             return
         }
-        guard let modelID = selectedOCRModel?.id else {
+        guard let ocrModel = selectedOCRModel else {
             validationError = t("Choose a vision-capable OCR model in Settings.")
             statusMessage = t("Failed")
+            return
+        }
+        let modelID = ocrModel.id
+        let usesTextStage = ocrMode == .extractThenTranslate
+            || (ModelDetection.isGLMOCRModel(at: ocrModel.resolvedPath ?? ocrModel.sourcePath) && ocrMode != .plainText)
+        let textStageModel = usesTextStage
+            ? resolvedAvailableTextModel(preferredID: preferences.ocr.postProcessingModelID)
+            : nil
+        let disclosureModel = ocrModel.isRemoteProvider ? ocrModel : textStageModel
+        guard confirmDesktopAssistantRemoteWorkbenchHandoff(using: disclosureModel) else {
             return
         }
 
@@ -1483,6 +1542,7 @@ final class AppState: ObservableObject {
                     guard revision == runRevision else {
                         return
                     }
+                    publishAssistantTaskFailure(error, workbenchRoute: .image)
                     validationError = error.localizedDescription
                     statusMessage = t("Failed")
                     isRunning = false
@@ -1506,6 +1566,12 @@ final class AppState: ObservableObject {
         guard selectedFileASRModel != nil else {
             validationError = t("Choose a local speech ASR model in Settings.")
             statusMessage = t("Failed")
+            return
+        }
+        let disclosureModel = selectedFileASRModel?.isRemoteProvider == true
+            ? selectedFileASRModel
+            : (mediaSubtitleMode == .original ? nil : resolvedAvailableTextModel(preferredID: nil))
+        guard confirmDesktopAssistantRemoteWorkbenchHandoff(using: disclosureModel) else {
             return
         }
 
@@ -1592,6 +1658,7 @@ final class AppState: ObservableObject {
                     guard revision == runRevision else {
                         return
                     }
+                    publishAssistantTaskFailure(error, workbenchRoute: .media)
                     validationError = error.localizedDescription
                     statusMessage = t("Failed")
                     isRunning = false
@@ -1605,6 +1672,11 @@ final class AppState: ObservableObject {
     func translateCurrentMediaSubtitles() {
         guard !mediaSubtitleSegments.isEmpty else {
             validationError = t("Generate transcript segments first.")
+            return
+        }
+        guard confirmDesktopAssistantRemoteWorkbenchHandoff(
+            using: resolvedAvailableTextModel(preferredID: nil)
+        ) else {
             return
         }
         currentRunTask?.cancel()
@@ -1651,6 +1723,7 @@ final class AppState: ObservableObject {
                     guard revision == runRevision else {
                         return
                     }
+                    publishAssistantTaskFailure(error, workbenchRoute: .media)
                     validationError = error.localizedDescription
                     statusMessage = t("Failed")
                     isRunning = false
@@ -4092,6 +4165,7 @@ final class AppState: ObservableObject {
         selectionInlineResultVisible = false
         validationError = nil
         statusMessage = t("Ready")
+        desktopAssistantWorkbenchHandoffPending = false
         quickActionSessionRevision += 1
         SelectedTextService.clearCapturedSelectionSource()
     }
@@ -4101,9 +4175,210 @@ final class AppState: ObservableObject {
         cancelScheduledModelUnload()
     }
 
+    func markDesktopAssistantWorkbenchHandoff() {
+        desktopAssistantWorkbenchHandoffPending = true
+    }
+
+    private func confirmDesktopAssistantRemoteWorkbenchHandoff(
+        using model: ModelDescriptor?,
+        localOnly: Bool = false
+    ) -> Bool {
+        let disclosureKey = "desktopAssistant.remoteWorkbenchDisclosureAcknowledged"
+        guard AssistantRemoteWorkbenchDisclosure.requiresConfirmation(
+            isAssistantHandoff: desktopAssistantWorkbenchHandoffPending,
+            isRemoteModel: model?.isRemoteProvider == true,
+            alreadyAcknowledged: UserDefaults.standard.bool(forKey: disclosureKey),
+            localOnly: localOnly
+        ) else {
+            return true
+        }
+
+        // 助手来源会保留到下一份输入，先跑本地任务后再切远程模型也必须经过首次确认。
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = preferences.appLanguage == .chinese
+            ? "将助手上下文发送到远程 Provider？"
+            : "Send Assistant Context to a Remote Provider?"
+        let providerName = model.map { "\($0.name) · \($0.providerDisplayName)" } ?? "Remote Provider"
+        alert.informativeText = preferences.appLanguage == .chinese
+            ? "本次工作台可能使用 \(providerName)。继续后，当前输入只会在实际调用时发送给该 Provider；后台观察始终只在本机处理。"
+            : "This workbench may use \(providerName). Continuing sends the current input only if that provider is actually called; background observation always remains local."
+        alert.addButton(withTitle: preferences.appLanguage == .chinese ? "继续发送" : "Continue")
+        alert.addButton(withTitle: preferences.appLanguage == .chinese ? "取消" : "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return false }
+        UserDefaults.standard.set(true, forKey: disclosureKey)
+        return true
+    }
+
+    private func resolvedAvailableTextModel(preferredID: UUID?) -> ModelDescriptor? {
+        if let preferredID,
+           let preferred = models.first(where: {
+               $0.id == preferredID && $0.isAvailableForUse && $0.capabilities.supportsText
+           }) {
+            return preferred
+        }
+        if let defaultModelID = preferences.defaultModelID,
+           let defaultModel = models.first(where: {
+               $0.id == defaultModelID && $0.isAvailableForUse && $0.capabilities.supportsText
+           }) {
+            return defaultModel
+        }
+        return models.first(where: { $0.isAvailableForUse && $0.capabilities.supportsText })
+    }
+
     func endExternalModelUse() {
         activeExternalModelUseCount = max(activeExternalModelUseCount - 1, 0)
         scheduleModelUnloadIfIdle()
+    }
+
+    func runDesktopAssistantInquiry(question: String, explicitContext: String?) async throws -> TaskResult {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        let context = explicitContext?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let userPrompt = context.isEmpty
+            ? question
+            : """
+              问题：
+              \(question)
+
+              用户明确选择的上下文：
+              \(context)
+              """
+        return try await engine.runLocalText(
+            request: TaskRequest(
+                task: .explain,
+                inputText: question,
+                systemPromptOverride: """
+                你是 llmTools 桌面情境助手。只依据用户的问题和明确附带的上下文回答，不推测未提供的事实。
+                使用提问所用语言，给出完整但紧凑的一次性回答；不要用省略号代替应说明的正文。
+                不创建多轮对话，也不要声称执行了任何动作；信息不足时明确指出缺少什么。
+                """,
+                userPromptOverride: userPrompt
+            ),
+            modelID: preferences.desktopAssistant.commentModelID
+        )
+    }
+
+    func detectDesktopAssistantLanguage(text: String) async throws -> LanguageDetectionResult {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        return try await engine.detectAssistantLanguage(text: text)
+    }
+
+    var assistantLocalTextModels: [ModelDescriptor] {
+        models.filter {
+            $0.isAvailableForUse
+                && !$0.isRemoteProvider
+                && ($0.format == .gguf || $0.format == .mlx)
+                && $0.capabilities.supportsText
+        }
+    }
+
+    var assistantUserModelWorkIsActive: Bool {
+        let meetingIsActive: Bool
+        switch liveMeetingSession?.state {
+        case .starting, .running, .stopping:
+            meetingIsActive = true
+        default:
+            meetingIsActive = false
+        }
+        return isRunning
+            || isPreparingOCRImage
+            || appLiveSubtitleRunState == .starting
+            || appLiveSubtitleRunState == .running
+            || appLiveSubtitleRunState == .stopping
+            || meetingIsActive
+            || liveMeetingASRInFlight
+            || liveMeetingFinalizeTaskIsRunning
+            || liveMeetingNotesTaskIsRunning
+            || ttsIsAnalyzing
+            || ttsIsGenerating
+            || quickTTSIsGenerating
+    }
+
+    func warmUpDesktopAssistantJudgmentModel(id: UUID) async throws {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        try await engine.warmUpLocalTextModel(id: id)
+    }
+
+    func runDesktopAssistantJudgment(
+        input: AssistantJudgmentInput,
+        modelID: UUID,
+        minimumConfidenceOverride: Double? = nil
+    ) async throws -> String {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        let result = try await engine.runExactLocalText(
+            request: TaskRequest(
+                task: .explain,
+                inputText: input.evidenceSummary,
+                systemPromptOverride: AssistantJudgmentContract.runtimeSystemPrompt(
+                    minimumConfidenceOverride: minimumConfidenceOverride
+                ),
+                userPromptOverride: AssistantJudgmentContract.userPrompt(
+                    for: input,
+                    minimumConfidenceOverride: minimumConfidenceOverride
+                ),
+                thinkingModeOverride: false,
+                maxOutputTokensOverride: 256
+            ),
+            modelID: modelID
+        )
+        return result.text
+    }
+
+    func runDesktopAssistantVision(
+        image: OCRImageInput,
+        modelID: UUID?
+    ) async throws -> AssistantSceneSummary {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        return try await engine.runDesktopAssistantVision(image: image, modelID: modelID)
+    }
+
+    func runDesktopAssistantComment(input: AssistantCommentInput) async throws -> String? {
+        let modelID: UUID?
+        if let configured = preferences.desktopAssistant.commentModelID {
+            modelID = configured
+        } else {
+            modelID = await engine.loadedLocalTextModelID()
+        }
+        guard let modelID else { return nil }
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        let result = try await engine.runExactLocalText(
+            request: TaskRequest(
+                task: .explain,
+                inputText: input.patternType.rawValue,
+                systemPromptOverride: AssistantCommentContract.systemPrompt,
+                userPromptOverride: AssistantCommentContract.userPrompt(for: input),
+                thinkingModeOverride: false,
+                maxOutputTokensOverride: 192
+            ),
+            modelID: modelID
+        )
+        return result.text
+    }
+
+    func runDesktopAssistantLocalTranslation(
+        text: String,
+        sourceLanguage: String,
+        targetLanguage: String
+    ) async throws -> TaskResult {
+        beginExternalModelUse()
+        defer { endExternalModelUse() }
+        return try await engine.runAssistantLocalTranslation(
+            text: text,
+            sourceLanguage: sourceLanguage,
+            targetLanguage: targetLanguage
+        )
+    }
+
+    func prepareModelServicesForApplicationTermination() async {
+        cancelScheduledModelUnload()
+        activeExternalModelUseCount = 0
+        await engine.unloadAll()
     }
 
     func createLiveSubtitleSession(
@@ -4919,6 +5194,7 @@ final class AppState: ObservableObject {
 
     private func beginQuickActionInputChange() {
         // 新输入代表新的用户意图；旧推理或旧图片下载不能在稍后覆盖当前面板。
+        desktopAssistantWorkbenchHandoffPending = false
         if quickTranslationSpeechTask != nil
             || ttsPlaybackTarget.map({ target in
                 if case .translation = target { return true }
@@ -5009,10 +5285,16 @@ final class AppState: ObservableObject {
         }
     }
 
-    private func finishLoadingOCRImage(_ image: OCRImageInput, statusMessage loadedStatusMessage: String) {
+    private func finishLoadingOCRImage(
+        _ image: OCRImageInput,
+        statusMessage loadedStatusMessage: String,
+        autoRunDefaultRecognition: Bool = true
+    ) {
         setOCRImage(image)
         statusMessage = loadedStatusMessage
-        runCurrentOCRIfDefaultRecognitionIsEnabled()
+        if autoRunDefaultRecognition {
+            runCurrentOCRIfDefaultRecognitionIsEnabled()
+        }
     }
 
     private func runCurrentOCRIfDefaultRecognitionIsEnabled() {

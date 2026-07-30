@@ -66,7 +66,7 @@ public actor AnthropicMessagesRunner: ModelRunner {
         let payload = MessagesRequest(
             model: configuration.modelID,
             maxTokens: max(configuration.maxOutputTokens ?? 4096, 1),
-            system: PromptTemplates.systemPrompt(for: request.task, preferences: preferences),
+            system: PromptTemplates.systemPrompt(for: request, preferences: preferences),
             messages: [
                 Message(role: "user", content: PromptTemplates.userPrompt(for: request, preferences: preferences))
             ],

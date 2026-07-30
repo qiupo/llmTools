@@ -30,6 +30,7 @@ public actor GGUFRunner: ModelRunner {
     }
 
     public func load(model descriptor: ModelDescriptor) async throws {
+        try Task.checkCancellation()
         unloadSync()
         let path = descriptor.resolvedPath?.path ?? descriptor.sourcePath.path
         guard !path.isEmpty else {
@@ -51,6 +52,15 @@ public actor GGUFRunner: ModelRunner {
             throw RunnerError.unsupportedConfiguration("Failed to initialize GGUF context.")
         }
 
+        do {
+            // 同步加载无法中途打断，但取消后必须先释放临时资源，不能重新占用模型内存。
+            try Task.checkCancellation()
+        } catch {
+            llama_free(loadedContext)
+            llama_model_free(loadedModel)
+            throw error
+        }
+
         model = loadedModel
         context = loadedContext
         modelID = descriptor.id
@@ -63,7 +73,7 @@ public actor GGUFRunner: ModelRunner {
             throw RunnerError.notLoaded
         }
 
-        let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
+        let systemPrompt = PromptTemplates.systemPrompt(for: request, preferences: preferences)
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
         let fullPrompt = chatPrompt(systemPrompt: systemPrompt, userPrompt: userPrompt)
 
@@ -72,7 +82,7 @@ public actor GGUFRunner: ModelRunner {
             prompt: fullPrompt,
             model: model,
             context: context,
-            maxNewTokens: defaultMaxNewTokens
+            maxNewTokens: min(request.maxOutputTokensOverride ?? defaultMaxNewTokens, defaultMaxNewTokens)
         )
         try Task.checkCancellation()
         let rawOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)

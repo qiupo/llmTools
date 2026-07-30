@@ -45,6 +45,8 @@ public actor MLXRunner: ModelRunner {
             from: directory,
             using: tokenizerLoader
         )
+        // unload 期间取消的加载不能在异步返回后重新提交为已加载状态。
+        try Task.checkCancellation()
         container = loaded
         modelID = descriptor.id
         modelName = descriptor.name
@@ -58,16 +60,18 @@ public actor MLXRunner: ModelRunner {
         }
 
         try Task.checkCancellation()
-        let systemPrompt = PromptTemplates.systemPrompt(for: request.task, preferences: preferences)
+        let systemPrompt = PromptTemplates.systemPrompt(for: request, preferences: preferences)
         let userPrompt = PromptTemplates.userPrompt(for: request, preferences: preferences)
+        let effectiveThinkingModeEnabled = request.thinkingModeOverride ?? thinkingModeEnabled
         var session = ChatSession(
             container,
             instructions: systemPrompt,
             generateParameters: LocalGenerationPolicy.parameters(
                 for: request.task,
-                thinkingModeEnabled: thinkingModeEnabled
+                thinkingModeEnabled: effectiveThinkingModeEnabled,
+                maxTokensOverride: request.maxOutputTokensOverride
             ),
-            additionalContext: ["enable_thinking": thinkingModeEnabled]
+            additionalContext: ["enable_thinking": effectiveThinkingModeEnabled]
         )
         let firstGeneration = try await GeneratedOutputGuard.collectGuardedResponse(
             from: session.streamDetails(to: userPrompt)
@@ -76,7 +80,7 @@ public actor MLXRunner: ModelRunner {
 
         var rawOutput = firstGeneration.text.trimmingCharacters(in: .whitespacesAndNewlines)
         var output = VisibleOutput.from(rawText: rawOutput)
-        if thinkingModeEnabled,
+        if effectiveThinkingModeEnabled,
            LocalGenerationPolicy.shouldRetryThinkingGeneration(
                visibleOutput: output,
                reachedTokenLimit: firstGeneration.reachedTokenLimit
@@ -85,7 +89,10 @@ public actor MLXRunner: ModelRunner {
             session = ChatSession(
                 container,
                 instructions: systemPrompt,
-                generateParameters: LocalGenerationPolicy.parameters(for: request.task),
+                generateParameters: LocalGenerationPolicy.parameters(
+                    for: request.task,
+                    maxTokensOverride: request.maxOutputTokensOverride
+                ),
                 additionalContext: ["enable_thinking": false]
             )
             let response = try await GeneratedOutputGuard.collectGuardedResponse(

@@ -1839,8 +1839,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
     public var textTaskModelIDs: [TaskKind: UUID]
     public var detailedTranslationEnabled: Bool
     public var detailedTranslationModelID: UUID?
-    public var autoCollapseWidget: Bool
-    public var widgetVisibleOnAllSpaces: Bool
+    public var desktopAssistant: DesktopAssistantPreferences
     public var launchAtLogin: Bool
     public var replaceOriginalText: Bool
     public var selectionActionEnabled: Bool
@@ -1874,8 +1873,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         textTaskModelIDs: [TaskKind: UUID] = [:],
         detailedTranslationEnabled: Bool = false,
         detailedTranslationModelID: UUID? = nil,
-        autoCollapseWidget: Bool = true,
-        widgetVisibleOnAllSpaces: Bool = true,
+        desktopAssistant: DesktopAssistantPreferences = DesktopAssistantPreferences(),
         launchAtLogin: Bool = false,
         replaceOriginalText: Bool = false,
         selectionActionEnabled: Bool = true,
@@ -1910,8 +1908,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         self.textTaskModelIDs = textTaskModelIDs
         self.detailedTranslationEnabled = detailedTranslationEnabled
         self.detailedTranslationModelID = detailedTranslationModelID
-        self.autoCollapseWidget = autoCollapseWidget
-        self.widgetVisibleOnAllSpaces = widgetVisibleOnAllSpaces
+        self.desktopAssistant = desktopAssistant
         self.launchAtLogin = launchAtLogin
         self.replaceOriginalText = replaceOriginalText
         self.selectionActionEnabled = selectionActionEnabled
@@ -1946,8 +1943,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         case textTaskModelIDs
         case detailedTranslationEnabled
         case detailedTranslationModelID
-        case autoCollapseWidget
-        case widgetVisibleOnAllSpaces
+        case desktopAssistant
         case launchAtLogin
         case replaceOriginalText
         case selectionActionEnabled
@@ -1984,8 +1980,8 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         textTaskModelIDs = try container.decodeIfPresent([TaskKind: UUID].self, forKey: .textTaskModelIDs) ?? [:]
         detailedTranslationEnabled = try container.decodeIfPresent(Bool.self, forKey: .detailedTranslationEnabled) ?? false
         detailedTranslationModelID = try container.decodeIfPresent(UUID.self, forKey: .detailedTranslationModelID)
-        autoCollapseWidget = try container.decodeIfPresent(Bool.self, forKey: .autoCollapseWidget) ?? true
-        widgetVisibleOnAllSpaces = try container.decodeIfPresent(Bool.self, forKey: .widgetVisibleOnAllSpaces) ?? true
+        desktopAssistant = try container.decodeIfPresent(DesktopAssistantPreferences.self, forKey: .desktopAssistant)
+            ?? DesktopAssistantPreferences()
         launchAtLogin = try container.decodeIfPresent(Bool.self, forKey: .launchAtLogin) ?? false
         replaceOriginalText = try container.decodeIfPresent(Bool.self, forKey: .replaceOriginalText) ?? false
         selectionActionEnabled = try container.decodeIfPresent(Bool.self, forKey: .selectionActionEnabled) ?? true
@@ -2034,8 +2030,7 @@ public struct AppPreferences: Codable, Sendable, Hashable {
         try container.encode(textTaskModelIDs, forKey: .textTaskModelIDs)
         try container.encode(detailedTranslationEnabled, forKey: .detailedTranslationEnabled)
         try container.encodeIfPresent(detailedTranslationModelID, forKey: .detailedTranslationModelID)
-        try container.encode(autoCollapseWidget, forKey: .autoCollapseWidget)
-        try container.encode(widgetVisibleOnAllSpaces, forKey: .widgetVisibleOnAllSpaces)
+        try container.encode(desktopAssistant, forKey: .desktopAssistant)
         try container.encode(launchAtLogin, forKey: .launchAtLogin)
         try container.encode(replaceOriginalText, forKey: .replaceOriginalText)
         try container.encode(selectionActionEnabled, forKey: .selectionActionEnabled)
@@ -2163,6 +2158,12 @@ public struct TaskRequest: Sendable, Hashable {
     public var summaryMode: SummaryMode?
     public var explanationMode: ExplanationMode?
     public var todoExtractionMode: TodoExtractionMode?
+    public var systemPromptOverride: String?
+    public var userPromptOverride: String?
+    // 严格限时的结构化本地请求可单次关闭思考，不改变用户为普通任务保存的模型设置。
+    public var thinkingModeOverride: Bool?
+    // 后台结构化 JSON 只需很短输出；单次收紧上限，避免沿用普通解释任务的长生成预算。
+    public var maxOutputTokensOverride: Int?
 
     public init(
         task: TaskKind,
@@ -2174,7 +2175,11 @@ public struct TaskRequest: Sendable, Hashable {
         polishStyle: String? = nil,
         summaryMode: SummaryMode? = nil,
         explanationMode: ExplanationMode? = nil,
-        todoExtractionMode: TodoExtractionMode? = nil
+        todoExtractionMode: TodoExtractionMode? = nil,
+        systemPromptOverride: String? = nil,
+        userPromptOverride: String? = nil,
+        thinkingModeOverride: Bool? = nil,
+        maxOutputTokensOverride: Int? = nil
     ) {
         self.task = task
         self.inputText = inputText
@@ -2186,6 +2191,10 @@ public struct TaskRequest: Sendable, Hashable {
         self.summaryMode = summaryMode
         self.explanationMode = explanationMode
         self.todoExtractionMode = todoExtractionMode
+        self.systemPromptOverride = systemPromptOverride
+        self.userPromptOverride = userPromptOverride
+        self.thinkingModeOverride = thinkingModeOverride
+        self.maxOutputTokensOverride = maxOutputTokensOverride.map { max(1, $0) }
     }
 }
 

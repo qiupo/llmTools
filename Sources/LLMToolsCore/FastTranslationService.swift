@@ -896,7 +896,7 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
     }
 
     func waitUntilReady() async throws -> FastTranslationSidecarEvent {
-        try await Task.detached(priority: .userInitiated) { [self] in
+        let task = Task.detached(priority: .userInitiated) { [self] in
             while true {
                 let event = try readEvent()
                 switch event.type {
@@ -919,7 +919,13 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
                     continue
                 }
             }
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+            self.stop()
+        }
     }
 
     func translate(
@@ -927,9 +933,15 @@ private final class FastTranslationProcessSession: @unchecked Sendable {
         pair: LanguagePair,
         resolution: FastTranslationCommandRunner.CommandResolution
     ) async throws -> [FastTranslatedSegment] {
-        try await Task.detached(priority: .userInitiated) { [self] in
+        let task = Task.detached(priority: .userInitiated) { [self] in
             try translateSync(batch: batch, pair: pair, resolution: resolution)
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+            self.stop()
+        }
     }
 
     func cancel(requestID: String) {

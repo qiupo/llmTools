@@ -23,7 +23,8 @@ Latest release: [v0.5.1](https://github.com/qiupo/llmTools/releases/tag/v0.5.1)
 - Local language routing, file-scope speaker diarization, fast MT routing, and engine-isolated webpage translation cache.
 - A separate local-only Meeting Transcription & Notes window for microphone, system audio, and offline audio/video input, with editable transcript rows, speaker correction, Chinese notes, recovery drafts, and Markdown/TXT/JSON export.
 - Local-only Text to Speech powered by VoxCPM2 bf16/4bit: Quick Action provides direct text, voice, delivery-style, preview, playback, and WAV/M4A export controls, while the separate workbench keeps reviewed multi-role scripts, resumable generation, and SRT export.
-- Pin controls for Quick Action, selection actions, the floating widget, Live Subtitles, and Meeting Transcription windows.
+- A local-only desktop context assistant with a 48pt movable orb, explicit one-shot inquiries, recent suggestion cards, and no background remote-provider calls.
+- Pin controls for Quick Action, selection actions, Live Subtitles, and Meeting Transcription windows. The desktop context assistant is always floating and has no pin control.
 - Capability-aware model settings with text-only, vision-capable, inferred, probed, and manual override states.
 - Privacy-oriented webpage diagnostics: hashed page/domain identifiers, no raw page text in diagnostics by default.
 - Release workflow that packages a macOS `.app` bundle and publishes GitHub Release assets.
@@ -39,7 +40,8 @@ Meeting transcription is independent from the low-latency Live Subtitles overlay
 | Feature | Entry | How to use it |
 | --- | --- | --- |
 | Selected-text Quick Action | Select text in another app, then press `Option + Space` | Choose Translate, Polish, Summarize, Explain, or Extract TODOs. Detailed translation prefers an enabled local quality model and includes alternatives, key vocabulary, and language notes. Source, translation, and key terms share the solidified `温柔女旁白` VoxCPM2 voice; clicking another read-aloud item cancels and replaces the active request. Grant Accessibility permission if automatic selection capture is needed. |
-| Pasted text and files | Status menu -> `Open Quick Action` or `Open Floating Widget` | Paste text, paste an image, or drag a supported file, choose a task/model, then copy or export the result. |
+| Pasted text and files | Status menu -> `Open Quick Action` | Paste text, paste an image, or drag a supported file, choose a task/model, then copy or export the result. |
+| Desktop context assistant | Status menu -> `Enable Desktop Context Assistant` | Complete the three-step local privacy setup. Normal first-run mode defaults to Moderate and runs the 24-fixture local model check; until it qualifies, proactive suggestions stay Quiet. Click the orb for Quick Ask, hover for recent suggestions or clipboard actions, or drag the orb freely between displays. |
 | Quick speech generation | Quick Action -> `Speech` | Enter text, choose a voice and delivery style, preview the selected voice, generate local speech, then play or export WAV/M4A. |
 | Image OCR and explanation | Status menu -> `Image OCR` | In Settings -> `OCR`, select a vision-capable local or remote model, then paste, drag, or choose an image and run OCR, structured extraction, translation, or explanation. |
 | Webpage translation | Settings -> `Web Page Translation`, then the Chromium extension popup | Repair the local browser bridge, load `browser-extension/chromium` as an unpacked extension, grant site access, and translate/restore the current page from the popup. |
@@ -47,7 +49,7 @@ Meeting transcription is independent from the low-latency Live Subtitles overlay
 | Desktop Live Subtitles | Status menu -> `Start Live Subtitles`, or the configured global shortcut | Select a realtime local ASR model in Settings -> `Media`, choose microphone, system audio, or both, then read the native floating overlay. |
 | Meeting Transcription & Notes | Status menu -> `会议转写与纪要` | Configure local meeting models in Settings -> `Meeting`, start microphone/system capture or import a local audio/video file, edit transcript/speakers, stop, optionally finalize, generate local Chinese notes, and export. |
 | Local Text to Speech | Status menu -> `文案转语音` | Enter ordinary or long-form copy and optionally review a multi-role script. Use the separate voice manager to design or clone, solidify, and preview voices, then generate, pause/resume playback, and export WAV/M4A/SRT. |
-| Window pinning | Pin icon in a supported tool window | Keep Quick Action, selection actions, the floating widget, Live Subtitles, or Meeting Transcription above other windows until unpinned or the app exits. |
+| Window pinning | Pin icon in a supported tool window | Keep Quick Action, selection actions, Live Subtitles, or Meeting Transcription above other windows until unpinned or the app exits. |
 
 ## Requirements
 

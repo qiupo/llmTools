@@ -5,6 +5,7 @@ import LLMToolsCore
 @MainActor
 final class LocalAppBridgeServer {
     private let appState: AppState
+    weak var assistantCoordinator: AssistantContextCoordinator?
     private var listener: NWListener?
     private var token = UUID().uuidString + UUID().uuidString
     private var runningPort: UInt16?
@@ -172,6 +173,17 @@ final class LocalAppBridgeServer {
                         modelSetup: BridgeModelSetupPayload(availability: availability)
                     )
                 )
+            case ("GET", "/desktopAssistantStatus"):
+                guard let assistantCoordinator else {
+                    sendResponse(connection: connection, statusCode: 500, payload: ["error": "Desktop assistant is unavailable"])
+                    return
+                }
+                // 诊断只导出状态和计数，绝不暴露观察到的正文、应用标识或本地模型标识。
+                sendResponse(
+                    connection: connection,
+                    statusCode: 200,
+                    payload: await assistantCoordinator.bridgeStatusPayload()
+                )
             case ("POST", "/translateSegments"):
                 guard appState.preferences.webPageTranslation.enabled else {
                     sendResponse(
@@ -207,6 +219,7 @@ final class LocalAppBridgeServer {
                     )
                 }
                 activeJobs[payload.jobID, default: [:]][taskID] = task
+                assistantCoordinator?.userModelActivityDidChange(true)
                 do {
                     let result = try await task.value
                     finishActiveJob(jobID: payload.jobID, taskID: taskID)
@@ -317,6 +330,9 @@ final class LocalAppBridgeServer {
     private func finishActiveJob(jobID: String, taskID: UUID) {
         removeActiveJob(jobID: jobID, taskID: taskID)
         appState.endExternalModelUse()
+        assistantCoordinator?.userModelActivityDidChange(
+            appState.assistantUserModelWorkIsActive || !activeJobs.isEmpty
+        )
     }
 
     private func removeActiveJob(jobID: String, taskID: UUID) {
