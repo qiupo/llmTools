@@ -589,15 +589,17 @@ final class AssistantContextCoordinator: ObservableObject {
         userModelWorkIsActive = appState.assistantUserModelWorkIsActive
         _ = await recomputeQualificationStates()
         hasBootstrapped = true
-        if preferences.isEnabled, preferences.hasCompletedCurrentOnboarding {
-            let usesEnhancedWindowContext = preferences.foregroundApplicationContextEnabled
-                && preferences.enhancedWindowContextEnabled
-            SelectedTextService.showPermissionGuideIfNeeded(
-                requiresAccessibility: usesEnhancedWindowContext || preferences.selectionContextEnabled,
-                requiresScreenRecording: usesEnhancedWindowContext
-            )
-        }
         refreshObservation(loadBehaviorStore: false)
+    }
+
+    func presentStartupPermissionGuideIfNeeded() {
+        guard preferences.isEnabled, preferences.hasCompletedCurrentOnboarding else { return }
+        let usesEnhancedWindowContext = preferences.foregroundApplicationContextEnabled
+            && preferences.enhancedWindowContextEnabled
+        SelectedTextService.showPermissionGuideIfNeeded(
+            requiresAccessibility: usesEnhancedWindowContext || preferences.selectionContextEnabled,
+            requiresScreenRecording: usesEnhancedWindowContext
+        )
     }
 
     func preferencesDidChange(_ preferences: DesktopAssistantPreferences) {
@@ -4269,7 +4271,6 @@ private final class AssistantActivityObserver: NSObject {
     private var lastUserActivitySignalAt = Date.distantPast
     private var lastUserActivityAt: Date?
     private var userIsPresent = false
-    private var sessionIsActive = true
     private var lastWindowContextKey: String?
     private var currentSurfaceID: String?
     private var currentSurfaceRevision: UInt64 = 0
@@ -4417,7 +4418,7 @@ private final class AssistantActivityObserver: NSObject {
               visualCaptureTask == nil,
               enhancedWindowContextEnabled,
               userIsPresent,
-              sessionIsActive,
+              Self.sessionIsActive,
               coordinator?.visualContextAnalysisIsEnabled == true,
               coordinator?.backgroundAssistantRoundIsRunning != true else { return }
         deferredVisualCaptureTrigger = nil
@@ -4448,9 +4449,8 @@ private final class AssistantActivityObserver: NSObject {
         }
         presenceObserverInstalled = true
 
-        sessionIsActive = !Self.screenIsLocked
         let idleSeconds = Self.secondsSinceLastUserInput
-        if sessionIsActive, idleSeconds < Self.userIdleTimeout {
+        if Self.sessionIsActive, idleSeconds < Self.userIdleTimeout {
             lastUserActivityAt = .now.addingTimeInterval(-idleSeconds)
             lastUserActivitySignalAt = lastUserActivityAt ?? .distantPast
             userIsPresent = true
@@ -4484,7 +4484,7 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func noteUserActivity(trigger: VisualCaptureTrigger, occurredAt: Date = .now) {
-        guard sessionIsActive, !Self.screenIsLocked else { return }
+        guard Self.sessionIsActive else { return }
         guard occurredAt.timeIntervalSince(lastUserActivitySignalAt) >= 0.2 else { return }
         lastUserActivitySignalAt = occurredAt
         lastUserActivityAt = occurredAt
@@ -4515,7 +4515,7 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func pollUserActivity() {
-        guard sessionIsActive, !Self.screenIsLocked else {
+        guard Self.sessionIsActive else {
             markUserAbsent(reason: "session-inactive")
             return
         }
@@ -4564,19 +4564,21 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     @objc private func handleSessionBecameInactive() {
-        sessionIsActive = false
         markUserAbsent(reason: "session-inactive")
     }
 
     @objc private func handleSessionBecameActive() {
-        sessionIsActive = !Self.screenIsLocked
-        guard sessionIsActive, Self.secondsSinceLastUserInput < 5 else { return }
+        guard Self.sessionIsActive, Self.secondsSinceLastUserInput < 5 else { return }
         noteUserActivity(trigger: .userInteraction)
     }
 
-    private static var screenIsLocked: Bool {
-        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
-        return (session["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue == true
+    private static var sessionIsActive: Bool {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any],
+              (session[kCGSessionOnConsoleKey as String] as? NSNumber)?.boolValue == true,
+              (session[kCGSessionLoginDoneKey as String] as? NSNumber)?.boolValue == true else { return false }
+        // 通知负责立即暂停；系统真值负责恢复，避免漏收唤醒通知后永久卡在 inactive。
+        return (session["CGSSessionScreenIsLocked"] as? NSNumber)?.boolValue != true
+            && CGDisplayIsAsleep(CGMainDisplayID()) == 0
     }
 
     private static var secondsSinceLastUserInput: TimeInterval {
@@ -4684,7 +4686,7 @@ private final class AssistantActivityObserver: NSObject {
     private func scheduleVisualCapture(after delay: TimeInterval, trigger: VisualCaptureTrigger) {
         guard enhancedWindowContextEnabled,
               userIsPresent,
-              sessionIsActive,
+              Self.sessionIsActive,
               coordinator?.visualContextAnalysisIsEnabled == true else { return }
         // 未授权时不能进入 ScreenCaptureKit，否则后台观察会再次触发系统权限弹窗。
         guard CGPreflightScreenCaptureAccess() else {
@@ -4738,7 +4740,7 @@ private final class AssistantActivityObserver: NSObject {
             guard !Task.isCancelled,
                   generation == visualCaptureGeneration,
                   userIsPresent,
-                  sessionIsActive,
+                  Self.sessionIsActive,
                   let coordinator else { return }
             guard !coordinator.backgroundAssistantRoundIsRunning else {
                 deferredVisualCaptureTrigger = trigger
@@ -4940,7 +4942,6 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func pollClipboard() {
-        pollUserActivity()
         let pasteboard = NSPasteboard.general
         let observedAt = Date.now
         let changeCount = pasteboard.changeCount

@@ -127,6 +127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, HotKeyServiceDelegate,
             applySelectionActionPreference()
             applyHotKeyPreferences()
             refreshStatusMenuItem()
+            // 权限说明使用模态窗口，必须等观察器、bridge 和基础交互完成启动后再展示。
+            assistantCoordinator.presentStartupPermissionGuideIfNeeded()
         }
     }
 
