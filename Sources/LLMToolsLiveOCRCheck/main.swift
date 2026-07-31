@@ -43,6 +43,12 @@ struct LLMToolsLiveOCRCheck {
         let image = try await MainActor.run {
             try makeFixtureImage(preferences: registry.preferences.ocr)
         }
+        let assistantScene: AssistantSceneSummary?
+        if !dedicatedOCR, !model.isRemoteProvider {
+            assistantScene = try await engine.runDesktopAssistantVision(image: image, modelID: model.id)
+        } else {
+            assistantScene = nil
+        }
 
         let ocr = try await engine.runOCR(
             image: image,
@@ -104,6 +110,7 @@ struct LLMToolsLiveOCRCheck {
         print("Model: \(model.name) (\(model.apiModelID ?? model.id.uuidString))")
         print("Model ID: \(model.id.uuidString)")
         print("Probe output: \(probe.map { oneLine($0.message, limit: 180) } ?? "not applicable for dedicated OCR")")
+        print("Assistant scene: \(assistantScene.map { "activity=\($0.activity), signal=\($0.signal), confidence=\($0.confidence)" } ?? "not run")")
         print("OCR output: \(oneLine(ocr.text, limit: 240))")
         print("Structured output: \(structured.map { oneLine($0.text, limit: 240) } ?? "not run")")
         print("Explanation output: \(explanation.map { oneLine($0.text, limit: 240) } ?? "not run")")

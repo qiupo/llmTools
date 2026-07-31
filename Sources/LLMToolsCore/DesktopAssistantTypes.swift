@@ -698,15 +698,16 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
         if stage == .capture, state == .scheduled,
            let delay = diagnosticToken("delay") {
             let includesCooldown = detail.contains("cooldown=true")
+            let interval = diagnosticToken("interval") ?? "15s"
             if detail.contains("reset=true") {
                 return localize(
-                    "检测到新操作，截图倒计时已重置为 \(delay)\(includesCooldown ? "（含 15 秒最短间隔）" : "")",
-                    "New activity reset the capture countdown to \(delay)\(includesCooldown ? " (includes the 15-second minimum interval)" : "")"
+                    "检测到新操作，截图倒计时已重置为 \(delay)\(includesCooldown ? "（含 \(interval) 间隔）" : "")",
+                    "New activity reset the capture countdown to \(delay)\(includesCooldown ? " (includes the \(interval) interval)" : "")"
                 )
             }
             return localize(
-                "操作结束后等待 \(delay) 再截图\(includesCooldown ? "（含 15 秒最短间隔）" : "")",
-                "Capture waits \(delay) after activity\(includesCooldown ? " (includes the 15-second minimum interval)" : "")"
+                "操作结束后等待 \(delay) 再截图\(includesCooldown ? "（含 \(interval) 间隔）" : "")",
+                "Capture waits \(delay) after activity\(includesCooldown ? " (includes the \(interval) interval)" : "")"
             )
         }
         switch detail {
@@ -714,6 +715,11 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
             return localize(
                 "前台是 llmTools、桌面或没有普通窗口，本轮截图结束",
                 "llmTools, the desktop, or no regular window is frontmost; capture ended"
+            )
+        case "frontmost-window-changed":
+            return localize(
+                "截图期间前台窗口已变化，旧画面已丢弃",
+                "The frontmost window changed during capture, so the stale frame was discarded"
             )
         case "unchanged-frame":
             return localize(
@@ -735,6 +741,41 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
                 "截图后检测到仍在输入，为避免分析过时画面，本轮视觉理解结束",
                 "Typing resumed after capture, so stale visual analysis was skipped"
             )
+        case "proactivity-inactive":
+            return localize(
+                "当前实际主动程度为安静，本轮不调用视觉模型",
+                "Effective proactivity is Quiet, so the vision model was not called"
+            )
+        case "proactivity-paused":
+            return localize(
+                "主动提示已手动暂停，本轮不调用视觉模型",
+                "Proactive suggestions are paused, so the vision model was not called"
+            )
+        case "proactivity-session-downgraded":
+            return localize(
+                "本次会话已自动降为安静，可在助手设置中恢复",
+                "This session was automatically reduced to Quiet and can be restored in Assistant settings"
+            )
+        case "no-qualified-model":
+            return localize(
+                "没有通过主动判断资格检查的本地模型，本轮结束",
+                "No local model has passed proactive-judgment qualification; the round ended"
+            )
+        case "no-vision-model":
+            return localize(
+                "没有可用于情境截图理解的本地视觉模型，本轮结束",
+                "No local vision model is available for screenshot understanding; the round ended"
+            )
+        case "background-resource-busy":
+            return localize(
+                "本地模型资源刚被另一轮占用，保留触发并稍后重试",
+                "Local model resources were claimed by another round; the trigger was kept for retry"
+            )
+        case "stale-visual-surface":
+            return localize(
+                "视觉理解完成前当前操作已变化，旧结果已丢弃并等待重试",
+                "The current operation changed before visual analysis finished; the stale result was discarded for retry"
+            )
         case "vision-cooldown":
             return localize(
                 "距离上次视觉理解不足 15 秒，本轮结束",
@@ -742,8 +783,8 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
             )
         case "no-evidence-in-window":
             return localize(
-                "8 秒窗口内没有可判断的语义证据，本轮结束",
-                "No semantic evidence was available in the 8-second window; the round ended"
+                "当前触发已没有可用的同情境语义证据，本轮结束",
+                "No current same-context semantic evidence remained for this trigger; the round ended"
             )
         case "duplicate-context-cooldown":
             return localize(
@@ -760,13 +801,26 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
             return localize("前台窗口截图已就绪，准备视觉理解", "The frontmost-window capture is ready for visual analysis")
         }
         if detail.hasPrefix("context-recorded ") {
-            return localize("已得到可用的场景语义，准备进入 8 秒聚合", "Usable scene semantics are ready for the 8-second aggregation")
+            return localize("已得到可用的场景语义，写入当前窗口的短期证据池", "Usable scene semantics were added to the current window's short-term evidence pool")
         }
-        if detail.hasPrefix("aggregation-window=8s ") {
-            let remaining = diagnosticToken("remaining") ?? "8.0s"
+        if detail.hasPrefix("vision-timeout ") {
+            let limit = diagnosticToken("limit") ?? "15s"
             return localize(
-                "证据窗口总长 8 秒，从首条证据开始，当前剩余 \(remaining)",
-                "The 8-second evidence window starts at the first evidence; \(remaining) remains"
+                "本地视觉模型超过 \(limit) 时限，已结束并等待重试",
+                "The local vision model exceeded the \(limit) limit and will retry later"
+            )
+        }
+        if detail.hasPrefix("vision-cancelled ") {
+            return localize("本轮视觉理解因状态变化而取消", "Visual analysis was cancelled because the assistant state changed")
+        }
+        if detail.hasPrefix("vision-model-error ") {
+            return localize("本地视觉模型运行失败，已进入重试等待", "The local vision model failed and will retry later")
+        }
+        if detail.hasPrefix("context-debounce ") {
+            let remaining = diagnosticToken("remaining") ?? "0.8s"
+            return localize(
+                "等待短防抖合并同一操作的并发证据，剩余 \(remaining)",
+                "A short debounce is merging concurrent evidence for this operation; \(remaining) remains"
             )
         }
         if detail.hasPrefix("evidence-ready ") {
@@ -784,8 +838,12 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
         if detail.hasPrefix("model-veto=confidence ") {
             return localize("模型倾向展示，但置信度没达到当前门槛", "The model leaned toward showing this, but its confidence was below the current threshold")
         }
-        if detail.hasPrefix("policy-veto=user-typing ") {
-            return localize("当前仍在输入，为避免打断，本轮选择静默", "Typing is still active, so this round stayed silent to avoid interruption")
+        if detail.hasPrefix("deferred=") {
+            let reason = diagnosticToken("deferred") ?? "busy"
+            return localize(
+                "判断已完成；当前因 \(reason) 延迟展示，条件恢复后继续",
+                "Judgment finished; presentation is deferred for \(reason) and will resume when clear"
+            )
         }
         if detail.hasPrefix("history-veto ") {
             return localize("同类提示近期多次被标记为不相关，本轮选择静默", "Similar suggestions were recently marked irrelevant, so this round stayed silent")
@@ -794,7 +852,7 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
             return localize("不展示气泡，本轮静默结束", "No bubble was shown; this round ended silently")
         }
         if detail.hasPrefix("peek-approved ") {
-            return localize("价值判断通过，准备生成性格表达并展示", "Value judgment passed; preparing the personality response and presentation")
+            return localize("价值判断与文案已通过，准备展示", "Value judgment and final wording passed; preparing presentation")
         }
         return nil
     }
@@ -811,7 +869,7 @@ public extension AssistantDiagnosticStage {
         switch self {
         case .capture: language == .chinese ? "截图" : "capture"
         case .vision: language == .chinese ? "视觉理解" : "vision"
-        case .context: language == .chinese ? "情境聚合" : "context"
+        case .context: language == .chinese ? "情境整合" : "context fusion"
         case .judgment: language == .chinese ? "价值判断" : "judgment"
         case .comment: language == .chinese ? "性格表达" : "comment"
         case .presentation: language == .chinese ? "展示" : "presentation"

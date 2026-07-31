@@ -158,6 +158,11 @@ public struct AssistantPatternCandidate: Sendable, Identifiable, Hashable {
     public var workbenchIsRecoverable: Bool
     /// 混合来源候选中仍可回到 llmTools 工作台的原始上下文引用。
     public var workbenchContextReference: UUID?
+    public var decisionKey: String
+    public var surfaceID: String?
+    public var surfaceRevision: UInt64
+    public var anchorGeneration: UInt64
+    public var sceneSignal: String?
 
     public init(
         id: UUID = UUID(),
@@ -179,7 +184,12 @@ public struct AssistantPatternCandidate: Sendable, Identifiable, Hashable {
         actionIDs: [AssistantActionID],
         availableTaskKinds: [TaskKind] = [],
         workbenchIsRecoverable: Bool = false,
-        workbenchContextReference: UUID? = nil
+        workbenchContextReference: UUID? = nil,
+        decisionKey: String? = nil,
+        surfaceID: String? = nil,
+        surfaceRevision: UInt64 = 0,
+        anchorGeneration: UInt64 = 0,
+        sceneSignal: String? = nil
     ) {
         self.id = id
         self.createdAt = createdAt
@@ -205,10 +215,27 @@ public struct AssistantPatternCandidate: Sendable, Identifiable, Hashable {
         self.availableTaskKinds = Array(Set(availableTaskKinds)).sorted { $0.rawValue < $1.rawValue }
         self.workbenchIsRecoverable = workbenchIsRecoverable
         self.workbenchContextReference = workbenchContextReference
+        self.decisionKey = decisionKey ?? "\(patternType.rawValue)|\(contentFingerprint ?? language ?? id.uuidString)"
+        self.surfaceID = surfaceID
+        self.surfaceRevision = surfaceRevision
+        self.anchorGeneration = anchorGeneration
+        self.sceneSignal = sceneSignal
     }
 
     public var isTaskFailure: Bool {
         patternType == .repeatedFailure && sourceTypes.contains(.llmToolsTask)
+    }
+
+    public var priority: Int {
+        switch patternType {
+        case .repeatedFailure: return 300
+        case .foreignClipboard: return 250
+        case .contextualOpportunity:
+            if sourceTypes.contains(.selection) || sourceTypes.contains(.clipboard) { return 180 }
+            if ["blocked", "deadline", "waiting"].contains(sceneSignal) { return 150 }
+            if sceneSignal == "success" { return 110 }
+            return 80
+        }
     }
 }
 
@@ -220,8 +247,13 @@ public actor AssistantPatternDetector {
     public static let foreignClipboardMinimumCharacterCount = 20
     public static let foreignClipboardMinimumConfidence = 0.80
     public static let foreignClipboardCooldown: TimeInterval = 60 * 60
-    public static let contextOpportunityAggregationWindow: TimeInterval = 8
+    public static let contextOpportunityDebounce: TimeInterval = 0.8
+    public static let contextOpportunityMaximumDebounce: TimeInterval = 2
+    public static let contextOpportunityEvidenceFreshness: TimeInterval = 60
+    public static let contextOpportunityVisualFreshness: TimeInterval = 30
+    public static let contextOpportunityClipboardBridge: TimeInterval = 30
     public static let contextOpportunityCooldown: TimeInterval = 10 * 60
+    public static let candidateReservationTTL: TimeInterval = AssistantContextBuffer.rawContextTTL
 
     private struct FailureSample: Sendable {
         var occurredAt: Date
@@ -245,8 +277,11 @@ public actor AssistantPatternDetector {
     private var clipboardByLanguage: [String: [String: ClipboardSample]] = [:]
     private var failureCooldowns: [String: Date] = [:]
     private var languageCooldowns: [String: Date] = [:]
+    private var failureReservations: [String: Date] = [:]
+    private var languageReservations: [String: Date] = [:]
     private var contextOpportunitySamples: [String: ContextOpportunitySample] = [:]
     private var contextOpportunityCooldowns: [String: Date] = [:]
+    private var contextOpportunityReservations: [String: Date] = [:]
 
     public init() {}
 
@@ -274,9 +309,10 @@ public actor AssistantPatternDetector {
         samples = samples.filter { $0.occurredAt >= now.addingTimeInterval(-Self.evidenceWindow) }
         failuresByFingerprint[fingerprint] = samples
         guard samples.count >= Self.repeatedFailureThreshold,
-              failureCooldowns[fingerprint, default: .distantPast] <= now else { return nil }
+              failureCooldowns[fingerprint, default: .distantPast] <= now,
+              failureReservations[fingerprint, default: .distantPast] <= now else { return nil }
 
-        failureCooldowns[fingerprint] = now.addingTimeInterval(Self.repeatedFailureCooldown)
+        failureReservations[fingerprint] = now.addingTimeInterval(Self.candidateReservationTTL)
         let first = samples.map(\.occurredAt).min() ?? now
         let latest = samples.max { $0.occurredAt < $1.occurredAt } ?? samples[samples.count - 1]
         let recoverableWorkbenchSample = samples
@@ -303,7 +339,8 @@ public actor AssistantPatternDetector {
             confidence: 1,
             actionIDs: actions,
             workbenchIsRecoverable: recoverableWorkbenchSample != nil,
-            workbenchContextReference: recoverableWorkbenchSample?.rawContextReference
+            workbenchContextReference: recoverableWorkbenchSample?.rawContextReference,
+            decisionKey: "repeatedFailure|\(fingerprint)"
         )
     }
 
@@ -329,9 +366,10 @@ public actor AssistantPatternDetector {
         samples = samples.filter { $0.value.occurredAt >= now.addingTimeInterval(-Self.evidenceWindow) }
         clipboardByLanguage[normalizedLanguage] = samples
         guard samples.count >= Self.foreignClipboardThreshold,
-              languageCooldowns[normalizedLanguage, default: .distantPast] <= now else { return nil }
+              languageCooldowns[normalizedLanguage, default: .distantPast] <= now,
+              languageReservations[normalizedLanguage, default: .distantPast] <= now else { return nil }
 
-        languageCooldowns[normalizedLanguage] = now.addingTimeInterval(Self.foreignClipboardCooldown)
+        languageReservations[normalizedLanguage] = now.addingTimeInterval(Self.candidateReservationTTL)
         let first = samples.values.map(\.occurredAt).min() ?? now
         return AssistantPatternCandidate(
             createdAt: now,
@@ -350,7 +388,8 @@ public actor AssistantPatternDetector {
                 .compactMap(\.rawContextReference),
             language: normalizedLanguage,
             confidence: event.confidence,
-            actionIDs: [.enableClipboardTranslation, .translateCurrentClipboard]
+            actionIDs: [.enableClipboardTranslation, .translateCurrentClipboard],
+            decisionKey: "foreignClipboard|\(normalizedLanguage)"
         )
     }
 
@@ -366,9 +405,26 @@ public actor AssistantPatternDetector {
               event.ephemeralContextReference != nil,
               event.expiresAt > now else { return false }
         prune(now: now)
-        let key = "\(event.source.rawValue)|\(fingerprint)"
+        let key = "\(event.source.rawValue)|\(event.contentType?.rawValue ?? "none")|\(event.surfaceID ?? "global")|\(fingerprint)"
+        if event.source == .windowContext, event.contentType == .image {
+            // 同一操作只保留最新视觉状态，旧页面截图不能继续作为当前画面的支持证据。
+            contextOpportunitySamples = contextOpportunitySamples.filter { _, sample in
+                let existing = sample.event
+                return existing.source != .windowContext
+                    || existing.contentType != .image
+                    || existing.surfaceID != event.surfaceID
+                    || existing.surfaceRevision != event.surfaceRevision
+                    || existing.anchorGeneration != event.anchorGeneration
+            }
+        }
         contextOpportunitySamples[key] = ContextOpportunitySample(event: event, fingerprint: fingerprint)
-        return true
+        if [.clipboard, .selection].contains(event.source), event.provenance != .observed {
+            return true
+        }
+        return event.source == .windowContext
+            && event.contentType == .image
+            && event.sceneSignal != nil
+            && event.sceneSignal != "none"
     }
 
     public enum ContextOpportunityFlushResult: Sendable {
@@ -378,32 +434,82 @@ public actor AssistantPatternDetector {
     }
 
     public func flushContextOpportunityResult(
-        windowEnd: Date? = nil,
+        trigger: AssistantActivityEvent? = nil,
         now: Date = .now
     ) -> ContextOpportunityFlushResult {
         prune(now: now)
-        let end = windowEnd ?? now
-        let oldest = end.addingTimeInterval(-Self.contextOpportunityAggregationWindow)
+        guard let trigger else { return .noEvidence }
         let samples = contextOpportunitySamples.values
-            .filter { $0.event.occurredAt >= oldest && $0.event.occurredAt <= end && $0.event.expiresAt > now }
-            .sorted { $0.event.occurredAt < $1.event.occurredAt }
-        // 延迟聚合只消费本轮时间窗，不能误删轮次切换后才到达的样本。
-        contextOpportunitySamples = contextOpportunitySamples.filter { $0.value.event.occurredAt > end }
+            .filter { sample in
+                let event = sample.event
+                guard event.expiresAt > now,
+                      event.occurredAt <= now,
+                      now.timeIntervalSince(event.occurredAt) <= Self.contextOpportunityEvidenceFreshness else {
+                    return false
+                }
+                if event.id == trigger.id { return true }
+                if event.surfaceID == trigger.surfaceID,
+                   event.surfaceRevision == trigger.surfaceRevision {
+                    if event.contentType == .image {
+                        return event.anchorGeneration == trigger.anchorGeneration
+                            && now.timeIntervalSince(event.occurredAt) <= Self.contextOpportunityVisualFreshness
+                    }
+                    if event.contentType == .metadata { return true }
+                    return event.anchorGeneration == trigger.anchorGeneration
+                }
+                return event.source == .clipboard
+                    && event.provenance != .observed
+                    && now.timeIntervalSince(event.occurredAt) <= Self.contextOpportunityClipboardBridge
+            }
+            .sorted { $0.event.occurredAt > $1.event.occurredAt }
         guard !samples.isEmpty else { return .noEvidence }
 
-        // 样本指纹已经是本机 HMAC；再次摘要只用于组合去重，行为记录中不落原文或窗口标题。
-        let keyMaterial = samples
-            .map { "\($0.event.source.rawValue)|\($0.fingerprint)" }
-            .sorted()
-            .joined(separator: "|")
-        let contextKey = SHA256.hash(data: Data(keyMaterial.utf8)).map { String(format: "%02x", $0) }.joined()
-        guard contextOpportunityCooldowns[contextKey, default: .distantPast] <= now else {
+        // 主锚点优先，支持证据按新旧排序；相同正文跨选区/剪贴板只保留一份。
+        var selected: [ContextOpportunitySample] = []
+        var fingerprints = Set<String>()
+        if let primary = samples.first(where: { $0.event.id == trigger.id }) {
+            selected.append(primary)
+            fingerprints.insert(primary.fingerprint)
+        }
+        for sample in samples where !fingerprints.contains(sample.fingerprint) {
+            selected.append(sample)
+            fingerprints.insert(sample.fingerprint)
+            if selected.count == 5 { break }
+        }
+        guard !selected.isEmpty else { return .noEvidence }
+        let primary = selected[0]
+        let decisionIdentity: String
+        if trigger.anchorGeneration > 0 {
+            decisionIdentity = "anchor:\(trigger.anchorGeneration)"
+        } else {
+            decisionIdentity = "content:\(trigger.contentFingerprint ?? primary.fingerprint)"
+        }
+        let decisionKeyMaterial = [
+            trigger.surfaceID ?? trigger.appIdentity ?? "global",
+            "revision:\(trigger.surfaceRevision)",
+            decisionIdentity
+        ].joined(separator: "|")
+        let decisionHash = SHA256.hash(data: Data(decisionKeyMaterial.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let decisionKey = "contextualOpportunity|\(decisionHash)"
+        let cooldownKeyMaterial = [
+            trigger.surfaceID ?? trigger.appIdentity ?? "global",
+            trigger.contentFingerprint ?? primary.fingerprint
+        ].joined(separator: "|")
+        let cooldownKey = SHA256.hash(data: Data(cooldownKeyMaterial.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        guard contextOpportunityCooldowns[cooldownKey, default: .distantPast] <= now else {
             return .duplicateCooldown
         }
-        contextOpportunityCooldowns[contextKey] = now.addingTimeInterval(Self.contextOpportunityCooldown)
+        guard contextOpportunityReservations[decisionKey, default: .distantPast] <= now else {
+            return .duplicateCooldown
+        }
+        contextOpportunityReservations[decisionKey] = now.addingTimeInterval(Self.candidateReservationTTL)
 
-        let events = samples.map(\.event)
-        let latest = events[events.count - 1]
+        let events = selected.map(\.event)
+        let latest = events.max { $0.occurredAt < $1.occurredAt } ?? trigger
         let appIdentities = Set(events.compactMap(\.appIdentity))
         let appIdentity = appIdentities.count == 1 ? appIdentities.first : nil
         let references = events.compactMap(\.ephemeralContextReference)
@@ -415,20 +521,25 @@ public actor AssistantPatternDetector {
             sourceTypes: events.map(\.source),
             appIdentity: appIdentity,
             appCategory: appIdentity.map(AssistantPrivacyPolicy.appCategory),
-            evidenceSummary: "authorized-context count=\(events.count) window=\(Int(Self.contextOpportunityAggregationWindow))s",
+            evidenceSummary: "authorized-context count=\(events.count) anchor=\(trigger.source.rawValue)",
             evidenceCount: events.count,
             durationSeconds: Int(max(0, now.timeIntervalSince(events.first?.occurredAt ?? now))),
-            contentFingerprint: contextKey,
-            rawContextReference: latest.ephemeralContextReference,
+            contentFingerprint: cooldownKey,
+            rawContextReference: trigger.ephemeralContextReference ?? latest.ephemeralContextReference,
             evidenceContextReferences: references,
             confidence: 1,
-            actionIDs: [.openQuickAction],
-            availableTaskKinds: TaskKind.interactiveCases
+            actionIDs: [.clipboard, .selection].contains(trigger.source) ? [.openQuickAction] : [],
+            availableTaskKinds: [.clipboard, .selection].contains(trigger.source) ? TaskKind.interactiveCases : [],
+            decisionKey: decisionKey,
+            surfaceID: trigger.surfaceID,
+            surfaceRevision: trigger.surfaceRevision,
+            anchorGeneration: trigger.anchorGeneration,
+            sceneSignal: trigger.sceneSignal
         ))
     }
 
-    public func flushContextOpportunity(windowEnd: Date? = nil, now: Date = .now) -> AssistantPatternCandidate? {
-        guard case .candidate(let candidate) = flushContextOpportunityResult(windowEnd: windowEnd, now: now) else {
+    public func flushContextOpportunity(trigger: AssistantActivityEvent? = nil, now: Date = .now) -> AssistantPatternCandidate? {
+        guard case .candidate(let candidate) = flushContextOpportunityResult(trigger: trigger, now: now) else {
             return nil
         }
         return candidate
@@ -439,8 +550,11 @@ public actor AssistantPatternDetector {
         clipboardByLanguage.removeAll()
         failureCooldowns.removeAll()
         languageCooldowns.removeAll()
+        failureReservations.removeAll()
+        languageReservations.removeAll()
         contextOpportunitySamples.removeAll()
         contextOpportunityCooldowns.removeAll()
+        contextOpportunityReservations.removeAll()
     }
 
     public func clear(pattern: AssistantPatternType) {
@@ -448,17 +562,50 @@ public actor AssistantPatternDetector {
         case .repeatedFailure:
             failuresByFingerprint.removeAll()
             failureCooldowns.removeAll()
+            failureReservations.removeAll()
         case .foreignClipboard:
             clipboardByLanguage.removeAll()
             languageCooldowns.removeAll()
+            languageReservations.removeAll()
         case .contextualOpportunity:
             contextOpportunitySamples.removeAll()
             contextOpportunityCooldowns.removeAll()
+            contextOpportunityReservations.removeAll()
         }
     }
 
     public func clearContextOpportunitySamples() {
         contextOpportunitySamples.removeAll()
+    }
+
+    public func settle(_ candidate: AssistantPatternCandidate, delivered: Bool, now: Date = .now) {
+        switch candidate.patternType {
+        case .repeatedFailure:
+            guard let key = candidate.contentFingerprint else { return }
+            failureReservations.removeValue(forKey: key)
+            if delivered { failureCooldowns[key] = now.addingTimeInterval(Self.repeatedFailureCooldown) }
+        case .foreignClipboard:
+            guard let key = candidate.language else { return }
+            languageReservations.removeValue(forKey: key)
+            if delivered { languageCooldowns[key] = now.addingTimeInterval(Self.foreignClipboardCooldown) }
+        case .contextualOpportunity:
+            if delivered {
+                // 同一操作的慢截图可能稍后到达；已展示过就继续占住该锚点，避免第二个气泡。
+                contextOpportunityReservations[candidate.decisionKey] = now.addingTimeInterval(Self.contextOpportunityCooldown)
+                let consumedReferences = Set(candidate.evidenceContextReferences)
+                contextOpportunitySamples = contextOpportunitySamples.filter { _, sample in
+                    guard sample.event.provenance != .observed,
+                          let reference = sample.event.ephemeralContextReference else { return true }
+                    return !consumedReferences.contains(reference)
+                }
+            } else {
+                contextOpportunityReservations.removeValue(forKey: candidate.decisionKey)
+            }
+            guard let cooldownKey = candidate.contentFingerprint else { return }
+            if delivered {
+                contextOpportunityCooldowns[cooldownKey] = now.addingTimeInterval(Self.contextOpportunityCooldown)
+            }
+        }
     }
 
     private func prune(now: Date) {
@@ -473,8 +620,14 @@ public actor AssistantPatternDetector {
         }
         failureCooldowns = failureCooldowns.filter { $0.value > now }
         languageCooldowns = languageCooldowns.filter { $0.value > now }
-        contextOpportunitySamples = contextOpportunitySamples.filter { $0.value.event.expiresAt > now }
+        failureReservations = failureReservations.filter { $0.value > now }
+        languageReservations = languageReservations.filter { $0.value > now }
+        let contextOldest = now.addingTimeInterval(-Self.contextOpportunityEvidenceFreshness)
+        contextOpportunitySamples = contextOpportunitySamples.filter {
+            $0.value.event.expiresAt > now && $0.value.event.occurredAt >= contextOldest
+        }
         contextOpportunityCooldowns = contextOpportunityCooldowns.filter { $0.value > now }
+        contextOpportunityReservations = contextOpportunityReservations.filter { $0.value > now }
     }
 }
 
@@ -512,9 +665,16 @@ public struct AssistantCandidateQueue: Sendable, Hashable {
         var removed = candidates.filter { $0.expiresAt <= now || $0.id == candidate.id }
         candidates.removeAll { $0.expiresAt <= now || $0.id == candidate.id }
         guard candidate.expiresAt > now else { return (false, removed) }
+        if let matchingIndex = candidates.firstIndex(where: { $0.decisionKey == candidate.decisionKey }) {
+            removed.append(candidates.remove(at: matchingIndex))
+        }
         if candidates.count >= Self.maximumCount {
-            guard candidate.isTaskFailure,
-                  let index = candidates.firstIndex(where: { !$0.isTaskFailure }) else {
+            guard let index = candidates.indices.min(by: {
+                if candidates[$0].priority != candidates[$1].priority {
+                    return candidates[$0].priority < candidates[$1].priority
+                }
+                return candidates[$0].createdAt < candidates[$1].createdAt
+            }), candidate.priority > candidates[index].priority else {
                 return (false, removed)
             }
             removed.append(candidates.remove(at: index))
@@ -536,7 +696,7 @@ public struct AssistantCandidateQueue: Sendable, Hashable {
         let index = candidates.indices.min { lhs, rhs in
             let left = candidates[lhs]
             let right = candidates[rhs]
-            if left.isTaskFailure != right.isTaskFailure { return left.isTaskFailure }
+            if left.priority != right.priority { return left.priority > right.priority }
             return left.createdAt < right.createdAt
         } ?? candidates.startIndex
         return (candidates.remove(at: index), removed)
@@ -685,6 +845,8 @@ public struct AssistantJudgmentInput: Codable, Sendable, Hashable {
     public var userIsTyping: Bool
     public var isFullScreen: Bool
     public var isPresenting: Bool
+    public var responseLanguage: String
+    public var personality: AssistantPersonality
     public var recentIrrelevantCount: Int
     public var recentBehaviorSummaries: [String]
     public var historicalAggregate: AssistantPatternAggregate?
@@ -709,6 +871,8 @@ public struct AssistantJudgmentInput: Codable, Sendable, Hashable {
         userIsTyping: Bool = false,
         isFullScreen: Bool = false,
         isPresenting: Bool = false,
+        responseLanguage: String = "zh-Hans",
+        personality: AssistantPersonality = .gentle,
         recentIrrelevantCount: Int = 0,
         recentBehaviorSummaries: [String] = [],
         historicalAggregate: AssistantPatternAggregate? = nil,
@@ -725,7 +889,7 @@ public struct AssistantJudgmentInput: Codable, Sendable, Hashable {
             .prefix(5)
             .map { $0 }
         self.allowedEvidenceQuotes = patternType == .contextualOpportunity
-            ? self.ephemeralEvidenceTexts
+            ? self.ephemeralEvidenceTexts.prefix(1)
                 .map { String($0.prefix(80)).trimmingCharacters(in: .whitespacesAndNewlines) }
                 .filter { !$0.isEmpty }
             : []
@@ -741,6 +905,8 @@ public struct AssistantJudgmentInput: Codable, Sendable, Hashable {
         self.userIsTyping = userIsTyping
         self.isFullScreen = isFullScreen
         self.isPresenting = isPresenting
+        self.responseLanguage = String(responseLanguage.prefix(16))
+        self.personality = personality
         self.recentIrrelevantCount = max(0, recentIrrelevantCount)
         self.recentBehaviorSummaries = recentBehaviorSummaries
             .compactMap(privacyPolicy.sanitizeEvidenceSummary)
@@ -832,7 +998,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
 }
 
 public enum AssistantJudgmentContract {
-    public static let promptVersion = 19
+    public static let promptVersion = 21
     public static let minimumActiveConfidence = 0.75
     public static let minimumModerateConfidence = 0.85
     public static let minimumAdjustableConfidence = 0.50
@@ -842,8 +1008,10 @@ public enum AssistantJudgmentContract {
 
     Mandatory veto always wins. mandatoryVetoReasons="none" means there is no veto; never invent another veto. When mandatoryVetoReasons is not "none", or historyPolicy is "suppressRepeatedlyIrrelevant", return false with recommendedPresentation="silent", suggestedActionIDs=[], lockedEvidenceQuote="", and suggestedTask=null. Every other false result uses the same four field values.
 
-    Pattern type and evidenceSufficient are authoritative upstream facts. Never re-detect the pattern or change evidenceSufficient from true to false merely because there is no explicit request, error, or tool. Judge only whether the supplied current facts merit one brief interruption.
+    Pattern type and evidenceSufficient are authoritative upstream facts. Never re-detect the pattern or change evidenceSufficient from true to false merely because there is no explicit request, error, or tool. Judge only whether the supplied current facts merit one brief interruption. userIsTyping, isFullScreen, and isPresenting describe delivery timing only; never use them as value vetoes. containsCode and containsURL are informational; availableActionIDs already excludes unsafe actions.
     A positive result needs confidence>=0.85 for moderate or >=0.75 for active and recommendedPresentation="peek". A contextualOpportunity may be a grounded social observation with no action: use suggestedActionIDs=[], lockedEvidenceQuote="", suggestedTask=null. Never force a tool merely to justify speaking.
+
+    For every positive result, reason is the final one-sentence assistant message shown to the user: write it in responseLanguage, match personality, keep it within 100 characters, and ground every factual phrase in ephemeralEvidenceTexts. Do not include URLs, code, private identifiers, hidden emotion, or off-screen facts. For a false result, reason is only a short diagnostic explanation.
 
     Use only supplied facts and only the PATTERN RECIPE in the current user message; rules and actions for other pattern types do not apply. Apply supplied vetoes strictly, then recognize the explicit positive rules without inventing extra vetoes.
     """
@@ -886,11 +1054,11 @@ public enum AssistantJudgmentContract {
         // 模式和证据充分性来自确定性预筛；模型只评价是否值得打扰，不能重新分类上游事实。
         let patternRecipe: String = switch input.patternType {
         case .repeatedFailure:
-            "PATTERN RECIPE repeatedFailure: evidenceCount, not evidenceTextCount, is the repetition count. explainError and returnToWorkbench are recovery actions when present in availableActionIDs. Return positive for a concrete unresolved error with evidenceCount>=3 and either supplied recovery action. Return false when evidence explicitly describes an intentional tutorial/example, expected output, or successful result. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains only exact supplied recovery IDs."
+            "PATTERN RECIPE repeatedFailure: evidenceCount, not evidenceTextCount, is the repetition count. explainError and returnToWorkbench are recovery actions when present in availableActionIDs. Return positive for a concrete unresolved error with evidenceCount>=3 and either supplied recovery action. Return false when evidence explicitly describes an intentional tutorial/example, expected output, or successful result. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains only exact supplied recovery IDs; reason is the final user-facing message."
         case .foreignClipboard:
-            "PATTERN RECIPE foreignClipboard: upstream detection already proved the language is foreign; English may be foreign, so do not re-detect language. Decide only topic coherence. Sections of one document or workflow are coherent even when details differ, for example installation, configuration, validation, and troubleshooting. Clearly different domains such as weather, software news, and cooking are unrelated. Absence of a translation request is not a refusal. NEGATIVE OVERRIDE: passive media or evidence saying \"no translation task was requested\" MUST be false. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains enableClipboardTranslation, translateCurrentClipboard, or both when supplied."
+            "PATTERN RECIPE foreignClipboard: upstream detection already proved the language is foreign; English may be foreign, so do not re-detect language. Decide only topic coherence. Sections of one document or workflow are coherent even when details differ, for example installation, configuration, validation, and troubleshooting. Clearly different domains such as weather, software news, and cooking are unrelated. Absence of a translation request is not a refusal. NEGATIVE OVERRIDE: passive media or evidence saying \"no translation task was requested\" MUST be false. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains enableClipboardTranslation, translateCurrentClipboard, or both when supplied; reason is the final user-facing message."
         case .contextualOpportunity:
-            "PATTERN RECIPE contextualOpportunity: evidenceSufficient=true means evidence is concrete and current; do not require an explicit request, error, tool, or next step. Return positive when the supplied facts support a specific timely companion remark: an imminent unresolved deadline, concrete blocker, foreign content with a stated response need, multiple blockers/tasks without owners, explicit success/fatigue/confusion, visible progress or a completed milestone, repeated focused work, or a clear transition between work stages. Return false when evidence is generic or ambiguous, only names an app/page, shows routine navigation or settings with no salient detail, is unchanged, or is ordinary passive reading with no specific current observation worth acknowledging. DEFAULT POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null. Use openQuickAction only when clearly useful, never use an action from another pattern. Never infer hidden emotion or off-screen facts."
+            "PATTERN RECIPE contextualOpportunity: evidenceSufficient=true means evidence is concrete and current; do not require an explicit request, error, tool, or next step. Return positive when the supplied facts support a specific timely companion remark: an imminent unresolved deadline, concrete blocker, foreign content with a stated response need, multiple blockers/tasks without owners, explicit success/fatigue/confusion, visible progress or a completed milestone, repeated focused work, or a clear transition between work stages. Return false when evidence is generic or ambiguous, only names an app/page, shows routine navigation or settings with no salient detail, is unchanged, or is ordinary passive reading with no specific current observation worth acknowledging. DEFAULT POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null, reason is the final grounded user-facing message. Use openQuickAction only when clearly useful, never use an action from another pattern. Never infer hidden emotion or off-screen facts."
         }
         let falseInvariant = "FALSE RECIPE: for every false result copy these exact field values: recommendedPresentation=\"silent\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null."
         let finalRecipe = mandatoryVetoReasons.isEmpty && !suppressRepeatedlyIrrelevant
@@ -917,6 +1085,12 @@ public enum AssistantJudgmentContract {
               !AssistantPrivacyPolicy.looksSensitive(output.reason),
               output.suggestedActionIDs.count <= 2,
               Set(output.suggestedActionIDs).isSubset(of: Set(input.availableActionIDs)) else { return nil }
+        if output.isHighValue {
+            guard output.reason.count <= 100,
+                  !output.reason.contains("\n"),
+                  !AssistantPrivacyPolicy.containsWebURL(output.reason),
+                  !AssistantPrivacyPolicy.looksLikeCode(output.reason) else { return nil }
+        }
         // 安全门由运行时再次执行，不能只相信模型遵守提示词。
         guard !output.isHighValue
             || (mandatoryVetoReasons(for: input).isEmpty && !input.suppressesRepeatedlyIrrelevantFeedback) else {
@@ -983,11 +1157,6 @@ public enum AssistantJudgmentContract {
         var reasons: [String] = []
         if input.sensitivity != .normal { reasons.append("sensitivity") }
         if !input.evidenceSufficient { reasons.append("evidenceSufficient") }
-        if input.userIsTyping { reasons.append("userIsTyping") }
-        if input.isFullScreen { reasons.append("isFullScreen") }
-        if input.isPresenting { reasons.append("isPresenting") }
-        if input.containsCode { reasons.append("containsCode") }
-        if input.containsURL { reasons.append("containsURL") }
         if input.ephemeralEvidenceTexts.isEmpty { reasons.append("emptyEvidence") }
         if input.patternType == .contextualOpportunity,
            input.sourceTypes.allSatisfy({ ![AssistantSource.clipboard, .selection, .windowContext].contains($0) }) {
@@ -1042,7 +1211,7 @@ public struct AssistantJudgmentFixture: Sendable, Identifiable, Hashable {
 }
 
 public enum AssistantJudgmentFixtures {
-    public static let version = 9
+    public static let version = 10
 
     public static let all: [AssistantJudgmentFixture] = {
         let p01Actions: [AssistantActionID] = [.explainError, .returnToWorkbench]
@@ -1060,18 +1229,18 @@ public enum AssistantJudgmentFixtures {
             fixture("p03-es", .foreignClipboard, "same-language=es distinct=5 window=300s", ["El documento explica el flujo de trabajo de traducción local.", "La siguiente sección presenta las opciones de privacidad.", "Al final se describen los pasos de verificación."], 5, 300, [.clipboard], p03Actions, confidence: 0.97, appCategory: "productivity"),
             fixture("p06-summary", .contextualOpportunity, "authorized-context count=2 window=8s", ["Five release-note items are still unresolved, and review begins in ten minutes.", "Release checklist"], 2, 6, [.clipboard, .windowContext], p06Actions, appCategory: "productivity", tasks: p06Tasks),
             fixture("p06-explain", .contextualOpportunity, "authorized-context count=1 window=8s", ["The local signing check keeps rejecting this package with an entitlement mismatch; the release is blocked."], 1, 0, [.selection], p06Actions, appCategory: "development", tasks: p06Tasks),
-            fixture("p06-progress", .contextualOpportunity, "authorized-context count=1 window=8s", ["activity=coding; signal=success; observation=The build panel shows all 24 checks passing beside the current editor; visibleText=24/24 passed"], 1, 0, [.windowContext], p06Actions, appCategory: "development", tasks: p06Tasks),
-            fixture("p06-transition", .contextualOpportunity, "authorized-context count=2 window=8s", ["activity=coding; signal=none; observation=The implementation is open at its final validation step.", "activity=terminal; signal=success; observation=The validation command has completed successfully."], 2, 5, [.windowContext], p06Actions, appCategory: "development", tasks: p06Tasks)
+            fixture("p06-progress", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=coding; signal=success; observation=The build panel shows all 24 checks passing beside the current editor; visibleText=24/24 passed"], 1, 0, [.windowContext], [], appCategory: "development"),
+            fixture("p06-transition", .contextualOpportunity, "authorized-context count=2 anchor=windowContext", ["activity=coding; signal=none; observation=The implementation is open at its final validation step.", "activity=terminal; signal=success; observation=The validation command has completed successfully."], 2, 5, [.windowContext], [], appCategory: "development")
         ]
         let negatives: [AssistantJudgmentFixture] = [
             fixture("n-sensitive", .contextualOpportunity, "sensitive content suppressed", ["password=do-not-send"], 1, 0, [.clipboard], p06Actions, sensitivity: .sensitive, tasks: p06Tasks, expected: false, hard: true),
             fixture("n-excluded", .contextualOpportunity, "excluded application", ["Summarize this private vault entry."], 1, 0, [.clipboard], p06Actions, sensitivity: .excludedApplication, tasks: p06Tasks, expected: false, hard: true),
-            fixture("n-fullscreen", .contextualOpportunity, "authorized-context count=1 window=8s", ["Summarize these release notes now."], 1, 0, [.clipboard], p06Actions, fullScreen: true, presenting: true, tasks: p06Tasks, expected: false, hard: true),
+            fixture("n-fullscreen", .contextualOpportunity, "ordinary full-screen playback", ["A full-screen video is playing without a deadline, blocker, or completed milestone."], 1, 0, [.windowContext], [], fullScreen: true, expected: false),
             fixture("n-insufficient", .contextualOpportunity, "window metadata only", [], 1, 0, [.windowContext], p06Actions, evidenceSufficient: false, tasks: p06Tasks, expected: false, hard: true),
             fixture("n-benign-error-text", .repeatedFailure, "same-error-signature count=3 window=180s", ["The tutorial intentionally prints the word error as a successful example."], 3, 180, [.clipboard], [.explainError], appCategory: "browser", expected: false),
             fixture("n-unrelated-foreign", .foreignClipboard, "same-language=en distinct=3 window=180s", ["Tomorrow will be sunny with light wind.", "A new software release was announced today.", "Bake the bread until the crust turns golden."], 3, 180, [.clipboard], p03Actions, confidence: 0.99, appCategory: "browser", expected: false),
-            fixture("n-code-copy", .contextualOpportunity, "code and URL context", ["func load() async throws { return try await runner.generate() } // https://example.com/runner"], 1, 0, [.clipboard], p06Actions, code: true, tasks: p06Tasks, expected: false, hard: true),
-            fixture("n-typing", .contextualOpportunity, "actionable text while typing", ["Summarize this draft before I send it."], 1, 0, [.clipboard], p06Actions, typing: true, tasks: p06Tasks, expected: false, hard: true),
+            fixture("n-code-copy", .contextualOpportunity, "routine code and URL context", ["func load() async throws { return try await runner.generate() } // https://example.com/runner"], 1, 0, [.clipboard], [], code: true, expected: false),
+            fixture("n-typing", .contextualOpportunity, "unfinished draft while typing", ["A draft is mid-sentence without a completed request, blocker, deadline, or milestone."], 1, 0, [.selection], p06Actions, typing: true, tasks: p06Tasks, expected: false),
             fixture("n-watching-video", .foreignClipboard, "watching a training video", ["These copied captions are notes from a video being watched; no translation task was requested."], 3, 540, [.clipboard], p03Actions, confidence: 0.96, appCategory: "media", expected: false),
             fixture("n-history-irrelevant", .contextualOpportunity, "normal long reading with repeated irrelevant feedback", ["The user is reading a long documentation chapter without asking for an operation."], 1, 540, [.clipboard], p06Actions, appCategory: "browser", historicalAggregate: AssistantPatternAggregate(detectedCount: 8, presentedCount: 6, actedCount: 0, irrelevantCount: 5), tasks: p06Tasks, expected: false),
             fixture("n-normal-app-switch", .contextualOpportunity, "normal IDE browser terminal switching", [], 3, 180, [.foregroundApplication], p06Actions, appCategory: "development", evidenceSufficient: false, tasks: p06Tasks, expected: false, hard: true),

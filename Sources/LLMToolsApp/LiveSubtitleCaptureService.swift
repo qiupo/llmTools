@@ -111,6 +111,16 @@ final class LiveSubtitleCaptureService: NSObject, @unchecked Sendable {
     }
 
     private func startSystemAudio(token: UUID) async throws {
+        guard CGPreflightScreenCaptureAccess() else {
+            // 系统音频和屏幕截图共用录屏权限；必须先走应用引导，不能让 ScreenCaptureKit 直接弹 TCC。
+            await SelectedTextService.showPermissionGuideIfNeeded(
+                requiresAccessibility: false,
+                requiresScreenRecording: true
+            )
+            throw LiveSubtitleCaptureServiceError.systemAudioUnavailable(
+                "Screen Recording permission is required."
+            )
+        }
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.current

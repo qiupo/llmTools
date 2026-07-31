@@ -21,6 +21,12 @@ public enum AssistantContentType: String, Codable, Sendable, CaseIterable, Hasha
     case media
 }
 
+public enum AssistantEvidenceProvenance: String, Codable, Sendable, CaseIterable, Hashable {
+    case explicit
+    case observed
+    case uncertain
+}
+
 public enum AssistantDropKind: String, Sendable, Hashable {
     case text
     case textFile
@@ -137,6 +143,11 @@ public struct AssistantActivityEvent: Codable, Sendable, Identifiable, Hashable 
     public var sensitivity: AssistantSensitivity
     public var confidence: Double
     public var occurrenceCount: Int
+    public var surfaceID: String?
+    public var surfaceRevision: UInt64
+    public var anchorGeneration: UInt64
+    public var provenance: AssistantEvidenceProvenance
+    public var sceneSignal: String?
     public var ephemeralContextReference: UUID?
     public var expiresAt: Date
 
@@ -153,6 +164,11 @@ public struct AssistantActivityEvent: Codable, Sendable, Identifiable, Hashable 
         sensitivity: AssistantSensitivity = .normal,
         confidence: Double = 1,
         occurrenceCount: Int = 1,
+        surfaceID: String? = nil,
+        surfaceRevision: UInt64 = 0,
+        anchorGeneration: UInt64 = 0,
+        provenance: AssistantEvidenceProvenance = .observed,
+        sceneSignal: String? = nil,
         ephemeralContextReference: UUID? = nil,
         expiresAt: Date? = nil
     ) {
@@ -168,8 +184,58 @@ public struct AssistantActivityEvent: Codable, Sendable, Identifiable, Hashable 
         self.sensitivity = sensitivity
         self.confidence = min(max(confidence, 0), 1)
         self.occurrenceCount = max(1, occurrenceCount)
+        self.surfaceID = surfaceID
+        self.surfaceRevision = surfaceRevision
+        self.anchorGeneration = anchorGeneration
+        self.provenance = provenance
+        self.sceneSignal = sceneSignal.map { String($0.prefix(24)) }
         self.ephemeralContextReference = ephemeralContextReference
         self.expiresAt = expiresAt ?? occurredAt.addingTimeInterval(60 * 60)
+    }
+}
+
+public struct AssistantContextOpportunityBatch: Sendable {
+    private var triggersByBucket: [String: AssistantActivityEvent] = [:]
+
+    public init() {}
+
+    public var count: Int { triggersByBucket.count }
+
+    @discardableResult
+    public mutating func insert(_ trigger: AssistantActivityEvent) -> AssistantActivityEvent {
+        let key = [
+            trigger.surfaceID ?? trigger.appIdentity ?? "global",
+            "revision:\(trigger.surfaceRevision)",
+            trigger.anchorGeneration > 0 ? "anchor:\(trigger.anchorGeneration)" : "source:\(trigger.source.rawValue)"
+        ].joined(separator: "|")
+        guard let pending = triggersByBucket[key] else {
+            triggersByBucket[key] = trigger
+            return trigger
+        }
+        let rank: (AssistantEvidenceProvenance) -> Int = {
+            switch $0 {
+            case .explicit: 2
+            case .observed: 1
+            case .uncertain: 0
+            }
+        }
+        // 同一操作内明确输入优先；不同 surface/anchor 保持为独立桶，不互相覆盖。
+        if rank(trigger.provenance) > rank(pending.provenance)
+            || rank(trigger.provenance) == rank(pending.provenance)
+                && trigger.occurredAt >= pending.occurredAt {
+            triggersByBucket[key] = trigger
+            return trigger
+        }
+        return pending
+    }
+
+    public mutating func drain() -> [AssistantActivityEvent] {
+        defer { triggersByBucket.removeAll() }
+        return triggersByBucket.values.sorted { $0.occurredAt < $1.occurredAt }
+    }
+
+    public mutating func removeAll() {
+        triggersByBucket.removeAll()
     }
 }
 
@@ -202,6 +268,54 @@ public actor AssistantContextBuffer {
         event.expiresAt = min(event.expiresAt, event.occurredAt.addingTimeInterval(Self.eventTTL))
 
         let raw = rawText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        // 同来源、同窗口、同指纹只累计次数。原文引用必须稳定，否则已排队候选会在重复回调后失去依据。
+        if let fingerprint = event.contentFingerprint,
+           let index = events.lastIndex(where: {
+               $0.type == event.type
+                   && $0.source == event.source
+                   && $0.appIdentity == event.appIdentity
+                   && $0.surfaceID == event.surfaceID
+                   && $0.contentFingerprint == fingerprint
+           }) {
+            let isNewest = event.occurredAt >= events[index].occurredAt
+            let reference: UUID?
+            if event.sensitivity == .normal,
+               let raw,
+               !raw.isEmpty,
+               raw.count <= Self.maximumClipboardTextLength {
+                let rawReference = events[index].ephemeralContextReference ?? UUID()
+                reference = rawReference
+                let incomingExpiry = event.occurredAt.addingTimeInterval(Self.rawContextTTL)
+                if isNewest || rawContexts[rawReference] == nil {
+                    rawContexts[rawReference] = RawContext(
+                        source: event.source,
+                        text: raw,
+                        expiresAt: max(rawContexts[rawReference]?.expiresAt ?? .distantPast, incomingExpiry)
+                    )
+                }
+            } else if event.sensitivity == .normal {
+                reference = events[index].ephemeralContextReference
+            } else {
+                if let oldReference = events[index].ephemeralContextReference {
+                    rawContexts.removeValue(forKey: oldReference)
+                }
+                reference = nil
+            }
+            events[index].occurredAt = max(events[index].occurredAt, event.occurredAt)
+            events[index].expiresAt = max(events[index].expiresAt, event.expiresAt)
+            events[index].confidence = max(events[index].confidence, event.confidence)
+            events[index].occurrenceCount += event.occurrenceCount
+            if isNewest {
+                events[index].sanitizedSummary = event.sanitizedSummary ?? events[index].sanitizedSummary
+                events[index].provenance = event.provenance
+                events[index].sceneSignal = event.sceneSignal ?? events[index].sceneSignal
+            }
+            events[index].surfaceRevision = max(events[index].surfaceRevision, event.surfaceRevision)
+            events[index].anchorGeneration = max(events[index].anchorGeneration, event.anchorGeneration)
+            events[index].ephemeralContextReference = reference
+            return events[index]
+        }
+
         if event.sensitivity == .normal,
            let raw,
            !raw.isEmpty,
@@ -221,26 +335,6 @@ public actor AssistantContextBuffer {
                 // 超长正文只保留清洗后的首尾摘要；完整原文永不进入短期 raw context。
                 event.sanitizedSummary = AssistantPrivacyPolicy().sanitizeOversizedContextSummary(raw)
             }
-        }
-
-        // 同来源、同应用、同指纹只累计次数，避免剪贴板轮询或重复回调挤满队列。
-        if let fingerprint = event.contentFingerprint,
-           let index = events.lastIndex(where: {
-               $0.type == event.type
-                   && $0.source == event.source
-                   && $0.appIdentity == event.appIdentity
-                   && $0.contentFingerprint == fingerprint
-           }) {
-            if let oldReference = events[index].ephemeralContextReference,
-               oldReference != event.ephemeralContextReference {
-                rawContexts.removeValue(forKey: oldReference)
-            }
-            events[index].occurredAt = max(events[index].occurredAt, event.occurredAt)
-            events[index].expiresAt = event.expiresAt
-            events[index].confidence = max(events[index].confidence, event.confidence)
-            events[index].occurrenceCount += event.occurrenceCount
-            events[index].ephemeralContextReference = event.ephemeralContextReference
-            return events[index]
         }
 
         events.append(event)

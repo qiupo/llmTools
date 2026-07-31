@@ -91,7 +91,7 @@ public struct TranslationStudyResult: Decodable, Sendable, Hashable {
         notes = (try? container.decode([String].self, forKey: .notes)) ?? []
     }
 
-    public static func parse(modelText: String) -> TranslationStudyResult? {
+    public static func parse(modelText: String, sourceText: String? = nil) -> TranslationStudyResult? {
         let trimmed = VisibleOutput.from(rawText: modelText)
         guard !trimmed.isEmpty else { return nil }
 
@@ -114,7 +114,15 @@ public struct TranslationStudyResult: Decodable, Sendable, Hashable {
                 .filter { $0 != result.translation }
                 .prefix(3)
                 .map { $0 }
+            let hadKeyTerms = !result.keyTerms.isEmpty
             result.keyTerms = result.keyTerms.compactMap(normalizedTerm).prefix(8).map { $0 }
+            if let sourceText, !sourceText.isEmpty {
+                result.keyTerms = result.keyTerms.filter {
+                    sourceText.range(of: $0.term, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+                }
+            }
+            // 模型照抄提示词占位项时，不能把模板误当成真实的语言详解。
+            guard !hadKeyTerms || !result.keyTerms.isEmpty else { continue }
             result.notes = uniqueNonEmpty(result.notes).prefix(4).map { $0 }
             return result
         }
@@ -124,7 +132,12 @@ public struct TranslationStudyResult: Decodable, Sendable, Hashable {
     private static func normalizedTerm(_ value: TranslationKeyTerm) -> TranslationKeyTerm? {
         var term = value
         term.term = normalized(term.term)
-        guard !term.term.isEmpty else { return nil }
+        let lowercasedTerm = term.term.lowercased()
+        guard !term.term.isEmpty,
+              !lowercasedTerm.contains("source-language word or phrase"),
+              !term.term.contains("源语言单词或短语") else {
+            return nil
+        }
         term.pronunciation = normalized(term.pronunciation)
         term.partOfSpeech = normalized(term.partOfSpeech)
         term.meaning = normalized(term.meaning)

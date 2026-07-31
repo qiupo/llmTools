@@ -3,6 +3,7 @@ import MLXLMCommon
 
 public enum LocalGenerationPolicy {
     public static let maximumThinkingTokens = 256
+    public static let maximumDetailedTranslationTokens = 8_192
     public static let maximumStructuredOCRPostProcessingCharacters = 1_024
 
     public static func maxTokens(for task: TaskKind) -> Int {
@@ -26,7 +27,7 @@ public enum LocalGenerationPolicy {
         override: Int? = nil
     ) -> Int {
         let regularLimit = maxTokens(for: task)
-        let requestedLimit = override.map { min(max(1, $0), regularLimit) } ?? regularLimit
+        let requestedLimit = override.map { min(max(1, $0), maximumDetailedTranslationTokens) } ?? regularLimit
         guard thinkingModeEnabled else { return requestedLimit }
         // 小模型可能把全部预算耗在隐藏思考里；限制首轮预算，未产出正文时由 runner 关闭思考重试。
         return min(requestedLimit, maximumThinkingTokens)

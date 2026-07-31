@@ -7,7 +7,15 @@ import UniformTypeIdentifiers
 
 @MainActor
 enum DesktopAssistantScreenCapture {
-    static func captureFrontmostWindow() async throws -> (image: OCRImageInput, bundleID: String)? {
+    static func captureFrontmostWindow() async throws -> (
+        image: OCRImageInput,
+        bundleID: String,
+        processIdentifier: pid_t,
+        windowID: CGWindowID,
+        capturedAt: Date
+    )? {
+        // 所有调用者最终都经过这里，避免未来新增入口绕过权限预检后直接触发系统弹窗。
+        guard CGPreflightScreenCaptureAccess() else { return nil }
         guard let application = NSWorkspace.shared.frontmostApplication,
               application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
               let bundleID = application.bundleIdentifier else { return nil }
@@ -18,9 +26,8 @@ enum DesktopAssistantScreenCapture {
                 && $0.frame.width >= 160
                 && $0.frame.height >= 120
         }
-        let frontWindowID = frontmostWindowID(processIdentifier: application.processIdentifier)
-        guard let window = candidates.first(where: { $0.windowID == frontWindowID })
-                ?? candidates.max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }) else {
+        guard let frontWindowID = frontmostWindowID(processIdentifier: application.processIdentifier),
+              let window = candidates.first(where: { $0.windowID == frontWindowID }) else {
             return nil
         }
 
@@ -38,6 +45,7 @@ enum DesktopAssistantScreenCapture {
             contentFilter: filter,
             configuration: configuration
         )
+        let capturedAt = Date.now
         let data = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             data,
@@ -59,11 +67,14 @@ enum DesktopAssistantScreenCapture {
                 contentHash: hash,
                 sourceDescription: "Foreground window snapshot"
             ),
-            bundleID
+            bundleID,
+            application.processIdentifier,
+            window.windowID,
+            capturedAt
         )
     }
 
-    private static func frontmostWindowID(processIdentifier: pid_t) -> CGWindowID? {
+    static func frontmostWindowID(processIdentifier: pid_t) -> CGWindowID? {
         guard let windows = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
             kCGNullWindowID

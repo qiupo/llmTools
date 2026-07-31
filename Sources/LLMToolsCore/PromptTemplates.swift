@@ -262,36 +262,30 @@ public enum PromptTemplates {
         }
 
         let retryInstruction = isRetry
-            ? "This is a retry. Return one complete JSON object with every required key."
+            ? "This is a retry. Return one complete JSON object."
             : "Return one complete JSON object."
         return """
         Translate\(sourceInstruction) to \(targetLanguage). \(qualityInstruction)
         \(retryInstruction) Use valid JSON with no Markdown fences or prose outside the object:
         {
-          "translation": "complete primary translation",
-          "alternatives": ["one to three useful alternative translations"],
-          "keyTerms": [
-            {
-              "term": "important source-language word or phrase",
-              "pronunciation": "standard IPA for one word only; empty for phrases or when uncertain",
-              "partOfSpeech": "part of speech",
-              "meaning": "meaning in \(targetLanguage)",
-              "usage": "concise usage or nuance in \(targetLanguage)",
-              "example": "short natural example in the source language",
-              "exampleTranslation": "example translated to \(targetLanguage)"
-            }
-          ],
-          "notes": ["up to four grammar, culture, tone, or ambiguity notes in \(targetLanguage)"]
+          "translation": "",
+          "alternatives": [],
+          "keyTerms": [],
+          "notes": []
         }
 
         Rules:
-        - Keep "translation" complete and faithful; never replace it with a summary.
+        - Replace the empty translation with the complete faithful translation; never copy this blank template.
+        - alternatives: 0 to 3 source-specific alternative translations as JSON strings, never objects.
+        - keyTerms: 0 to 8 source-specific objects with this exact shape:
+          {"term":"","pronunciation":"","partOfSpeech":"","meaning":"","usage":"","example":"","exampleTranslation":""}
+        - For a complete sentence, alternatives must contain 1 to 3 strings and keyTerms must contain 3 to 8 objects when available.
+        - notes: 0 to 4 useful grammar, culture, tone, or ambiguity notes.
+        - Every term must be copied exactly from the Source text, never translated.
+        - pronunciation: exact standard IPA for one source-language word only; never a translation or definition; otherwise an empty string.
+        - meaning, usage, and notes must use \(targetLanguage). example stays in the source language; exampleTranslation uses \(targetLanguage).
         - Resolve ambiguous words from the full context and use standard domain terminology.
-        - For a complete sentence, include at least 1 useful alternative and 3 to 8 key terms when available.
-        - For a single word or very short phrase, include only genuinely useful alternatives and terms.
-        - Never invent pronunciation. Fill it only for a single word when standard IPA is known confidently; otherwise use an empty string.
-        - Keep alternatives, terms, examples, and notes grounded in the source text.
-        - Use empty arrays when a section has no useful content.
+        - Keep every value grounded in the source text. Use an empty array when optional content is not useful.
 
         Source text:
         \(inputText)

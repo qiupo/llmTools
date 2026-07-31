@@ -4,6 +4,11 @@ import Carbon.HIToolbox
 
 @MainActor
 enum SelectedTextService {
+    private enum SystemPermission: Hashable {
+        case accessibility
+        case screenRecording
+    }
+
     private struct CapturedAccessibilitySelection {
         let id: UUID
         let processIdentifier: pid_t
@@ -27,6 +32,8 @@ enum SelectedTextService {
     private static var pasteboardOwnershipEventMonitor: Any?
     private static var lastUserInteractionDate = Date.distantPast
     private static var lastUserCopyShortcutDate = Date.distantPast
+    private static var guidedSystemPermissions: Set<SystemPermission> = []
+    private static var permissionGuideIsPresented = false
     private static let syntheticShortcutEventMarker: Int64 = 0x4C4C_4D54
     private static let nonTextPayloadTypeFragments = [
         "image",
@@ -80,9 +87,82 @@ enum SelectedTextService {
         AXIsProcessTrusted()
     }
 
-    static func requestAccessibilityPermission() {
-        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        AXIsProcessTrustedWithOptions(options)
+    static func showAccessibilityPermissionGuideIfNeeded() {
+        showPermissionGuideIfNeeded(requiresAccessibility: true, requiresScreenRecording: false)
+    }
+
+    static func showPermissionGuideIfNeeded(
+        requiresAccessibility: Bool,
+        requiresScreenRecording: Bool
+    ) {
+        showPermissionGuide(
+            requiresAccessibility: requiresAccessibility,
+            requiresScreenRecording: requiresScreenRecording,
+            ignoresPreviousPresentation: false
+        )
+    }
+
+    static func reopenPermissionGuide(
+        requiresAccessibility: Bool,
+        requiresScreenRecording: Bool
+    ) {
+        showPermissionGuide(
+            requiresAccessibility: requiresAccessibility,
+            requiresScreenRecording: requiresScreenRecording,
+            ignoresPreviousPresentation: true
+        )
+    }
+
+    private static func showPermissionGuide(
+        requiresAccessibility: Bool,
+        requiresScreenRecording: Bool,
+        ignoresPreviousPresentation: Bool
+    ) {
+        var missingPermissions: [SystemPermission] = []
+        if requiresAccessibility, !AXIsProcessTrusted() {
+            missingPermissions.append(.accessibility)
+        }
+        if requiresScreenRecording, !CGPreflightScreenCaptureAccess() {
+            missingPermissions.append(.screenRecording)
+        }
+        let permissionsToGuide = ignoresPreviousPresentation
+            ? missingPermissions
+            : missingPermissions.filter { !guidedSystemPermissions.contains($0) }
+        guard !permissionGuideIsPresented, !permissionsToGuide.isEmpty else { return }
+
+        // 自动路径每项权限每次启动只引导一次；设置页显式入口可以按需重复打开。
+        guidedSystemPermissions.formUnion(permissionsToGuide)
+        permissionGuideIsPresented = true
+        defer { permissionGuideIsPresented = false }
+
+        let usesChinese = Locale.preferredLanguages.first?.hasPrefix("zh") == true
+        let needsAccessibility = permissionsToGuide.contains(.accessibility)
+        let needsScreenRecording = permissionsToGuide.contains(.screenRecording)
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = usesChinese ? "需要完成系统权限设置" : "System Permissions Required"
+        alert.informativeText = permissionGuideDescription(
+            needsAccessibility: needsAccessibility,
+            needsScreenRecording: needsScreenRecording,
+            usesChinese: usesChinese
+        )
+        if needsAccessibility {
+            alert.addButton(withTitle: usesChinese ? "设置辅助功能" : "Accessibility Settings")
+        }
+        if needsScreenRecording {
+            alert.addButton(withTitle: usesChinese ? "设置屏幕录制" : "Screen Recording Settings")
+        }
+        alert.addButton(withTitle: usesChinese ? "稍后" : "Later")
+
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            openSystemSettings(for: needsAccessibility ? .accessibility : .screenRecording)
+        } else if response == .alertSecondButtonReturn,
+                  needsAccessibility,
+                  needsScreenRecording {
+            openSystemSettings(for: .screenRecording)
+        }
     }
 
     static func startMonitoringPasteboardOwnershipEvents() {
@@ -125,7 +205,7 @@ enum SelectedTextService {
     ) async -> String? {
         lastCapturedSourceBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         guard isAccessibilityTrusted else {
-            requestAccessibilityPermission()
+            showAccessibilityPermissionGuideIfNeeded()
             return nil
         }
 
@@ -211,6 +291,40 @@ enum SelectedTextService {
         // Cmd+C 回退只能读取文本，无法可靠标识原选区，因此禁止后续自动替换原文。
         lastCapturedAccessibilitySelection = nil
         return copied
+    }
+
+    private static func permissionGuideDescription(
+        needsAccessibility: Bool,
+        needsScreenRecording: Bool,
+        usesChinese: Bool
+    ) -> String {
+        var permissions: [String] = []
+        if needsAccessibility {
+            permissions.append(usesChinese
+                ? "• 辅助功能：读取主动选区和窗口标题"
+                : "• Accessibility: read explicit selections and window titles")
+        }
+        if needsScreenRecording {
+            permissions.append(usesChinese
+                ? "• 屏幕录制：读取增强窗口截图，并在你启动实时字幕或会议时采集系统音频"
+                : "• Screen Recording: capture enhanced window context and system audio when you start live subtitles or meetings")
+        }
+        let introduction = usesChinese
+            ? "请在“系统设置 > 隐私与安全性”中找到或添加 llmTools，并开启："
+            : "In System Settings > Privacy & Security, find or add llmTools and enable:"
+        let conclusion = usesChinese
+            ? "开启后返回 llmTools，权限状态会自动刷新。应用不会再重复触发系统授权弹窗。"
+            : "Return to llmTools after enabling access. Permission status refreshes automatically, without repeated system prompts."
+        return "\(introduction)\n\n\(permissions.joined(separator: "\n"))\n\n\(conclusion)"
+    }
+
+    private static func openSystemSettings(for permission: SystemPermission) {
+        let anchor = switch permission {
+        case .accessibility: "Privacy_Accessibility"
+        case .screenRecording: "Privacy_ScreenCapture"
+        }
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") else { return }
+        NSWorkspace.shared.open(url)
     }
 
     static func clearCapturedSelectionSource() {

@@ -597,7 +597,13 @@ public actor TaskEngine {
     }
 
     public func run(request: TaskRequest, modelID: UUID? = nil, persistHistory: Bool = true) async throws -> TaskResult {
-        let routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
+        var routedRequest = await requestWithDetectedSourceLanguageIfNeeded(request, surface: .text)
+        if routedRequest.task == .translate,
+           routedRequest.translationOutputMode == .detailed,
+           routedRequest.maxOutputTokensOverride == nil {
+            // 详解仍保留 3 至 8 个术语；单独放宽输出预算，不改变模型已识别的上下文窗口。
+            routedRequest.maxOutputTokensOverride = LocalGenerationPolicy.maximumDetailedTranslationTokens
+        }
         if let fastResult = try await translateTextWithFastMTIfSelected(routedRequest) {
             if persistHistory {
                 appendHistory(result: fastResult, request: routedRequest)
@@ -614,12 +620,25 @@ public actor TaskEngine {
         }
         var result = try await runner.generate(request: routedRequest, preferences: snapshot.preferences)
         result.sourceLanguage = routedRequest.sourceLanguage
-        if routedRequest.task == .translate,
-           routedRequest.translationOutputMode == .detailed,
-           let study = TranslationStudyResult.parse(modelText: result.text) {
-            // 复制、历史和原文回填继续使用纯译文；结构化内容只交给支持它的结果视图。
-            result.text = study.translation
-            result.translationStudy = study
+        if routedRequest.task == .translate, routedRequest.translationOutputMode == .detailed {
+            if let study = TranslationStudyResult.parse(
+                modelText: result.text,
+                sourceText: routedRequest.inputText
+            ) {
+                // 复制、历史和原文回填继续使用纯译文；结构化内容只交给支持它的结果视图。
+                result.text = study.translation
+                result.translationStudy = study
+            } else {
+                // 结构化输出损坏时回退一次普通翻译，避免把残缺 JSON 直接暴露给用户。
+                let malformedRawText = result.rawText
+                var fallbackRequest = routedRequest
+                fallbackRequest.translationOutputMode = .plain
+                fallbackRequest.maxOutputTokensOverride = nil
+                result = try await runner.generate(request: fallbackRequest, preferences: snapshot.preferences)
+                result.rawText = malformedRawText
+                result.sourceLanguage = routedRequest.sourceLanguage
+                result.translationStudy = TranslationStudyResult(translation: result.text)
+            }
         }
         if persistHistory {
             appendHistory(result: result, request: routedRequest)

@@ -44,9 +44,10 @@ public struct AssistantSceneSummary: Codable, Sendable, Hashable {
 }
 
 public enum AssistantSceneContract {
-    public static let promptVersion = 1
+    public static let promptVersion = 2
     public static let systemPrompt = """
     Describe only what is visibly present in the supplied desktop-window image. Return exactly one JSON object and no Markdown. Use exactly these keys: activity (short category such as coding, reading, chat, form, media, unknown), observation (one concrete sentence, maximum 180 characters), visibleText (array of at most three short exact snippets), signal (one of none, blocked, deadline, waiting, success, confusion, fatigue), confidence (number 0...1). Do not infer off-screen state, private identity, intent, or unseen application data. If uncertain, use activity=unknown, signal=none, and a cautious observation.
+    All five keys are required, including confidence. Before returning, verify the object has this exact shape: {"activity":"unknown","observation":"One visible fact.","visibleText":[],"signal":"none","confidence":0.5}
     """
 
     public static func parse(_ text: String) -> AssistantSceneSummary? {

@@ -5104,6 +5104,10 @@ struct SettingsView: View {
         .onAppear {
             refreshBrowserIntegrationStates()
             initializeProviderDraftIfNeeded()
+            assistantCoordinator.refreshPermissionStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            assistantCoordinator.refreshPermissionStatus()
         }
         .onDisappear {
             shortcutCaptureTarget = nil
@@ -5194,6 +5198,51 @@ struct SettingsView: View {
                         ),
                         trailing: AnyView(statusBadge(appState.launchAtLoginStatusText(), systemImage: launchStatusIcon))
                     )
+                }
+            }
+
+            // 辅助功能与屏幕录制均为应用级能力，不随助手开关或上下文来源隐藏。
+            settingRow(title: localizedSettingsText(chinese: "系统权限", english: "System Permissions")) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Label(
+                            assistantCoordinator.accessibilityAuthorized
+                                ? localizedSettingsText(chinese: "辅助功能已授权", english: "Accessibility Authorized")
+                                : localizedSettingsText(chinese: "辅助功能未授权", english: "Accessibility Not Authorized"),
+                            systemImage: assistantCoordinator.accessibilityAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(assistantCoordinator.accessibilityAuthorized ? Color.secondary : Color.orange)
+                        Spacer()
+                        if !assistantCoordinator.accessibilityAuthorized {
+                            Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openAccessibilitySettings)
+                                .controlSize(.small)
+                        }
+                    }
+                    HStack {
+                        Label(
+                            assistantCoordinator.screenCaptureAuthorized
+                                ? localizedSettingsText(chinese: "屏幕录制已授权", english: "Screen Recording Authorized")
+                                : localizedSettingsText(chinese: "屏幕录制未授权", english: "Screen Recording Not Authorized"),
+                            systemImage: assistantCoordinator.screenCaptureAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(assistantCoordinator.screenCaptureAuthorized ? Color.secondary : Color.orange)
+                        Spacer()
+                        if !assistantCoordinator.screenCaptureAuthorized {
+                            Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openScreenRecordingSettings)
+                                .controlSize(.small)
+                        }
+                    }
+                    if systemPermissionGuideIsAvailable {
+                        Button(action: reopenSystemPermissionGuide) {
+                            Label(
+                                localizedSettingsText(chinese: "打开权限引导", english: "Open Permission Guide"),
+                                systemImage: "questionmark.circle"
+                            )
+                        }
+                        .controlSize(.small)
+                    }
                 }
             }
 
@@ -5348,38 +5397,6 @@ struct SettingsView: View {
                         ),
                         trailing: AnyView(assistantSourceControls(.selection))
                     )
-                    HStack {
-                        Label(
-                            assistantCoordinator.accessibilityAuthorized
-                                ? localizedSettingsText(chinese: "辅助功能已授权", english: "Accessibility Authorized")
-                                : localizedSettingsText(chinese: "辅助功能未授权", english: "Accessibility Not Authorized"),
-                            systemImage: assistantCoordinator.accessibilityAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(assistantCoordinator.accessibilityAuthorized ? Color.secondary : Color.orange)
-                        Spacer()
-                        if !assistantCoordinator.accessibilityAuthorized {
-                            Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openAccessibilitySettings)
-                                .controlSize(.small)
-                        }
-                    }
-                    if appState.preferences.desktopAssistant.enhancedWindowContextEnabled {
-                        HStack {
-                            Label(
-                                assistantCoordinator.screenCaptureAuthorized
-                                    ? localizedSettingsText(chinese: "屏幕录制已授权", english: "Screen Recording Authorized")
-                                    : localizedSettingsText(chinese: "屏幕录制未授权", english: "Screen Recording Not Authorized"),
-                                systemImage: assistantCoordinator.screenCaptureAuthorized ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(assistantCoordinator.screenCaptureAuthorized ? Color.secondary : Color.orange)
-                            Spacer()
-                            if !assistantCoordinator.screenCaptureAuthorized {
-                                Button(localizedSettingsText(chinese: "打开系统设置", english: "Open System Settings"), action: openScreenRecordingSettings)
-                                    .controlSize(.small)
-                            }
-                        }
-                    }
                 }
             }
 
@@ -5483,8 +5500,12 @@ struct SettingsView: View {
                                 "\(status.lifecycleMode) · \(status.observationAllowed ? "observing" : "stopped")"
                             )
                             assistantDiagnosticLine(
+                                localizedSettingsText(chinese: "主动程度", english: "Proactivity"),
+                                "configured \(status.configuredProactivity) · effective \(status.effectiveProactivity) · judgment \(assistantOnOff(status.judgmentModelReady))"
+                            )
+                            assistantDiagnosticLine(
                                 localizedSettingsText(chinese: "观察器", english: "Observers"),
-                                "app \(assistantOnOff(status.foregroundObserverRunning)) · clipboard \(assistantOnOff(status.clipboardObserverRunning)) · permission \(assistantOnOff(status.permissionObserverRunning)) · selection \(assistantOnOff(status.selectionSourceEnabled))"
+                                "activity \(assistantOnOff(status.userActivityObserverRunning)) · app \(assistantOnOff(status.foregroundObserverRunning)) · clipboard \(assistantOnOff(status.clipboardObserverRunning)) · permission \(assistantOnOff(status.permissionObserverRunning)) · selection \(assistantOnOff(status.selectionSourceEnabled))"
                             )
                             assistantDiagnosticLine(
                                 localizedSettingsText(chinese: "用户状态", english: "User Presence"),
@@ -5500,7 +5521,7 @@ struct SettingsView: View {
                             )
                             assistantDiagnosticLine(
                                 localizedSettingsText(chinese: "思考流水线", english: "Thinking Pipeline"),
-                                "working \(assistantOnOff(status.assistantWorking)) · vision \(assistantOnOff(status.visualAnalysisRunning)) · aggregate \(assistantOnOff(status.contextAggregationRunning)) · judgment \(assistantOnOff(status.judgmentRunning))\(status.currentJudgmentPattern.map { " · \($0)" } ?? "")"
+                                "working \(assistantOnOff(status.assistantWorking)) · vision \(assistantOnOff(status.visualAnalysisRunning)) · aggregate \(assistantOnOff(status.contextAggregationRunning)) · buckets \(status.contextTriggerBucketCount) · judgment \(assistantOnOff(status.judgmentRunning))\(status.currentJudgmentPattern.map { " · \($0)" } ?? "")"
                             )
                             if let current = status.recentActivity.first {
                                 assistantDiagnosticLine(
@@ -5512,7 +5533,7 @@ struct SettingsView: View {
                                 localizedSettingsText(chinese: "本地模型资源", english: "Local Model Resources"),
                                 status.userModelWorkActive
                                     ? localizedSettingsText(chinese: "正在让位于用户任务", english: "Yielding to a user task")
-                                    : "judgment \(assistantOnOff(status.judgmentRunning)) · qualification \(assistantOnOff(status.qualificationRunning)) · translation \(assistantOnOff(status.translationRunning))"
+                                    : "recovery \(assistantOnOff(status.backgroundRecoveryPending)) · judgment \(assistantOnOff(status.judgmentRunning)) · qualification \(assistantOnOff(status.qualificationRunning)) · translation \(assistantOnOff(status.translationRunning))"
                             )
                             assistantDiagnosticLine(
                                 localizedSettingsText(chinese: "判断资格", english: "Judgment Qualification"),
@@ -5706,12 +5727,19 @@ struct SettingsView: View {
                 }
             }
             if assistantCoordinator.sessionProactivityWasDowngraded {
-                Label(
-                    localizedSettingsText(chinese: "本次会话已因连续负反馈自动降低主动性。", english: "Proactivity was reduced for this session after repeated negative feedback."),
-                    systemImage: "arrow.down.circle"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                HStack {
+                    Label(
+                        localizedSettingsText(chinese: "本次会话已因连续负反馈自动降低主动性。", english: "Proactivity was reduced for this session after repeated negative feedback."),
+                        systemImage: "arrow.down.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    Spacer()
+                    Button(action: assistantCoordinator.restoreSessionProactivity) {
+                        Label(localizedSettingsText(chinese: "恢复本次会话", english: "Restore Session"), systemImage: "arrow.counterclockwise")
+                    }
+                    .controlSize(.small)
+                }
             }
 
             checkboxLine(
@@ -6036,6 +6064,18 @@ struct SettingsView: View {
             }
         }
         assistantExcludedBundleIDDraft = ""
+    }
+
+    private var systemPermissionGuideIsAvailable: Bool {
+        !assistantCoordinator.accessibilityAuthorized
+            || !assistantCoordinator.screenCaptureAuthorized
+    }
+
+    private func reopenSystemPermissionGuide() {
+        SelectedTextService.reopenPermissionGuide(
+            requiresAccessibility: !assistantCoordinator.accessibilityAuthorized,
+            requiresScreenRecording: !assistantCoordinator.screenCaptureAuthorized
+        )
     }
 
     private func openAccessibilitySettings() {
@@ -6630,25 +6670,6 @@ struct SettingsView: View {
                 if assistantQualificationIsVisible {
                     assistantQualificationProgressView
                 }
-
-                Divider()
-
-                Picker(localizedSettingsText(chinese: "助手评论模型", english: "Comment Model"), selection: Binding(
-                    get: { appState.preferences.desktopAssistant.commentModelID },
-                    set: { value in assistantCoordinator.setCommentModelID(value) }
-                )) {
-                    Text(localizedSettingsText(chinese: "自动复用已加载本地模型", english: "Reuse Loaded Local Model")).tag(UUID?.none)
-                    ForEach(assistantCoordinator.assistantLocalTextModels.filter(\.isAvailableForUse)) { model in
-                        Text(model.name).tag(Optional(model.id))
-                    }
-                }
-                Text(localizedSettingsText(
-                    chinese: "评论模型无需通过上方判断资格，只改表达；3 秒内不可用或输出不合法时使用确定性模板。",
-                    english: "The comment model does not require judgment qualification and only changes wording. A deterministic template is used after 3 seconds or on invalid output."
-                ))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
             }
         }
     }

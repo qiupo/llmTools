@@ -4334,31 +4334,18 @@ final class AppState: ObservableObject {
     ) async throws -> AssistantSceneSummary {
         beginExternalModelUse()
         defer { endExternalModelUse() }
+        // 优先复用当前助手模型；它不支持视觉时，核心层才回退到其他本地 VLM。
         return try await engine.runDesktopAssistantVision(image: image, modelID: modelID)
     }
 
-    func runDesktopAssistantComment(input: AssistantCommentInput) async throws -> String? {
-        let modelID: UUID?
-        if let configured = preferences.desktopAssistant.commentModelID {
-            modelID = configured
-        } else {
-            modelID = await engine.loadedLocalTextModelID()
-        }
-        guard let modelID else { return nil }
-        beginExternalModelUse()
-        defer { endExternalModelUse() }
-        let result = try await engine.runExactLocalText(
-            request: TaskRequest(
-                task: .explain,
-                inputText: input.patternType.rawValue,
-                systemPromptOverride: AssistantCommentContract.systemPrompt,
-                userPromptOverride: AssistantCommentContract.userPrompt(for: input),
-                thinkingModeOverride: false,
-                maxOutputTokensOverride: 192
-            ),
-            modelID: modelID
-        )
-        return result.text
+    func recoverDesktopAssistantModelsAfterTimeout() async -> Bool {
+        // 只处理唯一一条仍未退出的助手调用；用户任务已经接管模型时绝不执行全局卸载。
+        guard !assistantUserModelWorkIsActive else { return false }
+        guard activeExternalModelUseCount > 0 else { return true }
+        guard activeExternalModelUseCount == 1 else { return false }
+        cancelScheduledModelUnload()
+        await engine.unloadAll()
+        return true
     }
 
     func runDesktopAssistantLocalTranslation(
@@ -5064,7 +5051,7 @@ final class AppState: ObservableObject {
             return
         }
         guard SelectedTextService.isAccessibilityTrusted else {
-            SelectedTextService.requestAccessibilityPermission()
+            SelectedTextService.showAccessibilityPermissionGuideIfNeeded()
             copyTextToPasteboard(text)
             validationError = t("Replace original text requires Accessibility permission.")
             statusMessage = t("Result copied; replacement unavailable")

@@ -11,6 +11,13 @@ private struct AssistantQualificationTimeout: LocalizedError {
     var errorDescription: String? { message }
 }
 
+fileprivate enum AssistantVisualAnalysisOutcome {
+    case consumed
+    case retryableFailure
+    case retryableContention
+    case skipped
+}
+
 private actor AssistantTimeoutRace<Value: Sendable> {
     private var continuation: CheckedContinuation<Value, Error>?
     private var result: Result<Value, Error>?
@@ -25,11 +32,13 @@ private actor AssistantTimeoutRace<Value: Sendable> {
         }
     }
 
-    func resolve(_ result: Result<Value, Error>) {
-        guard self.result == nil else { return }
+    @discardableResult
+    func resolve(_ result: Result<Value, Error>) -> Bool {
+        guard self.result == nil else { return false }
         self.result = result
         continuation?.resume(with: result)
         continuation = nil
+        return true
     }
 }
 
@@ -44,6 +53,7 @@ struct DesktopAssistantBridgeStatusPayload: Codable {
     var foregroundObserverRunning: Bool
     var clipboardObserverRunning: Bool
     var permissionObserverRunning: Bool
+    var userActivityObserverRunning: Bool
     var visualCaptureObserverRunning: Bool
     var visualCaptureTaskRunning: Bool
     var lastVisualCaptureAttemptAt: Date?
@@ -51,6 +61,7 @@ struct DesktopAssistantBridgeStatusPayload: Codable {
     var nextVisualCaptureAt: Date?
     var visualAnalysisRunning: Bool
     var contextAggregationRunning: Bool
+    var contextTriggerBucketCount: Int
     var currentJudgmentPattern: String?
     var assistantWorking: Bool
     var userPresent: Bool
@@ -83,6 +94,7 @@ struct DesktopAssistantBridgeStatusPayload: Codable {
     var temporaryTranslationActive: Bool
     var temporaryTranslationRemainingSeconds: Int
     var userModelWorkActive: Bool
+    var backgroundRecoveryPending: Bool
     var orbVisible: Bool
     var toolbarVisible: Bool
     var peekVisible: Bool
@@ -182,18 +194,20 @@ final class AssistantContextCoordinator: ObservableObject {
     private var qualificationRefreshTask: Task<Bool, Never>?
     private var proactivityRequestTask: Task<Void, Never>?
     private var contextOpportunityTask: Task<Void, Never>?
-    private var deferredContextOpportunityAggregation: (
-        source: AssistantSource,
-        contextEpoch: UInt64,
-        windowStart: Date
-    )?
+    private var contextOpportunityDebounceStartedAt: Date?
+    private var pendingContextOpportunityBatch = AssistantContextOpportunityBatch()
+    private var contextOpportunityGeneration: UInt64 = 0
     private var peekTimeoutTask: Task<Void, Never>?
+    private var pendingPresentationTask: Task<Void, Never>?
+    private var pendingPresentationGeneration: UInt64 = 0
     private var translationTask: Task<Void, Never>?
     private var translationExpiryTask: Task<Void, Never>?
     private var patternUndoTask: Task<Void, Never>?
+    private var backgroundRecoveryTask: Task<Void, Never>?
     private var backgroundWorkArbiter = AssistantBackgroundWorkArbiter()
     private var backgroundOperationCounts: [UUID: Int] = [:]
     private var finishedBackgroundWorkflows = Set<UUID>()
+    private var timedOutBackgroundOperationIDs = Set<UUID>()
     private var diagnosticTimeline = AssistantDiagnosticTimeline()
     private var visualAnalysisRunning = false
     private var contextEpoch: UInt64 = 0
@@ -233,6 +247,7 @@ final class AssistantContextCoordinator: ObservableObject {
     private var settledSessionFeedbackByCard: [UUID: AssistantFeedback] = [:]
     private var currentProactiveCardID: UUID?
     private var currentJudgmentCandidate: AssistantPatternCandidate?
+    private var pendingPresentations: [String: AssistantPendingPresentation] = [:]
     private var temporaryTranslationSession = AssistantTemporaryTranslationSession()
     private var pendingTranslations: [AssistantPendingTranslation] = []
     private var activeTranslation: AssistantPendingTranslation?
@@ -260,6 +275,17 @@ final class AssistantContextCoordinator: ObservableObject {
         var sourceCardID: UUID?
     }
 
+    private struct AssistantPendingPresentation {
+        var candidate: AssistantPatternCandidate
+        var presentation: AssistantPresentation
+        var actionIDs: [AssistantActionID]
+        var judgmentModelID: UUID?
+        var judgmentConfidence: Double?
+        var lockedEvidenceQuote: String?
+        var suggestedTask: TaskKind?
+        var comment: String
+    }
+
     init(appState: AppState) {
         self.appState = appState
     }
@@ -273,12 +299,35 @@ final class AssistantContextCoordinator: ObservableObject {
         isInquiryRunning || !activeDiagnosticStages.isEmpty
     }
     fileprivate var backgroundAssistantRoundIsRunning: Bool {
-        contextOpportunityTask != nil
-            || judgmentTask != nil
+        judgmentTask != nil
             || candidateQueue.count > 0
             || backgroundWorkArbiter.activeLease != nil
+            || backgroundRecoveryTask != nil
+            || !timedOutBackgroundOperationIDs.isEmpty
             || userModelWorkIsActive
             || maintenanceTask != nil
+    }
+    fileprivate var visualContextAnalysisIsEnabled: Bool {
+        currentJudgmentModelID != nil
+            && hasUsableDesktopAssistantVisionModel
+            && (effectiveProactivity == .moderate || effectiveProactivity == .active)
+    }
+    private var visualContextAnalysisDisableReason: String {
+        if currentJudgmentModelID == nil { return "no-qualified-model" }
+        if !hasUsableDesktopAssistantVisionModel { return "no-vision-model" }
+        if proactiveSuggestionsPaused { return "proactivity-paused" }
+        if sessionProactivityWasDowngraded { return "proactivity-session-downgraded" }
+        return "proactivity-inactive"
+    }
+    private var hasUsableDesktopAssistantVisionModel: Bool {
+        appState.models.contains { model in
+            model.isAvailableForUse
+                && !model.isRemoteProvider
+                && model.format == .mlx
+                && model.capabilities.supportsText
+                && model.capabilities.supportsImage
+                && !ModelDetection.isGLMOCRModel(at: model.resolvedPath ?? model.sourcePath)
+        }
     }
     var selectedCard: AssistantCard? {
         if case .ephemeralInquiry = panelContent { return ephemeralInquiryCard }
@@ -361,7 +410,7 @@ final class AssistantContextCoordinator: ObservableObject {
         case .cancelled: "cancelled"
         }
         return DesktopAssistantBridgeStatusPayload(
-            diagnosticSchemaVersion: 3,
+            diagnosticSchemaVersion: 4,
             diagnosticSnapshotAt: .now,
             enabled: preferences.isEnabled,
             lifecycleMode: lifecycle.mode.rawValue,
@@ -371,6 +420,7 @@ final class AssistantContextCoordinator: ObservableObject {
             foregroundObserverRunning: observer.foreground,
             clipboardObserverRunning: observer.clipboard,
             permissionObserverRunning: observer.permission,
+            userActivityObserverRunning: observer.userActivity,
             visualCaptureObserverRunning: observer.visualCapture,
             visualCaptureTaskRunning: observer.visualCaptureTaskRunning,
             lastVisualCaptureAttemptAt: observer.lastVisualCaptureAttemptAt,
@@ -378,6 +428,7 @@ final class AssistantContextCoordinator: ObservableObject {
             nextVisualCaptureAt: observer.nextVisualCaptureAt,
             visualAnalysisRunning: visualAnalysisRunning,
             contextAggregationRunning: contextOpportunityTask != nil,
+            contextTriggerBucketCount: pendingContextOpportunityBatch.count,
             currentJudgmentPattern: currentJudgmentCandidate?.patternType.rawValue,
             assistantWorking: assistantIsWorking,
             userPresent: userIsPresent,
@@ -413,6 +464,7 @@ final class AssistantContextCoordinator: ObservableObject {
             temporaryTranslationActive: temporaryTranslationIsActive,
             temporaryTranslationRemainingSeconds: max(0, Int(temporaryTranslationExpiresAt?.timeIntervalSinceNow ?? 0)),
             userModelWorkActive: userModelWorkIsActive,
+            backgroundRecoveryPending: backgroundRecoveryTask != nil || !timedOutBackgroundOperationIDs.isEmpty,
             orbVisible: window?.orbVisible ?? false,
             toolbarVisible: window?.toolbarVisible ?? false,
             peekVisible: window?.peekVisible ?? false,
@@ -448,9 +500,9 @@ final class AssistantContextCoordinator: ObservableObject {
         if stages != activeDiagnosticStages { activeDiagnosticStages = stages }
     }
 
-    private func skipVisualAnalysis(_ detail: String) -> Bool {
+    private func skipVisualAnalysis(_ detail: String) -> AssistantVisualAnalysisOutcome {
         recordDiagnosticActivity(stage: .vision, state: .skipped, detail: detail)
-        return false
+        return .skipped
     }
 
     func refreshDiagnosticSnapshot() async {
@@ -513,6 +565,11 @@ final class AssistantContextCoordinator: ObservableObject {
         language == .chinese ? chinese : english
     }
 
+    func refreshPermissionStatus() {
+        accessibilityAuthorized = AXIsProcessTrusted()
+        screenCaptureAuthorized = CGPreflightScreenCaptureAccess()
+    }
+
     func bootstrap() async {
         lifecycle = AssistantLifecycleMachine(preferences: preferences)
         sessionProactivity = AssistantSessionProactivityState(configured: preferences.proactivity)
@@ -532,6 +589,14 @@ final class AssistantContextCoordinator: ObservableObject {
         userModelWorkIsActive = appState.assistantUserModelWorkIsActive
         _ = await recomputeQualificationStates()
         hasBootstrapped = true
+        if preferences.isEnabled, preferences.hasCompletedCurrentOnboarding {
+            let usesEnhancedWindowContext = preferences.foregroundApplicationContextEnabled
+                && preferences.enhancedWindowContextEnabled
+            SelectedTextService.showPermissionGuideIfNeeded(
+                requiresAccessibility: usesEnhancedWindowContext || preferences.selectionContextEnabled,
+                requiresScreenRecording: usesEnhancedWindowContext
+            )
+        }
         refreshObservation(loadBehaviorStore: false)
     }
 
@@ -555,22 +620,20 @@ final class AssistantContextCoordinator: ObservableObject {
            preferences.clipboardAuthorization != .allowed {
             clearContext(source: .clipboard)
         }
-        if hasBootstrapped,
-           (!previouslyUsedEnhancedWindowContext && nowUsesEnhancedWindowContext
-               || !appliedPreferences.selectionContextEnabled && preferences.selectionContextEnabled),
-           !AXIsProcessTrusted() {
-            SelectedTextService.requestAccessibilityPermission()
-        }
-        if hasBootstrapped,
-           !previouslyUsedEnhancedWindowContext,
-           nowUsesEnhancedWindowContext,
-           !CGPreflightScreenCaptureAccess() {
-            requestScreenCapturePermission()
+        if hasBootstrapped {
+            SelectedTextService.showPermissionGuideIfNeeded(
+                requiresAccessibility: !previouslyUsedEnhancedWindowContext && nowUsesEnhancedWindowContext
+                    || !appliedPreferences.selectionContextEnabled && preferences.selectionContextEnabled,
+                requiresScreenRecording: !previouslyUsedEnhancedWindowContext && nowUsesEnhancedWindowContext
+            )
         }
         appliedPreferences = preferences
         if previous.proactivity != preferences.proactivity {
             sessionProactivity.updateConfigured(preferences.proactivity)
             sessionProactivityWasDowngraded = false
+        }
+        if !visualContextAnalysisIsEnabled {
+            activityObserver.cancelPendingVisualCapture(reason: visualContextAnalysisDisableReason)
         }
         if previous.repeatedFailureEnabled, !preferences.repeatedFailureEnabled {
             cancelCandidateJudgment(discardQueue: true)
@@ -1259,8 +1322,9 @@ final class AssistantContextCoordinator: ObservableObject {
         isStageAPreview = false
         let tasks = [
             inquiryTask, pauseTask, behaviorLoadTask, judgmentTask, qualificationTask,
-            proactivityRequestTask, contextOpportunityTask, peekTimeoutTask, translationTask,
-            translationExpiryTask, patternUndoTask, maintenanceTask, cardClearTask, contextMaintenanceTask
+            proactivityRequestTask, contextOpportunityTask, peekTimeoutTask, pendingPresentationTask, translationTask,
+            translationExpiryTask, patternUndoTask, maintenanceTask, cardClearTask, contextMaintenanceTask,
+            backgroundRecoveryTask
         ].compactMap { $0 }
         tasks.forEach { $0.cancel() }
         cancelStageCWork(cancelQualification: true)
@@ -1275,6 +1339,8 @@ final class AssistantContextCoordinator: ObservableObject {
         _ = await waitForBackgroundWorkToSettle(timeout: 5)
         maintenanceTask = nil
         cardClearTask = nil
+        backgroundRecoveryTask = nil
+        timedOutBackgroundOperationIDs.removeAll()
         userModelWorkIsActive = false
         clearPanelEphemera()
         windowController?.closeAll()
@@ -1298,7 +1364,14 @@ final class AssistantContextCoordinator: ObservableObject {
         }
     }
 
-    func recordWindowContext(bundleID: String, title: String) {
+    func recordWindowContext(
+        bundleID: String,
+        title: String,
+        observedAt: Date,
+        surfaceID: String?,
+        surfaceRevision: UInt64,
+        anchorGeneration: UInt64
+    ) {
         guard lifecycle.observationIsAllowed,
               userIsPresent,
               preferences.foregroundApplicationContextEnabled,
@@ -1313,12 +1386,17 @@ final class AssistantContextCoordinator: ObservableObject {
             guard !Task.isCancelled,
                   let event = await contextBuffer.appendIfCurrent(
                     AssistantActivityEvent(
+                        occurredAt: observedAt,
                         type: .windowContextChanged,
                         source: .windowContext,
                         appIdentity: bundleID,
                         contentType: .metadata,
                         sanitizedSummary: summary,
-                        contentFingerprint: fingerprint
+                        contentFingerprint: fingerprint,
+                        surfaceID: surfaceID,
+                        surfaceRevision: surfaceRevision,
+                        anchorGeneration: anchorGeneration,
+                        provenance: .observed
                     ),
                     rawText: summary,
                     expectedEpoch: epoch
@@ -1328,15 +1406,25 @@ final class AssistantContextCoordinator: ObservableObject {
         }
     }
 
-    func recordScreenSnapshot(_ image: OCRImageInput, bundleID: String) async -> Bool {
+    fileprivate func recordScreenSnapshot(
+        _ image: OCRImageInput,
+        bundleID: String,
+        capturedAt: Date,
+        surfaceID: String?,
+        surfaceRevision: UInt64,
+        anchorGeneration: UInt64
+    ) async -> AssistantVisualAnalysisOutcome {
         guard lifecycle.observationIsAllowed else { return skipVisualAnalysis("observation-disabled") }
         guard userIsPresent else { return skipVisualAnalysis("user-absent") }
         guard preferences.foregroundApplicationContextEnabled,
               preferences.enhancedWindowContextEnabled else { return skipVisualAnalysis("enhanced-context-disabled") }
-        guard effectiveProactivity == .moderate || effectiveProactivity == .active else {
-            return skipVisualAnalysis("proactivity-inactive")
+        guard let judgmentModelID = currentJudgmentModelID else {
+            return skipVisualAnalysis("no-qualified-model")
         }
-        guard currentJudgmentModelID != nil else { return skipVisualAnalysis("no-qualified-model") }
+        guard hasUsableDesktopAssistantVisionModel else { return skipVisualAnalysis("no-vision-model") }
+        guard effectiveProactivity == .moderate || effectiveProactivity == .active else {
+            return skipVisualAnalysis(visualContextAnalysisDisableReason)
+        }
         guard !userModelWorkIsActive else { return skipVisualAnalysis("user-model-busy") }
         guard !Self.userIsActivelyTyping else { return skipVisualAnalysis("user-typing") }
         guard Date.now.timeIntervalSince(lastVisionAnalysisAt) >= 15 else {
@@ -1352,7 +1440,8 @@ final class AssistantContextCoordinator: ObservableObject {
             return skipVisualAnalysis("image-pixel-limit")
         }
         guard let lease = backgroundWorkArbiter.claim(.vision) else {
-            return skipVisualAnalysis("background-resource-busy")
+            recordDiagnosticActivity(stage: .vision, state: .skipped, detail: "background-resource-busy")
+            return .retryableContention
         }
 
         let epoch = contextEpoch
@@ -1366,50 +1455,86 @@ final class AssistantContextCoordinator: ObservableObject {
         }
         let summary: AssistantSceneSummary
         do {
-            summary = try await withBackgroundTimeout(lease: lease, seconds: 15) { [appState, image, modelID = currentJudgmentModelID] in
-                try await appState.runDesktopAssistantVision(image: image, modelID: modelID)
+            summary = try await withBackgroundTimeout(lease: lease, seconds: 15) { [appState, image, judgmentModelID] in
+                try await appState.runDesktopAssistantVision(image: image, modelID: judgmentModelID)
             }
+        } catch is CancellationError {
+            let elapsed = Int(Date.now.timeIntervalSince(startedAt) * 1_000)
+            recordDiagnosticActivity(
+                stage: .vision,
+                state: .cancelled,
+                detail: "vision-cancelled elapsed=\(elapsed)ms"
+            )
+            return .skipped
+        } catch is AssistantBackgroundTimeout {
+            let elapsed = Int(Date.now.timeIntervalSince(startedAt) * 1_000)
+            recordDiagnosticActivity(
+                stage: .vision,
+                state: .failed,
+                detail: "vision-timeout limit=15s elapsed=\(elapsed)ms"
+            )
+            return .retryableFailure
         } catch {
             let elapsed = Int(Date.now.timeIntervalSince(startedAt) * 1_000)
             recordDiagnosticActivity(
                 stage: .vision,
-                state: error is CancellationError ? .cancelled : .failed,
-                detail: "timeout-or-model-error elapsed=\(elapsed)ms"
+                state: .failed,
+                detail: "vision-model-error elapsed=\(elapsed)ms"
             )
-            // 模型已经处理过这一帧；失败帧也按哈希去重，避免 20 秒一次持续重试。
-            return true
+            return .retryableFailure
         }
 
         guard !Task.isCancelled,
               epoch == contextEpoch,
-              lifecycle.observationIsAllowed,
-              let contextText = privacyPolicy.sanitizeModelEvidence(summary.contextText),
-              !contextText.isEmpty,
-              !AssistantPrivacyPolicy.looksSensitive(contextText) else {
-            // 已实际调用过模型的同一画面不循环重试；只有场景哈希变化后才再次分析。
+              lifecycle.observationIsAllowed else {
             recordDiagnosticActivity(
                 stage: .vision,
                 state: Task.isCancelled ? .cancelled : .skipped,
                 detail: "invalid-sensitive-or-stale-summary"
             )
-            return true
+            return .skipped
+        }
+        guard activityObserver.surfaceIsCurrent(
+            id: surfaceID,
+            revision: surfaceRevision,
+            anchorGeneration: anchorGeneration
+        ) else {
+            recordDiagnosticActivity(stage: .vision, state: .skipped, detail: "stale-visual-surface")
+            return .retryableContention
+        }
+        guard
+              let contextText = privacyPolicy.sanitizeModelEvidence(summary.contextText),
+              !contextText.isEmpty,
+              !AssistantPrivacyPolicy.looksSensitive(contextText) else {
+            recordDiagnosticActivity(
+                stage: .vision,
+                state: Task.isCancelled ? .cancelled : .skipped,
+                detail: "invalid-sensitive-or-stale-summary"
+            )
+            return .skipped
         }
         let fingerprint = try? await fingerprintStore.fingerprint(text: image.contentHash)
         guard !Task.isCancelled,
               epoch == contextEpoch,
               let event = await contextBuffer.appendIfCurrent(
                   AssistantActivityEvent(
+                      occurredAt: capturedAt,
                       type: .windowContextChanged,
                       source: .windowContext,
                       appIdentity: bundleID,
                       contentType: .image,
                       sanitizedSummary: String(contextText.prefix(240)),
                       contentFingerprint: fingerprint,
-                      confidence: summary.confidence
+                      confidence: summary.confidence,
+                      surfaceID: surfaceID,
+                      surfaceRevision: surfaceRevision,
+                      anchorGeneration: anchorGeneration,
+                      provenance: .observed,
+                      sceneSignal: summary.signal
                   ),
                   rawText: contextText,
                   expectedEpoch: epoch
-              ) else { return true }
+              ) else { return .skipped }
         lastSourceUse[.windowContext] = .now
         screenCaptureAuthorized = true
         let elapsed = Int(Date.now.timeIntervalSince(startedAt) * 1_000)
@@ -1419,25 +1544,31 @@ final class AssistantContextCoordinator: ObservableObject {
             detail: "context-recorded confidence=\(String(format: "%.2f", summary.confidence)) elapsed=\(elapsed)ms"
         )
         await collectContextOpportunity(event, expectedContextEpoch: epoch)
-        return true
-    }
-
-    func requestScreenCapturePermission() {
-        screenCaptureAuthorized = CGRequestScreenCaptureAccess()
+        return .consumed
     }
 
     func recordSelection(_ text: String, bundleID: String?) {
         guard lifecycle.observationIsAllowed,
               preferences.selectionContextEnabled else { return }
+        if let bundleID,
+           NSWorkspace.shared.frontmostApplication?.bundleIdentifier != bundleID {
+            // AX/服务回调可能晚于应用切换；已知来源不再位于前台时不能把旧选区挂到新窗口。
+            return
+        }
         // 划词本身就是明确的用户输入，先刷新在场状态，避免空闲边界吞掉本次选区。
         activityObserver.noteExplicitUserActivity()
         guard userIsPresent else { return }
+        let surface = activityObserver.explicitSurfaceSnapshot(bundleID: bundleID)
         ingestText(
             text,
             type: .selectionCaptured,
             source: .selection,
             bundleID: bundleID,
-            removeErrorNoise: true
+            removeErrorNoise: true,
+            observedAt: .now,
+            surfaceID: surface.0,
+            surfaceRevision: surface.1,
+            anchorGeneration: surface.2
         )
     }
 
@@ -1456,26 +1587,46 @@ final class AssistantContextCoordinator: ObservableObject {
             bundleID: nil,
             removeErrorNoise: true,
             workbenchIsRecoverable: workbenchIsRecoverable,
-            workbenchRoute: workbenchRoute
+            workbenchRoute: workbenchRoute,
+            observedAt: .now,
+            provenance: .explicit
         )
     }
 
-    func recordClipboardText(_ text: String, bundleID: String?) async {
+    func recordClipboardText(
+        _ text: String,
+        bundleID: String?,
+        possibleBundleIDs: [String],
+        observedAt: Date,
+        surfaceID: String?,
+        surfaceRevision: UInt64,
+        anchorGeneration: UInt64,
+        provenance: AssistantEvidenceProvenance
+    ) async {
         guard lifecycle.observationIsAllowed,
               userIsPresent,
               preferences.clipboardAuthorization == .allowed else { return }
         let policy = privacyPolicy
-        let sensitivity = policy.sensitivity(text: text, bundleID: bundleID)
-        guard sensitivity != .excludedApplication else { return }
+        guard possibleBundleIDs.allSatisfy({
+            policy.sensitivity(text: nil, bundleID: $0) != .excludedApplication
+        }) else { return }
+        let sensitivity = policy.sensitivity(text: text, bundleID: nil)
         guard sensitivity == .normal else {
             let epoch = contextEpoch
             let suppressionEpoch = behaviorEpoch
             guard await contextBuffer.appendIfCurrent(AssistantActivityEvent(
+                occurredAt: observedAt,
                 type: .clipboardChanged,
                 source: .clipboard,
                 contentType: .text,
-                sensitivity: .sensitive
+                sensitivity: .sensitive,
+                surfaceID: surfaceID,
+                surfaceRevision: surfaceRevision,
+                anchorGeneration: anchorGeneration,
+                provenance: provenance
             ), expectedEpoch: epoch) != nil else { return }
+            cancelContextOpportunityAggregation()
+            await patternDetector.clearContextOpportunitySamples()
             await persistSensitiveSuppression(expectedEpoch: suppressionEpoch)
             lastSourceUse[.clipboard] = .now
             return
@@ -1485,21 +1636,26 @@ final class AssistantContextCoordinator: ObservableObject {
         guard !Task.isCancelled,
               let event = await contextBuffer.appendIfCurrent(
                 AssistantActivityEvent(
+                    occurredAt: observedAt,
                     type: .clipboardChanged,
                     source: .clipboard,
                     appIdentity: preferences.foregroundApplicationContextEnabled ? bundleID : nil,
                     contentType: AssistantPrivacyPolicy.looksLikeURL(text) ? .url : .text,
-                    contentFingerprint: fingerprint
+                    contentFingerprint: fingerprint,
+                    surfaceID: surfaceID,
+                    surfaceRevision: surfaceRevision,
+                    anchorGeneration: anchorGeneration,
+                    provenance: provenance
                 ),
                 rawText: text,
                 expectedEpoch: epoch
               ) else { return }
         lastSourceUse[.clipboard] = .now
-        await collectContextOpportunity(event, expectedContextEpoch: epoch)
-
-        if preferences.proactivity != .manual,
+        let looksLikeError = AssistantPatternRules.looksLikeError(text)
+        if provenance != .observed,
+           preferences.proactivity != .manual,
            preferences.repeatedFailureEnabled,
-           AssistantPatternRules.looksLikeError(text),
+           looksLikeError,
            let errorFingerprint = try? await fingerprintStore.fingerprint(text: text, removeErrorNoise: true) {
             guard !Task.isCancelled,
                   epoch == contextEpoch,
@@ -1512,57 +1668,66 @@ final class AssistantContextCoordinator: ObservableObject {
             }
         }
 
-        guard (preferences.proactivity != .manual || temporaryTranslationIsActive),
-              preferences.foreignClipboardEnabled,
-              !preferences.suppressedForeignLanguages.contains("*"),
-              text.filter({ !$0.isWhitespace }).count >= 20,
-              !AssistantPrivacyPolicy.looksLikeURL(text),
-              !AssistantPrivacyPolicy.looksLikeCode(text) else { return }
-        guard let result = try? await appState.detectDesktopAssistantLanguage(text: String(text.prefix(4_000))),
-              !Task.isCancelled,
-              let language = result.language,
-              result.isReliable,
-              result.confidence >= 0.80,
-              !preferences.suppressedForeignLanguages.contains(where: { Self.languagesMatch($0, language) }),
-              !Self.languagesMatch(language, appState.preferences.defaultTranslationTarget),
-              contextEpoch == epoch,
-              lifecycle.observationIsAllowed,
-              preferences.clipboardAuthorization == .allowed else { return }
-        guard let foreignEvent = await contextBuffer.appendIfCurrent(
-                AssistantActivityEvent(
-                    occurredAt: event.occurredAt,
-                    type: .foreignTextDetected,
-                    source: .clipboard,
-                    appIdentity: event.appIdentity,
-                    contentType: .text,
-                    sanitizedSummary: "language=\(language)",
-                    contentFingerprint: fingerprint,
-                    confidence: result.confidence
-                ),
-                rawText: text,
-                expectedEpoch: epoch
-          ) else { return }
-        guard !Task.isCancelled,
-              epoch == contextEpoch,
-              lifecycle.observationIsAllowed,
-              preferences.clipboardAuthorization == .allowed else { return }
-        handleDetectedForeignClipboard(
-            text: text,
-            language: language,
-            event: foreignEvent,
-            effectiveCharacterCount: text.filter { !$0.isWhitespace }.count
-        )
-        if event.occurrenceCount == 1,
-           preferences.proactivity != .manual,
-           epoch == contextEpoch,
+        var isForeignClipboard = false
+        let effectiveCharacterCount = text.filter { !$0.isWhitespace }.count
+        let canDetectForeign = provenance != .observed
+            && preferences.foreignClipboardEnabled
+            && effectiveCharacterCount >= AssistantPatternDetector.foreignClipboardMinimumCharacterCount
+            && !AssistantPrivacyPolicy.looksLikeURL(text)
+            && !AssistantPrivacyPolicy.looksLikeCode(text)
+        if canDetectForeign,
+           let result = try? await appState.detectDesktopAssistantLanguage(text: String(text.prefix(4_000))),
+           !Task.isCancelled,
+           let language = result.language,
+           result.isReliable,
+           result.confidence >= AssistantPatternDetector.foreignClipboardMinimumConfidence,
+           !Self.languagesMatch(language, appState.preferences.defaultTranslationTarget),
+           contextEpoch == epoch,
            lifecycle.observationIsAllowed,
-           preferences.clipboardAuthorization == .allowed,
-           let candidate = await patternDetector.ingestForeignClipboard(
-               foreignEvent,
-               language: language,
-               effectiveCharacterCount: text.filter { !$0.isWhitespace }.count
-           ) {
-            handlePatternCandidate(candidate, expectedContextEpoch: epoch)
+           preferences.clipboardAuthorization == .allowed {
+            isForeignClipboard = true
+            let languageIsAllowed = !preferences.suppressedForeignLanguages.contains("*")
+                && !preferences.suppressedForeignLanguages.contains(where: { Self.languagesMatch($0, language) })
+            if languageIsAllowed,
+               let foreignEvent = await contextBuffer.appendIfCurrent(
+                   AssistantActivityEvent(
+                       occurredAt: event.occurredAt,
+                       type: .foreignTextDetected,
+                       source: .clipboard,
+                       appIdentity: event.appIdentity,
+                       contentType: .text,
+                       sanitizedSummary: "language=\(language)",
+                       contentFingerprint: fingerprint,
+                       confidence: result.confidence,
+                       surfaceID: event.surfaceID,
+                       surfaceRevision: event.surfaceRevision,
+                       anchorGeneration: event.anchorGeneration,
+                       provenance: event.provenance
+                   ),
+                   rawText: text,
+                   expectedEpoch: epoch
+               ) {
+                handleDetectedForeignClipboard(
+                    text: text,
+                    language: language,
+                    event: foreignEvent,
+                    effectiveCharacterCount: effectiveCharacterCount
+                )
+                if event.occurrenceCount == 1,
+                   preferences.proactivity != .manual,
+                   let candidate = await patternDetector.ingestForeignClipboard(
+                       foreignEvent,
+                       language: language,
+                       effectiveCharacterCount: effectiveCharacterCount
+                   ) {
+                    handlePatternCandidate(candidate, expectedContextEpoch: epoch)
+                }
+            }
+        }
+
+        // 专用模式拥有各自意图，P-06 不能用一次错误或一次外语复制绕过 P-01/P-03 阈值。
+        if provenance != .observed, !looksLikeError, !isForeignClipboard {
+            await collectContextOpportunity(event, expectedContextEpoch: epoch)
         }
     }
 
@@ -1586,13 +1751,15 @@ final class AssistantContextCoordinator: ObservableObject {
     func noteClipboardProvenance(
         changeCount: Int,
         text: String?,
-        bundleID: String?,
-        sourceIsReliable: Bool
+        possibleBundleIDs: [String]
     ) {
         observedClipboardChangeCount = changeCount
-        observedClipboardSensitivity = sourceIsReliable
-            ? privacyPolicy.sensitivity(text: text, bundleID: bundleID)
-            : .sensitive
+        let applicationsAreAllowed = possibleBundleIDs.allSatisfy {
+            privacyPolicy.sensitivity(text: nil, bundleID: $0) != .excludedApplication
+        }
+        observedClipboardSensitivity = applicationsAreAllowed
+            ? privacyPolicy.sensitivity(text: text, bundleID: nil)
+            : .excludedApplication
     }
 
     func clearContext(source: AssistantSource) {
@@ -1769,11 +1936,21 @@ final class AssistantContextCoordinator: ObservableObject {
 
     func pauseProactiveSuggestions() {
         proactiveSuggestionsPaused = true
+        activityObserver.cancelPendingVisualCapture(reason: visualContextAnalysisDisableReason)
+        cancelContextOpportunityAggregation()
+        cancelPendingPresentations()
         cancelCandidateJudgment(discardQueue: true)
+        Task { await patternDetector.clearContextOpportunitySamples() }
     }
 
     func resumeProactiveSuggestions() {
         proactiveSuggestionsPaused = false
+    }
+
+    func restoreSessionProactivity() {
+        proactiveSuggestionsPaused = false
+        sessionProactivity.updateConfigured(preferences.proactivity)
+        sessionProactivityWasDowngraded = false
     }
 
     func startPendingQualification() {
@@ -1842,11 +2019,6 @@ final class AssistantContextCoordinator: ObservableObject {
         appState.updatePreferences { $0.desktopAssistant.judgmentModelID = id }
     }
 
-    func setCommentModelID(_ id: UUID?) {
-        guard id == nil || assistantLocalTextModels.contains(where: { $0.id == id && $0.isAvailableForUse }) else { return }
-        appState.updatePreferences { $0.desktopAssistant.commentModelID = id }
-    }
-
     fileprivate func userPresenceDidChange(_ present: Bool, lastActivityAt: Date?) {
         self.lastUserActivityAt = lastActivityAt
         guard userIsPresent != present else { return }
@@ -1856,6 +2028,7 @@ final class AssistantContextCoordinator: ObservableObject {
         // 人离开后只暂停主动链路；用户明确发起的问答和模型任务不在这里被误杀。
         cancelContextOpportunityAggregation()
         cancelCandidateJudgment(discardQueue: true)
+        cancelPendingPresentations()
         discardAllCandidateTracking()
         activeDiagnosticStages.removeAll()
         Task { await patternDetector.clearContextOpportunitySamples() }
@@ -1882,9 +2055,12 @@ final class AssistantContextCoordinator: ObservableObject {
                 translationTask?.cancel()
             }
         } else {
-            scheduleDeferredBackgroundWork()
-            activityObserver.resumeDeferredVisualCaptureIfPossible()
-            resumeDeferredContextOpportunityAggregationIfNeeded()
+            if timedOutBackgroundOperationIDs.isEmpty {
+                scheduleDeferredBackgroundWork()
+                activityObserver.resumeDeferredVisualCaptureIfPossible()
+            } else {
+                scheduleBackgroundModelRecovery()
+            }
         }
     }
 
@@ -1912,12 +2088,13 @@ final class AssistantContextCoordinator: ObservableObject {
         backgroundOperationCounts.removeValue(forKey: lease.id)
         scheduleDeferredBackgroundWork()
         activityObserver.resumeDeferredVisualCaptureIfPossible()
-        resumeDeferredContextOpportunityAggregationIfNeeded()
     }
 
     private func scheduleDeferredBackgroundWork() {
         guard backgroundWorkArbiter.activeLease == nil,
               !userModelWorkIsActive,
+              backgroundRecoveryTask == nil,
+              timedOutBackgroundOperationIDs.isEmpty,
               maintenanceTask == nil else { return }
         if !pendingTranslations.isEmpty {
             startNextTranslationIfNeeded()
@@ -1941,12 +2118,49 @@ final class AssistantContextCoordinator: ObservableObject {
         return true
     }
 
+    private func scheduleBackgroundModelRecovery() {
+        guard backgroundRecoveryTask == nil,
+              !timedOutBackgroundOperationIDs.isEmpty,
+              !userModelWorkIsActive else { return }
+        backgroundRecoveryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await Task.sleep(for: .seconds(2))
+            } catch {
+                backgroundRecoveryTask = nil
+                return
+            }
+            guard !timedOutBackgroundOperationIDs.isEmpty else {
+                backgroundRecoveryTask = nil
+                scheduleDeferredBackgroundWork()
+                activityObserver.resumeDeferredVisualCaptureIfPossible()
+                return
+            }
+            guard !userModelWorkIsActive else {
+                backgroundRecoveryTask = nil
+                return
+            }
+            let recovered = await appState.recoverDesktopAssistantModelsAfterTimeout()
+            backgroundRecoveryTask = nil
+            guard !Task.isCancelled else { return }
+            if recovered {
+                timedOutBackgroundOperationIDs.removeAll()
+            } else {
+                scheduleBackgroundModelRecovery()
+                return
+            }
+            scheduleDeferredBackgroundWork()
+            activityObserver.resumeDeferredVisualCaptureIfPossible()
+        }
+    }
+
     private func withBackgroundTimeout<T: Sendable>(
         lease: AssistantBackgroundWorkLease,
         seconds: TimeInterval,
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         backgroundOperationCounts[lease.id, default: 0] += 1
+        let operationID = UUID()
         let race = AssistantTimeoutRace<T>()
         let operationTask = Task { [weak self] in
             let result: Result<T, Error>
@@ -1956,16 +2170,30 @@ final class AssistantContextCoordinator: ObservableObject {
                 result = .failure(error)
             }
             await race.resolve(result)
-            await MainActor.run { self?.backgroundOperationDidSettle(lease) }
+            await MainActor.run {
+                self?.timedOutBackgroundOperationIDs.remove(operationID)
+                self?.backgroundOperationDidSettle(lease)
+            }
         }
-        let timeoutTask = Task {
+        // 超时钟必须脱离 MainActor；本地模型冷启动不能拖住计时器本身。
+        let timeoutTask = Task.detached { [weak self] in
             do {
                 try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
             } catch {
                 return
             }
             operationTask.cancel()
-            await race.resolve(.failure(AssistantBackgroundTimeout()))
+            guard await race.resolve(.failure(AssistantBackgroundTimeout())) else {
+                return
+            }
+            await MainActor.run {
+                guard let self,
+                      self.backgroundOperationCounts[lease.id, default: 0] > 0 else { return }
+                self.timedOutBackgroundOperationIDs.insert(operationID)
+                // 底层模型若不响应取消，也不能永久占住助手唯一的后台租约。
+                self.backgroundOperationDidSettle(lease)
+                self.scheduleBackgroundModelRecovery()
+            }
         }
         return try await withTaskCancellationHandler {
             defer { timeoutTask.cancel() }
@@ -1973,7 +2201,15 @@ final class AssistantContextCoordinator: ObservableObject {
         } onCancel: {
             operationTask.cancel()
             timeoutTask.cancel()
-            Task { await race.resolve(.failure(CancellationError())) }
+            Task { @MainActor [weak self] in
+                self?.timedOutBackgroundOperationIDs.insert(operationID)
+                guard await race.resolve(.failure(CancellationError())) else {
+                    self?.timedOutBackgroundOperationIDs.remove(operationID)
+                    return
+                }
+                self?.backgroundOperationDidSettle(lease)
+                self?.scheduleBackgroundModelRecovery()
+            }
         }
     }
 
@@ -2071,6 +2307,9 @@ final class AssistantContextCoordinator: ObservableObject {
         }
         currentJudgmentModelID = selected?.id
         currentJudgmentModelName = selected?.name
+        if !visualContextAnalysisIsEnabled {
+            activityObserver.cancelPendingVisualCapture(reason: visualContextAnalysisDisableReason)
+        }
         if selected == nil,
            preferences.hasCompletedCurrentOnboarding,
            preferences.proactivity.requiresQualifiedJudgment,
@@ -2306,48 +2545,39 @@ final class AssistantContextCoordinator: ObservableObject {
               userIsPresent,
               currentJudgmentModelID != nil,
               effectiveProactivity == .moderate || effectiveProactivity == .active,
-              sourceIsCurrentlyAuthorized(event.source),
-              await patternDetector.ingestContextOpportunity(event) else { return }
-
-        // 当前聚合窗口内的新证据直接并入本轮；模型工作期间只保留一次下一轮请求。
-        guard contextOpportunityTask == nil else { return }
-        guard !backgroundAssistantRoundIsRunning,
-              !activityObserver.visualCaptureTaskIsActive else {
-            deferredContextOpportunityAggregation = (
-                event.source,
-                expectedContextEpoch,
-                event.occurredAt
-            )
-            return
-        }
-        scheduleContextOpportunityAggregation(
-            source: event.source,
-            expectedContextEpoch: expectedContextEpoch,
-            windowStart: event.occurredAt
-        )
+              sourceIsCurrentlyAuthorized(event.source) else { return }
+        let shouldTrigger = await patternDetector.ingestContextOpportunity(event)
+        guard shouldTrigger else { return }
+        scheduleContextOpportunityAggregation(trigger: event, expectedContextEpoch: expectedContextEpoch)
     }
 
     private func scheduleContextOpportunityAggregation(
-        source: AssistantSource,
-        expectedContextEpoch: UInt64,
-        windowStart: Date
+        trigger: AssistantActivityEvent,
+        expectedContextEpoch: UInt64
     ) {
-        guard contextOpportunityTask == nil,
-              expectedContextEpoch == contextEpoch,
+        guard expectedContextEpoch == contextEpoch,
               lifecycle.observationIsAllowed,
               userIsPresent,
               currentJudgmentModelID != nil,
               effectiveProactivity == .moderate || effectiveProactivity == .active,
-              sourceIsCurrentlyAuthorized(source),
-              !backgroundAssistantRoundIsRunning,
-              !activityObserver.visualCaptureTaskIsActive else { return }
+              sourceIsCurrentlyAuthorized(trigger.source) else { return }
 
-        let windowEnd = windowStart.addingTimeInterval(AssistantPatternDetector.contextOpportunityAggregationWindow)
-        let remaining = max(0, windowEnd.timeIntervalSinceNow)
+        let now = Date.now
+        let startedAt = contextOpportunityDebounceStartedAt ?? now
+        contextOpportunityDebounceStartedAt = startedAt
+        let selectedTrigger = pendingContextOpportunityBatch.insert(trigger)
+        let target = min(
+            now.addingTimeInterval(AssistantPatternDetector.contextOpportunityDebounce),
+            startedAt.addingTimeInterval(AssistantPatternDetector.contextOpportunityMaximumDebounce)
+        )
+        let remaining = max(0, target.timeIntervalSince(now))
+        contextOpportunityGeneration &+= 1
+        let generation = contextOpportunityGeneration
+        contextOpportunityTask?.cancel()
         recordDiagnosticActivity(
             stage: .context,
             state: .scheduled,
-            detail: "aggregation-window=8s remaining=\(String(format: "%.1f", remaining))s source=\(source.rawValue)"
+            detail: "context-debounce remaining=\(String(format: "%.1f", remaining))s source=\(selectedTrigger.source.rawValue) buckets=\(pendingContextOpportunityBatch.count)"
         )
         contextOpportunityTask = Task { [weak self] in
             do {
@@ -2356,61 +2586,67 @@ final class AssistantContextCoordinator: ObservableObject {
                 return
             }
             guard !Task.isCancelled, let self,
+                  generation == contextOpportunityGeneration,
                   expectedContextEpoch == contextEpoch,
                   lifecycle.observationIsAllowed else { return }
-            // 固定使用首条证据定义的窗口终点，避免任务晚醒几毫秒后把首条证据排除在外。
-            let result = await patternDetector.flushContextOpportunityResult(windowEnd: windowEnd)
-            guard !Task.isCancelled,
-                  expectedContextEpoch == contextEpoch else { return }
-            contextOpportunityTask = nil
-            switch result {
-            case .candidate(let candidate):
-                recordDiagnosticActivity(
-                    stage: .context,
-                    state: .succeeded,
-                    detail: "evidence-ready count=\(candidate.evidenceCount)"
-                )
-                handlePatternCandidate(candidate, expectedContextEpoch: expectedContextEpoch)
-            case .noEvidence:
-                recordDiagnosticActivity(
-                    stage: .context,
-                    state: .skipped,
-                    detail: "no-evidence-in-window"
-                )
-            case .duplicateCooldown:
-                recordDiagnosticActivity(
-                    stage: .context,
-                    state: .skipped,
-                    detail: "duplicate-context-cooldown"
-                )
+            let triggers = pendingContextOpportunityBatch.drain()
+            contextOpportunityDebounceStartedAt = nil
+            for currentTrigger in triggers {
+                guard expectedContextEpoch == contextEpoch,
+                      lifecycle.observationIsAllowed,
+                      userIsPresent,
+                      currentJudgmentModelID != nil,
+                      effectiveProactivity == .moderate || effectiveProactivity == .active,
+                      sourceIsCurrentlyAuthorized(currentTrigger.source) else { continue }
+                let result = await patternDetector.flushContextOpportunityResult(trigger: currentTrigger)
+                let resultIsStillCurrent = expectedContextEpoch == contextEpoch
+                    && lifecycle.observationIsAllowed
+                    && userIsPresent
+                    && currentJudgmentModelID != nil
+                    && (effectiveProactivity == .moderate || effectiveProactivity == .active)
+                    && sourceIsCurrentlyAuthorized(currentTrigger.source)
+                switch result {
+                case .candidate(let candidate):
+                    guard resultIsStillCurrent else {
+                        await patternDetector.settle(candidate, delivered: false)
+                        continue
+                    }
+                    recordDiagnosticActivity(
+                        stage: .context,
+                        state: .succeeded,
+                        detail: "evidence-ready count=\(candidate.evidenceCount)"
+                    )
+                    handlePatternCandidate(candidate, expectedContextEpoch: expectedContextEpoch)
+                case .noEvidence:
+                    recordDiagnosticActivity(
+                        stage: .context,
+                        state: .skipped,
+                        detail: "no-evidence-in-window"
+                    )
+                case .duplicateCooldown:
+                    recordDiagnosticActivity(
+                        stage: .context,
+                        state: .skipped,
+                        detail: "duplicate-context-cooldown"
+                    )
+                }
             }
+            if generation == contextOpportunityGeneration { contextOpportunityTask = nil }
             scheduleDeferredBackgroundWork()
             activityObserver.resumeDeferredVisualCaptureIfPossible()
-            resumeDeferredContextOpportunityAggregationIfNeeded()
         }
     }
 
-    private func resumeDeferredContextOpportunityAggregationIfNeeded() {
-        guard contextOpportunityTask == nil,
-              !backgroundAssistantRoundIsRunning,
-              !activityObserver.visualCaptureTaskIsActive,
-              let deferred = deferredContextOpportunityAggregation else { return }
-        deferredContextOpportunityAggregation = nil
-        scheduleContextOpportunityAggregation(
-            source: deferred.source,
-            expectedContextEpoch: deferred.contextEpoch,
-            windowStart: deferred.windowStart
-        )
-    }
-
     private func cancelContextOpportunityAggregation() {
+        contextOpportunityGeneration &+= 1
         contextOpportunityTask?.cancel()
         contextOpportunityTask = nil
-        deferredContextOpportunityAggregation = nil
+        contextOpportunityDebounceStartedAt = nil
+        pendingContextOpportunityBatch.removeAll()
     }
 
     fileprivate func visualCaptureRoundDidSettle() {
-        resumeDeferredContextOpportunityAggregationIfNeeded()
+        scheduleDeferredBackgroundWork()
     }
 
     private func handlePatternCandidate(_ candidate: AssistantPatternCandidate, expectedContextEpoch: UInt64) {
@@ -2425,17 +2661,20 @@ final class AssistantContextCoordinator: ObservableObject {
                 state: .skipped,
                 detail: "candidate-invalid-or-disabled pattern=\(candidate.patternType.rawValue)"
             )
+            Task { await patternDetector.settle(candidate, delivered: false) }
             return
         }
         candidateBehaviorEpochs[candidate.id] = behaviorEpoch
         candidateContextEpochs[candidate.id] = expectedContextEpoch
         candidateCardEpochs[candidate.id] = cardEpoch
         guard candidateIsCurrentlyAllowed(candidate) else {
+            Task { await patternDetector.settle(candidate, delivered: false) }
             discardCandidateTracking(candidate.id)
             return
         }
         switch effectiveProactivity {
         case .manual:
+            Task { await patternDetector.settle(candidate, delivered: false) }
             discardCandidateTracking(candidate.id)
             return
         case .quiet:
@@ -2455,7 +2694,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 Task { await degradeCandidate(candidate) }
                 return
             }
-            if let policyVeto = hardPolicyVetoReason(for: candidate) {
+            if let policyVeto = decisionPolicyVetoReason(for: candidate) {
                 recordDiagnosticActivity(
                     stage: .judgment,
                     state: .skipped,
@@ -2465,7 +2704,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 return
             }
             let enqueueResult = candidateQueue.enqueueReportingRemovals(candidate)
-            retireQueuedCandidates(enqueueResult.removed, replacingID: candidate.id)
+            retireQueuedCandidates(enqueueResult.removed, replacingCandidate: candidate)
             guard enqueueResult.inserted else {
                 recordDiagnosticActivity(
                     stage: .judgment,
@@ -2486,7 +2725,6 @@ final class AssistantContextCoordinator: ObservableObject {
 
     private func startNextCandidateIfNeeded() {
         guard judgmentTask == nil,
-              contextOpportunityTask == nil,
               !userModelWorkIsActive,
               lifecycle.observationIsAllowed,
               candidateQueue.count > 0,
@@ -2526,7 +2764,7 @@ final class AssistantContextCoordinator: ObservableObject {
             await degradeCandidate(candidate)
             return
         }
-        if let policyVeto = hardPolicyVetoReason(for: candidate) {
+        if let policyVeto = decisionPolicyVetoReason(for: candidate) {
             recordDiagnosticActivity(
                 stage: .judgment,
                 state: .skipped,
@@ -2538,7 +2776,7 @@ final class AssistantContextCoordinator: ObservableObject {
         let semanticEvidence = await contextBuffer.rawTexts(for: candidate.evidenceContextReferences)
             .compactMap(privacyPolicy.sanitizeModelEvidence)
         guard !Task.isCancelled, candidateIsCurrentlyAllowed(candidate) else {
-            discardCandidateTracking(candidate.id)
+            await persistCandidateDecision(candidate, presentation: .silent)
             return
         }
         let requiredSemanticCount = candidate.patternType == .foreignClipboard
@@ -2562,18 +2800,30 @@ final class AssistantContextCoordinator: ObservableObject {
             )
             : []
         guard !Task.isCancelled, candidateIsCurrentlyAllowed(candidate) else {
-            discardCandidateTracking(candidate.id)
+            await persistCandidateDecision(candidate, presentation: .silent)
             return
         }
         var historicalAggregate = preferences.useBehaviorHistory
             ? await behaviorStore.aggregate(for: candidate.patternType)
             : nil
         guard !Task.isCancelled, candidateIsCurrentlyAllowed(candidate) else {
-            discardCandidateTracking(candidate.id)
+            await persistCandidateDecision(candidate, presentation: .silent)
             return
+        }
+        let judgmentPersonality: AssistantPersonality = if preferences.personality == .lightTeasing,
+                                                            (historicalAggregate?.unfunnyCount ?? 0) > 0 {
+            .gentle
+        } else {
+            preferences.personality
         }
         // “不好笑”只影响表达，不允许进入主动价值权重。
         historicalAggregate?.unfunnyCount = 0
+        let containsURL = semanticEvidence.contains(where: AssistantPrivacyPolicy.containsWebURL)
+        let containsCode = semanticEvidence.contains(where: AssistantPrivacyPolicy.looksLikeCode)
+        // P-06 遇到代码或 URL 时仍可做事实性的陪伴表达，但不能把原文直接带进 Quick Action。
+        let blocksContextAction = candidate.patternType == .contextualOpportunity && (containsURL || containsCode)
+        let availableActionIDs = blocksContextAction ? [] : candidate.actionIDs
+        let availableTaskKinds = availableActionIDs.contains(.openQuickAction) ? candidate.availableTaskKinds : []
         let input = AssistantJudgmentInput(
             patternType: candidate.patternType,
             evidenceSummary: candidate.evidenceSummary,
@@ -2585,21 +2835,22 @@ final class AssistantContextCoordinator: ObservableObject {
             languageConfidence: candidate.patternType == .foreignClipboard ? candidate.confidence : nil,
             sensitivity: .normal,
             evidenceSufficient: semanticEvidence.count >= requiredSemanticCount
-                && !candidate.actionIDs.isEmpty
-                && (candidate.patternType != .contextualOpportunity || !candidate.availableTaskKinds.isEmpty),
-            containsURL: semanticEvidence.contains(where: AssistantPrivacyPolicy.containsWebURL),
-            containsCode: semanticEvidence.contains(where: AssistantPrivacyPolicy.looksLikeCode),
+                && (candidate.patternType == .contextualOpportunity || !availableActionIDs.isEmpty),
+            containsURL: containsURL,
+            containsCode: containsCode,
             userIsTyping: Self.userIsActivelyTyping,
             isFullScreen: Self.frontmostApplicationIsFullScreen,
-            // V1 不猜测会议或投屏状态；只有可确定的前台全屏窗口进入 presenting 否决。
-            isPresenting: Self.frontmostApplicationIsFullScreen,
+            // V1 没有可信的投屏/会议信号，不把全屏等同于正在演示。
+            isPresenting: false,
+            responseLanguage: language == .chinese ? "zh-Hans" : "en",
+            personality: judgmentPersonality,
             recentIrrelevantCount: relatedRecords.lazy.filter { $0.userFeedback == .irrelevant }.count,
             recentBehaviorSummaries: relatedRecords.map(Self.behaviorJudgmentSummary),
             historicalAggregate: historicalAggregate,
             proactivity: effectiveProactivity,
             hourlyPresentationCount: proactivePresentationCount,
-            availableTaskKinds: candidate.availableTaskKinds,
-            availableActionIDs: candidate.actionIDs
+            availableTaskKinds: availableTaskKinds,
+            availableActionIDs: availableActionIDs
         )
         let minimumConfidenceOverride = preferences.judgmentConfidenceThresholdOverride
         if input.suppressesRepeatedlyIrrelevantFeedback {
@@ -2676,7 +2927,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 )
                 return
             }
-            if let policyVeto = hardPolicyVetoReason(for: candidate) {
+            if let policyVeto = decisionPolicyVetoReason(for: candidate) {
                 recordDiagnosticActivity(
                     stage: .judgment,
                     state: .skipped,
@@ -2689,7 +2940,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 )
                 return
             }
-            let lockedActions = output.suggestedActionIDs.filter(candidate.actionIDs.contains)
+            let lockedActions = output.suggestedActionIDs.filter(availableActionIDs.contains)
             guard !lockedActions.isEmpty || candidate.patternType == .contextualOpportunity else {
                 recordDiagnosticActivity(
                     stage: .judgment,
@@ -2712,7 +2963,8 @@ final class AssistantContextCoordinator: ObservableObject {
                 judgmentConfidence: output.confidence,
                 lockedEvidenceQuote: output.lockedEvidenceQuote,
                 suggestedTask: output.suggestedTask,
-                backgroundLease: lease
+                lockedComment: output.reason,
+                contextSummary: semanticEvidence.joined(separator: "\n")
             )
         } catch is CancellationError {
             recordDiagnosticActivity(
@@ -2723,8 +2975,9 @@ final class AssistantContextCoordinator: ObservableObject {
             if candidatesToBadgeAfterPreemption.remove(candidate.id) != nil,
                candidateIsCurrentlyAllowed(candidate) {
                 await degradeCandidate(candidate, judgmentModelID: modelID)
-            } else if !candidateIsCurrentlyAllowed(candidate) {
-                discardCandidateTracking(candidate.id)
+            } else {
+                // 任意取消都必须归还检测器 reservation；只有用户模型抢占明确转为徽标。
+                await persistCandidateDecision(candidate, presentation: .silent)
             }
             return
         } catch {
@@ -2805,7 +3058,9 @@ final class AssistantContextCoordinator: ObservableObject {
         judgmentConfidence: Double?,
         lockedEvidenceQuote: String? = nil,
         suggestedTask: TaskKind? = nil,
-        backgroundLease: AssistantBackgroundWorkLease? = nil
+        lockedComment: String? = nil,
+        contextSummary: String? = nil,
+        allowDeferral: Bool = true
     ) async {
         guard candidateIsCurrentlyAllowed(candidate) else {
             await persistCandidateDecision(candidate, presentation: .silent)
@@ -2820,13 +3075,6 @@ final class AssistantContextCoordinator: ObservableObject {
         } else {
             preferences.personality
         }
-        let contextSummary: String? = if candidate.patternType == .contextualOpportunity,
-                                         actionIDs.isEmpty,
-                                         let reference = candidate.rawContextReference {
-            await contextBuffer.rawText(for: reference)
-        } else {
-            nil
-        }
         let commentInput = AssistantCommentInput(
             patternType: candidate.patternType,
             personality: commentPersonality,
@@ -2839,41 +3087,26 @@ final class AssistantContextCoordinator: ObservableObject {
             allowedActionIDs: actionIDs,
             contextSummary: contextSummary
         )
-        var comment = AssistantCommentTemplates.comment(for: commentInput)
+        let comment = lockedComment ?? AssistantCommentTemplates.comment(for: commentInput)
         let includesJoke = commentPersonality == .lightTeasing
-        if presentation == .peek, !userModelWorkIsActive, let backgroundLease {
-            recordDiagnosticActivity(
-                stage: .comment,
-                state: .running,
-                detail: "pattern=\(candidate.patternType.rawValue)"
+        if allowDeferral,
+           presentation == .peek,
+           decisionPolicyVetoReason(for: candidate) == nil,
+           let blockReason = transientPresentationBlockReason() {
+            enqueuePendingPresentation(
+                AssistantPendingPresentation(
+                    candidate: candidate,
+                    presentation: presentation,
+                    actionIDs: actionIDs,
+                    judgmentModelID: judgmentModelID,
+                    judgmentConfidence: judgmentConfidence,
+                    lockedEvidenceQuote: lockedEvidenceQuote,
+                    suggestedTask: suggestedTask,
+                    comment: comment
+                ),
+                reason: blockReason
             )
-            do {
-                if let outputText = try await withBackgroundTimeout(lease: backgroundLease, seconds: 3, operation: { [appState] in
-                    try await appState.runDesktopAssistantComment(input: commentInput)
-                }),
-                   let output = AssistantCommentContract.parse(outputText, input: commentInput) {
-                    // 评论模型只改表达；判断阶段锁定的事实、展示级别和动作集合保持不变。
-                    comment = output.comment
-                    recordDiagnosticActivity(
-                        stage: .comment,
-                        state: .succeeded,
-                        detail: "model-wording pattern=\(candidate.patternType.rawValue)"
-                    )
-                } else {
-                    recordDiagnosticActivity(
-                        stage: .comment,
-                        state: .skipped,
-                        detail: "invalid-output-template-fallback pattern=\(candidate.patternType.rawValue)"
-                    )
-                }
-            } catch {
-                // 确定性模板覆盖资源冲突、超时和非法输出，不影响提示本身。
-                recordDiagnosticActivity(
-                    stage: .comment,
-                    state: error is CancellationError ? .cancelled : .skipped,
-                    detail: "model-error-template-fallback pattern=\(candidate.patternType.rawValue)"
-                )
-            }
+            return
         }
         if let cardClearTask { await cardClearTask.value }
         guard candidateIsCurrentlyAllowed(candidate) else {
@@ -2884,6 +3117,11 @@ final class AssistantContextCoordinator: ObservableObject {
             requested: presentation,
             hardPolicyAllowsPeek: hardPolicyAllowsPeek(for: candidate)
         )
+        guard finalPresentation != .badge || !actionIDs.isEmpty else {
+            // 无动作 P-06 不计徽标；暂时无法展开时宁可等待下一次可信情境，也不保存一条不可见“徽标”。
+            await persistCandidateDecision(candidate, presentation: .silent)
+            return
+        }
         let card = AssistantCard(
             source: candidate.source,
             patternType: candidate.patternType,
@@ -2908,6 +3146,7 @@ final class AssistantContextCoordinator: ObservableObject {
             let rollbackEpoch = cardEpoch
             let rolledBackCards = await cardStore.remove(id: card.id)
             commitCardSnapshot(rolledBackCards, expectedEpoch: rollbackEpoch)
+            await persistCandidateDecision(candidate, presentation: .silent)
             return
         }
         cards = storedCards
@@ -2932,9 +3171,26 @@ final class AssistantContextCoordinator: ObservableObject {
         if includesJoke { cardsIncludingJoke.insert(card.id) }
         cardBehaviorRecordIDs[card.id] = card.id
         pruneCardMetadata()
+        var deliveredPresentation = finalPresentation
+        if finalPresentation == .peek {
+            if showProactiveCard(card.id) {
+                proactivePresentationDates.append(.now)
+                proactivelyPresentedCardIDs.insert(card.id)
+                proactiveOriginCardIDs.insert(card.id)
+            } else if actionIDs.isEmpty {
+                let rollbackEpoch = cardEpoch
+                let rolledBackCards = await cardStore.remove(id: card.id)
+                commitCardSnapshot(rolledBackCards, expectedEpoch: rollbackEpoch)
+                pruneCardMetadata()
+                await persistCandidateDecision(candidate, presentation: .silent)
+                return
+            } else {
+                deliveredPresentation = .badge
+            }
+        }
         await persistCandidateDecision(
             candidate,
-            presentation: finalPresentation,
+            presentation: deliveredPresentation,
             cardID: card.id,
             judgmentModelID: judgmentModelID,
             judgmentConfidence: judgmentConfidence
@@ -2942,13 +3198,120 @@ final class AssistantContextCoordinator: ObservableObject {
         recordDiagnosticActivity(
             stage: .presentation,
             state: .succeeded,
-            detail: "\(finalPresentation.rawValue) pattern=\(candidate.patternType.rawValue) actions=\(actionIDs.count)"
+            detail: "\(deliveredPresentation.rawValue) pattern=\(candidate.patternType.rawValue) actions=\(actionIDs.count)"
         )
-        if finalPresentation == .peek {
-            proactivePresentationDates.append(.now)
-            proactivelyPresentedCardIDs.insert(card.id)
-            proactiveOriginCardIDs.insert(card.id)
-            showProactiveCard(card.id)
+    }
+
+    private func enqueuePendingPresentation(_ pending: AssistantPendingPresentation, reason: String) {
+        let key = pending.candidate.decisionKey
+        guard pendingPresentations[key] == nil else {
+            // 同一决策只保留第一个待展示结果；它仍持有检测器预留，不能由重复项提前结算。
+            discardCandidateTracking(pending.candidate.id)
+            return
+        }
+        if pendingPresentations.count >= AssistantCandidateQueue.maximumCount,
+           let lowest = pendingPresentations.min(by: {
+               $0.value.candidate.priority < $1.value.candidate.priority
+           }) {
+            guard pending.candidate.priority > lowest.value.candidate.priority else {
+                Task { await persistCandidateDecision(pending.candidate, presentation: .silent) }
+                return
+            }
+            pendingPresentations.removeValue(forKey: lowest.key)
+            Task { await persistCandidateDecision(lowest.value.candidate, presentation: .silent) }
+        }
+        pendingPresentations[key] = pending
+        recordDiagnosticActivity(
+            stage: .presentation,
+            state: .scheduled,
+            detail: "deferred=\(reason) pattern=\(pending.candidate.patternType.rawValue) pending=\(pendingPresentations.count)"
+        )
+        schedulePendingPresentations()
+    }
+
+    private func schedulePendingPresentations() {
+        guard pendingPresentationTask == nil, !pendingPresentations.isEmpty else { return }
+        pendingPresentationGeneration &+= 1
+        let generation = pendingPresentationGeneration
+        pendingPresentationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await drainPendingPresentations(generation: generation)
+            guard generation == pendingPresentationGeneration else { return }
+            pendingPresentationTask = nil
+            if !pendingPresentations.isEmpty { schedulePendingPresentations() }
+        }
+    }
+
+    private func drainPendingPresentations(generation: UInt64) async {
+        while !Task.isCancelled, generation == pendingPresentationGeneration {
+            let invalid = pendingPresentations.values.filter { !candidateIsCurrentlyAllowed($0.candidate) }
+            for item in invalid {
+                pendingPresentations.removeValue(forKey: item.candidate.decisionKey)
+                await persistCandidateDecision(item.candidate, presentation: .silent)
+            }
+            guard let next = pendingPresentations.values.max(by: {
+                if $0.candidate.priority != $1.candidate.priority {
+                    return $0.candidate.priority < $1.candidate.priority
+                }
+                return $0.candidate.createdAt > $1.candidate.createdAt
+            }) else { return }
+
+            if let veto = decisionPolicyVetoReason(for: next.candidate) {
+                pendingPresentations.removeValue(forKey: next.candidate.decisionKey)
+                recordDiagnosticActivity(
+                    stage: .presentation,
+                    state: .skipped,
+                    detail: "deferred-veto=\(veto) pattern=\(next.candidate.patternType.rawValue)"
+                )
+                if next.actionIDs.isEmpty {
+                    await persistCandidateDecision(next.candidate, presentation: .silent)
+                } else {
+                    await addCandidateCard(
+                        next.candidate,
+                        presentation: .badge,
+                        actionIDs: next.actionIDs,
+                        judgmentModelID: next.judgmentModelID,
+                        judgmentConfidence: next.judgmentConfidence,
+                        lockedEvidenceQuote: next.lockedEvidenceQuote,
+                        suggestedTask: next.suggestedTask,
+                        lockedComment: next.comment,
+                        allowDeferral: false
+                    )
+                }
+                continue
+            }
+            if transientPresentationBlockReason() != nil {
+                do {
+                    try await Task.sleep(for: .milliseconds(250))
+                } catch {
+                    return
+                }
+                continue
+            }
+
+            pendingPresentations.removeValue(forKey: next.candidate.decisionKey)
+            await addCandidateCard(
+                next.candidate,
+                presentation: next.presentation,
+                actionIDs: next.actionIDs,
+                judgmentModelID: next.judgmentModelID,
+                judgmentConfidence: next.judgmentConfidence,
+                lockedEvidenceQuote: next.lockedEvidenceQuote,
+                suggestedTask: next.suggestedTask,
+                lockedComment: next.comment,
+                allowDeferral: false
+            )
+        }
+    }
+
+    private func cancelPendingPresentations() {
+        pendingPresentationGeneration &+= 1
+        pendingPresentationTask?.cancel()
+        pendingPresentationTask = nil
+        let pending = Array(pendingPresentations.values)
+        pendingPresentations.removeAll()
+        for item in pending {
+            Task { await persistCandidateDecision(item.candidate, presentation: .silent) }
         }
     }
 
@@ -2959,11 +3322,17 @@ final class AssistantContextCoordinator: ObservableObject {
         judgmentModelID: UUID? = nil,
         judgmentConfidence: Double? = nil
     ) async {
-        guard let candidateEpoch = candidateBehaviorEpochs[candidate.id] else { return }
+        guard let candidateEpoch = candidateBehaviorEpochs[candidate.id] else {
+            await patternDetector.settle(candidate, delivered: presentation != .silent)
+            return
+        }
         defer { discardCandidateTracking(candidate.id) }
         if let maintenanceTask { await maintenanceTask.value }
         guard candidateEpoch == behaviorEpoch,
-              candidateIsCurrentlyAllowed(candidate) else { return }
+              candidateIsCurrentlyAllowed(candidate) else {
+            await patternDetector.settle(candidate, delivered: presentation != .silent)
+            return
+        }
         let outcome: AssistantBehaviorOutcome = switch presentation {
         case .silent: .suppressed
         case .badge: .badged
@@ -2990,6 +3359,7 @@ final class AssistantContextCoordinator: ObservableObject {
         )
         _ = await behaviorStore.append(record)
         behaviorSummary = await behaviorStore.summary()
+        await patternDetector.settle(candidate, delivered: presentation != .silent)
     }
 
     private func candidateIsCurrentlyAllowed(_ candidate: AssistantPatternCandidate) -> Bool {
@@ -3008,20 +3378,29 @@ final class AssistantContextCoordinator: ObservableObject {
             guard preferences.foreignClipboardEnabled,
                   preferences.clipboardAuthorization == .allowed else { return false }
         case .contextualOpportunity:
-            guard !candidate.availableTaskKinds.isEmpty else { return false }
+            if candidate.surfaceID != nil,
+               !activityObserver.surfaceIsCurrent(
+                   id: candidate.surfaceID,
+                   revision: candidate.surfaceRevision,
+                   anchorGeneration: candidate.anchorGeneration
+               ) {
+                return false
+            }
         }
         guard candidate.sourceTypes.allSatisfy(sourceIsCurrentlyAuthorized) else { return false }
         guard let appIdentity = candidate.appIdentity else { return true }
         return privacyPolicy.sensitivity(text: nil, bundleID: appIdentity) != .excludedApplication
     }
 
-    private func showProactiveCard(_ id: UUID) {
-        guard lifecycle.isVisible else { return }
+    @discardableResult
+    private func showProactiveCard(_ id: UUID) -> Bool {
+        guard lifecycle.isVisible else { return false }
+        let requiresUserAction = cards.first(where: { $0.id == id })?.requiresUserAction == true
         let expectedCardEpoch = cardEpoch
         panelContent = .card(id)
         guard windowController?.showPeek(activating: false) == true else {
             panelContent = .none
-            return
+            return false
         }
         currentProactiveCardID = id
         Task {
@@ -3039,29 +3418,39 @@ final class AssistantContextCoordinator: ObservableObject {
             guard commitCardSnapshot(storedCards, expectedEpoch: expectedCardEpoch) else { return }
             panelContent = .none
             windowController?.hidePeek()
-            applySessionInteraction(.noInteractionTimeout)
+            if requiresUserAction {
+                applySessionInteraction(.noInteractionTimeout)
+            }
         }
+        return true
     }
 
     private func hardPolicyAllowsPeek(for candidate: AssistantPatternCandidate, now: Date = .now) -> Bool {
-        hardPolicyVetoReason(for: candidate, now: now) == nil
+        decisionPolicyVetoReason(for: candidate, now: now) == nil
+            && transientPresentationBlockReason() == nil
     }
 
-    private func hardPolicyVetoReason(for candidate: AssistantPatternCandidate, now: Date = .now) -> String? {
+    private func decisionPolicyVetoReason(for candidate: AssistantPatternCandidate, now: Date = .now) -> String? {
         prunePresentationDates(now: now)
         guard lifecycle.observationIsAllowed else { return "observation-disabled" }
         guard userIsPresent else { return "user-absent" }
-        guard lifecycle.isVisible else { return "assistant-hidden" }
         guard candidate.expiresAt > now else { return "candidate-expired" }
-        guard !userModelWorkIsActive else { return "user-model-busy" }
-        guard !Self.userIsActivelyTyping else { return "user-typing" }
-        guard !Self.frontmostApplicationIsFullScreen else { return "fullscreen" }
-        guard windowController?.assistantInteractionIsInProgress != true else { return "assistant-interaction" }
         guard proactivePresentationCount < effectiveProactivity.hourlyPresentationLimit else { return "hourly-limit" }
         guard !preferences.quietHours.contains(now) || candidate.isTaskFailure else { return "quiet-hours" }
         guard effectiveProactivity == .moderate || effectiveProactivity == .active else {
             return "proactivity-inactive"
         }
+        return nil
+    }
+
+    private func transientPresentationBlockReason() -> String? {
+        guard lifecycle.isVisible else { return "assistant-hidden" }
+        guard !userModelWorkIsActive else { return "user-model-busy" }
+        guard !Self.userIsActivelyTyping else { return "user-typing" }
+        guard preferences.showOverFullScreen || !Self.frontmostApplicationIsFullScreen else { return "fullscreen" }
+        guard windowController?.assistantInteractionIsInProgress != true else { return "assistant-interaction" }
+        guard panelContent == .none else { return "assistant-panel-visible" }
+        guard currentProactiveCardID == nil else { return "another-peek-visible" }
         return nil
     }
 
@@ -3090,8 +3479,8 @@ final class AssistantContextCoordinator: ObservableObject {
             )
         case .contextualOpportunity:
             return text(
-                "8 秒内检测到 \(candidate.evidenceCount) 条已授权情境依据",
-                "Detected \(candidate.evidenceCount) authorized context items within 8 seconds"
+                "结合当前操作与窗口状态，使用了 \(candidate.evidenceCount) 条已授权情境依据",
+                "Used \(candidate.evidenceCount) authorized context items from the current action and window state"
             )
         }
     }
@@ -3110,9 +3499,14 @@ final class AssistantContextCoordinator: ObservableObject {
 
     private func retireQueuedCandidates(
         _ candidates: [AssistantPatternCandidate],
-        replacingID: UUID? = nil
+        replacingCandidate: AssistantPatternCandidate? = nil
     ) {
-        for candidate in candidates where candidate.id != replacingID {
+        for candidate in candidates where candidate.id != replacingCandidate?.id {
+            if candidate.decisionKey == replacingCandidate?.decisionKey {
+                // 新候选继承同一检测器预留；这里只清掉旧队列项的 epoch，不能提前解除预留。
+                discardCandidateTracking(candidate.id)
+                continue
+            }
             Task { await persistCandidateDecision(candidate, presentation: .silent) }
         }
     }
@@ -3134,6 +3528,7 @@ final class AssistantContextCoordinator: ObservableObject {
     private func cancelStageCWork(cancelQualification shouldCancelQualification: Bool) {
         cancelCandidateJudgment(discardQueue: true)
         cancelContextOpportunityAggregation()
+        cancelPendingPresentations()
         peekTimeoutTask?.cancel()
         patternUndoTask?.cancel()
         stopTemporaryTranslation()
@@ -3144,6 +3539,9 @@ final class AssistantContextCoordinator: ObservableObject {
     private func applySessionInteraction(_ interaction: AssistantSessionInteraction) {
         _ = sessionProactivity.apply(interaction)
         sessionProactivityWasDowngraded = sessionProactivity.didDowngrade
+        if !visualContextAnalysisIsEnabled {
+            activityObserver.cancelPendingVisualCapture(reason: visualContextAnalysisDisableReason)
+        }
     }
 
     private static var userIsActivelyTyping: Bool {
@@ -3628,7 +4026,12 @@ final class AssistantContextCoordinator: ObservableObject {
         bundleID: String?,
         removeErrorNoise: Bool,
         workbenchIsRecoverable: Bool = false,
-        workbenchRoute: AssistantWorkbenchRoute? = nil
+        workbenchRoute: AssistantWorkbenchRoute? = nil,
+        observedAt: Date = .now,
+        surfaceID: String? = nil,
+        surfaceRevision: UInt64 = 0,
+        anchorGeneration: UInt64 = 0,
+        provenance: AssistantEvidenceProvenance = .explicit
     ) {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard userIsPresent, !value.isEmpty else { return }
@@ -3643,12 +4046,17 @@ final class AssistantContextCoordinator: ObservableObject {
                 : nil
             guard let event = await contextBuffer.appendIfCurrent(
                 AssistantActivityEvent(
+                    occurredAt: observedAt,
                     type: type,
                     source: source,
                     appIdentity: sensitivity == .normal && preferences.foregroundApplicationContextEnabled ? bundleID : nil,
                     contentType: .text,
                     contentFingerprint: fingerprint,
-                    sensitivity: sensitivity
+                    sensitivity: sensitivity,
+                    surfaceID: surfaceID,
+                    surfaceRevision: surfaceRevision,
+                    anchorGeneration: anchorGeneration,
+                    provenance: provenance
                 ),
                 rawText: sensitivity == .normal ? value : nil,
                 expectedEpoch: epoch
@@ -3661,7 +4069,8 @@ final class AssistantContextCoordinator: ObservableObject {
             if let reference = event.ephemeralContextReference, let workbenchRoute {
                 workbenchRoutesByRawContext[reference] = workbenchRoute
             }
-            if sensitivity == .normal {
+            let looksLikeError = AssistantPatternRules.looksLikeError(value)
+            if sensitivity == .normal, !looksLikeError {
                 await collectContextOpportunity(event, expectedContextEpoch: epoch)
             }
             guard sensitivity == .normal,
@@ -3670,7 +4079,7 @@ final class AssistantContextCoordinator: ObservableObject {
                   sourceIsCurrentlyAuthorized(source),
                   preferences.proactivity != .manual,
                   preferences.repeatedFailureEnabled,
-                  AssistantPatternRules.looksLikeError(value),
+                  looksLikeError,
                   let candidate = await patternDetector.ingestFailure(
                       event,
                       workbenchIsRecoverable: workbenchIsRecoverable
@@ -3789,14 +4198,11 @@ final class AssistantContextCoordinator: ObservableObject {
     }
 
     private func requestAccessibilityForDraftSourcesIfNeeded() {
-        if draftForegroundApplicationEnabled,
-           draftEnhancedWindowContextEnabled,
-           !CGPreflightScreenCaptureAccess() {
-            requestScreenCapturePermission()
-        }
-        guard ((draftForegroundApplicationEnabled && draftEnhancedWindowContextEnabled) || draftSelectionContextEnabled),
-              !AXIsProcessTrusted() else { return }
-        SelectedTextService.requestAccessibilityPermission()
+        let usesEnhancedWindowContext = draftForegroundApplicationEnabled && draftEnhancedWindowContextEnabled
+        SelectedTextService.showPermissionGuideIfNeeded(
+            requiresAccessibility: usesEnhancedWindowContext || draftSelectionContextEnabled,
+            requiresScreenRecording: usesEnhancedWindowContext
+        )
     }
 
     private static func languagesMatch(_ lhs: String, _ rhs: String) -> Bool {
@@ -3809,9 +4215,20 @@ final class AssistantContextCoordinator: ObservableObject {
 
 @MainActor
 private final class AssistantActivityObserver: NSObject {
+    private struct SurfaceSnapshot {
+        var id: String?
+        var revision: UInt64
+        var anchorGeneration: UInt64
+    }
+
     private struct ClipboardSnapshot {
         var changeCount: Int
+        var observedAt: Date
         var bundleID: String?
+        var possibleBundleIDs: [String]
+        var surface: SurfaceSnapshot
+        var userInitiated: Bool
+        var sourceIsReliable: Bool
         var kind: AssistantClipboardObservationKind
         var text: String?
     }
@@ -3823,17 +4240,19 @@ private final class AssistantActivityObserver: NSObject {
 
     private static let userIdleTimeout: TimeInterval = 60
     private static let visualCaptureDebounce: TimeInterval = 3
-    // 首次操作仍快速响应；持续操作最多每分钟进入一次本地视觉链路，避免 VLM 几乎常驻满载。
-    private static let minimumVisualCaptureInterval: TimeInterval = 60
+    private static let minimumVisualCaptureInterval: TimeInterval = 15
+    private static let failedVisualCaptureRetryInterval: TimeInterval = 30
 
     private weak var coordinator: AssistantContextCoordinator?
     private var workspaceObserverInstalled = false
     private var presenceObserverInstalled = false
     private var clipboardTimer: Timer?
     private var permissionTimer: Timer?
+    private var userActivityTimer: Timer?
     private var userIdleTask: Task<Void, Never>?
     private var visualCaptureTask: Task<Void, Never>?
     private var deferredVisualCaptureTrigger: VisualCaptureTrigger?
+    private var activeVisualCaptureTrigger: VisualCaptureTrigger?
     private var visualCaptureGeneration: UInt64 = 0
     private var clipboardStabilityTasks: [Int: Task<Void, Never>] = [:]
     private var clipboardProcessingTasks: [Int: Task<Void, Never>] = [:]
@@ -3845,20 +4264,29 @@ private final class AssistantActivityObserver: NSObject {
     private var selectionEnabled = false
     private var lastAccessibilityAuthorized = AXIsProcessTrusted()
     private var lastApplicationActivationAt = Date.distantPast
+    private var previousApplicationBundleID: String?
+    private var currentApplicationBundleID: String?
     private var lastUserActivitySignalAt = Date.distantPast
     private var lastUserActivityAt: Date?
     private var userIsPresent = false
     private var sessionIsActive = true
     private var lastWindowContextKey: String?
+    private var currentSurfaceID: String?
+    private var currentSurfaceRevision: UInt64 = 0
+    private var currentSurfaceContentKey: String?
+    private var anchorGeneration: UInt64 = 0
+    private var lastAnchorAt = Date.distantPast
     private var lastVisualCaptureHash: String?
     private var lastVisualCaptureAttemptAt: Date?
     private var lastVisualCaptureAt: Date?
     private var nextVisualCaptureAt: Date?
+    private var visualCaptureNeedsBackoff = false
 
     var diagnosticStatus: (
         foreground: Bool,
         clipboard: Bool,
         permission: Bool,
+        userActivity: Bool,
         visualCapture: Bool,
         visualCaptureTaskRunning: Bool,
         lastVisualCaptureAttemptAt: Date?,
@@ -3870,6 +4298,7 @@ private final class AssistantActivityObserver: NSObject {
             workspaceObserverInstalled && foregroundEnabled,
             clipboardTimer != nil && clipboardEnabled,
             permissionTimer != nil,
+            userActivityTimer != nil,
             permissionTimer != nil && enhancedWindowContextEnabled,
             visualCaptureTask != nil,
             lastVisualCaptureAttemptAt,
@@ -3955,6 +4384,8 @@ private final class AssistantActivityObserver: NSObject {
         clipboardEnabled = false
         selectionEnabled = false
         lastWindowContextKey = nil
+        currentSurfaceID = nil
+        currentSurfaceContentKey = nil
     }
 
     func markAssistantClipboardWrite(changeCount: Int) {
@@ -3963,6 +4394,9 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     func cancelPendingVisualCapture(reason: String = "user-model-preemption") {
+        let preservedTrigger = reason == "user-model-preemption"
+            ? deferredVisualCaptureTrigger ?? activeVisualCaptureTrigger
+            : nil
         if visualCaptureTask != nil {
             coordinator?.recordDiagnosticActivity(
                 stage: .capture,
@@ -3973,7 +4407,8 @@ private final class AssistantActivityObserver: NSObject {
         visualCaptureGeneration &+= 1
         visualCaptureTask?.cancel()
         visualCaptureTask = nil
-        deferredVisualCaptureTrigger = nil
+        activeVisualCaptureTrigger = nil
+        deferredVisualCaptureTrigger = preservedTrigger
         nextVisualCaptureAt = nil
     }
 
@@ -3983,6 +4418,7 @@ private final class AssistantActivityObserver: NSObject {
               enhancedWindowContextEnabled,
               userIsPresent,
               sessionIsActive,
+              coordinator?.visualContextAnalysisIsEnabled == true,
               coordinator?.backgroundAssistantRoundIsRunning != true else { return }
         deferredVisualCaptureTrigger = nil
         scheduleVisualCapture(after: Self.visualCaptureDebounce, trigger: trigger)
@@ -3993,6 +4429,7 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func startPresenceObserverIfNeeded() {
+        startUserActivityTimerIfNeeded()
         guard !presenceObserverInstalled else { return }
         let center = NSWorkspace.shared.notificationCenter
         [
@@ -4026,6 +4463,8 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func stopPresenceObserver() {
+        userActivityTimer?.invalidate()
+        userActivityTimer = nil
         userIdleTask?.cancel()
         userIdleTask = nil
         if presenceObserverInstalled {
@@ -4051,8 +4490,28 @@ private final class AssistantActivityObserver: NSObject {
         lastUserActivityAt = occurredAt
         userIsPresent = true
         coordinator?.userPresenceDidChange(true, lastActivityAt: occurredAt)
+        if let application = NSWorkspace.shared.frontmostApplication,
+           application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+           let windowID = DesktopAssistantScreenCapture.frontmostWindowID(
+               processIdentifier: application.processIdentifier
+           ) {
+            _ = updateSurface(
+                processIdentifier: application.processIdentifier,
+                windowID: windowID,
+                incrementAnchor: true
+            )
+        }
         scheduleUserIdleTimeout()
         scheduleVisualCapture(after: Self.visualCaptureDebounce, trigger: trigger)
+    }
+
+    private func startUserActivityTimerIfNeeded() {
+        guard userActivityTimer == nil else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pollUserActivity() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        userActivityTimer = timer
     }
 
     private func pollUserActivity() {
@@ -4132,6 +4591,7 @@ private final class AssistantActivityObserver: NSObject {
 
     private func startWorkspaceObserverIfNeeded() {
         guard !workspaceObserverInstalled else { return }
+        currentApplicationBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(handleApplicationActivation(_:)),
@@ -4155,6 +4615,8 @@ private final class AssistantActivityObserver: NSObject {
         guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
               let bundleID = application.bundleIdentifier,
               Self.secondsSinceLastUserInput < 2 else { return }
+        previousApplicationBundleID = currentApplicationBundleID
+        currentApplicationBundleID = bundleID
         noteUserActivity(trigger: .applicationActivated)
         lastApplicationActivationAt = .now
         coordinator?.recordApplicationActivation(bundleID: bundleID)
@@ -4212,13 +4674,23 @@ private final class AssistantActivityObserver: NSObject {
         visualCaptureGeneration &+= 1
         visualCaptureTask?.cancel()
         visualCaptureTask = nil
+        activeVisualCaptureTrigger = nil
         deferredVisualCaptureTrigger = nil
         lastVisualCaptureHash = nil
+        visualCaptureNeedsBackoff = false
         nextVisualCaptureAt = nil
     }
 
     private func scheduleVisualCapture(after delay: TimeInterval, trigger: VisualCaptureTrigger) {
-        guard enhancedWindowContextEnabled, userIsPresent, sessionIsActive else { return }
+        guard enhancedWindowContextEnabled,
+              userIsPresent,
+              sessionIsActive,
+              coordinator?.visualContextAnalysisIsEnabled == true else { return }
+        // 未授权时不能进入 ScreenCaptureKit，否则后台观察会再次触发系统权限弹窗。
+        guard CGPreflightScreenCaptureAccess() else {
+            coordinator?.screenCaptureAuthorized = false
+            return
+        }
         let captureIsRunning = visualCaptureTask != nil && nextVisualCaptureAt == nil
         guard !captureIsRunning,
               coordinator?.backgroundAssistantRoundIsRunning != true else {
@@ -4226,8 +4698,11 @@ private final class AssistantActivityObserver: NSObject {
             return
         }
         deferredVisualCaptureTrigger = nil
+        let cooldownInterval = visualCaptureNeedsBackoff
+            ? Self.failedVisualCaptureRetryInterval
+            : Self.minimumVisualCaptureInterval
         let cooldown = lastVisualCaptureAttemptAt.map {
-            max(0, Self.minimumVisualCaptureInterval - Date.now.timeIntervalSince($0))
+            max(0, cooldownInterval - Date.now.timeIntervalSince($0))
         } ?? 0
         let effectiveDelay = max(delay, cooldown)
         // 连续操作只重置同一轮防抖；诊断同步刷新这一条计划的真实起算时间。
@@ -4235,17 +4710,19 @@ private final class AssistantActivityObserver: NSObject {
         visualCaptureGeneration &+= 1
         let generation = visualCaptureGeneration
         visualCaptureTask?.cancel()
+        activeVisualCaptureTrigger = trigger
         nextVisualCaptureAt = .now.addingTimeInterval(effectiveDelay)
         coordinator?.recordDiagnosticActivity(
             stage: .capture,
             state: .scheduled,
-            detail: "trigger=\(trigger.rawValue) delay=\(String(format: "%.1f", effectiveDelay))s reset=\(captureWasPending) cooldown=\(cooldown > delay)"
+            detail: "trigger=\(trigger.rawValue) delay=\(String(format: "%.1f", effectiveDelay))s reset=\(captureWasPending) cooldown=\(cooldown > delay) interval=\(Int(cooldownInterval))s"
         )
         visualCaptureTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
                 if generation == visualCaptureGeneration {
                     visualCaptureTask = nil
+                    activeVisualCaptureTrigger = nil
                     nextVisualCaptureAt = nil
                     coordinator?.visualCaptureRoundDidSettle()
                     resumeDeferredVisualCaptureIfPossible()
@@ -4283,6 +4760,18 @@ private final class AssistantActivityObserver: NSObject {
                     )
                     return
                 }
+                guard let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+                      frontmostApplication.processIdentifier == capture.processIdentifier,
+                      DesktopAssistantScreenCapture.frontmostWindowID(
+                          processIdentifier: capture.processIdentifier
+                      ) == capture.windowID else {
+                    coordinator.recordDiagnosticActivity(
+                        stage: .capture,
+                        state: .skipped,
+                        detail: "frontmost-window-changed"
+                    )
+                    return
+                }
                 guard AssistantPrivacyPolicy(
                     excludedApplicationBundleIDs: coordinator.preferences.excludedApplicationBundleIDs
                 ).sensitivity(text: nil, bundleID: capture.bundleID) == .normal else {
@@ -4308,8 +4797,31 @@ private final class AssistantActivityObserver: NSObject {
                     detail: "frame-ready \(capture.image.pixelWidth ?? 0)x\(capture.image.pixelHeight ?? 0)"
                 )
                 coordinator.screenCaptureAuthorized = true
-                if await coordinator.recordScreenSnapshot(capture.image, bundleID: capture.bundleID) {
+                let surface = updateSurface(
+                    processIdentifier: capture.processIdentifier,
+                    windowID: capture.windowID
+                )
+                let outcome = await coordinator.recordScreenSnapshot(
+                    capture.image,
+                    bundleID: capture.bundleID,
+                    capturedAt: capture.capturedAt,
+                    surfaceID: surface.id,
+                    surfaceRevision: surface.revision,
+                    anchorGeneration: surface.anchorGeneration
+                )
+                switch outcome {
+                case .consumed:
+                    visualCaptureNeedsBackoff = false
                     lastVisualCaptureHash = capture.image.contentHash
+                case .retryableFailure:
+                    visualCaptureNeedsBackoff = true
+                    deferredVisualCaptureTrigger = trigger
+                case .retryableContention:
+                    visualCaptureNeedsBackoff = false
+                    lastVisualCaptureAttemptAt = nil
+                    deferredVisualCaptureTrigger = trigger
+                case .skipped:
+                    visualCaptureNeedsBackoff = false
                 }
             } catch {
                 // 未授予屏幕录制权限或窗口已消失时保持安静，下一次场景变化会自然重试。
@@ -4319,13 +4831,19 @@ private final class AssistantActivityObserver: NSObject {
                     state: .failed,
                     detail: "permission-or-window-error"
                 )
+                visualCaptureNeedsBackoff = coordinator.screenCaptureAuthorized
+                if coordinator.screenCaptureAuthorized {
+                    deferredVisualCaptureTrigger = trigger
+                }
             }
         }
     }
 
     private func pollAccessibilityPermission() {
-        pollUserActivity()
         let authorized = AXIsProcessTrusted()
+        if enhancedWindowContextEnabled {
+            coordinator?.screenCaptureAuthorized = CGPreflightScreenCaptureAccess()
+        }
         if authorized != lastAccessibilityAuthorized {
             let wasAuthorized = lastAccessibilityAuthorized
             lastAccessibilityAuthorized = authorized
@@ -4351,12 +4869,80 @@ private final class AssistantActivityObserver: NSObject {
         let key = "\(bundleID)|\(sanitizedTitle)"
         guard key != lastWindowContextKey else { return }
         lastWindowContextKey = key
-        coordinator?.recordWindowContext(bundleID: bundleID, title: sanitizedTitle)
+        let surface = updateSurface(
+            processIdentifier: application.processIdentifier,
+            windowID: DesktopAssistantScreenCapture.frontmostWindowID(processIdentifier: application.processIdentifier),
+            contentKey: sanitizedTitle
+        )
+        coordinator?.recordWindowContext(
+            bundleID: bundleID,
+            title: sanitizedTitle,
+            observedAt: .now,
+            surfaceID: surface.id,
+            surfaceRevision: surface.revision,
+            anchorGeneration: surface.anchorGeneration
+        )
+    }
+
+    private func updateSurface(
+        processIdentifier: pid_t,
+        windowID: CGWindowID?,
+        contentKey: String? = nil,
+        incrementAnchor: Bool = false
+    ) -> SurfaceSnapshot {
+        let surfaceID = windowID.map { "\(processIdentifier):\($0)" }
+        let surfaceChanged = currentSurfaceID != surfaceID
+        if surfaceChanged {
+            currentSurfaceID = surfaceID
+            currentSurfaceRevision &+= 1
+            currentSurfaceContentKey = contentKey
+        } else if let contentKey, contentKey != currentSurfaceContentKey {
+            currentSurfaceContentKey = contentKey
+            currentSurfaceRevision &+= 1
+        }
+        if incrementAnchor {
+            let now = Date.now
+            if surfaceChanged
+                || now.timeIntervalSince(lastAnchorAt) > AssistantPatternDetector.contextOpportunityMaximumDebounce {
+                anchorGeneration &+= 1
+            }
+            lastAnchorAt = now
+        }
+        return SurfaceSnapshot(
+            id: currentSurfaceID,
+            revision: currentSurfaceRevision,
+            anchorGeneration: anchorGeneration
+        )
+    }
+
+    fileprivate func explicitSurfaceSnapshot(bundleID: String?) -> (String?, UInt64, UInt64) {
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              bundleID == nil || application.bundleIdentifier == bundleID else {
+            let now = Date.now
+            if now.timeIntervalSince(lastAnchorAt) > AssistantPatternDetector.contextOpportunityMaximumDebounce {
+                anchorGeneration &+= 1
+            }
+            lastAnchorAt = now
+            return (nil, currentSurfaceRevision, anchorGeneration)
+        }
+        let surface = updateSurface(
+            processIdentifier: application.processIdentifier,
+            windowID: DesktopAssistantScreenCapture.frontmostWindowID(processIdentifier: application.processIdentifier),
+            incrementAnchor: true
+        )
+        return (surface.id, surface.revision, surface.anchorGeneration)
+    }
+
+    fileprivate func surfaceIsCurrent(id: String?, revision: UInt64, anchorGeneration: UInt64) -> Bool {
+        currentSurfaceID == id
+            && currentSurfaceRevision == revision
+            && self.anchorGeneration == anchorGeneration
     }
 
     private func pollClipboard() {
         pollUserActivity()
         let pasteboard = NSPasteboard.general
+        let observedAt = Date.now
         let changeCount = pasteboard.changeCount
         guard changeCount != lastClipboardChangeCount else { return }
         lastClipboardChangeCount = changeCount
@@ -4366,22 +4952,51 @@ private final class AssistantActivityObserver: NSObject {
         }
         guard !SelectedTextService.shouldIgnorePasteboardChange(changeCount) else { return }
         guard userIsPresent else { return }
-        let bundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let application = NSWorkspace.shared.frontmostApplication
+        let bundleID = application?.bundleIdentifier
         let types = pasteboard.pasteboardItems?.flatMap(\.types) ?? pasteboard.types ?? []
         let kind = AssistantClipboardClassifier.classify(typeIdentifiers: types.map(\.rawValue))
-        // 来源稳定前只在内存短暂保留本次内容；验证仍为同一前台应用后才进入隐私清洗和上下文。
+        let sourceIsReliable = observedAt.timeIntervalSince(lastApplicationActivationAt) >= 0.75
+        let possibleBundleIDs = Array(Set(
+            ([bundleID] + (sourceIsReliable ? [] : [previousApplicationBundleID])).compactMap { $0 }
+        ))
+        let userInitiated = Self.secondsSinceLastUserInput < 2
+        let surface: SurfaceSnapshot
+        if let application {
+            surface = updateSurface(
+                processIdentifier: application.processIdentifier,
+                windowID: DesktopAssistantScreenCapture.frontmostWindowID(processIdentifier: application.processIdentifier),
+                incrementAnchor: userInitiated
+            )
+        } else {
+            if userInitiated {
+                if observedAt.timeIntervalSince(lastAnchorAt) > AssistantPatternDetector.contextOpportunityMaximumDebounce {
+                    anchorGeneration &+= 1
+                }
+                lastAnchorAt = observedAt
+            }
+            surface = SurfaceSnapshot(
+                id: currentSurfaceID,
+                revision: currentSurfaceRevision,
+                anchorGeneration: anchorGeneration
+            )
+        }
+        // 切换应用后的短暂歧义同时校验前后两个来源；正文仍只在内存停留，任一来源被排除就整条丢弃。
         let snapshot = ClipboardSnapshot(
             changeCount: changeCount,
-            bundleID: bundleID,
+            observedAt: observedAt,
+            bundleID: sourceIsReliable ? bundleID : nil,
+            possibleBundleIDs: possibleBundleIDs,
+            surface: surface,
+            userInitiated: userInitiated,
+            sourceIsReliable: sourceIsReliable,
             kind: kind,
             text: kind == .plainText ? pasteboard.string(forType: .string) : nil
         )
-        let sourceIsReliable = Date.now.timeIntervalSince(lastApplicationActivationAt) >= 0.75
         coordinator?.noteClipboardProvenance(
             changeCount: changeCount,
             text: sourceIsReliable ? snapshot.text : nil,
-            bundleID: bundleID,
-            sourceIsReliable: sourceIsReliable
+            possibleBundleIDs: possibleBundleIDs
         )
         guard clipboardEnabled else { return }
         if !sourceIsReliable {
@@ -4408,18 +5023,12 @@ private final class AssistantActivityObserver: NSObject {
     }
 
     private func processStableClipboard(_ snapshot: ClipboardSnapshot) {
-        guard clipboardEnabled,
-              NSWorkspace.shared.frontmostApplication?.bundleIdentifier == snapshot.bundleID else { return }
-        guard Date.now.timeIntervalSince(lastApplicationActivationAt) >= 0.75 else {
-            scheduleStableClipboardProcessing(snapshot)
-            return
-        }
+        guard clipboardEnabled else { return }
         if NSPasteboard.general.changeCount == snapshot.changeCount {
             coordinator?.noteClipboardProvenance(
                 changeCount: snapshot.changeCount,
                 text: snapshot.text,
-                bundleID: snapshot.bundleID,
-                sourceIsReliable: true
+                possibleBundleIDs: snapshot.possibleBundleIDs
             )
         }
         switch snapshot.kind {
@@ -4428,7 +5037,18 @@ private final class AssistantActivityObserver: NSObject {
                   clipboardProcessingTasks[snapshot.changeCount] == nil else { return }
             clipboardProcessingTasks[snapshot.changeCount] = Task { @MainActor [weak self, weak coordinator] in
                 guard !Task.isCancelled else { return }
-                await coordinator?.recordClipboardText(text, bundleID: snapshot.bundleID)
+                await coordinator?.recordClipboardText(
+                    text,
+                    bundleID: snapshot.bundleID,
+                    possibleBundleIDs: snapshot.possibleBundleIDs,
+                    observedAt: snapshot.observedAt,
+                    surfaceID: snapshot.surface.id,
+                    surfaceRevision: snapshot.surface.revision,
+                    anchorGeneration: snapshot.surface.anchorGeneration,
+                    provenance: snapshot.userInitiated
+                        ? (snapshot.sourceIsReliable ? .explicit : .uncertain)
+                        : .observed
+                )
                 self?.clipboardProcessingTasks.removeValue(forKey: snapshot.changeCount)
             }
         case .file:

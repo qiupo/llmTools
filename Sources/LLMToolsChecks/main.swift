@@ -173,6 +173,30 @@ struct LLMToolsChecks {
             generalVisionOnly.imageRecognition && generalVisionOnly.imagePostProcessing,
             "A general VLM should handle image explanation without requiring a second text model."
         )
+        let fastAssistantVisionModel = ModelDescriptor(
+            name: "Fast general VLM",
+            sourcePath: textModel.sourcePath,
+            format: .mlx,
+            sizeClass: "0.8b",
+            role: .fast,
+            contextLength: 32_768,
+            capabilities: .vision(source: .manual, confidence: 1)
+        )
+        let qualityAssistantVisionModel = ModelDescriptor(
+            name: "Quality general VLM",
+            sourcePath: textModel.sourcePath,
+            format: .mlx,
+            sizeClass: "9b",
+            role: .quality,
+            contextLength: 32_768,
+            capabilities: .vision(source: .manual, confidence: 1)
+        )
+        try require(
+            ModelRecommendationPolicy.preferredVisionModel(
+                in: [qualityAssistantVisionModel, fastAssistantVisionModel]
+            )?.id == fastAssistantVisionModel.id,
+            "Automatic desktop vision routing must prefer the fast local VLM over the qualified judgment model."
+        )
 
         let speechModel = ModelDescriptor(
             name: "Qwen3-ASR-0.6B-8bit",
@@ -1559,6 +1583,15 @@ struct LLMToolsChecks {
                 && readableDiagnostic.contains("重置为 3.0s"),
             "Exported and on-screen assistant activity must share the same readable diagnostic explanation."
         )
+        let readableVisionTimeout = AssistantDiagnosticEvent(
+            stage: .vision,
+            state: .failed,
+            detail: "vision-timeout limit=15s elapsed=15000ms"
+        ).localizedSummary(language: .chinese)
+        try require(
+            readableVisionTimeout.contains("超过 15s 时限"),
+            "Vision timeout diagnostics must distinguish a real deadline from cancellation or model failure."
+        )
         let resumeAt = Date(timeIntervalSince1970: 200)
         lifecycle.apply(.pause(until: resumeAt))
         lifecycle.apply(.tick(Date(timeIntervalSince1970: 199)))
@@ -1907,9 +1940,31 @@ struct LLMToolsChecks {
             contentFingerprint: normalizedA
         )
         let merged = await buffer.append(duplicate, rawText: "new raw text", now: base.addingTimeInterval(1))
-        try require(merged.occurrenceCount == 2, "Duplicate source/app/fingerprint events should merge into one counter.")
+        let refreshedRawText = await buffer.rawText(for: storedFirst.ephemeralContextReference, now: base.addingTimeInterval(1))
+        try require(
+            merged.occurrenceCount == 2
+                && merged.ephemeralContextReference == storedFirst.ephemeralContextReference
+                && refreshedRawText == "new raw text",
+            "Duplicate evidence must keep a stable raw-context reference while refreshing its bounded in-memory value."
+        )
         let mergedEvents = await buffer.snapshot(now: base.addingTimeInterval(1))
         try require(mergedEvents.count == 1, "Merged activity events should occupy one queue slot.")
+        var delayedDuplicate = duplicate
+        delayedDuplicate.occurredAt = base.addingTimeInterval(0.5)
+        let delayedMerge = await buffer.append(
+            delayedDuplicate,
+            rawText: "stale delayed text",
+            now: base.addingTimeInterval(1.5)
+        )
+        let rawTextAfterDelayedMerge = await buffer.rawText(
+            for: storedFirst.ephemeralContextReference,
+            now: base.addingTimeInterval(1.5)
+        )
+        try require(
+            delayedMerge.occurredAt == base.addingTimeInterval(1)
+                && rawTextAfterDelayedMerge == "new raw text",
+            "A late observer callback must not overwrite newer evidence or move its real occurrence time backward."
+        )
         let expiredRawText = await buffer.rawText(for: merged.ephemeralContextReference, now: base.addingTimeInterval(601))
         try require(expiredRawText == nil, "Raw context must expire after 10 minutes even while the activity counter remains.")
 
@@ -2535,11 +2590,25 @@ struct LLMToolsChecks {
                 && mixedFailure?.isTaskFailure == true,
             "P-01 must retain a recoverable llmTools workbench route even when later matching evidence comes from selections."
         )
-        let failureDuringCooldown = await detector.ingestFailure(
+        let failureDuringReservation = await detector.ingestFailure(
             failureEvent(offset: 301, source: .llmToolsTask),
             now: base.addingTimeInterval(301)
         )
-        try require(failureDuringCooldown == nil, "P-01 must enforce its 30-minute fingerprint cooldown.")
+        try require(failureDuringReservation == nil, "P-01 must not emit the same candidate while its first decision is pending.")
+        if let repeated { await detector.settle(repeated, delivered: false, now: base.addingTimeInterval(301)) }
+        let failureAfterSuppression = await detector.ingestFailure(
+            failureEvent(offset: 302, source: .llmToolsTask),
+            now: base.addingTimeInterval(302)
+        )
+        try require(failureAfterSuppression != nil, "A suppressed P-01 candidate must become eligible again without burning its cooldown.")
+        if let failureAfterSuppression {
+            await detector.settle(failureAfterSuppression, delivered: true, now: base.addingTimeInterval(302))
+        }
+        let failureDuringCooldown = await detector.ingestFailure(
+            failureEvent(offset: 303, source: .llmToolsTask),
+            now: base.addingTimeInterval(303)
+        )
+        try require(failureDuringCooldown == nil, "A delivered P-01 candidate must enforce its 30-minute fingerprint cooldown.")
         try require(AssistantPatternRules.looksLikeError("Fatal error: port already in use"), "Explicit error text should pass P-01 prefiltering.")
         try require(!AssistantPatternRules.looksLikeError("A normal paragraph about today's project notes."), "Ordinary text must not enter P-01 detection.")
 
@@ -2575,13 +2644,31 @@ struct LLMToolsChecks {
         try require(foreign?.patternType == .foreignClipboard && foreign?.evidenceCount == 3, "P-03 must trigger at three distinct same-language texts.")
         try require(foreign?.evidenceContextReferences.count == 3, "P-03 must give the value judge all three distinct ephemeral texts.")
         try require(foreign?.appCategory == "browser", "P-03 must retain the coarse app category for related-history filtering.")
-        let foreignDuringCooldown = await p03Detector.ingestForeignClipboard(
+        let foreignDuringReservation = await p03Detector.ingestForeignClipboard(
             foreignEvent("d", offset: 120),
             language: "en",
             effectiveCharacterCount: 30,
             now: base.addingTimeInterval(120)
         )
-        try require(foreignDuringCooldown == nil, "P-03 must enforce its 60-minute language cooldown.")
+        try require(foreignDuringReservation == nil, "P-03 must not emit a duplicate while its first decision is pending.")
+        if let foreign { await p03Detector.settle(foreign, delivered: false, now: base.addingTimeInterval(120)) }
+        let foreignAfterSuppression = await p03Detector.ingestForeignClipboard(
+            foreignEvent("e", offset: 121),
+            language: "en",
+            effectiveCharacterCount: 30,
+            now: base.addingTimeInterval(121)
+        )
+        try require(foreignAfterSuppression != nil, "A suppressed P-03 candidate must be eligible again.")
+        if let foreignAfterSuppression {
+            await p03Detector.settle(foreignAfterSuppression, delivered: true, now: base.addingTimeInterval(121))
+        }
+        let foreignDuringCooldown = await p03Detector.ingestForeignClipboard(
+            foreignEvent("f", offset: 122),
+            language: "en",
+            effectiveCharacterCount: 30,
+            now: base.addingTimeInterval(122)
+        )
+        try require(foreignDuringCooldown == nil, "A delivered P-03 candidate must enforce its 60-minute language cooldown.")
         let lowConfidenceDetector = AssistantPatternDetector()
         let lowConfidence = await lowConfidenceDetector.ingestForeignClipboard(
             foreignEvent("low", offset: 0, confidence: 0.79),
@@ -2618,7 +2705,13 @@ struct LLMToolsChecks {
             _ id: String,
             offset: TimeInterval,
             source: AssistantSource,
-            appIdentity: String? = "com.example.editor"
+            appIdentity: String? = "com.example.editor",
+            surfaceID: String? = "4242:7",
+            surfaceRevision: UInt64 = 1,
+            anchorGeneration: UInt64 = 1,
+            provenance: AssistantEvidenceProvenance = .explicit,
+            contentType: AssistantContentType? = nil,
+            sceneSignal: String? = nil
         ) -> AssistantActivityEvent {
             let type: AssistantActivityType = switch source {
             case .clipboard: .clipboardChanged
@@ -2631,39 +2724,77 @@ struct LLMToolsChecks {
                 type: type,
                 source: source,
                 appIdentity: appIdentity,
-                contentType: source == .windowContext ? .metadata : .text,
+                contentType: contentType ?? (source == .windowContext ? .metadata : .text),
                 contentFingerprint: id,
+                surfaceID: surfaceID,
+                surfaceRevision: surfaceRevision,
+                anchorGeneration: anchorGeneration,
+                provenance: provenance,
+                sceneSignal: sceneSignal,
                 ephemeralContextReference: source == .foregroundApplication ? nil : UUID()
             )
         }
+        var opportunityBatch = AssistantContextOpportunityBatch()
+        let observedBatchTrigger = contextEvent(
+            "batch-visual",
+            offset: 0,
+            source: .windowContext,
+            provenance: .observed,
+            contentType: .image,
+            sceneSignal: "success"
+        )
+        let explicitBatchTrigger = contextEvent("batch-selection", offset: 0.2, source: .selection)
+        _ = opportunityBatch.insert(observedBatchTrigger)
+        let selectedBatchTrigger = opportunityBatch.insert(explicitBatchTrigger)
+        let otherSurfaceTrigger = contextEvent(
+            "batch-other-window",
+            offset: 0.3,
+            source: .clipboard,
+            surfaceID: "5252:8",
+            anchorGeneration: 2
+        )
+        _ = opportunityBatch.insert(otherSurfaceTrigger)
+        let drainedBatch = opportunityBatch.drain()
+        try require(
+            selectedBatchTrigger.id == explicitBatchTrigger.id
+                && drainedBatch.count == 2
+                && Set(drainedBatch.map(\.id)) == Set([explicitBatchTrigger.id, otherSurfaceTrigger.id])
+                && opportunityBatch.count == 0,
+            "Concurrent context triggers must merge only within one operation bucket and preserve independent surfaces."
+        )
         let acceptedForegroundMetadata = await p06Detector.ingestContextOpportunity(
             contextEvent("metadata", offset: 0, source: .foregroundApplication),
             now: base
         )
         try require(!acceptedForegroundMetadata, "P-06 must never trigger from foreground-application metadata alone.")
-        let acceptedClipboardContext = await p06Detector.ingestContextOpportunity(
-            contextEvent("clipboard", offset: 0, source: .clipboard),
-            now: base
+        let titleSupport = contextEvent(
+            "window-title",
+            offset: 0,
+            source: .windowContext,
+            provenance: .observed
         )
-        let acceptedWindowContext = await p06Detector.ingestContextOpportunity(
-            contextEvent("window", offset: 7, source: .windowContext),
-            now: base.addingTimeInterval(7)
+        let acceptedWindowContext = await p06Detector.ingestContextOpportunity(titleSupport, now: base)
+        let clipboardTrigger = contextEvent("clipboard", offset: 0.2, source: .clipboard)
+        let acceptedClipboardContext = await p06Detector.ingestContextOpportunity(
+            clipboardTrigger,
+            now: base.addingTimeInterval(0.2)
         )
         try require(
-            acceptedClipboardContext && acceptedWindowContext,
-            "P-06 must accept only authorized semantic sources with ephemeral evidence."
+            acceptedClipboardContext && !acceptedWindowContext,
+            "Explicit clipboard or selection evidence may trigger P-06; a window title is support only."
         )
         let contextualOpportunity = await p06Detector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(7),
-            now: base.addingTimeInterval(15)
+            trigger: clipboardTrigger,
+            now: base.addingTimeInterval(1)
         )
         try require(
             contextualOpportunity?.patternType == .contextualOpportunity
                 && contextualOpportunity?.evidenceCount == 2
                 && contextualOpportunity?.sourceTypes == [.clipboard, .windowContext]
                 && contextualOpportunity?.actionIDs == [.openQuickAction]
-                && contextualOpportunity?.availableTaskKinds == TaskKind.interactiveCases.sorted { $0.rawValue < $1.rawValue },
-            "P-06 must merge the last eight seconds and route only through existing Quick Action tasks."
+                && contextualOpportunity?.availableTaskKinds == TaskKind.interactiveCases.sorted { $0.rawValue < $1.rawValue }
+                && contextualOpportunity?.surfaceID == "4242:7",
+            "P-06 must fuse support by surface identity and keep actions owned by the explicit trigger."
         )
         try require(
             AssistantPatternType.contextualOpportunity.conservativeFallbackPresentation == .silent
@@ -2672,108 +2803,243 @@ struct LLMToolsChecks {
             "P-06 must stay silent when local semantic judgment is unavailable or invalid."
         )
         let emptyWindowDetector = AssistantPatternDetector()
-        let emptyWindowResult = await emptyWindowDetector.flushContextOpportunityResult(windowEnd: base, now: base)
+        let emptyWindowResult = await emptyWindowDetector.flushContextOpportunityResult(now: base)
         try require(
             { if case .noEvidence = emptyWindowResult { return true }; return false }(),
-            "P-06 diagnostics must distinguish an empty aggregation window."
+            "P-06 diagnostics must distinguish a missing decision trigger."
         )
-        let delayedWakeDetector = AssistantPatternDetector()
-        _ = await delayedWakeDetector.ingestContextOpportunity(
-            contextEvent("delayed-wakeup", offset: 0, source: .windowContext),
-            now: base
+
+        let visualDetector = AssistantPatternDetector()
+        let neutralVisual = contextEvent(
+            "neutral-visual",
+            offset: 0,
+            source: .windowContext,
+            provenance: .observed,
+            contentType: .image,
+            sceneSignal: "none"
         )
-        let delayedWakeResult = await delayedWakeDetector.flushContextOpportunityResult(
-            windowEnd: base.addingTimeInterval(8),
-            now: base.addingTimeInterval(8.2)
+        let salientVisual = contextEvent(
+            "success-visual",
+            offset: 1,
+            source: .windowContext,
+            provenance: .observed,
+            contentType: .image,
+            sceneSignal: "success"
+        )
+        let neutralVisualTriggers = await visualDetector.ingestContextOpportunity(neutralVisual, now: base)
+        let salientVisualTriggers = await visualDetector.ingestContextOpportunity(
+            salientVisual,
+            now: base.addingTimeInterval(1)
+        )
+        let visualOpportunity = await visualDetector.flushContextOpportunity(
+            trigger: salientVisual,
+            now: base.addingTimeInterval(1.8)
         )
         try require(
-            { if case .candidate(let candidate) = delayedWakeResult { return candidate.evidenceCount == 1 }; return false }(),
-            "A slightly late aggregation task must keep evidence on its fixed eight-second boundary."
+            !neutralVisualTriggers
+                && salientVisualTriggers
+                && visualOpportunity?.sceneSignal == "success"
+                && visualOpportunity?.actionIDs.isEmpty == true
+                && visualOpportunity?.availableTaskKinds.isEmpty == true,
+            "Only a salient visual signal may trigger an actionless observation; neutral screenshots remain support only."
         )
-        _ = await p06Detector.ingestContextOpportunity(contextEvent("clipboard", offset: 60, source: .clipboard), now: base.addingTimeInterval(60))
-        _ = await p06Detector.ingestContextOpportunity(contextEvent("window", offset: 67, source: .windowContext), now: base.addingTimeInterval(67))
-        let contextualDuringCooldown = await p06Detector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(67),
-            now: base.addingTimeInterval(67)
-        )
-        try require(contextualDuringCooldown == nil, "P-06 must enforce a ten-minute cooldown for the same context combination.")
-        _ = await p06Detector.ingestContextOpportunity(contextEvent("different", offset: 68, source: .selection), now: base.addingTimeInterval(68))
-        let differentContext = await p06Detector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(68),
-            now: base.addingTimeInterval(68)
-        )
-        try require(differentContext != nil, "A different P-06 context must remain eligible during another context's cooldown.")
-        _ = await p06Detector.ingestContextOpportunity(contextEvent("clipboard", offset: 615, source: .clipboard), now: base.addingTimeInterval(615))
-        _ = await p06Detector.ingestContextOpportunity(contextEvent("window", offset: 622, source: .windowContext), now: base.addingTimeInterval(622))
-        let contextualAfterCooldown = await p06Detector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(622),
-            now: base.addingTimeInterval(622)
-        )
-        try require(contextualAfterCooldown != nil, "P-06 must become eligible again at the ten-minute cooldown boundary.")
 
         let p06CooldownDetector = AssistantPatternDetector()
-        _ = await p06CooldownDetector.ingestContextOpportunity(contextEvent("stable", offset: 0, source: .clipboard), now: base)
-        let initialCooldownCandidate = await p06CooldownDetector.flushContextOpportunity(windowEnd: base, now: base)
+        let initialTrigger = contextEvent("stable", offset: 0, source: .clipboard)
+        _ = await p06CooldownDetector.ingestContextOpportunity(initialTrigger, now: base)
+        let initialCooldownCandidate = await p06CooldownDetector.flushContextOpportunity(trigger: initialTrigger, now: base)
         try require(
             initialCooldownCandidate != nil,
-            "Expected an initial P-06 candidate before testing source revocation."
+            "Expected an initial P-06 candidate before testing transactional cooldown."
         )
-        await p06CooldownDetector.clearContextOpportunitySamples()
-        _ = await p06CooldownDetector.ingestContextOpportunity(
-            contextEvent("stable", offset: 30, source: .clipboard),
-            now: base.addingTimeInterval(30)
-        )
-        let revokedCooldownResult = await p06CooldownDetector.flushContextOpportunityResult(
-            windowEnd: base.addingTimeInterval(30),
-            now: base.addingTimeInterval(30)
+        let reservedTrigger = contextEvent("another-value", offset: 1, source: .selection)
+        _ = await p06CooldownDetector.ingestContextOpportunity(reservedTrigger, now: base.addingTimeInterval(1))
+        let reservedResult = await p06CooldownDetector.flushContextOpportunityResult(
+            trigger: reservedTrigger,
+            now: base.addingTimeInterval(1)
         )
         try require(
-            { if case .duplicateCooldown = revokedCooldownResult { return true }; return false }(),
-            "Clearing revoked-source samples must preserve and report the ten-minute cooldown."
+            { if case .duplicateCooldown = reservedResult { return true }; return false }(),
+            "Different evidence from the same surface anchor must share one reserved P-06 decision."
+        )
+        if let initialCooldownCandidate {
+            await p06CooldownDetector.settle(initialCooldownCandidate, delivered: false, now: base.addingTimeInterval(1))
+        }
+        let retryTrigger = contextEvent("stable", offset: 2, source: .clipboard)
+        _ = await p06CooldownDetector.ingestContextOpportunity(retryTrigger, now: base.addingTimeInterval(2))
+        let retryCandidate = await p06CooldownDetector.flushContextOpportunity(
+            trigger: retryTrigger,
+            now: base.addingTimeInterval(2)
+        )
+        try require(retryCandidate != nil, "A suppressed P-06 decision must be immediately eligible again.")
+        if let retryCandidate {
+            await p06CooldownDetector.settle(retryCandidate, delivered: true, now: base.addingTimeInterval(2))
+        }
+        await p06CooldownDetector.clearContextOpportunitySamples()
+        let cooldownTrigger = contextEvent(
+            "stable",
+            offset: 3,
+            source: .clipboard,
+            anchorGeneration: 3
+        )
+        _ = await p06CooldownDetector.ingestContextOpportunity(cooldownTrigger, now: base.addingTimeInterval(3))
+        let deliveredCooldownResult = await p06CooldownDetector.flushContextOpportunityResult(
+            trigger: cooldownTrigger,
+            now: base.addingTimeInterval(3)
+        )
+        try require(
+            { if case .duplicateCooldown = deliveredCooldownResult { return true }; return false }(),
+            "Only a delivered P-06 decision starts the ten-minute cooldown, which survives sample clearing."
+        )
+        let differentTrigger = contextEvent(
+            "different",
+            offset: 4,
+            source: .selection,
+            anchorGeneration: 2
+        )
+        _ = await p06CooldownDetector.ingestContextOpportunity(differentTrigger, now: base.addingTimeInterval(4))
+        let differentContext = await p06CooldownDetector.flushContextOpportunity(
+            trigger: differentTrigger,
+            now: base.addingTimeInterval(4)
+        )
+        try require(differentContext != nil, "A different decision key must remain eligible during another context's cooldown.")
+        let afterCooldownTrigger = contextEvent(
+            "stable",
+            offset: 602,
+            source: .clipboard,
+            anchorGeneration: 4
+        )
+        _ = await p06CooldownDetector.ingestContextOpportunity(afterCooldownTrigger, now: base.addingTimeInterval(602))
+        let contextualAfterCooldown = await p06CooldownDetector.flushContextOpportunity(
+            trigger: afterCooldownTrigger,
+            now: base.addingTimeInterval(602)
+        )
+        try require(contextualAfterCooldown != nil, "P-06 must become eligible at the delivered cooldown boundary.")
+
+        let p06IdentityDetector = AssistantPatternDetector()
+        let oldRevisionTitle = contextEvent(
+            "old-revision",
+            offset: 0,
+            source: .windowContext,
+            surfaceRevision: 1,
+            provenance: .observed
+        )
+        _ = await p06IdentityDetector.ingestContextOpportunity(oldRevisionTitle, now: base)
+        let newRevisionTrigger = contextEvent(
+            "new-revision",
+            offset: 5,
+            source: .selection,
+            surfaceRevision: 2,
+            anchorGeneration: 2
+        )
+        _ = await p06IdentityDetector.ingestContextOpportunity(newRevisionTrigger, now: base.addingTimeInterval(5))
+        let boundedContext = await p06IdentityDetector.flushContextOpportunity(
+            trigger: newRevisionTrigger,
+            now: base.addingTimeInterval(5.8)
+        )
+        try require(
+            boundedContext?.evidenceCount == 1 && boundedContext?.source == .selection,
+            "A new surface revision must not absorb a stale title from the previous page state."
         )
 
-        let p06WindowDetector = AssistantPatternDetector()
-        _ = await p06WindowDetector.ingestContextOpportunity(contextEvent("old", offset: 0, source: .selection), now: base)
-        _ = await p06WindowDetector.ingestContextOpportunity(contextEvent("new", offset: 9, source: .clipboard), now: base.addingTimeInterval(9))
-        let boundedContext = await p06WindowDetector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(9),
-            now: base.addingTimeInterval(9)
+        let clipboardBridgeDetector = AssistantPatternDetector()
+        let bridgeClipboard = contextEvent(
+            "bridge-copy",
+            offset: 0,
+            source: .clipboard,
+            surfaceID: "111:1"
         )
-        try require(
-            boundedContext?.evidenceCount == 1 && boundedContext?.source == .clipboard,
-            "P-06 must exclude evidence older than its eight-second aggregation window."
-        )
-        let p06LateFlushDetector = AssistantPatternDetector()
-        _ = await p06LateFlushDetector.ingestContextOpportunity(
-            contextEvent("first-window", offset: 0, source: .selection),
+        _ = await clipboardBridgeDetector.ingestContextOpportunity(
+            bridgeClipboard,
             now: base
         )
-        _ = await p06LateFlushDetector.ingestContextOpportunity(
-            contextEvent("next-window", offset: 9, source: .clipboard),
-            now: base.addingTimeInterval(9)
+        let pasteDestinationTrigger = contextEvent(
+            "destination-selection",
+            offset: 20,
+            source: .selection,
+            surfaceID: "222:2"
         )
-        let firstWindow = await p06LateFlushDetector.flushContextOpportunity(
-            windowEnd: base,
-            now: base.addingTimeInterval(9)
+        _ = await clipboardBridgeDetector.ingestContextOpportunity(
+            pasteDestinationTrigger,
+            now: base.addingTimeInterval(20)
         )
-        let nextWindow = await p06LateFlushDetector.flushContextOpportunity(
-            windowEnd: base.addingTimeInterval(9),
-            now: base.addingTimeInterval(9)
+        let bridgedContext = await clipboardBridgeDetector.flushContextOpportunity(
+            trigger: pasteDestinationTrigger,
+            now: base.addingTimeInterval(20.8)
         )
         try require(
-            firstWindow?.source == .selection && nextWindow?.source == .clipboard,
-            "A late P-06 debounce flush must consume only its own window and preserve newer samples."
+            bridgedContext?.evidenceCount == 2
+                && bridgedContext?.sourceTypes == [.clipboard, .selection]
+                && bridgedContext?.surfaceID == "222:2",
+            "A recent explicit clipboard copy may bridge one app switch while the destination remains the decision owner."
         )
+        if let bridgedContext {
+            await clipboardBridgeDetector.settle(bridgedContext, delivered: true, now: base.addingTimeInterval(21))
+        }
+        let laterDestinationTrigger = contextEvent(
+            "later-destination",
+            offset: 25,
+            source: .selection,
+            surfaceID: "333:3",
+            anchorGeneration: 3
+        )
+        _ = await clipboardBridgeDetector.ingestContextOpportunity(
+            laterDestinationTrigger,
+            now: base.addingTimeInterval(25)
+        )
+        let contextAfterBridgeConsumption = await clipboardBridgeDetector.flushContextOpportunity(
+            trigger: laterDestinationTrigger,
+            now: base.addingTimeInterval(25.8)
+        )
+        try require(
+            contextAfterBridgeConsumption?.evidenceCount == 1,
+            "Explicit clipboard evidence must be consumed after one delivered cross-app context instead of bridging repeatedly."
+        )
+
+        let latestVisualDetector = AssistantPatternDetector()
+        let oldVisual = contextEvent(
+            "old-visual",
+            offset: 0,
+            source: .windowContext,
+            provenance: .observed,
+            contentType: .image,
+            sceneSignal: "blocked"
+        )
+        let currentVisual = contextEvent(
+            "current-visual",
+            offset: 1,
+            source: .windowContext,
+            provenance: .observed,
+            contentType: .image,
+            sceneSignal: "none"
+        )
+        let currentSelection = contextEvent("current-selection", offset: 1.2, source: .selection)
+        _ = await latestVisualDetector.ingestContextOpportunity(oldVisual, now: base)
+        _ = await latestVisualDetector.ingestContextOpportunity(currentVisual, now: base.addingTimeInterval(1))
+        _ = await latestVisualDetector.ingestContextOpportunity(currentSelection, now: base.addingTimeInterval(1.2))
+        let latestVisualContext = await latestVisualDetector.flushContextOpportunity(
+            trigger: currentSelection,
+            now: base.addingTimeInterval(2)
+        )
+        try require(
+            latestVisualContext?.evidenceCount == 2,
+            "Only the latest visual state from one surface operation may support the current explicit trigger."
+        )
+
         let p06WindowOnlyDetector = AssistantPatternDetector()
-        _ = await p06WindowOnlyDetector.ingestContextOpportunity(
-            contextEvent("actionable-window-title", offset: 0, source: .windowContext),
+        let windowOnlyTitle = contextEvent(
+            "window-title-only",
+            offset: 0,
+            source: .windowContext,
+            provenance: .observed
+        )
+        let windowOnlyTrigger = await p06WindowOnlyDetector.ingestContextOpportunity(
+            windowOnlyTitle,
             now: base
         )
-        let windowOnlyContext = await p06WindowOnlyDetector.flushContextOpportunity(windowEnd: base, now: base)
         try require(
-            windowOnlyContext?.sourceTypes == [.windowContext]
-                && windowOnlyContext?.evidenceCount == 1,
-            "P-06 may qualify an authorized sanitized window-title change, while foreground-app metadata remains ineligible."
+            !windowOnlyTrigger,
+            "A sanitized window-title change is supporting evidence and must never create a message on its own."
         )
 
         var queue = AssistantCandidateQueue()
@@ -2797,6 +3063,21 @@ struct LLMToolsChecks {
         let replacement = queue.enqueueReportingRemovals(candidate(.repeatedFailure, offset: 4, source: .llmToolsTask), now: base)
         try require(replacement.inserted && replacement.removed.count == 1, "A task failure should report the lower-priority candidate it replaces.")
         try require(queue.count == 3 && queue.popNext(now: base)?.isTaskFailure == true, "Task failures must run before clipboard candidates.")
+
+        var deduplicatingQueue = AssistantCandidateQueue()
+        var firstDecision = candidate(.contextualOpportunity, offset: 0, source: .selection)
+        firstDecision.decisionKey = "contextualOpportunity|same-surface-anchor"
+        var updatedDecision = candidate(.contextualOpportunity, offset: 1, source: .selection)
+        updatedDecision.decisionKey = firstDecision.decisionKey
+        _ = deduplicatingQueue.enqueue(firstDecision, now: base)
+        let deduplicated = deduplicatingQueue.enqueueReportingRemovals(updatedDecision, now: base)
+        try require(
+            deduplicated.inserted
+                && deduplicated.removed.map(\.id) == [firstDecision.id]
+                && deduplicatingQueue.count == 1
+                && deduplicatingQueue.popNext(now: base)?.id == updatedDecision.id,
+            "Concurrent triggers for the same decision key must update one queue slot instead of creating duplicate messages."
+        )
 
         var session = AssistantSessionProactivityState(configured: .active)
         try require(!session.apply(.explicitNegative) && session.effective == .active, "One negative response must not lower proactivity.")
@@ -2919,19 +3200,18 @@ struct LLMToolsChecks {
             hasAppSwitchFixture
                 && hasVideoFixture
                 && typingFixture?.input.userIsTyping == true
-                && typingFixture?.isHardNegative == true
+                && typingFixture?.isHardNegative == false
                 && hasLongReadingFixture
                 && contextualOpportunityPositives.count == 4
                 && p06UsesImplicitEvidence
-                && contextualOpportunityPositives.allSatisfy {
-                    !$0.input.allowedEvidenceQuotes.isEmpty
-                        && !$0.input.availableTaskKinds.isEmpty
-                        && $0.input.availableActionIDs == [.openQuickAction]
-                }
+                && contextualOpportunityPositives.filter { $0.input.availableActionIDs == [.openQuickAction] }.count == 2
+                && contextualOpportunityPositives.filter { $0.input.availableActionIDs.isEmpty }.count == 2
+                && contextualOpportunityPositives.allSatisfy { !$0.input.allowedEvidenceQuotes.isEmpty }
                 && passiveReadingFixture?.input.historicalAggregate == nil
                 && passiveReadingFixture?.input.containsURL == false
                 && passiveReadingFixture?.input.containsCode == false
-                && embeddedURLFixture?.input.containsURL == true,
+                && embeddedURLFixture?.input.containsURL == true
+                && embeddedURLFixture?.input.availableActionIDs.isEmpty == true,
             "Qualification fixtures must cover app switching, video watching, typing, passive reading, feedback, embedded URLs, and four implicit grounded P-06 positives."
         )
         try require(
@@ -2940,7 +3220,9 @@ struct LLMToolsChecks {
         )
         let goodSamples = try AssistantJudgmentFixtures.all.map { fixture -> AssistantQualificationSample in
             let isContextualOpportunity = fixture.input.patternType == .contextualOpportunity
-            let shouldLockContext = fixture.expectsPeek && isContextualOpportunity
+            let shouldLockContext = fixture.expectsPeek
+                && isContextualOpportunity
+                && fixture.input.availableActionIDs.contains(.openQuickAction)
             let output = AssistantJudgmentOutput(
                 isHighValue: fixture.expectsPeek,
                 valueScore: fixture.expectsPeek ? 0.9 : 0.1,
@@ -3106,13 +3388,15 @@ struct LLMToolsChecks {
             "Judgment parsing must enforce the same 120-character reason limit advertised by the prompt."
         )
         try require(
-            AssistantJudgmentContract.promptVersion == 19
-                && AssistantJudgmentFixtures.version == 9
+            AssistantJudgmentContract.promptVersion == 21
+                && AssistantJudgmentFixtures.version == 10
                 && AssistantJudgmentContract.systemPrompt.contains("Return exactly one JSON object")
                 && AssistantJudgmentContract.systemPrompt.contains("no longer than 120 characters")
                 && AssistantJudgmentContract.systemPrompt.contains("Never force a tool")
                 && AssistantJudgmentContract.systemPrompt.contains("authoritative upstream facts")
-                && AssistantJudgmentContract.systemPrompt.contains("rules and actions for other pattern types do not apply"),
+                && AssistantJudgmentContract.systemPrompt.contains("rules and actions for other pattern types do not apply")
+                && AssistantJudgmentContract.systemPrompt.contains("final one-sentence assistant message")
+                && AssistantJudgmentContract.systemPrompt.contains("delivery timing only"),
             "The qualification cache version and strict structured-output contract must change together."
         )
         let p06PositiveFixture = try requireNonNil(
@@ -3161,6 +3445,28 @@ struct LLMToolsChecks {
         try require(
             AssistantJudgmentContract.parse(groundedP06Text, input: p06PositiveFixture.input) != nil,
             "P-06 must accept a quote, task, and action locked to supplied local evidence."
+        )
+        try require(
+            p06PositiveFixture.input.allowedEvidenceQuotes.count == 1,
+            "Only the primary explicit P-06 evidence may become an executable Quick Action quote."
+        )
+        if p06PositiveFixture.input.ephemeralEvidenceTexts.count > 1 {
+            var supportQuoteOutput = groundedP06Output
+            supportQuoteOutput.lockedEvidenceQuote = String(
+                p06PositiveFixture.input.ephemeralEvidenceTexts[1].prefix(80)
+            )
+            let supportQuoteText = String(decoding: try JSONEncoder().encode(supportQuoteOutput), as: UTF8.self)
+            try require(
+                AssistantJudgmentContract.parse(supportQuoteText, input: p06PositiveFixture.input) == nil,
+                "Window or visual support evidence must never become the parameter of a Quick Action."
+            )
+        }
+        var unsafeFinalMessage = groundedP06Output
+        unsafeFinalMessage.reason = "Open https://example.com and run func deploy() now."
+        let unsafeFinalMessageText = String(decoding: try JSONEncoder().encode(unsafeFinalMessage), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(unsafeFinalMessageText, input: p06PositiveFixture.input) == nil,
+            "The one-pass judgment boundary must reject a final bubble message containing a URL or code."
         )
         let actionlessP06Output = AssistantJudgmentOutput(
             isHighValue: true,
@@ -3218,23 +3524,24 @@ struct LLMToolsChecks {
         {"activity":"coding","observation":"A build result is visible beside the current editor.","visibleText":["Build succeeded"],"signal":"success","confidence":0.91}
         """
         try require(
-            AssistantSceneContract.parse(validSceneJSON)?.signal == "success"
+            AssistantSceneContract.promptVersion == 2
+                && AssistantSceneContract.systemPrompt.contains("All five keys are required")
+                && AssistantSceneContract.parse(validSceneJSON)?.signal == "success"
                 && AssistantSceneContract.parse(
                     "{\"activity\":\"form\",\"observation\":\"password=secret\",\"visibleText\":[],\"signal\":\"none\",\"confidence\":0.9}"
                 ) == nil,
             "Visual context must accept bounded grounded JSON and reject sensitive summaries."
         )
-        let hardVetoFixture = try requireNonNil(
+        let codeContextFixture = try requireNonNil(
             AssistantJudgmentFixtures.all.first(where: { $0.id == "n-code-copy" }),
             "Expected the embedded URL and code qualification fixture."
         )
-        var hardVetoPositive = groundedP06Output
-        hardVetoPositive.lockedEvidenceQuote = hardVetoFixture.input.allowedEvidenceQuotes[0]
-        hardVetoPositive.suggestedTask = hardVetoFixture.input.availableTaskKinds[0]
-        let hardVetoPositiveText = String(decoding: try JSONEncoder().encode(hardVetoPositive), as: UTF8.self)
+        var safeCodeObservation = actionlessP06Output
+        safeCodeObservation.reason = "The current code is visible, but no clear milestone needs interruption."
+        let safeCodeObservationText = String(decoding: try JSONEncoder().encode(safeCodeObservation), as: UTF8.self)
         try require(
-            AssistantJudgmentContract.parse(hardVetoPositiveText, input: hardVetoFixture.input) == nil,
-            "Mandatory code and URL vetoes must be enforced after model output parsing."
+            AssistantJudgmentContract.parse(safeCodeObservationText, input: codeContextFixture.input) != nil,
+            "Code and URL evidence may support a safe actionless judgment; upstream must remove its Quick Action entry."
         )
         var fullEvidenceP06Output = groundedP06Output
         fullEvidenceP06Output.lockedEvidenceQuote = p06PositiveFixture.input.ephemeralEvidenceTexts[0]
@@ -3353,10 +3660,12 @@ struct LLMToolsChecks {
         )
         try require(
             AssistantJudgmentContract.userPrompt(for: fullScreenFixture.input)
-                .contains("mandatoryVetoReasons=isFullScreen")
+                .contains("mandatoryVetoReasons=none")
                 && AssistantJudgmentContract.userPrompt(for: fullScreenFixture.input)
-                    .contains("MANDATORY VETO isFullScreen"),
-            "Mandatory presentation vetoes must be salient in the production judgment prompt."
+                    .contains("\"isFullScreen\":true")
+                && AssistantJudgmentContract.userPrompt(for: typingFixture!.input)
+                    .contains("mandatoryVetoReasons=none"),
+            "Typing and full-screen state must remain delivery hints instead of value-judgment vetoes."
         )
         try require(
             AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[0].input)
@@ -5859,6 +6168,14 @@ struct LLMToolsChecks {
 
     private static func checkLocalGenerationTokenLimits() throws {
         try require(
+            LocalGenerationPolicy.maxTokens(
+                for: .translate,
+                thinkingModeEnabled: false,
+                override: LocalGenerationPolicy.maximumDetailedTranslationTokens
+            ) == 8_192,
+            "Expected detailed translation to allow its full local output budget."
+        )
+        try require(
             LocalGenerationPolicy.maxTokens(for: .translate, thinkingModeEnabled: true)
                 == LocalGenerationPolicy.maximumThinkingTokens,
             "Expected thinking mode to use a bounded first-pass budget before the non-thinking retry."
@@ -7322,6 +7639,11 @@ struct LLMToolsChecks {
         try require(prompt.contains("\"translation\""), "Detailed translation prompt must require a primary translation.")
         try require(prompt.contains("\"keyTerms\""), "Detailed translation prompt must require key vocabulary.")
         try require(prompt.contains("\"exampleTranslation\""), "Detailed translation prompt must require translated examples.")
+        try require(
+            !prompt.contains("important source-language word or phrase")
+                && !prompt.contains("standard IPA for one word only"),
+            "Detailed translation prompt must not contain semantic placeholders that small models can echo."
+        )
 
         // 覆盖小模型常见的 Markdown 围栏，并验证重复、空值和数量上限会被收敛。
         let parsed = try requireNonNil(
@@ -7381,6 +7703,27 @@ struct LLMToolsChecks {
         try require(malformedAlternatives.keyTerms.first?.term == "false positive", "Expected valid key terms to remain available.")
         try require(malformedAlternatives.notes == ["这是影响分析中的常用表达。"], "Expected valid notes to remain available.")
 
+        try require(
+            TranslationStudyResult.parse(modelText: """
+            {
+              "translation": "译文",
+              "alternatives": [],
+              "keyTerms": [{"term": "important source-language word or phrase"}],
+              "notes": []
+            }
+            """) == nil,
+            "Prompt placeholders must not be accepted as detailed vocabulary."
+        )
+        try require(
+            TranslationStudyResult.parse(
+                modelText: """
+                {"translation":"浏览器扩展","alternatives":[],"keyTerms":[{"term":"浏览器扩展"}],"notes":[]}
+                """,
+                sourceText: "browser extension"
+            ) == nil,
+            "Detailed vocabulary must come from the source text instead of the translation."
+        )
+
         let thinkingOnly = """
         Thinking Process:
         The requested schema is {"translation":"placeholder","alternatives":[],"keyTerms":[],"notes":[]}.
@@ -7408,10 +7751,17 @@ struct LLMToolsChecks {
 
         let registryStore = RegistryStore(fileURL: root.appendingPathComponent("registry.json"))
         let historyStore = HistoryStore(fileURL: root.appendingPathComponent("history.json"))
-        let runner = StubRunner(output: """
-        Thinking Process:
-        The translation of "hello" in Chinese is "你好".
-        """)
+        let invalidDetailedOutput = """
+        {"translation":"结构化译文","alternatives":[],"keyTerms":[{"term":"important source-language word or phrase"}],"notes":[]}
+        """
+        let runner = StubRunner(outputs: [
+            """
+            Thinking Process:
+            The translation of "hello" in Chinese is "你好".
+            """,
+            invalidDetailedOutput,
+            "结构化失败后的普通译文"
+        ])
         let engine = TaskEngine(
             registryStore: registryStore,
             historyStore: historyStore,
@@ -7431,6 +7781,30 @@ struct LLMToolsChecks {
             "Expected raw model output to be preserved, got \(result.text)."
         )
         try require(result.rawText == result.text, "Stub runner output should be raw and visible.")
+
+        let fallbackResult = try await engine.run(
+            request: TaskRequest(
+                task: .translate,
+                inputText: "detailed",
+                translationOutputMode: .detailed
+            )
+        )
+        try require(
+            fallbackResult.text == "结构化失败后的普通译文"
+                && fallbackResult.translationStudy?.translation == fallbackResult.text,
+            "Invalid detailed JSON must fall back to a clean plain translation."
+        )
+        try require(
+            fallbackResult.rawText == invalidDetailedOutput,
+            "Detailed fallback should retain the malformed response only as opt-in raw output."
+        )
+        let recordedRequests = await runner.recordedRequests()
+        try require(
+            recordedRequests.map(\.translationOutputMode) == [.plain, .detailed, .plain]
+                && recordedRequests[1].maxOutputTokensOverride == 8_192
+                && recordedRequests[2].maxOutputTokensOverride == nil,
+            "Detailed translation must use the larger output budget and make exactly one bounded plain retry."
+        )
     }
 
     private static func checkOpenAICompatibleRunnerUsesChatCompletions() async throws {
