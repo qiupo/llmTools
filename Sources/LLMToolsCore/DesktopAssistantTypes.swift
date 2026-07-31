@@ -17,7 +17,8 @@ public enum AssistantProactivity: String, Codable, Sendable, CaseIterable, Ident
         case .manual: 0
         case .quiet: 1
         case .moderate: 2
-        case .active: 4
+        // 活跃档是用户明确选择的桌宠陪伴模式，最多约十分钟说一次。
+        case .active: 6
         }
     }
 }
@@ -25,9 +26,27 @@ public enum AssistantProactivity: String, Codable, Sendable, CaseIterable, Ident
 public enum AssistantPersonality: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
     case professional
     case gentle
+    case lively
+    case calm
     case lightTeasing
 
     public var id: String { rawValue }
+
+    /// 给本地小模型一条明确、短小的性格边界，避免只看到枚举名后自由猜测语气。
+    public var promptGuidance: String {
+        switch self {
+        case .professional:
+            "PROFESSIONAL: Speak like a sharp, trustworthy work partner. Lead with the useful point; stay precise and concise. No cute filler, praise, or chitchat. Style example: 'There are several conditions; trace the state dependency first.'"
+        case .gentle:
+            "GENTLE: Speak like a warm, relaxed companion. Be encouraging without therapy language, overpraise, or assumptions about the user's feelings. Style example: 'These conditions are a little tangled; take them one at a time.'"
+        case .lively:
+            "LIVELY: Be bright, curious, and energetic. One light exclamation is fine; never sound childish, noisy, emoji-heavy, or relentlessly positive. Style example: 'All the conditions are here; let us take them one by one!'"
+        case .calm:
+            "CALM: Be understated, steady, and dependable, using short sentences. Slightly cool is fine; never sound dismissive, cryptic, or superior. Style example: 'Several conditions. Follow the state flow first.'"
+        case .lightTeasing:
+            "LIGHT TEASING: Use one small situational joke or playful metaphor. Tease the task, error, or situation, never the user; no insults, sarcasm, memes, or canned punchlines. Style example: 'These conditions took the scenic route; unpack them one by one.'"
+        }
+    }
 }
 
 public enum AssistantToolbarTrigger: String, Codable, Sendable, CaseIterable, Identifiable, Hashable {
@@ -803,11 +822,11 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
         if detail.hasPrefix("context-recorded ") {
             return localize("已得到可用的场景语义，写入当前窗口的短期证据池", "Usable scene semantics were added to the current window's short-term evidence pool")
         }
-        if detail.hasPrefix("vision-timeout ") {
-            let limit = diagnosticToken("limit") ?? "15s"
+        if detail.hasPrefix("vision-watchdog-timeout ") || detail.hasPrefix("vision-timeout ") {
+            let limit = diagnosticToken("limit") ?? "60s"
             return localize(
-                "本地视觉模型超过 \(limit) 时限，已结束并等待重试",
-                "The local vision model exceeded the \(limit) limit and will retry later"
+                "本地视觉模型运行超过 \(limit)，按卡死保护结束并等待重试",
+                "The local vision model exceeded the \(limit) hang watchdog and will retry later"
             )
         }
         if detail.hasPrefix("vision-cancelled ") {
@@ -837,6 +856,16 @@ public struct AssistantDiagnosticEvent: Codable, Sendable, Identifiable, Hashabl
         }
         if detail.hasPrefix("model-veto=confidence ") {
             return localize("模型倾向展示，但置信度没达到当前门槛", "The model leaned toward showing this, but its confidence was below the current threshold")
+        }
+        if detail.hasPrefix("model-watchdog-timeout ") {
+            let limit = diagnosticToken("limit") ?? "60s"
+            return localize(
+                "价值模型运行超过 \(limit)，按卡死保护结束并等待重试",
+                "The value model exceeded the \(limit) hang watchdog and will retry later"
+            )
+        }
+        if detail.hasPrefix("model-error ") {
+            return localize("价值模型运行失败，已静默结束本轮", "The value model failed, so this round ended silently")
         }
         if detail.hasPrefix("deferred=") {
             let reason = diagnosticToken("deferred") ?? "busy"

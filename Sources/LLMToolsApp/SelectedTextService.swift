@@ -240,32 +240,29 @@ enum SelectedTextService {
         }
 
         let pasteboard = NSPasteboard.general
+        // 截图框选也会触发全局拖拽监听；已有图片或文件时跳过合成复制，完整保留剪贴板。
+        guard !preserveNonTextClipboardPayloads || !pasteboardContainsNonTextPayload(pasteboard) else {
+            return nil
+        }
         let originalSnapshot = PasteboardSnapshot.capture(from: pasteboard)
-        let marker = "llmTools-\(UUID().uuidString)"
+        let originalChangeCount = pasteboard.changeCount
         let captureStartedAt = Date()
 
-        pasteboard.clearContents()
-        pasteboard.setString(marker, forType: .string)
-        let markerChangeCount = pasteboard.changeCount
-        noteInternalPasteboardWrite(changeCount: markerChangeCount)
         sendCopyShortcut()
         await waitForSyntheticCopy()
 
-        // changeCount 记录合成复制完成后的所有权；恢复前若再次变化，说明用户或其他程序已写入新内容。
+        // changeCount 足以判断 Cmd+C 是否写入，无需把可粘贴的内部哨兵放进系统剪贴板。
         let capturedChangeCount = pasteboard.changeCount
         let hasNonTextPayload = preserveNonTextClipboardPayloads && pasteboardContainsNonTextPayload(pasteboard)
         let copied = hasNonTextPayload ? nil : pasteboard.string(forType: .string)
+        await yieldPasteboardOwnershipCheck()
         let userCopiedDuringCapture = lastUserCopyShortcutDate >= captureStartedAt
         let userInteractedDuringCapture = lastUserInteractionDate >= captureStartedAt
-        let changeCountDelta = capturedChangeCount >= markerChangeCount
-            ? capturedChangeCount - markerChangeCount
-            : Int.max
-        let markerStillOwned = changeCountDelta == 0 && copied == marker
-        let syntheticCopyStillOwned = changeCountDelta == 1 && copied != marker
-        await yieldPasteboardOwnershipCheck()
         let pasteboardStillOwned = pasteboard.changeCount == capturedChangeCount
-            && (markerStillOwned || syntheticCopyStillOwned)
-        if !userCopiedDuringCapture {
+            && capturedChangeCount != originalChangeCount
+        if !userCopiedDuringCapture,
+           !userInteractedDuringCapture,
+           pasteboardStillOwned {
             noteInternalPasteboardWrite(changeCount: capturedChangeCount)
         }
         if !userCopiedDuringCapture,
@@ -285,7 +282,7 @@ enum SelectedTextService {
         }
 
         let trimmed = copied?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let trimmed, !trimmed.isEmpty, trimmed != marker else {
+        guard let trimmed, !trimmed.isEmpty else {
             return nil
         }
         // Cmd+C 回退只能读取文本，无法可靠标识原选区，因此禁止后续自动替换原文。

@@ -1457,7 +1457,8 @@ final class AssistantContextCoordinator: ObservableObject {
         }
         let summary: AssistantSceneSummary
         do {
-            summary = try await withBackgroundTimeout(lease: lease, seconds: 15) { [appState, image, judgmentModelID] in
+            // 这里只保留防止底层模型永久卡死的 watchdog；慢推理完成后仍由下方场景版本校验决定是否采用。
+            summary = try await withBackgroundTimeout(lease: lease, seconds: 60) { [appState, image, judgmentModelID] in
                 try await appState.runDesktopAssistantVision(image: image, modelID: judgmentModelID)
             }
         } catch is CancellationError {
@@ -1473,7 +1474,7 @@ final class AssistantContextCoordinator: ObservableObject {
             recordDiagnosticActivity(
                 stage: .vision,
                 state: .failed,
-                detail: "vision-timeout limit=15s elapsed=\(elapsed)ms"
+                detail: "vision-watchdog-timeout limit=60s elapsed=\(elapsed)ms"
             )
             return .retryableFailure
         } catch {
@@ -2066,6 +2067,10 @@ final class AssistantContextCoordinator: ObservableObject {
         }
     }
 
+    fileprivate func prioritizeAssistantInteraction() {
+        activityObserver.suppressVisualCaptureForAssistantInteraction()
+    }
+
     private func finishBackgroundWorkflow(_ lease: AssistantBackgroundWorkLease) {
         finishedBackgroundWorkflows.insert(lease.id)
         guard backgroundOperationCounts[lease.id, default: 0] == 0 else { return }
@@ -2365,6 +2370,9 @@ final class AssistantContextCoordinator: ObservableObject {
             }
             guard generation == qualificationGeneration else { return }
             qualificationProgress.beginRunning()
+            // 资格检查与评估共用同一热推理上限，避免能生成正确气泡的模型因两处阈值不一致被误判。
+            let fixtureTimeoutMilliseconds = AssistantQualificationEvaluator.maximumFixtureLatencyMilliseconds
+            let fixtureTimeoutSeconds = TimeInterval(fixtureTimeoutMilliseconds) / 1_000
             while run.samples.count < AssistantJudgmentFixtures.all.count {
                 try Task.checkCancellation()
                 guard !userModelWorkIsActive else {
@@ -2377,7 +2385,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 let startedAt = ContinuousClock.now
                 let output: String?
                 do {
-                    output = try await withBackgroundTimeout(lease: lease, seconds: 5) { [appState, modelID = run.model.id, input = fixture.input] in
+                    output = try await withBackgroundTimeout(lease: lease, seconds: fixtureTimeoutSeconds) { [appState, modelID = run.model.id, input = fixture.input] in
                         try await appState.runDesktopAssistantJudgment(input: input, modelID: modelID)
                     }
                 } catch is CancellationError {
@@ -2388,7 +2396,7 @@ final class AssistantContextCoordinator: ObservableObject {
                           qualificationRun?.id == run.id else { throw CancellationError() }
                     let elapsed = ContinuousClock.now - startedAt
                     let latency = max(
-                        5_000,
+                        fixtureTimeoutMilliseconds,
                         Int(elapsed.components.seconds * 1_000)
                             + Int(elapsed.components.attoseconds / 1_000_000_000_000_000)
                     )
@@ -2400,8 +2408,8 @@ final class AssistantContextCoordinator: ObservableObject {
                     qualificationRun = run
                     qualificationProgress.recordCompleted(run.samples.count)
                     throw AssistantQualificationTimeout(message: text(
-                        "热推理样例 \(run.samples.count)/\(AssistantJudgmentFixtures.all.count) 超过 5 秒。",
-                        "Hot-inference fixture \(run.samples.count)/\(AssistantJudgmentFixtures.all.count) exceeded 5 seconds."
+                        "热推理样例 \(run.samples.count)/\(AssistantJudgmentFixtures.all.count) 超过 \(Int(fixtureTimeoutSeconds)) 秒。",
+                        "Hot-inference fixture \(run.samples.count)/\(AssistantJudgmentFixtures.all.count) exceeded \(Int(fixtureTimeoutSeconds)) seconds."
                     ))
                 } catch {
                     output = nil
@@ -2548,7 +2556,10 @@ final class AssistantContextCoordinator: ObservableObject {
               currentJudgmentModelID != nil,
               effectiveProactivity == .moderate || effectiveProactivity == .active,
               sourceIsCurrentlyAuthorized(event.source) else { return }
-        let shouldTrigger = await patternDetector.ingestContextOpportunity(event)
+        let shouldTrigger = await patternDetector.ingestContextOpportunity(
+            event,
+            activeCompanionMode: effectiveProactivity == .active
+        )
         guard shouldTrigger else { return }
         scheduleContextOpportunityAggregation(trigger: event, expectedContextEpoch: expectedContextEpoch)
     }
@@ -2867,18 +2878,14 @@ final class AssistantContextCoordinator: ObservableObject {
         do {
             try Task.checkCancellation()
             guard candidateIsCurrentlyAllowed(candidate) else { throw CancellationError() }
-            let startedAt = ContinuousClock.now
-            try await withBackgroundTimeout(lease: lease, seconds: 8) { [appState] in
+            // 桌宠允许反应慢；60 秒只负责回收真正卡死的本地模型，不作为用户体感 SLA。
+            try await withBackgroundTimeout(lease: lease, seconds: 60) { [appState] in
                 try Task.checkCancellation()
                 try await appState.warmUpDesktopAssistantJudgmentModel(id: modelID)
             }
             try Task.checkCancellation()
             guard candidateIsCurrentlyAllowed(candidate) else { throw CancellationError() }
-            let warmupElapsed = ContinuousClock.now - startedAt
-            let warmupSeconds = Double(warmupElapsed.components.seconds)
-                + Double(warmupElapsed.components.attoseconds) / 1_000_000_000_000_000_000
-            let generationLimit = min(5, max(0.05, 8 - warmupSeconds))
-            let outputText = try await withBackgroundTimeout(lease: lease, seconds: generationLimit) { [appState] in
+            let outputText = try await withBackgroundTimeout(lease: lease, seconds: 60) { [appState] in
                 try Task.checkCancellation()
                 return try await appState.runDesktopAssistantJudgment(
                     input: input,
@@ -2965,7 +2972,7 @@ final class AssistantContextCoordinator: ObservableObject {
                 judgmentConfidence: output.confidence,
                 lockedEvidenceQuote: output.lockedEvidenceQuote,
                 suggestedTask: output.suggestedTask,
-                lockedComment: output.reason,
+                lockedComment: output.comment,
                 contextSummary: semanticEvidence.joined(separator: "\n")
             )
         } catch is CancellationError {
@@ -2982,11 +2989,18 @@ final class AssistantContextCoordinator: ObservableObject {
                 await persistCandidateDecision(candidate, presentation: .silent)
             }
             return
+        } catch is AssistantBackgroundTimeout {
+            recordDiagnosticActivity(
+                stage: .judgment,
+                state: .failed,
+                detail: "model-watchdog-timeout limit=60s pattern=\(candidate.patternType.rawValue)"
+            )
+            await degradeCandidate(candidate, judgmentModelID: modelID)
         } catch {
             recordDiagnosticActivity(
                 stage: .judgment,
                 state: .failed,
-                detail: "timeout-or-model-error pattern=\(candidate.patternType.rawValue)"
+                detail: "model-error pattern=\(candidate.patternType.rawValue)"
             )
             await degradeCandidate(candidate, judgmentModelID: modelID)
         }
@@ -4413,6 +4427,16 @@ private final class AssistantActivityObserver: NSObject {
         nextVisualCaptureAt = nil
     }
 
+    func suppressVisualCaptureForAssistantInteraction() {
+        // 助手自身的拖动和菜单 hover 不是用户正在处理的桌面上下文，不能再触发本地 VLM。
+        lastUserActivitySignalAt = .now
+        lastUserActivityAt = lastUserActivitySignalAt
+        userIsPresent = true
+        coordinator?.userPresenceDidChange(true, lastActivityAt: lastUserActivityAt)
+        scheduleUserIdleTimeout()
+        cancelPendingVisualCapture(reason: "assistant-interaction")
+    }
+
     fileprivate func resumeDeferredVisualCaptureIfPossible() {
         guard let trigger = deferredVisualCaptureTrigger,
               visualCaptureTask == nil,
@@ -4688,6 +4712,7 @@ private final class AssistantActivityObserver: NSObject {
               userIsPresent,
               Self.sessionIsActive,
               coordinator?.visualContextAnalysisIsEnabled == true else { return }
+        guard coordinator?.windowController?.assistantInteractionIsInProgress != true else { return }
         // 未授权时不能进入 ScreenCaptureKit，否则后台观察会再次触发系统权限弹窗。
         guard CGPreflightScreenCaptureAccess() else {
             coordinator?.screenCaptureAuthorized = false
@@ -5130,6 +5155,7 @@ final class FloatingAssistantWindowController: NSObject {
     private var dragDidMove = false
     private var dropOriginalFrame: CGRect?
     private var activeDropClassification: AssistantDropClassification?
+    private var contextMenuIsOpen = false
     private var toolbarVisible = false
     private var screenObserver: Any?
     private var workspaceVisibilityObservers: [NSObjectProtocol] = []
@@ -5138,7 +5164,7 @@ final class FloatingAssistantWindowController: NSObject {
     private var hasRestoredInitialPosition = false
 
     var assistantInteractionIsInProgress: Bool {
-        dragLocalMonitor != nil || dragGlobalMonitor != nil || dropOriginalFrame != nil
+        dragLocalMonitor != nil || dragGlobalMonitor != nil || dropOriginalFrame != nil || contextMenuIsOpen
     }
 
     var diagnosticStatus: (
@@ -5377,6 +5403,7 @@ final class FloatingAssistantWindowController: NSObject {
     }
 
     func beginOrbPointerInteraction(pointerOffset: CGPoint, clickCount: Int) {
+        coordinator.prioritizeAssistantInteraction()
         removeDragMonitors()
         dragStart = NSEvent.mouseLocation
         dragPointerOffset = pointerOffset
@@ -5384,11 +5411,12 @@ final class FloatingAssistantWindowController: NSObject {
         dragDidMove = false
         let mask: NSEvent.EventTypeMask = [.leftMouseDragged, .leftMouseUp]
         dragLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
-            Task { @MainActor in self?.handleOrbDragEvent(event) }
+            // AppKit 监视器在主线程回调；同步处理可让系统合并高频事件，避免旧坐标排队追赶鼠标。
+            MainActor.assumeIsolated { self?.handleOrbDragEvent(event) }
             return event
         }
         dragGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
-            Task { @MainActor in self?.handleOrbDragEvent(event) }
+            MainActor.assumeIsolated { self?.handleOrbDragEvent(event) }
         }
     }
 
@@ -5404,6 +5432,7 @@ final class FloatingAssistantWindowController: NSObject {
         removeDragMonitors()
         if dragDidMove {
             finishOrbDrag(mouseLocation: location, pointerOffset: dragPointerOffset)
+            coordinator.prioritizeAssistantInteraction()
         } else if dragClickCount == 1 {
             orbClicked()
         }
@@ -5418,8 +5447,10 @@ final class FloatingAssistantWindowController: NSObject {
 
     func dragOrb(mouseLocation: CGPoint, pointerOffset: CGPoint) {
         hoverOpenTask?.cancel()
-        toolbarPanel.orderOut(nil)
-        toolbarVisible = false
+        if toolbarVisible {
+            toolbarPanel.orderOut(nil)
+            toolbarVisible = false
+        }
         let screen = screen(containing: mouseLocation) ?? orbPanel.screen ?? NSScreen.main
         guard let visibleFrame = screen?.visibleFrame else { return }
         let proposed = CGRect(
@@ -5428,8 +5459,10 @@ final class FloatingAssistantWindowController: NSObject {
             width: AssistantWindowGeometry.orbDiameter,
             height: AssistantWindowGeometry.orbDiameter
         )
-        orbPanel.setFrame(AssistantWindowGeometry.clampedOrbFrame(proposed, in: visibleFrame), display: true)
-        placeAccessories()
+        let clamped = AssistantWindowGeometry.clampedOrbFrame(proposed, in: visibleFrame)
+        // 尺寸不变时只移动 WindowServer 图层，不强制 SwiftUI 在每个鼠标事件上重绘。
+        orbPanel.setFrameOrigin(clamped.origin)
+        if peekPanel.isVisible { placeAccessories() }
     }
 
     func finishOrbDrag(mouseLocation: CGPoint, pointerOffset: CGPoint) {
@@ -5483,6 +5516,12 @@ final class FloatingAssistantWindowController: NSObject {
     }
 
     func showContextMenu(event: NSEvent, in view: NSView) {
+        contextMenuIsOpen = true
+        coordinator.prioritizeAssistantInteraction()
+        defer {
+            contextMenuIsOpen = false
+            coordinator.prioritizeAssistantInteraction()
+        }
         let menu = NSMenu()
         addMenuItem(menu, coordinator.text("打开 Quick Action", "Open Quick Action"), #selector(openQuickAction))
         addMenuItem(menu, coordinator.text("查看最近提示", "Recent Suggestions"), #selector(openRecent))

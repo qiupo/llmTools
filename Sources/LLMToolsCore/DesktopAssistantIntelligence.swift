@@ -253,6 +253,7 @@ public actor AssistantPatternDetector {
     public static let contextOpportunityVisualFreshness: TimeInterval = 30
     public static let contextOpportunityClipboardBridge: TimeInterval = 30
     public static let contextOpportunityCooldown: TimeInterval = 10 * 60
+    public static let activeCompanionInterval: TimeInterval = 5 * 60
     public static let candidateReservationTTL: TimeInterval = AssistantContextBuffer.rawContextTTL
 
     private struct FailureSample: Sendable {
@@ -282,6 +283,7 @@ public actor AssistantPatternDetector {
     private var contextOpportunitySamples: [String: ContextOpportunitySample] = [:]
     private var contextOpportunityCooldowns: [String: Date] = [:]
     private var contextOpportunityReservations: [String: Date] = [:]
+    private var nextActiveCompanionAt = Date.distantPast
 
     public init() {}
 
@@ -396,6 +398,7 @@ public actor AssistantPatternDetector {
     @discardableResult
     public func ingestContextOpportunity(
         _ event: AssistantActivityEvent,
+        activeCompanionMode: Bool = false,
         now: Date = .now
     ) -> Bool {
         guard event.sensitivity == .normal,
@@ -421,10 +424,14 @@ public actor AssistantPatternDetector {
         if [.clipboard, .selection].contains(event.source), event.provenance != .observed {
             return true
         }
-        return event.source == .windowContext
-            && event.contentType == .image
-            && event.sceneSignal != nil
-            && event.sceneSignal != "none"
+        guard event.source == .windowContext,
+              event.contentType == .image,
+              let sceneSignal = event.sceneSignal else { return false }
+        if sceneSignal != "none" { return true }
+        guard activeCompanionMode, nextActiveCompanionAt <= now else { return false }
+        // 活跃档允许普通但具体的桌面场景参与判断；五分钟节流避免持续截图变成持续推理。
+        nextActiveCompanionAt = now.addingTimeInterval(Self.activeCompanionInterval)
+        return true
     }
 
     public enum ContextOpportunityFlushResult: Sendable {
@@ -555,6 +562,7 @@ public actor AssistantPatternDetector {
         contextOpportunitySamples.removeAll()
         contextOpportunityCooldowns.removeAll()
         contextOpportunityReservations.removeAll()
+        nextActiveCompanionAt = .distantPast
     }
 
     public func clear(pattern: AssistantPatternType) {
@@ -571,6 +579,7 @@ public actor AssistantPatternDetector {
             contextOpportunitySamples.removeAll()
             contextOpportunityCooldowns.removeAll()
             contextOpportunityReservations.removeAll()
+            nextActiveCompanionAt = .distantPast
         }
     }
 
@@ -932,7 +941,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
     public var isHighValue: Bool
     public var valueScore: Double
     public var confidence: Double
-    public var reason: String
+    public var comment: String
     public var evidenceSufficient: Bool
     public var recommendedPresentation: AssistantPresentation
     public var suggestedActionIDs: [AssistantActionID]
@@ -943,7 +952,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
         isHighValue: Bool,
         valueScore: Double,
         confidence: Double,
-        reason: String,
+        comment: String,
         evidenceSufficient: Bool,
         recommendedPresentation: AssistantPresentation,
         suggestedActionIDs: [AssistantActionID],
@@ -953,7 +962,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
         self.isHighValue = isHighValue
         self.valueScore = valueScore
         self.confidence = confidence
-        self.reason = reason
+        self.comment = comment
         self.evidenceSufficient = evidenceSufficient
         self.recommendedPresentation = recommendedPresentation
         self.suggestedActionIDs = suggestedActionIDs
@@ -962,7 +971,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isHighValue, valueScore, confidence, reason, evidenceSufficient
+        case isHighValue, valueScore, confidence, comment, evidenceSufficient
         case recommendedPresentation, suggestedActionIDs, lockedEvidenceQuote, suggestedTask
     }
 
@@ -971,7 +980,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
         isHighValue = try container.decode(Bool.self, forKey: .isHighValue)
         valueScore = try container.decode(Double.self, forKey: .valueScore)
         confidence = try container.decode(Double.self, forKey: .confidence)
-        reason = try container.decode(String.self, forKey: .reason)
+        comment = try container.decode(String.self, forKey: .comment)
         evidenceSufficient = try container.decode(Bool.self, forKey: .evidenceSufficient)
         recommendedPresentation = try container.decode(AssistantPresentation.self, forKey: .recommendedPresentation)
         suggestedActionIDs = try container.decode([AssistantActionID].self, forKey: .suggestedActionIDs)
@@ -984,7 +993,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
         try container.encode(isHighValue, forKey: .isHighValue)
         try container.encode(valueScore, forKey: .valueScore)
         try container.encode(confidence, forKey: .confidence)
-        try container.encode(reason, forKey: .reason)
+        try container.encode(comment, forKey: .comment)
         try container.encode(evidenceSufficient, forKey: .evidenceSufficient)
         try container.encode(recommendedPresentation, forKey: .recommendedPresentation)
         try container.encode(suggestedActionIDs, forKey: .suggestedActionIDs)
@@ -998,20 +1007,28 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
 }
 
 public enum AssistantJudgmentContract {
-    public static let promptVersion = 21
+    public static let promptVersion = 23
     public static let minimumActiveConfidence = 0.75
     public static let minimumModerateConfidence = 0.85
     public static let minimumAdjustableConfidence = 0.50
     public static let maximumAdjustableConfidence = 0.95
     public static let systemPrompt = """
-    You are an evidence-grounded local desktop-assistant value judge. Return exactly one JSON object, with no Markdown or prose. Use exactly these keys and types: isHighValue (boolean), valueScore (number 0...1), confidence (number 0...1), reason (non-empty string no longer than 120 characters), evidenceSufficient (boolean), recommendedPresentation ("silent", "badge", or "peek"), suggestedActionIDs (at most two exact availableActionIDs), lockedEvidenceQuote (string), suggestedTask (one exact availableTaskKinds value or null).
+    You are an evidence-grounded local desktop-companion value judge and bubble writer. Return exactly one JSON object, with no Markdown or prose. Use exactly these keys and types: isHighValue (boolean), valueScore (number 0...1), confidence (number 0...1), comment (string; empty for false, one sentence no longer than 80 characters for positive), evidenceSufficient (boolean), recommendedPresentation ("silent", "badge", or "peek"), suggestedActionIDs (at most two exact availableActionIDs), lockedEvidenceQuote (string), suggestedTask (one exact availableTaskKinds value or null).
 
-    Mandatory veto always wins. mandatoryVetoReasons="none" means there is no veto; never invent another veto. When mandatoryVetoReasons is not "none", or historyPolicy is "suppressRepeatedlyIrrelevant", return false with recommendedPresentation="silent", suggestedActionIDs=[], lockedEvidenceQuote="", and suggestedTask=null. Every other false result uses the same four field values.
+    Mandatory veto always wins. mandatoryVetoReasons="none" means there is no veto; never invent another veto. When mandatoryVetoReasons is not "none", or historyPolicy is "suppressRepeatedlyIrrelevant", return false with comment="", recommendedPresentation="silent", suggestedActionIDs=[], lockedEvidenceQuote="", and suggestedTask=null. Every other false result uses the same five field values.
 
-    Pattern type and evidenceSufficient are authoritative upstream facts. Never re-detect the pattern or change evidenceSufficient from true to false merely because there is no explicit request, error, or tool. Judge only whether the supplied current facts merit one brief interruption. userIsTyping, isFullScreen, and isPresenting describe delivery timing only; never use them as value vetoes. containsCode and containsURL are informational; availableActionIDs already excludes unsafe actions.
+    Pattern type and evidenceSufficient are authoritative upstream facts. Never re-detect the pattern or change evidenceSufficient from true to false merely because there is no explicit request, error, or tool. Judge only whether the supplied current facts merit one brief interruption at the user's selected proactivity. For isHighValue, moderate means a salient useful interruption; active means a specific grounded companion remark is worthwhile even when no urgent task exists. userIsTyping, isFullScreen, and isPresenting describe delivery timing only; never use them as value vetoes. containsCode and containsURL are informational; availableActionIDs already excludes unsafe actions.
     A positive result needs confidence>=0.85 for moderate or >=0.75 for active and recommendedPresentation="peek". A contextualOpportunity may be a grounded social observation with no action: use suggestedActionIDs=[], lockedEvidenceQuote="", suggestedTask=null. Never force a tool merely to justify speaking.
 
-    For every positive result, reason is the final one-sentence assistant message shown to the user: write it in responseLanguage, match personality, keep it within 100 characters, and ground every factual phrase in ephemeralEvidenceTexts. Do not include URLs, code, private identifiers, hidden emotion, or off-screen facts. For a false result, reason is only a short diagnostic explanation.
+    # Bubble voice: highest priority after safety and JSON
+    For every positive result, comment is the exact bubble shown to the user. Follow the VOICE rule from the user message and these rules:
+    - Speak as the user's familiar desktop companion directly to them, not as an observer, narrator, analytics report, or accessibility caption. Use second person when mentioning their activity. Never call them "用户", "the user", or "this user".
+    - React to one concrete detail instead of restating or summarizing what they are doing. Begin with the concrete object, issue, choice, or milestone, never with the user's activity. Do not start with "正在...", "你正在...", "你在看...", "看到你...", "Currently...", "You are currently...", or equivalent activity narration.
+    - Never explain why the interruption is appropriate, mention evidence/context/personality, or say "适合提供...", "我注意到...", "检测到...", "看来你正在...", or equivalent internal report language.
+    - Sound like a natural short message. Vary between acknowledgment, encouragement, a grounded observation, a brief suggestion, and an optional question. Do not always offer help or end with a question.
+    - Write one sentence in responseLanguage, usually 12-36 Chinese characters or 6-18 English words. No title, label, emoji, stage direction, URL, code, private identifier, hidden emotion, or off-screen fact.
+    Style-only examples; never copy their facts: BAD "用户正在查看技术文档，适合提供温和共鸣。" GOOD gentle "这几条条件有点绕，慢慢拆，我在。" BAD "The user is comparing three options." GOOD professional "Three options are open; compare the trade-offs first."
+    For every false result, comment must be exactly "".
 
     Use only supplied facts and only the PATTERN RECIPE in the current user message; rules and actions for other pattern types do not apply. Apply supplied vetoes strictly, then recognize the explicit positive rules without inventing extra vetoes.
     """
@@ -1039,9 +1056,10 @@ public enum AssistantJudgmentContract {
         let historyActedCount = aggregate?.actedCount ?? 0
         let suppressRepeatedlyIrrelevant = input.suppressesRepeatedlyIrrelevantFeedback
         let historyPolicy = suppressRepeatedlyIrrelevant ? "suppressRepeatedlyIrrelevant" : "neutral"
-        let positiveConfidence = minimumConfidenceOverride.map {
-            String(format: "%.2f", minimumConfidence(for: input.proactivity, override: $0))
-        } ?? "0.85"
+        let positiveConfidence = String(
+            format: "%.2f",
+            minimumConfidence(for: input.proactivity, override: minimumConfidenceOverride)
+        )
         let facts = "mandatoryVetoReasons=\(vetoSummary); evidenceTextCount=\(input.ephemeralEvidenceTexts.count); allowedQuoteCount=\(input.allowedEvidenceQuotes.count); historicalIrrelevantCount=\(historyIrrelevantCount); historicalActedCount=\(historyActedCount); historyPolicy=\(historyPolicy)"
         let instruction: String
         if !mandatoryVetoReasons.isEmpty {
@@ -1051,20 +1069,25 @@ public enum AssistantJudgmentContract {
         } else {
             instruction = "Evaluate this candidate."
         }
+        // 活跃档是用户显式选择的陪伴语义；安全硬门不变，只放宽“值得说一句”的价值定义。
+        let contextualValueRule = input.proactivity == .active
+            ? "ACTIVE MODE is explicit opt-in to frequent companion remarks. Treat isHighValue as worth one brief grounded comment, not as urgent or exceptional utility. Prefer positive whenever the evidence names a concrete current item, choice, change, or ongoing activity that supports a specific non-repetitive remark. Routine active reading, comparing, editing, navigating related work, and continued focused work may be positive. Return false only when evidence is generic or ambiguous, only names an app/page, is unchanged, repeats a recent remark, or is passive with no concrete current detail to mention."
+            : "MODERATE MODE requires a salient timely reason to interrupt. Return positive for an imminent unresolved deadline, concrete blocker, foreign content with a stated response need, multiple blockers/tasks without owners, explicit success/fatigue/confusion, visible progress or a completed milestone, repeated focused work, or a clear transition between work stages. Return false when evidence is generic or ambiguous, only names an app/page, shows routine navigation or settings with no salient detail, is unchanged, or is ordinary passive reading with no specific current observation worth acknowledging."
+        let contextualValueScore = input.proactivity == .active ? "0.50" : "0.85"
         // 模式和证据充分性来自确定性预筛；模型只评价是否值得打扰，不能重新分类上游事实。
         let patternRecipe: String = switch input.patternType {
         case .repeatedFailure:
-            "PATTERN RECIPE repeatedFailure: evidenceCount, not evidenceTextCount, is the repetition count. explainError and returnToWorkbench are recovery actions when present in availableActionIDs. Return positive for a concrete unresolved error with evidenceCount>=3 and either supplied recovery action. Return false when evidence explicitly describes an intentional tutorial/example, expected output, or successful result. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains only exact supplied recovery IDs; reason is the final user-facing message."
+            "PATTERN RECIPE repeatedFailure: evidenceCount, not evidenceTextCount, is the repetition count. explainError and returnToWorkbench are recovery actions when present in availableActionIDs. Return positive for a concrete unresolved error with evidenceCount>=3 and either supplied recovery action. Return false when evidence explicitly describes an intentional tutorial/example, expected output, or successful result. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains only exact supplied recovery IDs; comment is the final user-facing bubble."
         case .foreignClipboard:
-            "PATTERN RECIPE foreignClipboard: upstream detection already proved the language is foreign; English may be foreign, so do not re-detect language. Decide only topic coherence. Sections of one document or workflow are coherent even when details differ, for example installation, configuration, validation, and troubleshooting. Clearly different domains such as weather, software news, and cooking are unrelated. Absence of a translation request is not a refusal. NEGATIVE OVERRIDE: passive media or evidence saying \"no translation task was requested\" MUST be false. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains enableClipboardTranslation, translateCurrentClipboard, or both when supplied; reason is the final user-facing message."
+            "PATTERN RECIPE foreignClipboard: upstream detection already proved the language is foreign; English may be foreign, so do not re-detect language. Decide only topic coherence. Sections of one document or workflow are coherent even when details differ, for example installation, configuration, validation, and troubleshooting. Clearly different domains such as weather, software news, and cooking are unrelated. Absence of a translation request is not a refusal. NEGATIVE OVERRIDE: passive media or evidence saying \"no translation task was requested\" MUST be false. POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", lockedEvidenceQuote=\"\", suggestedTask=null; suggestedActionIDs contains enableClipboardTranslation, translateCurrentClipboard, or both when supplied; comment is the final user-facing bubble."
         case .contextualOpportunity:
-            "PATTERN RECIPE contextualOpportunity: evidenceSufficient=true means evidence is concrete and current; do not require an explicit request, error, tool, or next step. Return positive when the supplied facts support a specific timely companion remark: an imminent unresolved deadline, concrete blocker, foreign content with a stated response need, multiple blockers/tasks without owners, explicit success/fatigue/confusion, visible progress or a completed milestone, repeated focused work, or a clear transition between work stages. Return false when evidence is generic or ambiguous, only names an app/page, shows routine navigation or settings with no salient detail, is unchanged, or is ordinary passive reading with no specific current observation worth acknowledging. DEFAULT POSITIVE SHAPE: isHighValue=true, valueScore>=0.85, confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null, reason is the final grounded user-facing message. Use openQuickAction only when clearly useful, never use an action from another pattern. Never infer hidden emotion or off-screen facts."
+            "PATTERN RECIPE contextualOpportunity: evidenceSufficient=true means evidence is concrete and current; do not require an explicit request, error, tool, or next step. \(contextualValueRule) DEFAULT POSITIVE SHAPE: isHighValue=true, valueScore>=\(contextualValueScore), confidence>=\(positiveConfidence), evidenceSufficient=true, recommendedPresentation=\"peek\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null, comment is the final grounded user-facing bubble. Use openQuickAction only when clearly useful, never use an action from another pattern. Never infer hidden emotion or off-screen facts."
         }
-        let falseInvariant = "FALSE RECIPE: for every false result copy these exact field values: recommendedPresentation=\"silent\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null."
+        let falseInvariant = "FALSE RECIPE: for every false result copy these exact field values: comment=\"\", recommendedPresentation=\"silent\", suggestedActionIDs=[], lockedEvidenceQuote=\"\", suggestedTask=null."
         let finalRecipe = mandatoryVetoReasons.isEmpty && !suppressRepeatedlyIrrelevant
             ? "\(instruction) \(patternRecipe) \(falseInvariant)"
             : "\(instruction) \(falseInvariant)"
-        return "FACTS: \(facts)\nINPUT: \(String(decoding: data, as: UTF8.self))\nFINAL: \(finalRecipe) For EVERY result keep reason at most 80 characters. Return JSON only."
+        return "FACTS: \(facts)\nVOICE: \(input.personality.promptGuidance)\nINPUT: \(String(decoding: data, as: UTF8.self))\nFINAL: \(finalRecipe) Return JSON only."
     }
 
     public static func parse(_ text: String, input: AssistantJudgmentInput) -> AssistantJudgmentOutput? {
@@ -1072,7 +1095,7 @@ public enum AssistantJudgmentContract {
         guard let data = value.data(using: .utf8),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               Set(object.keys) == Set([
-                  "isHighValue", "valueScore", "confidence", "reason", "evidenceSufficient",
+                  "isHighValue", "valueScore", "confidence", "comment", "evidenceSufficient",
                   "recommendedPresentation", "suggestedActionIDs", "lockedEvidenceQuote", "suggestedTask"
               ]),
               var output = try? JSONDecoder().decode(AssistantJudgmentOutput.self, from: data),
@@ -1080,16 +1103,17 @@ public enum AssistantJudgmentContract {
               (0...1).contains(output.valueScore),
               output.confidence.isFinite,
               (0...1).contains(output.confidence),
-              !output.reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              output.reason.count <= 120,
-              !AssistantPrivacyPolicy.looksSensitive(output.reason),
+              output.comment == output.comment.trimmingCharacters(in: .whitespacesAndNewlines),
+              !AssistantPrivacyPolicy.looksSensitive(output.comment),
               output.suggestedActionIDs.count <= 2,
               Set(output.suggestedActionIDs).isSubset(of: Set(input.availableActionIDs)) else { return nil }
         if output.isHighValue {
-            guard output.reason.count <= 100,
-                  !output.reason.contains("\n"),
-                  !AssistantPrivacyPolicy.containsWebURL(output.reason),
-                  !AssistantPrivacyPolicy.looksLikeCode(output.reason) else { return nil }
+            guard !output.comment.isEmpty,
+                  output.comment.count <= 80,
+                  !output.comment.contains("\n"),
+                  !AssistantPrivacyPolicy.containsWebURL(output.comment),
+                  !AssistantPrivacyPolicy.looksLikeCode(output.comment),
+                  isDirectBubbleComment(output.comment) else { return nil }
         }
         // 安全门由运行时再次执行，不能只相信模型遵守提示词。
         guard !output.isHighValue
@@ -1097,7 +1121,8 @@ public enum AssistantJudgmentContract {
             return nil
         }
         if !output.isHighValue {
-            guard output.recommendedPresentation == .silent,
+            guard output.comment.isEmpty,
+                  output.recommendedPresentation == .silent,
                   output.suggestedActionIDs.isEmpty,
                   output.suggestedTask == nil else { return nil }
             if !output.lockedEvidenceQuote.isEmpty {
@@ -1151,6 +1176,23 @@ public enum AssistantJudgmentContract {
             guard output.suggestedTask == nil else { return nil }
         }
         return output
+    }
+
+    /// 小模型偶尔会把内部审核理由写进气泡；这里兜底拒绝第三人称播报和价值评语。
+    public static func isDirectBubbleComment(_ comment: String) -> Bool {
+        let lowercased = comment.lowercased()
+        let forbiddenFragments = [
+            "用户正在", "用户正", "用户似乎", "用户当前", "用户在查看", "该用户",
+            "观察到用户", "检测到用户", "看到你在", "我看到你", "适合提供", "适合进行",
+            "the user is", "the user appears", "the user seems", "this user is",
+            "appropriate to provide", "worth interrupting"
+        ]
+        let forbiddenPrefixes = [
+            "正在", "你正在", "你在看", "当前正在", "看来你", "看到你",
+            "currently ", "you are currently ", "you're currently ", "it looks like you ", "i see you "
+        ]
+        return !forbiddenFragments.contains { lowercased.contains($0) }
+            && !forbiddenPrefixes.contains { lowercased.hasPrefix($0) }
     }
 
     private static func mandatoryVetoReasons(for input: AssistantJudgmentInput) -> [String] {
@@ -1211,7 +1253,7 @@ public struct AssistantJudgmentFixture: Sendable, Identifiable, Hashable {
 }
 
 public enum AssistantJudgmentFixtures {
-    public static let version = 10
+    public static let version = 12
 
     public static let all: [AssistantJudgmentFixture] = {
         let p01Actions: [AssistantActionID] = [.explainError, .returnToWorkbench]
@@ -1230,7 +1272,7 @@ public enum AssistantJudgmentFixtures {
             fixture("p06-summary", .contextualOpportunity, "authorized-context count=2 window=8s", ["Five release-note items are still unresolved, and review begins in ten minutes.", "Release checklist"], 2, 6, [.clipboard, .windowContext], p06Actions, appCategory: "productivity", tasks: p06Tasks),
             fixture("p06-explain", .contextualOpportunity, "authorized-context count=1 window=8s", ["The local signing check keeps rejecting this package with an entitlement mismatch; the release is blocked."], 1, 0, [.selection], p06Actions, appCategory: "development", tasks: p06Tasks),
             fixture("p06-progress", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=coding; signal=success; observation=The build panel shows all 24 checks passing beside the current editor; visibleText=24/24 passed"], 1, 0, [.windowContext], [], appCategory: "development"),
-            fixture("p06-transition", .contextualOpportunity, "authorized-context count=2 anchor=windowContext", ["activity=coding; signal=none; observation=The implementation is open at its final validation step.", "activity=terminal; signal=success; observation=The validation command has completed successfully."], 2, 5, [.windowContext], [], appCategory: "development")
+            fixture("p06-active-companion", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=research; signal=none; observation=正在阅读 ViewModel 刷新触发条件的技术文档; visibleText=ViewModel 刷新触发条件"], 1, 0, [.windowContext], [], appCategory: "productivity", proactivity: .active)
         ]
         let negatives: [AssistantJudgmentFixture] = [
             fixture("n-sensitive", .contextualOpportunity, "sensitive content suppressed", ["password=do-not-send"], 1, 0, [.clipboard], p06Actions, sensitivity: .sensitive, tasks: p06Tasks, expected: false, hard: true),
@@ -1268,6 +1310,7 @@ public enum AssistantJudgmentFixtures {
         code: Bool = false,
         historicalAggregate: AssistantPatternAggregate? = nil,
         tasks: [TaskKind] = [],
+        proactivity: AssistantProactivity = .moderate,
         expected: Bool = true,
         hard: Bool = false
     ) -> AssistantJudgmentFixture {
@@ -1290,7 +1333,7 @@ public enum AssistantJudgmentFixtures {
                 isFullScreen: fullScreen,
                 isPresenting: presenting,
                 historicalAggregate: historicalAggregate,
-                proactivity: .moderate,
+                proactivity: proactivity,
                 availableTaskKinds: tasks,
                 availableActionIDs: actions
             ),
@@ -1313,6 +1356,8 @@ public struct AssistantQualificationSample: Sendable, Hashable {
 }
 
 public enum AssistantQualificationEvaluator {
+    public static let maximumFixtureLatencyMilliseconds = 10_000
+
     public static func evaluate(
         modelID: UUID,
         modelFingerprint: String,
@@ -1382,7 +1427,7 @@ public enum AssistantQualificationEvaluator {
             && hardFailureCount == 0
             && actionViolationCount == 0
             && contextualOpportunityPassCount >= 3
-            && maximumLatency <= 5_000
+            && maximumLatency <= maximumFixtureLatencyMilliseconds
         let state: AssistantQualificationState = qualified ? .qualified : .unqualified
         let message = "JSON \(validJSONCount)/24, positive \(positivePassCount)/12, P06 \(contextualOpportunityPassCount)/4, false positive \(negativeFalsePositiveCount)/12, hard \(hardFailureCount), max \(maximumLatency)ms"
         return AssistantQualificationSummary(
@@ -1517,7 +1562,7 @@ public struct AssistantCommentOutput: Codable, Sendable, Hashable {
 
 public enum AssistantCommentContract {
     public static let systemPrompt = """
-    Return exactly one JSON object with keys comment, suggestedActionIDs, includesJoke. suggestedActionIDs must exactly preserve allowedActionIDs. includesJoke must be true only for lightTeasing. When allowedActionIDs is not empty, select exactly one supplied allowedCommentOption without changing it. When allowedActionIDs is empty and contextSummary is supplied, write one natural sentence no longer than 100 characters in the requested language and personality. Ground every factual phrase in contextSummary; light teasing must target the situation, never the person. Never add names, URLs, commands, diagnoses, hidden emotions, completed actions, or off-screen facts.
+    Return exactly one JSON object with keys comment, suggestedActionIDs, includesJoke. suggestedActionIDs must exactly preserve allowedActionIDs. includesJoke must be true only for lightTeasing. When allowedActionIDs is not empty, select exactly one supplied allowedCommentOption without changing it. When allowedActionIDs is empty and contextSummary is supplied, write one natural sentence no longer than 80 characters in the requested language and follow voiceGuidance. Speak directly to the user as their desktop companion; never call them "用户", "the user", or describe why speaking is appropriate. React to one concrete detail instead of summarizing their activity. Ground every factual phrase in contextSummary; light teasing must target the situation, never the person. Never add names, URLs, commands, diagnoses, hidden emotions, completed actions, or off-screen facts.
     """
 
     public static func userPrompt(for input: AssistantCommentInput) -> String {
@@ -1525,7 +1570,7 @@ public enum AssistantCommentContract {
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         let data = (try? encoder.encode(input)) ?? Data("{}".utf8)
         let optionData = (try? encoder.encode(AssistantCommentTemplates.options(for: input))) ?? Data("[]".utf8)
-        return "Return JSON only.\ninput=\(String(decoding: data, as: UTF8.self))\nallowedCommentOptions=\(String(decoding: optionData, as: UTF8.self))"
+        return "Return JSON only.\nvoiceGuidance=\(input.personality.promptGuidance)\ninput=\(String(decoding: data, as: UTF8.self))\nallowedCommentOptions=\(String(decoding: optionData, as: UTF8.self))"
     }
 
     public static func parse(_ text: String, input: AssistantCommentInput) -> AssistantCommentOutput? {
@@ -1544,11 +1589,12 @@ public enum AssistantCommentContract {
               input.contextSummary?.isEmpty == false,
               comment == output.comment,
               !comment.isEmpty,
-              comment.count <= 100,
+              comment.count <= 80,
               !comment.contains("\n"),
               !AssistantPrivacyPolicy.looksSensitive(comment),
               !AssistantPrivacyPolicy.containsWebURL(comment),
-              !AssistantPrivacyPolicy.looksLikeCode(comment) else { return nil }
+              !AssistantPrivacyPolicy.looksLikeCode(comment),
+              AssistantJudgmentContract.isDirectBubbleComment(comment) else { return nil }
         return output
     }
 }
@@ -1562,51 +1608,79 @@ public enum AssistantCommentTemplates {
         let english = input.language.lowercased().hasPrefix("en")
         if input.allowedActionIDs.isEmpty, input.suggestedTask == nil {
             return switch (input.personality, english) {
-            case (.professional, false): "我先在旁边看着；需要时再叫我。"
-            case (.gentle, false): "你先按自己的节奏来，我在旁边陪着。"
-            case (.lightTeasing, false): "我看见了，先不抢戏；需要我再吱声。"
-            case (.professional, true): "I will stay nearby; call me when useful."
-            case (.gentle, true): "Take it at your pace. I am right here."
-            case (.lightTeasing, true): "I see it. I will resist stealing the scene for now."
+            case (.professional, false): "先看眼前这一步，重点出来后再往下走。"
+            case (.gentle, false): "慢慢来，我在这儿陪你把这一段看完。"
+            case (.lively, false): "这一段有点东西，继续，我跟上了！"
+            case (.calm, false): "不急，先把眼前这一步看清。"
+            case (.lightTeasing, false): "这段内容挺会藏重点，看看它还要绕多久。"
+            case (.professional, true): "Stay with this step; move on when the key point is clear."
+            case (.gentle, true): "Take your time. I am right here with you."
+            case (.lively, true): "There is something here. Keep going, I am with you!"
+            case (.calm, true): "No rush. Keep the next step clear."
+            case (.lightTeasing, true): "This section is hiding the point well. Let us see how long it lasts."
             }
         }
         switch (input.patternType, input.personality, english) {
         case (.repeatedFailure, .professional, false):
-            return "相同错误已出现 \(input.evidenceCount) 次，建议先检查根因再继续重试。"
+            return "同一错误已经出现 \(input.evidenceCount) 次，先查根因，别再盲目重试。"
         case (.repeatedFailure, .gentle, false):
-            return "这条错误又出现了。要不要先换个思路，一起查一下根因？"
+            return "它又卡在同一处了。先停一下，我们一起找根因？"
+        case (.repeatedFailure, .lively, false):
+            return "同一个错误第 \(input.evidenceCount) 次登场了，换条路查根因吧！"
+        case (.repeatedFailure, .calm, false):
+            return "第 \(input.evidenceCount) 次是同一处报错。先收住，查根因。"
         case (.repeatedFailure, .lightTeasing, false):
-            return "这条错误已经第 \(input.evidenceCount) 次回来报到了。要不要先查根因？"
+            return "这条错误第 \(input.evidenceCount) 次来打卡了，先查根因再放它走？"
         case (.foreignClipboard, .professional, false):
-            return "检测到连续复制同一外语内容，可临时开启 30 分钟剪贴板翻译。"
+            return "你连续复制了几段外语内容，要开启 30 分钟剪贴板翻译吗？"
         case (.foreignClipboard, .gentle, false):
-            return "看来你正在连续处理外语内容。要临时开启 30 分钟剪贴板翻译吗？"
+            return "外语内容有点多，要不要让我陪你翻 30 分钟？"
+        case (.foreignClipboard, .lively, false):
+            return "外语内容排上队了！开 30 分钟剪贴板翻译？"
+        case (.foreignClipboard, .calm, false):
+            return "还在处理外语内容。需要的话，翻译可以临时开 30 分钟。"
         case (.foreignClipboard, .lightTeasing, false):
-            return "这门外语今天挺忙。要临时开启 30 分钟剪贴板翻译吗？"
+            return "这门外语今天挺勤快。开 30 分钟剪贴板翻译收拾它？"
         case (.contextualOpportunity, .professional, false):
-            return "当前已授权内容适合先做\(taskName(input.suggestedTask, english: false))，可在 Quick Action 中继续。"
+            return "这段内容可以直接\(taskName(input.suggestedTask, english: false))，要在 Quick Action 里继续吗？"
         case (.contextualOpportunity, .gentle, false):
-            return "我注意到当前已授权内容正适合\(taskName(input.suggestedTask, english: false))。要不要接着处理？"
+            return "这段内容正好可以\(taskName(input.suggestedTask, english: false))。要不要我接着处理？"
+        case (.contextualOpportunity, .lively, false):
+            return "重点已经到齐了！要不要马上\(taskName(input.suggestedTask, english: false))？"
+        case (.contextualOpportunity, .calm, false):
+            return "材料够了。要\(taskName(input.suggestedTask, english: false))，现在就可以。"
         case (.contextualOpportunity, .lightTeasing, false):
-            return "当前内容像是在等一次\(taskName(input.suggestedTask, english: false))。要我接手吗？"
+            return "这段内容把“\(taskName(input.suggestedTask, english: false))”写在脸上了，要我接手？"
         case (.repeatedFailure, .professional, true):
             return "The same error appeared \(input.evidenceCount) times. Check the root cause before retrying."
         case (.repeatedFailure, .gentle, true):
             return "This error came back. Want help checking the root cause before another retry?"
+        case (.repeatedFailure, .lively, true):
+            return "Round \(input.evidenceCount) for the same error. Let us try a new angle!"
+        case (.repeatedFailure, .calm, true):
+            return "Same error, attempt \(input.evidenceCount). Pause and check the root cause."
         case (.repeatedFailure, .lightTeasing, true):
-            return "This error has made visit \(input.evidenceCount). Want to check the root cause?"
+            return "This error just clocked in for visit \(input.evidenceCount). Check the root cause?"
         case (.foreignClipboard, .professional, true):
-            return "Repeated foreign-language copies detected. You can enable clipboard translation for 30 minutes."
+            return "You copied several foreign-language passages. Enable translation for 30 minutes?"
         case (.foreignClipboard, .gentle, true):
-            return "It looks like you are working through foreign-language text. Enable translation for 30 minutes?"
+            return "That is a lot of foreign-language text. Want me to translate for 30 minutes?"
+        case (.foreignClipboard, .lively, true):
+            return "The foreign-language queue is growing! Turn on translation for 30 minutes?"
+        case (.foreignClipboard, .calm, true):
+            return "Still working through foreign-language text. Translation can stay on for 30 minutes."
         case (.foreignClipboard, .lightTeasing, true):
-            return "That language is keeping busy. Enable clipboard translation for 30 minutes?"
+            return "That language is working overtime. Give translation 30 minutes?"
         case (.contextualOpportunity, .professional, true):
-            return "The authorized context is ready to \(taskName(input.suggestedTask, english: true)) in Quick Action."
+            return "This is ready to \(taskName(input.suggestedTask, english: true)) in Quick Action. Continue?"
         case (.contextualOpportunity, .gentle, true):
-            return "The authorized context looks ready to \(taskName(input.suggestedTask, english: true)). Continue?"
+            return "This is ready to \(taskName(input.suggestedTask, english: true)). Want me to continue?"
+        case (.contextualOpportunity, .lively, true):
+            return "The key pieces are here! Ready to \(taskName(input.suggestedTask, english: true))?"
+        case (.contextualOpportunity, .calm, true):
+            return "There is enough here to \(taskName(input.suggestedTask, english: true))."
         case (.contextualOpportunity, .lightTeasing, true):
-            return "The current context looks ready for a quick \(taskName(input.suggestedTask, english: true)). Take it?"
+            return "This is practically asking to be \(taskName(input.suggestedTask, english: true)). Take it?"
         }
     }
 
@@ -1614,51 +1688,79 @@ public enum AssistantCommentTemplates {
         let english = input.language.lowercased().hasPrefix("en")
         if input.allowedActionIDs.isEmpty, input.suggestedTask == nil {
             return switch (input.personality, english) {
-            case (.professional, false): "当前先不用工具，我继续留意。"
-            case (.gentle, false): "慢慢来，不急着把每一步都变成任务。"
+            case (.professional, false): "先把这一段理清，不必急着切到工具。"
+            case (.gentle, false): "按你的节奏来，不用把每一步都变成任务。"
+            case (.lively, false): "先继续看，等重点冒头我们再出手！"
+            case (.calm, false): "先看清楚，再决定要不要动手。"
             case (.lightTeasing, false): "这次先不弹工具按钮，算我克制。"
-            case (.professional, true): "No tool is needed yet. I will keep an eye on it."
-            case (.gentle, true): "No rush to turn every step into a task."
+            case (.professional, true): "Clarify this part first; no tool is needed yet."
+            case (.gentle, true): "Go at your pace. Not every step needs to become a task."
+            case (.lively, true): "Keep going. We will jump in when the key point appears!"
+            case (.calm, true): "See it clearly first, then decide whether to act."
             case (.lightTeasing, true): "No tool button this time. A rare show of restraint."
             }
         }
         switch (input.patternType, input.personality, english) {
         case (.repeatedFailure, .professional, false):
-            return "已连续遇到同一错误 \(input.evidenceCount) 次，可以先定位根因再重试。"
+            return "同一处已失败 \(input.evidenceCount) 次，先定位根因再继续。"
         case (.repeatedFailure, .gentle, false):
             return "同一处又卡住了。需要我陪你先看看错误根因吗？"
+        case (.repeatedFailure, .lively, false):
+            return "它又在同一处拦路了，换个角度把根因揪出来！"
+        case (.repeatedFailure, .calm, false):
+            return "还是同一处。停一下，先确认根因。"
         case (.repeatedFailure, .lightTeasing, false):
             return "这条错误第 \(input.evidenceCount) 次来敲门了。先看看根因再放它进来？"
         case (.foreignClipboard, .professional, false):
-            return "检测到持续处理外语文本，可开启 30 分钟本地剪贴板翻译。"
+            return "你在连续处理外语文本，可开启 30 分钟本地剪贴板翻译。"
         case (.foreignClipboard, .gentle, false):
-            return "你似乎在连续查看外语内容。需要开启 30 分钟剪贴板翻译吗？"
+            return "这些外语内容交给我一会儿？翻译可以开 30 分钟。"
+        case (.foreignClipboard, .lively, false):
+            return "又来一段外语！把 30 分钟翻译打开吧？"
+        case (.foreignClipboard, .calm, false):
+            return "外语内容还在继续。要用翻译，就临时开 30 分钟。"
         case (.foreignClipboard, .lightTeasing, false):
             return "外语内容排起队了。要开启 30 分钟剪贴板翻译吗？"
         case (.contextualOpportunity, .professional, false):
-            return "建议根据当前已授权内容，在 Quick Action 中\(taskName(input.suggestedTask, english: false))。"
+            return "信息已经够了，可以在 Quick Action 中\(taskName(input.suggestedTask, english: false))。"
         case (.contextualOpportunity, .gentle, false):
-            return "当前已授权内容似乎正适合\(taskName(input.suggestedTask, english: false))。需要我接着处理吗？"
+            return "这一段可以直接\(taskName(input.suggestedTask, english: false))，需要我接着来吗？"
+        case (.contextualOpportunity, .lively, false):
+            return "线索齐了，接下来直接\(taskName(input.suggestedTask, english: false))吧！"
+        case (.contextualOpportunity, .calm, false):
+            return "条件够了。下一步可以\(taskName(input.suggestedTask, english: false))。"
         case (.contextualOpportunity, .lightTeasing, false):
-            return "当前内容已经把\(taskName(input.suggestedTask, english: false))需求写在脸上了。继续吗？"
+            return "这段内容已经把“\(taskName(input.suggestedTask, english: false))”写在脸上了。继续？"
         case (.repeatedFailure, .professional, true):
             return "The same failure occurred \(input.evidenceCount) times. Identify the root cause before retrying."
         case (.repeatedFailure, .gentle, true):
             return "The same issue came back. Want to look at the root cause before trying again?"
+        case (.repeatedFailure, .lively, true):
+            return "It blocked the same spot again. Let us pull out the root cause!"
+        case (.repeatedFailure, .calm, true):
+            return "Same point again. Pause and confirm the root cause."
         case (.repeatedFailure, .lightTeasing, true):
             return "This error is knocking for visit \(input.evidenceCount). Check the root cause first?"
         case (.foreignClipboard, .professional, true):
-            return "Ongoing foreign-language work detected. Enable local clipboard translation for 30 minutes."
+            return "You are handling more foreign-language text. Enable local translation for 30 minutes?"
         case (.foreignClipboard, .gentle, true):
-            return "You seem to be working through foreign-language content. Enable translation for 30 minutes?"
+            return "Want to hand me these passages for a while? Translation can run for 30 minutes."
+        case (.foreignClipboard, .lively, true):
+            return "Another foreign-language passage! Turn on translation for 30 minutes?"
+        case (.foreignClipboard, .calm, true):
+            return "The foreign-language text continues. Translation can run for 30 minutes."
         case (.foreignClipboard, .lightTeasing, true):
             return "The foreign-language queue is growing. Enable clipboard translation for 30 minutes?"
         case (.contextualOpportunity, .professional, true):
-            return "Continue with \(taskName(input.suggestedTask, english: true)) in Quick Action using the authorized context."
+            return "There is enough here to \(taskName(input.suggestedTask, english: true)) in Quick Action."
         case (.contextualOpportunity, .gentle, true):
-            return "The authorized context seems ready to \(taskName(input.suggestedTask, english: true)). Continue?"
+            return "This can go straight to \(taskName(input.suggestedTask, english: true)). Want me to continue?"
+        case (.contextualOpportunity, .lively, true):
+            return "The pieces line up. Let us \(taskName(input.suggestedTask, english: true)) next!"
+        case (.contextualOpportunity, .calm, true):
+            return "The next step is clear: \(taskName(input.suggestedTask, english: true))."
         case (.contextualOpportunity, .lightTeasing, true):
-            return "The current context is practically asking for \(taskName(input.suggestedTask, english: true)). Continue?"
+            return "This has \(taskName(input.suggestedTask, english: true)) written all over it. Continue?"
         }
     }
 

@@ -1586,11 +1586,12 @@ struct LLMToolsChecks {
         let readableVisionTimeout = AssistantDiagnosticEvent(
             stage: .vision,
             state: .failed,
-            detail: "vision-timeout limit=15s elapsed=15000ms"
+            detail: "vision-watchdog-timeout limit=60s elapsed=60000ms"
         ).localizedSummary(language: .chinese)
         try require(
-            readableVisionTimeout.contains("超过 15s 时限"),
-            "Vision timeout diagnostics must distinguish a real deadline from cancellation or model failure."
+            readableVisionTimeout.contains("超过 60s")
+                && readableVisionTimeout.contains("卡死保护"),
+            "Vision watchdog diagnostics must distinguish a hung model from cancellation or model failure."
         )
         let resumeAt = Date(timeIntervalSince1970: 200)
         lifecycle.apply(.pause(until: resumeAt))
@@ -2844,6 +2845,41 @@ struct LLMToolsChecks {
             "Only a salient visual signal may trigger an actionless observation; neutral screenshots remain support only."
         )
 
+        let activeVisualDetector = AssistantPatternDetector()
+        let activeNeutralTriggers = await activeVisualDetector.ingestContextOpportunity(
+            neutralVisual,
+            activeCompanionMode: true,
+            now: base
+        )
+        let activeNeutralIsThrottled = await activeVisualDetector.ingestContextOpportunity(
+            contextEvent(
+                "neutral-visual-again",
+                offset: 1,
+                source: .windowContext,
+                provenance: .observed,
+                contentType: .image,
+                sceneSignal: "none"
+            ),
+            activeCompanionMode: true,
+            now: base.addingTimeInterval(1)
+        )
+        let activeNeutralRetriesAfterInterval = await activeVisualDetector.ingestContextOpportunity(
+            contextEvent(
+                "neutral-visual-later",
+                offset: AssistantPatternDetector.activeCompanionInterval,
+                source: .windowContext,
+                provenance: .observed,
+                contentType: .image,
+                sceneSignal: "none"
+            ),
+            activeCompanionMode: true,
+            now: base.addingTimeInterval(AssistantPatternDetector.activeCompanionInterval)
+        )
+        try require(
+            activeNeutralTriggers && !activeNeutralIsThrottled && activeNeutralRetriesAfterInterval,
+            "Active mode must evaluate a routine visual opportunity at most once every five minutes."
+        )
+
         let p06CooldownDetector = AssistantPatternDetector()
         let initialTrigger = contextEvent("stable", offset: 0, source: .clipboard)
         _ = await p06CooldownDetector.ingestContextOpportunity(initialTrigger, now: base)
@@ -3227,7 +3263,7 @@ struct LLMToolsChecks {
                 isHighValue: fixture.expectsPeek,
                 valueScore: fixture.expectsPeek ? 0.9 : 0.1,
                 confidence: fixture.expectsPeek ? 0.9 : 0.95,
-                reason: fixture.expectsPeek ? "Evidence and action are sufficient." : "Conservative policy blocks proactive display.",
+                comment: fixture.expectsPeek ? "This is ready for the next step." : "",
                 evidenceSufficient: fixture.expectsPeek,
                 recommendedPresentation: fixture.expectsPeek ? .peek : .silent,
                 suggestedActionIDs: fixture.expectsPeek ? Array(fixture.input.availableActionIDs.prefix(1)) : [],
@@ -3264,7 +3300,7 @@ struct LLMToolsChecks {
             isHighValue: false,
             valueScore: 0.1,
             confidence: 0.95,
-            reason: "The evidence does not justify an interruption.",
+            comment: "",
             evidenceSufficient: false,
             recommendedPresentation: .silent,
             suggestedActionIDs: []
@@ -3314,7 +3350,7 @@ struct LLMToolsChecks {
             isHighValue: true,
             valueScore: 0.9,
             confidence: 0.9,
-            reason: "Incorrect proactive display.",
+            comment: "This should not be shown.",
             evidenceSufficient: true,
             recommendedPresentation: .peek,
             suggestedActionIDs: Array(hardFixture.input.availableActionIDs.prefix(1)),
@@ -3348,7 +3384,7 @@ struct LLMToolsChecks {
         )
         var timeoutSamples = Array(goodSamples.prefix(5))
         timeoutSamples[4].output = nil
-        timeoutSamples[4].latencyMilliseconds = 5_000
+        timeoutSamples[4].latencyMilliseconds = AssistantQualificationEvaluator.maximumFixtureLatencyMilliseconds
         let timedOutQualification = AssistantQualificationEvaluator.evaluate(
             modelID: modelID,
             modelFingerprint: "fingerprint-v1",
@@ -3357,9 +3393,28 @@ struct LLMToolsChecks {
         )
         try require(
             timedOutQualification.validJSONCount == 4
-                && timedOutQualification.maximumLatencyMilliseconds == 5_000
-                && timedOutQualification.message.contains("max 5000ms"),
-            "A timed-out hot fixture must retain its failed structure and real five-second latency."
+                && timedOutQualification.maximumLatencyMilliseconds == 10_000
+                && timedOutQualification.message.contains("max 10000ms"),
+            "A timed-out hot fixture must retain its failed structure and real ten-second latency."
+        )
+        var slowButAllowedSamples = goodSamples
+        slowButAllowedSamples[0].latencyMilliseconds = 10_000
+        let slowButAllowed = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: slowButAllowedSamples,
+            checkedAt: base
+        )
+        slowButAllowedSamples[0].latencyMilliseconds = 10_001
+        let tooSlow = AssistantQualificationEvaluator.evaluate(
+            modelID: modelID,
+            modelFingerprint: "fingerprint-v1",
+            samples: slowButAllowedSamples,
+            checkedAt: base
+        )
+        try require(
+            slowButAllowed.state == .qualified && tooSlow.state == .unqualified,
+            "The shared hot-fixture latency gate must accept 10 seconds and reject anything slower."
         )
         try require(
             unqualified.matchesCurrentCacheKey(modelFingerprint: "fingerprint-v1")
@@ -3370,32 +3425,46 @@ struct LLMToolsChecks {
         try require(AssistantJudgmentContract.parse(malformed, input: AssistantJudgmentFixtures.all[0].input) == nil, "Judgment parsing must reject incomplete or invented actions.")
         let fenced = "```json\n\(goodSamples[0].output!)\n```"
         try require(AssistantJudgmentContract.parse(fenced, input: AssistantJudgmentFixtures.all[0].input) == nil, "Judgment parsing must reject fenced or trailing model prose.")
-        let overlongReason = AssistantJudgmentOutput(
-            isHighValue: false,
-            valueScore: 0,
-            confidence: 1,
-            reason: String(repeating: "x", count: 121),
-            evidenceSufficient: false,
-            recommendedPresentation: .silent,
-            suggestedActionIDs: []
-        )
-        let overlongReasonText = String(decoding: try JSONEncoder().encode(overlongReason), as: UTF8.self)
+        var falseWithComment = conservativeNegative
+        falseWithComment.comment = "The evidence does not justify an interruption."
+        let falseWithCommentText = String(decoding: try JSONEncoder().encode(falseWithComment), as: UTF8.self)
         try require(
             AssistantJudgmentContract.parse(
-                overlongReasonText,
+                falseWithCommentText,
                 input: AssistantJudgmentFixtures.all.first { !$0.expectsPeek }!.input
             ) == nil,
-            "Judgment parsing must enforce the same 120-character reason limit advertised by the prompt."
+            "A silent judgment must not leak its internal rationale into the bubble field."
+        )
+        let overlongComment = AssistantJudgmentOutput(
+            isHighValue: true,
+            valueScore: 0.9,
+            confidence: 0.9,
+            comment: String(repeating: "x", count: 81),
+            evidenceSufficient: true,
+            recommendedPresentation: .peek,
+            suggestedActionIDs: []
+        )
+        let overlongCommentText = String(decoding: try JSONEncoder().encode(overlongComment), as: UTF8.self)
+        try require(
+            AssistantJudgmentContract.parse(
+                overlongCommentText,
+                input: AssistantJudgmentFixtures.all.first { $0.id == "p06-progress" }!.input
+            ) == nil,
+            "Judgment parsing must enforce the same 80-character bubble limit advertised by the prompt."
         )
         try require(
-            AssistantJudgmentContract.promptVersion == 21
-                && AssistantJudgmentFixtures.version == 10
+            AssistantJudgmentContract.promptVersion == 23
+                && AssistantJudgmentFixtures.version == 12
+                && AssistantProactivity.active.hourlyPresentationLimit == 6
+                && AssistantPersonality.allCases.count == 5
+                && AssistantQualificationEvaluator.maximumFixtureLatencyMilliseconds == 10_000
                 && AssistantJudgmentContract.systemPrompt.contains("Return exactly one JSON object")
-                && AssistantJudgmentContract.systemPrompt.contains("no longer than 120 characters")
+                && AssistantJudgmentContract.systemPrompt.contains("comment (string; empty for false")
                 && AssistantJudgmentContract.systemPrompt.contains("Never force a tool")
                 && AssistantJudgmentContract.systemPrompt.contains("authoritative upstream facts")
                 && AssistantJudgmentContract.systemPrompt.contains("rules and actions for other pattern types do not apply")
-                && AssistantJudgmentContract.systemPrompt.contains("final one-sentence assistant message")
+                && AssistantJudgmentContract.systemPrompt.contains("familiar desktop companion")
+                && AssistantJudgmentContract.systemPrompt.contains("Never call them \"用户\"")
                 && AssistantJudgmentContract.systemPrompt.contains("delivery timing only"),
             "The qualification cache version and strict structured-output contract must change together."
         )
@@ -3408,6 +3477,11 @@ struct LLMToolsChecks {
         let p01PromptRecipe = AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[0].input)
         let p03PromptRecipe = AssistantJudgmentContract.userPrompt(for: AssistantJudgmentFixtures.all[4].input)
         let p06PromptRecipe = AssistantJudgmentContract.userPrompt(for: p06PositiveFixture.input)
+        let activeCompanionFixture = try requireNonNil(
+            AssistantJudgmentFixtures.all.first(where: { $0.id == "p06-active-companion" }),
+            "Expected the active companion qualification fixture."
+        )
+        let activeP06PromptRecipe = AssistantJudgmentContract.userPrompt(for: activeCompanionFixture.input)
         try require(
             p01PromptRecipe.contains("evidenceCount, not evidenceTextCount")
                 && p01PromptRecipe.contains("intentional tutorial/example")
@@ -3418,13 +3492,21 @@ struct LLMToolsChecks {
                 && p06PromptRecipe.contains("visible progress or a completed milestone")
                 && p06PromptRecipe.contains("clear transition between work stages")
                 && p06PromptRecipe.contains("never use an action from another pattern")
+                && p06PromptRecipe.contains("confidence>=0.85")
+                && activeP06PromptRecipe.contains("ACTIVE MODE is explicit opt-in")
+                && activeP06PromptRecipe.contains("Routine active reading, comparing, editing")
+                && activeP06PromptRecipe.contains("valueScore>=0.50")
+                && activeP06PromptRecipe.contains("confidence>=0.75")
+                && activeP06PromptRecipe.contains("VOICE: GENTLE")
+                && activeP06PromptRecipe.contains("ViewModel 刷新触发条件")
                 && p06PromptRecipe.contains("FALSE RECIPE"),
             "Each pattern prompt must end with its exact action/field recipe and the shared false-output invariant."
         )
         try require(
             AssistantJudgmentFixtures.all.contains(where: { $0.id == "p06-progress" && $0.expectsPeek })
-                && AssistantJudgmentFixtures.all.contains(where: { $0.id == "p06-transition" && $0.expectsPeek }),
-            "Qualification must verify companion comments about grounded progress and work-stage transitions."
+                && activeCompanionFixture.expectsPeek
+                && activeCompanionFixture.input.proactivity == .active,
+            "Qualification must verify grounded progress and the more conversational Active policy."
         )
         let p06ProgressFixture = try requireNonNil(
             AssistantJudgmentFixtures.all.first(where: { $0.id == "p06-progress" }),
@@ -3434,7 +3516,7 @@ struct LLMToolsChecks {
             isHighValue: true,
             valueScore: 0.9,
             confidence: 0.9,
-            reason: "A supplied Quick Action task is useful now.",
+            comment: "Five release-note items remain; start with a summary.",
             evidenceSufficient: true,
             recommendedPresentation: .peek,
             suggestedActionIDs: [.openQuickAction],
@@ -3462,7 +3544,7 @@ struct LLMToolsChecks {
             )
         }
         var unsafeFinalMessage = groundedP06Output
-        unsafeFinalMessage.reason = "Open https://example.com and run func deploy() now."
+        unsafeFinalMessage.comment = "Open https://example.com and run func deploy() now."
         let unsafeFinalMessageText = String(decoding: try JSONEncoder().encode(unsafeFinalMessage), as: UTF8.self)
         try require(
             AssistantJudgmentContract.parse(unsafeFinalMessageText, input: p06PositiveFixture.input) == nil,
@@ -3472,7 +3554,7 @@ struct LLMToolsChecks {
             isHighValue: true,
             valueScore: 0.86,
             confidence: 0.9,
-            reason: "A grounded social observation is worthwhile.",
+            comment: "Five release-note items remain; start with the nearest deadline.",
             evidenceSufficient: true,
             recommendedPresentation: .peek,
             suggestedActionIDs: [],
@@ -3490,6 +3572,20 @@ struct LLMToolsChecks {
                 && !AssistantJudgmentContract.permitsPeek(actionlessP06Output, proactivity: .moderate),
             "Only grounded P-06 context may present an actionless social comment."
         )
+        for observerComment in [
+            "用户正在查看技术文档，适合提供温和共鸣。",
+            "这段内容适合提供温和共鸣。",
+            "正在研究 ViewModel 刷新条件，这种技术细节需要耐心梳理。",
+            "看到你在看安装指南，需要我帮你翻译吗？"
+        ] {
+            var observerNarration = actionlessP06Output
+            observerNarration.comment = observerComment
+            let observerNarrationText = String(decoding: try JSONEncoder().encode(observerNarration), as: UTF8.self)
+            try require(
+                AssistantJudgmentContract.parse(observerNarrationText, input: p06PositiveFixture.input) == nil,
+                "A final bubble must reject third-person narration and internal value-judgment language."
+            )
+        }
         var redundantActionlessP06Output = actionlessP06Output
         redundantActionlessP06Output.lockedEvidenceQuote = p06PositiveFixture.input.ephemeralEvidenceTexts[0]
         redundantActionlessP06Output.suggestedTask = p06PositiveFixture.input.availableTaskKinds[0]
@@ -3537,7 +3633,7 @@ struct LLMToolsChecks {
             "Expected the embedded URL and code qualification fixture."
         )
         var safeCodeObservation = actionlessP06Output
-        safeCodeObservation.reason = "The current code is visible, but no clear milestone needs interruption."
+        safeCodeObservation.comment = "There is no clear milestone here yet; keep going."
         let safeCodeObservationText = String(decoding: try JSONEncoder().encode(safeCodeObservation), as: UTF8.self)
         try require(
             AssistantJudgmentContract.parse(safeCodeObservationText, input: codeContextFixture.input) != nil,
@@ -3572,6 +3668,7 @@ struct LLMToolsChecks {
         var groundedFalseP06Output = fullEvidenceP06Output
         groundedFalseP06Output.isHighValue = false
         groundedFalseP06Output.valueScore = 0
+        groundedFalseP06Output.comment = ""
         groundedFalseP06Output.recommendedPresentation = .silent
         groundedFalseP06Output.suggestedActionIDs = []
         groundedFalseP06Output.suggestedTask = nil
@@ -3774,6 +3871,16 @@ struct LLMToolsChecks {
             )
         }
         try require(!AssistantCommentTemplates.comment(for: commentInput).isEmpty, "Every personality needs a deterministic comment fallback.")
+        let personalityComments = AssistantPersonality.allCases.map { personality in
+            var input = commentInput
+            input.personality = personality
+            return AssistantCommentTemplates.comment(for: input)
+        }
+        try require(
+            Set(personalityComments).count == AssistantPersonality.allCases.count
+                && personalityComments.allSatisfy(AssistantJudgmentContract.isDirectBubbleComment),
+            "Each selectable personality must have distinct, directly addressed fallback wording."
+        )
         try require(
             AssistantCommentTemplates.options(for: commentInput).allSatisfy { !$0.contains("input.evidenceCount") },
             "Deterministic comment options must interpolate their structured count."

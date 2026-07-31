@@ -5940,6 +5940,8 @@ struct SettingsView: View {
         switch value {
         case .professional: return localizedSettingsText(chinese: "专业管家", english: "Professional")
         case .gentle: return localizedSettingsText(chinese: "温和搭档", english: "Gentle")
+        case .lively: return localizedSettingsText(chinese: "元气队友", english: "Lively")
+        case .calm: return localizedSettingsText(chinese: "冷静搭档", english: "Calm")
         case .lightTeasing: return localizedSettingsText(chinese: "轻度吐槽", english: "Light Teasing")
         }
     }
