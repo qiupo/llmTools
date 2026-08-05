@@ -5,13 +5,14 @@ const LOCAL_CHARS_PER_BATCH = 800;
 const REMOTE_SEGMENTS_PER_BATCH = 5;
 const REMOTE_CHARS_PER_BATCH = 900;
 const MENU_TOGGLE_ID = "llmtools-toggle-page";
-const TARGET_LANGUAGE = "zh-Hans";
+const DEFAULT_TARGET_LANGUAGE = "zh-Hans";
 const TRANSLATION_CACHE_KEY_V1 = "webPageTranslationCacheV1";
 const TRANSLATION_CACHE_KEY = "webPageTranslationCacheV2";
 const TRANSLATION_CACHE_MAX_ENTRIES = 2000;
 const DOMAIN_RULES_KEY = "webPageDomainRulesV1";
 const PAGE_DEFAULTS_KEY = "webPageDomainDefaultsV1";
 const PENDING_INDICATOR_STYLE_KEY = "webPagePendingIndicatorStyleV1";
+const TARGET_LANGUAGE_KEY = "webPageTargetLanguageV1";
 const DOMAIN_RULE_ASK = "ask";
 const DOMAIN_RULE_ALWAYS = "alwaysTranslate";
 const DOMAIN_RULE_NEVER = "neverTranslate";
@@ -89,6 +90,7 @@ const EXTENSION_TEXT = {
     pendingStyleFlipText: "翻牌",
     pendingStyleNone: "无样式",
     pendingStyleSaved: ({ styleLabel }) => `待翻译样式：${styleLabel}`,
+    targetLanguageSaved: "目标语言已保存。",
     siteDefaultsSaved: ({ domain }) => `${domain}：已保存站点默认值。`,
     autoTranslatePermissionMissing: ({ domain }) => `${domain} 需要先在 Chrome 授权后才能自动翻译。`,
     siteTranslationBlocked: ({ domain }) => `${domain} 已设置为不翻译。`,
@@ -151,6 +153,7 @@ const EXTENSION_TEXT = {
     pendingStyleFlipText: "Flip text",
     pendingStyleNone: "No style",
     pendingStyleSaved: ({ styleLabel }) => `Pending style: ${styleLabel}`,
+    targetLanguageSaved: "Target language saved.",
     siteDefaultsSaved: ({ domain }) => `${domain}: site defaults saved.`,
     autoTranslatePermissionMissing: ({ domain }) => `${domain} needs Chrome site permission before auto-translation can run.`,
     siteTranslationBlocked: ({ domain }) => `${domain} is set to never translate.`,
@@ -175,6 +178,7 @@ let nativeWebPageTranslationEngineID = TRANSLATION_ENGINE_LLM;
 let nativeWebPageTranslationEngineModelID = "";
 let nativePageDefaultsLoaded = false;
 let pendingIndicatorStyle = DEFAULT_PENDING_INDICATOR_STYLE;
+let webPageTargetLanguage = DEFAULT_TARGET_LANGUAGE;
 let currentAppLanguage = DEFAULT_APP_LANGUAGE;
 let nativePort = null;
 
@@ -585,7 +589,7 @@ function redactedDiagnosticsForState(state = {}) {
       engineID: state.translationEngineID || "",
       engineModelID: state.translationEngineModelID || "",
       detectedSource: state.detectedSourceLanguage || "",
-      target: state.targetLanguage || TARGET_LANGUAGE,
+      target: state.targetLanguage || DEFAULT_TARGET_LANGUAGE,
       elapsedMs: Math.max(0, Number(state.translationElapsedMs) || 0),
       fallbackReason: state.translationFallbackReason || ""
     },
@@ -718,6 +722,8 @@ async function handleMessage(message, sender) {
       return setTranslationQualityForTab(tabID, message?.translationQuality || message?.qualityMode);
     case "setPendingIndicatorStyle":
       return setPendingIndicatorStyleForTab(tabID, message?.pendingIndicatorStyle);
+    case "setWebPageTargetLanguage":
+      return setWebPageTargetLanguageForTab(tabID, message?.targetLanguage);
     case "setDomainPageDefaults":
       return setDomainPageDefaultsForTab(tabID, message?.tabURL || sender?.tab?.url || "", {
         readingMode: message?.readingMode,
@@ -764,7 +770,7 @@ function getState(tabID) {
       translationEngineModelID: "",
       domainTranslationEngineDefault: "",
       detectedSourceLanguage: "",
-      targetLanguage: TARGET_LANGUAGE,
+      targetLanguage: DEFAULT_TARGET_LANGUAGE,
       translationElapsedMs: 0,
       translationFallbackReason: "",
       pendingIndicatorStyle: DEFAULT_PENDING_INDICATOR_STYLE,
@@ -796,6 +802,9 @@ function stateFor(tabID, status, message, patch = {}) {
   const nextPendingIndicatorStyle = normalizePendingIndicatorStyle(
     patch.pendingIndicatorStyle || current.pendingIndicatorStyle || pendingIndicatorStyle
   );
+  const targetLanguage = normalizeTargetLanguage(
+    patch.targetLanguage || current.targetLanguage || webPageTargetLanguage
+  );
   const unsupportedEmbeddedContent = normalizeUnsupportedEmbeddedContent(patch.unsupportedEmbeddedContent || current.unsupportedEmbeddedContent);
   const diagnosticStartedAt = diagnosticStartedAtForStatus(status, patch, current);
   const lastErrorCode = patch.lastErrorCode || (status === "failed" ? errorCodeFromMessage(message) : "");
@@ -815,6 +824,7 @@ function stateFor(tabID, status, message, patch = {}) {
     translationEngine,
     translationEngineID,
     translationEngineModelID,
+    targetLanguage,
     pendingIndicatorStyle: nextPendingIndicatorStyle,
     pendingIndicatorStyleLabel: pendingIndicatorStyleLabel(nextPendingIndicatorStyle, appLanguage),
     unsupportedEmbeddedContent,
@@ -1017,6 +1027,30 @@ async function clearLocalPendingIndicatorStyle() {
   await chrome.storage.local.remove(PENDING_INDICATOR_STYLE_KEY).catch(() => {});
 }
 
+async function loadLocalTargetLanguage() {
+  if (!chrome.storage?.local) {
+    return DEFAULT_TARGET_LANGUAGE;
+  }
+  const result = await chrome.storage.local.get(TARGET_LANGUAGE_KEY).catch(() => ({}));
+  return normalizeTargetLanguage(result?.[TARGET_LANGUAGE_KEY]);
+}
+
+async function saveLocalTargetLanguage(language) {
+  if (!chrome.storage?.local) {
+    return;
+  }
+  await chrome.storage.local.set({
+    [TARGET_LANGUAGE_KEY]: normalizeTargetLanguage(language)
+  }).catch(() => {});
+}
+
+async function clearLocalTargetLanguage() {
+  if (!chrome.storage?.local?.remove) {
+    return;
+  }
+  await chrome.storage.local.remove(TARGET_LANGUAGE_KEY).catch(() => {});
+}
+
 async function domainRuleForURL(url = "") {
   const domain = normalizedDomainFromURL(url);
   if (!domain) {
@@ -1194,6 +1228,24 @@ async function setPendingIndicatorStyleForTab(tabID, requestedStyle = DEFAULT_PE
   });
 }
 
+async function setWebPageTargetLanguageForTab(tabID, requestedLanguage = DEFAULT_TARGET_LANGUAGE) {
+  const current = getState(tabID);
+  const language = normalizeTargetLanguage(requestedLanguage);
+  webPageTargetLanguage = language;
+  try {
+    const response = await nativeRequest("setWebPageTargetLanguage", { targetLanguage: language }, { tabID });
+    webPageTargetLanguage = normalizeTargetLanguage(response?.payload?.targetLanguage);
+    await clearLocalTargetLanguage();
+  } catch {
+    await saveLocalTargetLanguage(language);
+  }
+  return stateFor(tabID, current.status || "idle", t("targetLanguageSaved", {}, current.appLanguage), {
+    appLanguage: current.appLanguage,
+    targetLanguage: webPageTargetLanguage,
+    notice: true
+  });
+}
+
 async function setDomainPageDefaultsForTab(tabID, fallbackURL = "", requestedDefaults = {}) {
   const current = getState(tabID);
   const language = current.appLanguage;
@@ -1269,7 +1321,7 @@ function getJob(tabID) {
       cache: new Map(),
       urlHash: "",
       title: "",
-      targetLanguage: TARGET_LANGUAGE,
+      targetLanguage: webPageTargetLanguage,
       running: false,
       cancelled: false,
       discovered: 0,
@@ -1324,6 +1376,8 @@ async function checkStatus(tabID) {
   );
   const localPendingIndicatorStyle = await loadLocalPendingIndicatorStyle();
   pendingIndicatorStyle = normalizePendingIndicatorStyle(payload.pendingIndicatorStyle || localPendingIndicatorStyle);
+  const localTargetLanguage = await loadLocalTargetLanguage();
+  webPageTargetLanguage = normalizeTargetLanguage(payload.webPageTargetLanguage || localTargetLanguage);
   nativeWebPageTranslationEngine = normalizeTranslationEngine(payload.webPageTranslationEngine);
   nativeWebPageTranslationEngineID = payload.webPageTranslationEngineID || translationEngineIDForPreference(nativeWebPageTranslationEngine);
   nativeWebPageTranslationEngineModelID = payload.webPageTranslationEngineModelID || translationEngineModelIDForPreference(nativeWebPageTranslationEngine);
@@ -1359,6 +1413,7 @@ async function checkStatus(tabID) {
       translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
       translationEngineID: translationEngineIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine),
       translationEngineModelID: translationEngineModelIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine, nativeWebPageTranslationEngineModelID),
+      targetLanguage: webPageTargetLanguage,
       pendingIndicatorStyle
     });
   }
@@ -1383,6 +1438,7 @@ async function checkStatus(tabID) {
     translationEngine: domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine,
     translationEngineID: translationEngineIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine),
     translationEngineModelID: translationEngineModelIDForPreference(domainPatch.domainTranslationEngineDefault || nativeWebPageTranslationEngine, nativeWebPageTranslationEngineModelID),
+    targetLanguage: webPageTargetLanguage,
     pendingIndicatorStyle,
     hasTranslations: false,
     done: 0,
@@ -1552,7 +1608,8 @@ async function translatePage(tabID, options = {}) {
     urlHash: "",
     domain: domainPatch.domain || status.domain || "",
     title: "",
-    targetLanguage: TARGET_LANGUAGE,
+    // 每个任务复制启动时的目标语言，后续切换不会污染正在运行的翻译。
+    targetLanguage: webPageTargetLanguage,
     running: false,
     cancelled: false,
     discovered: 0,
@@ -1833,7 +1890,7 @@ async function translateAndApplyBatch(tabID, job, batch) {
   const result = await nativeRequest("translateSegments", {
     jobID: job.jobID,
     sourceLanguage: job.sourceLanguage || SOURCE_LANGUAGE_AUTO,
-    targetLanguage: TARGET_LANGUAGE,
+    targetLanguage: job.targetLanguage,
     translationQuality: job.translationQuality,
     translationEngine: job.translationEngine,
     urlHash: job.urlHash,
@@ -1980,9 +2037,9 @@ async function retranslatePage(tabID, options = {}) {
 
   const urlHash = job?.urlHash || await currentTabURLHash(tabID, tabURL);
   if (urlHash) {
-    await clearStoredTranslationsForURL(urlHash, TARGET_LANGUAGE);
+    await clearStoredTranslationsForURL(urlHash, webPageTargetLanguage);
     if (job?.storageCache) {
-      removeCachedEntriesForURL(job.storageCache, urlHash, TARGET_LANGUAGE);
+      removeCachedEntriesForURL(job.storageCache, urlHash, webPageTargetLanguage);
     }
   }
 
@@ -2065,9 +2122,9 @@ async function clearCurrentPageCache(tabID, tabURL = "") {
   const urlHash = job?.urlHash || await currentTabURLHash(tabID, tabURL);
   let removed = 0;
   if (urlHash) {
-    removed += await clearStoredTranslationsForURL(urlHash, TARGET_LANGUAGE);
+    removed += await clearStoredTranslationsForURL(urlHash, null);
     if (job?.storageCache) {
-      removeCachedEntriesForURL(job.storageCache, urlHash, TARGET_LANGUAGE);
+      removeCachedEntriesForURL(job.storageCache, urlHash, null);
     }
   }
 
@@ -2117,9 +2174,9 @@ async function clearCurrentDomainCache(tabID, tabURL = "") {
   const domain = normalizedDomainFromURL(url) || job?.domain || getState(tabID).domain || "";
   let removed = 0;
   if (domain) {
-    removed += await clearStoredTranslationsForDomain(domain, TARGET_LANGUAGE);
+    removed += await clearStoredTranslationsForDomain(domain, null);
     if (job?.storageCache) {
-      removeCachedEntriesForDomain(job.storageCache, domain, TARGET_LANGUAGE);
+      removeCachedEntriesForDomain(job.storageCache, domain, null);
     }
   }
 
@@ -2247,8 +2304,8 @@ function translationCacheEntryMatches(job, segment, entry, options = {}) {
   if (!entry?.translation || entry.sourceText !== segment.text || entry.textHash !== segment.textHash) {
     return false;
   }
-  const target = job.targetLanguage || TARGET_LANGUAGE;
-  if ((entry.targetLanguage || TARGET_LANGUAGE) !== target) {
+  const target = job.targetLanguage || DEFAULT_TARGET_LANGUAGE;
+  if ((entry.targetLanguage || DEFAULT_TARGET_LANGUAGE) !== target) {
     return false;
   }
   const domain = normalizeDomain(job.domain || "");
@@ -2271,7 +2328,7 @@ function translationCacheEntryMatches(job, segment, entry, options = {}) {
 }
 
 function translationCacheID(job, segment) {
-  const target = job.targetLanguage || TARGET_LANGUAGE;
+  const target = job.targetLanguage || DEFAULT_TARGET_LANGUAGE;
   const engineID = job.translationEngineID || translationEngineIDForPreference(job.translationEngine);
   const engineModelID = job.translationEngineModelID || "";
   const source = normalizeSourceLanguage(job.cacheSourceLanguage || job.sourceLanguage);
@@ -2285,7 +2342,7 @@ function cacheEntryForSegment(job, segment, translation) {
     id: translationCacheID(job, segment),
     sourceText: segment.text,
     translation,
-    targetLanguage: job.targetLanguage || TARGET_LANGUAGE,
+    targetLanguage: job.targetLanguage || DEFAULT_TARGET_LANGUAGE,
     translationQuality: normalizeTranslationQuality(job.translationQuality),
     translationEngineID: job.translationEngineID || translationEngineIDForPreference(job.translationEngine),
     translationEngineModelID: job.translationEngineModelID || "",
@@ -2346,7 +2403,7 @@ function migrateTranslationCacheV1ToV2(cacheV1) {
     if (!entry?.textHash || !entry.translation) {
       continue;
     }
-    const target = entry.targetLanguage || TARGET_LANGUAGE;
+    const target = entry.targetLanguage || DEFAULT_TARGET_LANGUAGE;
     const domain = normalizeDomain(entry.domain || "");
     const source = normalizeSourceLanguage(entry.cacheSourceLanguage || SOURCE_LANGUAGE_AUTO);
     const engineID = entry.translationEngineID || TRANSLATION_ENGINE_LLM;
@@ -2369,7 +2426,7 @@ function migrateTranslationCacheV1ToV2(cacheV1) {
   return migrated;
 }
 
-async function clearStoredTranslationsForURL(urlHash, targetLanguage = TARGET_LANGUAGE) {
+async function clearStoredTranslationsForURL(urlHash, targetLanguage = DEFAULT_TARGET_LANGUAGE) {
   if (!chrome.storage?.local || !urlHash) {
     return 0;
   }
@@ -2381,7 +2438,7 @@ async function clearStoredTranslationsForURL(urlHash, targetLanguage = TARGET_LA
   return removed;
 }
 
-async function clearStoredTranslationsForDomain(domain, targetLanguage = TARGET_LANGUAGE) {
+async function clearStoredTranslationsForDomain(domain, targetLanguage = DEFAULT_TARGET_LANGUAGE) {
   if (!chrome.storage?.local || !domain) {
     return 0;
   }
@@ -2405,7 +2462,7 @@ async function clearStoredTranslations() {
   return removed;
 }
 
-function removeCachedEntriesForURL(cache, urlHash, targetLanguage = TARGET_LANGUAGE) {
+function removeCachedEntriesForURL(cache, urlHash, targetLanguage = DEFAULT_TARGET_LANGUAGE) {
   if (!cache || !urlHash) {
     return 0;
   }
@@ -2420,7 +2477,7 @@ function removeCachedEntriesForURL(cache, urlHash, targetLanguage = TARGET_LANGU
   return removed;
 }
 
-function removeCachedEntriesForDomain(cache, domain, targetLanguage = TARGET_LANGUAGE) {
+function removeCachedEntriesForDomain(cache, domain, targetLanguage = DEFAULT_TARGET_LANGUAGE) {
   if (!cache || !domain) {
     return 0;
   }
@@ -2646,6 +2703,10 @@ function normalizePendingIndicatorStyle(style) {
     return style;
   }
   return DEFAULT_PENDING_INDICATOR_STYLE;
+}
+
+function normalizeTargetLanguage(language) {
+  return ["zh-Hans", "en", "ja", "ko"].includes(language) ? language : DEFAULT_TARGET_LANGUAGE;
 }
 
 function normalizeTranslationConcurrency(value, isRemoteProvider) {

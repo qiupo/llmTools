@@ -1007,7 +1007,7 @@ public struct AssistantJudgmentOutput: Codable, Sendable, Hashable {
 }
 
 public enum AssistantJudgmentContract {
-    public static let promptVersion = 23
+    public static let promptVersion = 26
     public static let minimumActiveConfidence = 0.75
     public static let minimumModerateConfidence = 0.85
     public static let minimumAdjustableConfidence = 0.50
@@ -1087,7 +1087,11 @@ public enum AssistantJudgmentContract {
         let finalRecipe = mandatoryVetoReasons.isEmpty && !suppressRepeatedlyIrrelevant
             ? "\(instruction) \(patternRecipe) \(falseInvariant)"
             : "\(instruction) \(falseInvariant)"
-        return "FACTS: \(facts)\nVOICE: \(input.personality.promptGuidance)\nINPUT: \(String(decoding: data, as: UTF8.self))\nFINAL: \(finalRecipe) Return JSON only."
+        // 小模型更偏重 Prompt 尾部；在最终成文处重申陪伴优先，避免又复述技术主题。
+        let personalityFinalRule = input.personality == .playfulGirl
+            ? "PLAYFUL GIRL COMMENT OVERRIDE: Omit every specific technical subject from INPUT. Refer only to this part, this thing, or the hurdle in the response language, then offer emotional companionship. Do not repeat any technical token."
+            : ""
+        return "FACTS: \(facts)\nVOICE: \(input.personality.promptGuidance)\nINPUT: \(String(decoding: data, as: UTF8.self))\nFINAL: \(finalRecipe)\n\(personalityFinalRule) Return JSON only."
     }
 
     public static func parse(_ text: String, input: AssistantJudgmentInput) -> AssistantJudgmentOutput? {
@@ -1253,7 +1257,7 @@ public struct AssistantJudgmentFixture: Sendable, Identifiable, Hashable {
 }
 
 public enum AssistantJudgmentFixtures {
-    public static let version = 12
+    public static let version = 13
 
     public static let all: [AssistantJudgmentFixture] = {
         let p01Actions: [AssistantActionID] = [.explainError, .returnToWorkbench]
@@ -1272,7 +1276,7 @@ public enum AssistantJudgmentFixtures {
             fixture("p06-summary", .contextualOpportunity, "authorized-context count=2 window=8s", ["Five release-note items are still unresolved, and review begins in ten minutes.", "Release checklist"], 2, 6, [.clipboard, .windowContext], p06Actions, appCategory: "productivity", tasks: p06Tasks),
             fixture("p06-explain", .contextualOpportunity, "authorized-context count=1 window=8s", ["The local signing check keeps rejecting this package with an entitlement mismatch; the release is blocked."], 1, 0, [.selection], p06Actions, appCategory: "development", tasks: p06Tasks),
             fixture("p06-progress", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=coding; signal=success; observation=The build panel shows all 24 checks passing beside the current editor; visibleText=24/24 passed"], 1, 0, [.windowContext], [], appCategory: "development"),
-            fixture("p06-active-companion", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=research; signal=none; observation=正在阅读 ViewModel 刷新触发条件的技术文档; visibleText=ViewModel 刷新触发条件"], 1, 0, [.windowContext], [], appCategory: "productivity", proactivity: .active)
+            fixture("p06-active-companion", .contextualOpportunity, "authorized-context count=1 anchor=windowContext", ["activity=research; signal=none; observation=正在阅读 ViewModel 刷新触发条件的技术文档; visibleText=ViewModel 刷新触发条件"], 1, 0, [.windowContext], [], appCategory: "productivity", personality: .playfulGirl, proactivity: .active)
         ]
         let negatives: [AssistantJudgmentFixture] = [
             fixture("n-sensitive", .contextualOpportunity, "sensitive content suppressed", ["password=do-not-send"], 1, 0, [.clipboard], p06Actions, sensitivity: .sensitive, tasks: p06Tasks, expected: false, hard: true),
@@ -1310,6 +1314,7 @@ public enum AssistantJudgmentFixtures {
         code: Bool = false,
         historicalAggregate: AssistantPatternAggregate? = nil,
         tasks: [TaskKind] = [],
+        personality: AssistantPersonality = .gentle,
         proactivity: AssistantProactivity = .moderate,
         expected: Bool = true,
         hard: Bool = false
@@ -1332,6 +1337,7 @@ public enum AssistantJudgmentFixtures {
                 userIsTyping: typing,
                 isFullScreen: fullScreen,
                 isPresenting: presenting,
+                personality: personality,
                 historicalAggregate: historicalAggregate,
                 proactivity: proactivity,
                 availableTaskKinds: tasks,
@@ -1612,11 +1618,13 @@ public enum AssistantCommentTemplates {
             case (.gentle, false): "慢慢来，我在这儿陪你把这一段看完。"
             case (.lively, false): "这一段有点东西，继续，我跟上了！"
             case (.calm, false): "不急，先把眼前这一步看清。"
+            case (.playfulGirl, false): "这段还挺会绕弯呀，别急，我陪你慢慢看。"
             case (.lightTeasing, false): "这段内容挺会藏重点，看看它还要绕多久。"
             case (.professional, true): "Stay with this step; move on when the key point is clear."
             case (.gentle, true): "Take your time. I am right here with you."
             case (.lively, true): "There is something here. Keep going, I am with you!"
             case (.calm, true): "No rush. Keep the next step clear."
+            case (.playfulGirl, true): "This part is taking the scenic route. No rush, I am right here with you."
             case (.lightTeasing, true): "This section is hiding the point well. Let us see how long it lasts."
             }
         }
@@ -1629,6 +1637,8 @@ public enum AssistantCommentTemplates {
             return "同一个错误第 \(input.evidenceCount) 次登场了，换条路查根因吧！"
         case (.repeatedFailure, .calm, false):
             return "第 \(input.evidenceCount) 次是同一处报错。先收住，查根因。"
+        case (.repeatedFailure, .playfulGirl, false):
+            return "它又来捣乱啦。先缓一缓，我陪你一起面对。"
         case (.repeatedFailure, .lightTeasing, false):
             return "这条错误第 \(input.evidenceCount) 次来打卡了，先查根因再放它走？"
         case (.foreignClipboard, .professional, false):
@@ -1639,6 +1649,8 @@ public enum AssistantCommentTemplates {
             return "外语内容排上队了！开 30 分钟剪贴板翻译？"
         case (.foreignClipboard, .calm, false):
             return "还在处理外语内容。需要的话，翻译可以临时开 30 分钟。"
+        case (.foreignClipboard, .playfulGirl, false):
+            return "外语内容又排起队啦，要不要先交给我一会儿？"
         case (.foreignClipboard, .lightTeasing, false):
             return "这门外语今天挺勤快。开 30 分钟剪贴板翻译收拾它？"
         case (.contextualOpportunity, .professional, false):
@@ -1649,6 +1661,8 @@ public enum AssistantCommentTemplates {
             return "重点已经到齐了！要不要马上\(taskName(input.suggestedTask, english: false))？"
         case (.contextualOpportunity, .calm, false):
             return "材料够了。要\(taskName(input.suggestedTask, english: false))，现在就可以。"
+        case (.contextualOpportunity, .playfulGirl, false):
+            return "这段让我来\(taskName(input.suggestedTask, english: false))吧，我们一起把它收好呀？"
         case (.contextualOpportunity, .lightTeasing, false):
             return "这段内容把“\(taskName(input.suggestedTask, english: false))”写在脸上了，要我接手？"
         case (.repeatedFailure, .professional, true):
@@ -1659,6 +1673,8 @@ public enum AssistantCommentTemplates {
             return "Round \(input.evidenceCount) for the same error. Let us try a new angle!"
         case (.repeatedFailure, .calm, true):
             return "Same error, attempt \(input.evidenceCount). Pause and check the root cause."
+        case (.repeatedFailure, .playfulGirl, true):
+            return "It is causing trouble again. Take a breath; I am still with you."
         case (.repeatedFailure, .lightTeasing, true):
             return "This error just clocked in for visit \(input.evidenceCount). Check the root cause?"
         case (.foreignClipboard, .professional, true):
@@ -1669,6 +1685,8 @@ public enum AssistantCommentTemplates {
             return "The foreign-language queue is growing! Turn on translation for 30 minutes?"
         case (.foreignClipboard, .calm, true):
             return "Still working through foreign-language text. Translation can stay on for 30 minutes."
+        case (.foreignClipboard, .playfulGirl, true):
+            return "The foreign-language pile is back. Want to hand it to me for a bit?"
         case (.foreignClipboard, .lightTeasing, true):
             return "That language is working overtime. Give translation 30 minutes?"
         case (.contextualOpportunity, .professional, true):
@@ -1679,6 +1697,8 @@ public enum AssistantCommentTemplates {
             return "The key pieces are here! Ready to \(taskName(input.suggestedTask, english: true))?"
         case (.contextualOpportunity, .calm, true):
             return "There is enough here to \(taskName(input.suggestedTask, english: true))."
+        case (.contextualOpportunity, .playfulGirl, true):
+            return "Let me \(taskName(input.suggestedTask, english: true)) this with you. We can take it gently."
         case (.contextualOpportunity, .lightTeasing, true):
             return "This is practically asking to be \(taskName(input.suggestedTask, english: true)). Take it?"
         }
@@ -1692,11 +1712,13 @@ public enum AssistantCommentTemplates {
             case (.gentle, false): "按你的节奏来，不用把每一步都变成任务。"
             case (.lively, false): "先继续看，等重点冒头我们再出手！"
             case (.calm, false): "先看清楚，再决定要不要动手。"
+            case (.playfulGirl, false): "按你的节奏慢慢来，我就在旁边陪着你呀。"
             case (.lightTeasing, false): "这次先不弹工具按钮，算我克制。"
             case (.professional, true): "Clarify this part first; no tool is needed yet."
             case (.gentle, true): "Go at your pace. Not every step needs to become a task."
             case (.lively, true): "Keep going. We will jump in when the key point appears!"
             case (.calm, true): "See it clearly first, then decide whether to act."
+            case (.playfulGirl, true): "Take it at your pace. I will stay right here with you."
             case (.lightTeasing, true): "No tool button this time. A rare show of restraint."
             }
         }
@@ -1709,6 +1731,8 @@ public enum AssistantCommentTemplates {
             return "它又在同一处拦路了，换个角度把根因揪出来！"
         case (.repeatedFailure, .calm, false):
             return "还是同一处。停一下，先确认根因。"
+        case (.repeatedFailure, .playfulGirl, false):
+            return "又卡在这里啦，别急，我还在呢。"
         case (.repeatedFailure, .lightTeasing, false):
             return "这条错误第 \(input.evidenceCount) 次来敲门了。先看看根因再放它进来？"
         case (.foreignClipboard, .professional, false):
@@ -1719,6 +1743,8 @@ public enum AssistantCommentTemplates {
             return "又来一段外语！把 30 分钟翻译打开吧？"
         case (.foreignClipboard, .calm, false):
             return "外语内容还在继续。要用翻译，就临时开 30 分钟。"
+        case (.foreignClipboard, .playfulGirl, false):
+            return "这些外语先让我陪你处理一会儿，好不好呀？"
         case (.foreignClipboard, .lightTeasing, false):
             return "外语内容排起队了。要开启 30 分钟剪贴板翻译吗？"
         case (.contextualOpportunity, .professional, false):
@@ -1729,6 +1755,8 @@ public enum AssistantCommentTemplates {
             return "线索齐了，接下来直接\(taskName(input.suggestedTask, english: false))吧！"
         case (.contextualOpportunity, .calm, false):
             return "条件够了。下一步可以\(taskName(input.suggestedTask, english: false))。"
+        case (.contextualOpportunity, .playfulGirl, false):
+            return "交给我陪你\(taskName(input.suggestedTask, english: false))吧，慢慢来就好。"
         case (.contextualOpportunity, .lightTeasing, false):
             return "这段内容已经把“\(taskName(input.suggestedTask, english: false))”写在脸上了。继续？"
         case (.repeatedFailure, .professional, true):
@@ -1739,6 +1767,8 @@ public enum AssistantCommentTemplates {
             return "It blocked the same spot again. Let us pull out the root cause!"
         case (.repeatedFailure, .calm, true):
             return "Same point again. Pause and confirm the root cause."
+        case (.repeatedFailure, .playfulGirl, true):
+            return "The same spot caught us again. No rush, I am still here."
         case (.repeatedFailure, .lightTeasing, true):
             return "This error is knocking for visit \(input.evidenceCount). Check the root cause first?"
         case (.foreignClipboard, .professional, true):
@@ -1749,6 +1779,8 @@ public enum AssistantCommentTemplates {
             return "Another foreign-language passage! Turn on translation for 30 minutes?"
         case (.foreignClipboard, .calm, true):
             return "The foreign-language text continues. Translation can run for 30 minutes."
+        case (.foreignClipboard, .playfulGirl, true):
+            return "Let me stay with you and handle these passages for a bit, okay?"
         case (.foreignClipboard, .lightTeasing, true):
             return "The foreign-language queue is growing. Enable clipboard translation for 30 minutes?"
         case (.contextualOpportunity, .professional, true):
@@ -1759,6 +1791,8 @@ public enum AssistantCommentTemplates {
             return "The pieces line up. Let us \(taskName(input.suggestedTask, english: true)) next!"
         case (.contextualOpportunity, .calm, true):
             return "The next step is clear: \(taskName(input.suggestedTask, english: true))."
+        case (.contextualOpportunity, .playfulGirl, true):
+            return "I can stay with you and \(taskName(input.suggestedTask, english: true)) this. No need to rush."
         case (.contextualOpportunity, .lightTeasing, true):
             return "This has \(taskName(input.suggestedTask, english: true)) written all over it. Continue?"
         }

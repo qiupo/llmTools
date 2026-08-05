@@ -3,6 +3,7 @@ const modelEl = document.getElementById("model");
 const barEl = document.getElementById("bar");
 const domainEl = document.getElementById("domain");
 const domainRuleEl = document.getElementById("domainRule");
+const targetLanguageEl = document.getElementById("targetLanguage");
 const diagnosticsEl = document.getElementById("diagnostics");
 const readingModeEl = document.getElementById("readingMode");
 const discoveryScopeEl = document.getElementById("discoveryScope");
@@ -42,6 +43,11 @@ const POPUP_TEXT = {
     domainRuleAsk: "手动翻译",
     domainRuleAlways: "自动翻译此网站",
     domainRuleNever: "不翻译此网站",
+    targetLanguage: "目标语言",
+    targetChinese: "中文",
+    targetEnglish: "英文",
+    targetJapanese: "日文",
+    targetKorean: "韩文",
     readingMode: "阅读模式",
     readingModeReplace: "替换译文",
     readingModeBilingual: "双语对照",
@@ -100,6 +106,11 @@ const POPUP_TEXT = {
     domainRuleAsk: "Translate manually",
     domainRuleAlways: "Auto-translate this site",
     domainRuleNever: "Never translate this site",
+    targetLanguage: "Target",
+    targetChinese: "Chinese",
+    targetEnglish: "English",
+    targetJapanese: "Japanese",
+    targetKorean: "Korean",
     readingMode: "Reading mode",
     readingModeReplace: "Replace",
     readingModeBilingual: "Bilingual",
@@ -169,6 +180,11 @@ function applyLanguage(language = appLanguage) {
   domainRuleEl.options[0].textContent = t("domainRuleAsk");
   domainRuleEl.options[1].textContent = t("domainRuleAlways");
   domainRuleEl.options[2].textContent = t("domainRuleNever");
+  targetLanguageEl.setAttribute("aria-label", t("targetLanguage"));
+  targetLanguageEl.options[0].textContent = t("targetChinese");
+  targetLanguageEl.options[1].textContent = t("targetEnglish");
+  targetLanguageEl.options[2].textContent = t("targetJapanese");
+  targetLanguageEl.options[3].textContent = t("targetKorean");
   readingModeEl.setAttribute("aria-label", t("readingMode"));
   readingModeEl.options[0].textContent = t("readingModeReplace");
   readingModeEl.options[1].textContent = t("readingModeBilingual");
@@ -205,6 +221,7 @@ async function send(type, extra = {}) {
       canClearCache: false,
       domain: "",
       domainRule: "ask",
+      targetLanguage: "zh-Hans",
       readingMode: "replace",
       discoveryScope: "visible",
       translationQuality: "natural",
@@ -317,6 +334,8 @@ function render(state) {
   domainEl.textContent = state.domain || t("domainUnknown");
   domainRuleEl.value = state.domainRule || "ask";
   domainRuleEl.disabled = !state.domain;
+  targetLanguageEl.value = state.targetLanguage || "zh-Hans";
+  targetLanguageEl.disabled = state.status === "translating" || state.status === "discovering";
   readingModeEl.value = state.readingMode || "replace";
   readingModeEl.disabled = state.status === "unsupportedPage";
   discoveryScopeEl.value = state.discoveryScope || "visible";
@@ -352,6 +371,7 @@ async function refresh() {
     retranslateBtn.disabled = true;
     cancelBtn.disabled = true;
     restoreBtn.disabled = true;
+    targetLanguageEl.disabled = true;
     readingModeEl.disabled = true;
     discoveryScopeEl.disabled = true;
     translationQualityEl.disabled = true;
@@ -413,6 +433,17 @@ domainRuleEl.addEventListener("change", async () => {
     }
   }
   render(await send("setDomainRule", { rule: domainRuleEl.value }));
+});
+
+targetLanguageEl.addEventListener("change", async () => {
+  const state = await send("setWebPageTargetLanguage", { targetLanguage: targetLanguageEl.value });
+  // 当前页已有译文时立即重译，避免语言已切换但页面仍停留在旧译文。
+  if (state?.hasTranslations) {
+    statusEl.textContent = t("retranslatingPage");
+    render(await send("retranslatePage", { discoveryScope: discoveryScopeEl.value }));
+    return;
+  }
+  render(state);
 });
 
 readingModeEl.addEventListener("change", async () => {

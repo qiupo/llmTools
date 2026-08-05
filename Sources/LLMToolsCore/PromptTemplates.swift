@@ -19,7 +19,7 @@ public enum PromptTemplates {
             return "You are a professional translation and language-learning assistant. Preserve meaning, formatting, numbers, code, and names. Follow the requested output format exactly."
         case .webPageTranslate:
             return """
-            You are a webpage translation engine. Translate webpage text to Simplified Chinese.
+            You are a webpage translation engine. Translate webpage text to the target language requested by the user.
             Preserve meaning, numbers, names, URLs, product names, code-like tokens, and UI intent.
             Return only valid JSON that follows the requested schema.
             Do not explain.
@@ -325,8 +325,8 @@ public enum PromptTemplates {
 
         Rules:
         - Preserve links, numbers, product names, keyboard shortcuts, and code-like tokens.
-        - For buttons and short UI labels, use concise Chinese.
-        - For paragraphs, use natural Chinese.
+        - For buttons and short UI labels, use concise wording in the target language.
+        - For paragraphs, use natural phrasing in the target language.
         \(webPageQualityInstruction(qualityMode))
         - Do not add commentary.
 
@@ -371,11 +371,11 @@ public enum PromptTemplates {
     private static func webPageQualityInstruction(_ mode: WebPageTranslationQualityMode) -> String {
         switch mode {
         case .natural:
-            return "- Prefer fluent, natural Simplified Chinese while preserving the source meaning."
+            return "- Prefer fluent, natural phrasing in the target language while preserving the source meaning."
         case .literal:
             return "- Prefer a more literal translation; preserve source sentence structure and terminology when it remains readable."
         case .technical:
-            return "- Preserve technical terminology, API names, product names, code-like tokens, and UI labels; use standard technical Chinese where appropriate."
+            return "- Preserve technical terminology, API names, product names, code-like tokens, and UI labels; use standard technical wording in the target language where appropriate."
         }
     }
 
@@ -393,7 +393,7 @@ public enum PromptTemplates {
     private static func webPageTranslationPrompt(inputText: String, isRetry: Bool) -> String {
         let retryLine = isRetry ? "Return only the translated text." : "Output only the translation."
         return """
-        Translate this webpage text to Simplified Chinese. \(retryLine)
+        Follow the target language and translation rules in the request below. \(retryLine)
         \(inputText)
         """
     }

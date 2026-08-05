@@ -5488,7 +5488,7 @@ struct SettingsView: View {
                             HStack(spacing: 6) {
                                 Image(systemName: "dot.radiowaves.left.and.right")
                                     .foregroundStyle(Color.green)
-                                Text(localizedSettingsText(chinese: "实时更新", english: "Live"))
+                                Text(localizedSettingsText(chinese: "诊断快照", english: "Snapshot"))
                                 Spacer()
                                 Text(status.diagnosticSnapshotAt.formatted(date: .omitted, time: .standard))
                                     .monospacedDigit()
@@ -5590,14 +5590,8 @@ struct SettingsView: View {
                 }
                 .task(id: assistantDiagnosticsExpanded) {
                     guard assistantDiagnosticsExpanded else { return }
-                    while !Task.isCancelled {
-                        await assistantCoordinator.refreshDiagnosticSnapshot()
-                        do {
-                            try await Task.sleep(for: .seconds(1))
-                        } catch {
-                            return
-                        }
-                    }
+                    // 诊断内容布局较重，展开时取一次快照；持续查看时使用上方刷新按钮，避免整页每秒重排。
+                    await assistantCoordinator.refreshDiagnosticSnapshot()
                 }
             }
         }
@@ -5942,6 +5936,7 @@ struct SettingsView: View {
         case .gentle: return localizedSettingsText(chinese: "温和搭档", english: "Gentle")
         case .lively: return localizedSettingsText(chinese: "元气队友", english: "Lively")
         case .calm: return localizedSettingsText(chinese: "冷静搭档", english: "Calm")
+        case .playfulGirl: return localizedSettingsText(chinese: "俏皮少女", english: "Playful Girl")
         case .lightTeasing: return localizedSettingsText(chinese: "轻度吐槽", english: "Light Teasing")
         }
     }

@@ -3453,10 +3453,10 @@ struct LLMToolsChecks {
             "Judgment parsing must enforce the same 80-character bubble limit advertised by the prompt."
         )
         try require(
-            AssistantJudgmentContract.promptVersion == 23
-                && AssistantJudgmentFixtures.version == 12
+            AssistantJudgmentContract.promptVersion == 26
+                && AssistantJudgmentFixtures.version == 13
                 && AssistantProactivity.active.hourlyPresentationLimit == 6
-                && AssistantPersonality.allCases.count == 5
+                && AssistantPersonality.allCases.count == 6
                 && AssistantQualificationEvaluator.maximumFixtureLatencyMilliseconds == 10_000
                 && AssistantJudgmentContract.systemPrompt.contains("Return exactly one JSON object")
                 && AssistantJudgmentContract.systemPrompt.contains("comment (string; empty for false")
@@ -3497,7 +3497,10 @@ struct LLMToolsChecks {
                 && activeP06PromptRecipe.contains("Routine active reading, comparing, editing")
                 && activeP06PromptRecipe.contains("valueScore>=0.50")
                 && activeP06PromptRecipe.contains("confidence>=0.75")
-                && activeP06PromptRecipe.contains("VOICE: GENTLE")
+                && activeP06PromptRecipe.contains("VOICE: PLAYFUL GIRL")
+                && activeP06PromptRecipe.contains("Do not explain, analyze, summarize, or advise on technical details")
+                && activeP06PromptRecipe.contains("never repeat technical terms")
+                && activeP06PromptRecipe.contains("PLAYFUL GIRL COMMENT OVERRIDE")
                 && activeP06PromptRecipe.contains("ViewModel 刷新触发条件")
                 && p06PromptRecipe.contains("FALSE RECIPE"),
             "Each pattern prompt must end with its exact action/field recipe and the shared false-output invariant."
@@ -3505,7 +3508,8 @@ struct LLMToolsChecks {
         try require(
             AssistantJudgmentFixtures.all.contains(where: { $0.id == "p06-progress" && $0.expectsPeek })
                 && activeCompanionFixture.expectsPeek
-                && activeCompanionFixture.input.proactivity == .active,
+                && activeCompanionFixture.input.proactivity == .active
+                && activeCompanionFixture.input.personality == .playfulGirl,
             "Qualification must verify grounded progress and the more conversational Active policy."
         )
         let p06ProgressFixture = try requireNonNil(
@@ -3880,6 +3884,15 @@ struct LLMToolsChecks {
             Set(personalityComments).count == AssistantPersonality.allCases.count
                 && personalityComments.allSatisfy(AssistantJudgmentContract.isDirectBubbleComment),
             "Each selectable personality must have distinct, directly addressed fallback wording."
+        )
+        var playfulGirlInput = commentInput
+        playfulGirlInput.personality = .playfulGirl
+        let playfulGirlComment = AssistantCommentTemplates.comment(for: playfulGirlInput)
+        try require(
+            playfulGirlComment.contains("陪")
+                && !playfulGirlComment.contains("根因")
+                && !playfulGirlComment.contains("重试"),
+            "The playful-girl fallback should offer companionship instead of technical analysis."
         )
         try require(
             AssistantCommentTemplates.options(for: commentInput).allSatisfy { !$0.contains("input.evidenceCount") },
@@ -6082,6 +6095,21 @@ struct LLMToolsChecks {
             preferences: qualityPreferences
         )
         try require(routedTranslationPrompt.contains("Translate from English to Simplified Chinese."), "Expected detected source language to affect normal translation prompt.")
+
+        let englishWebPagePrompt = try PromptTemplates.webPageBatchPrompt(
+            segments: [WebPageTranslationSegment(segmentID: "web-en", text: "模型与价格")],
+            targetLanguage: "en",
+            isRetry: false
+        )
+        let englishWebPageSystemPrompt = PromptTemplates.defaultSystemPrompt(for: .webPageTranslate)
+        let wrappedEnglishWebPagePrompt = PromptTemplates.userPrompt(
+            for: TaskRequest(task: .webPageTranslate, inputText: englishWebPagePrompt),
+            preferences: preferences
+        )
+        try require(englishWebPagePrompt.contains("Translate each item to English."), "Expected webpage translation prompt to use the selected English target.")
+        try require(!englishWebPagePrompt.contains("Chinese"), "English webpage translation rules must not force Chinese wording.")
+        try require(!englishWebPageSystemPrompt.contains("Simplified Chinese"), "Webpage system prompt must not override the selected target language.")
+        try require(!wrappedEnglishWebPagePrompt.contains("Simplified Chinese"), "Wrapped webpage prompt must preserve the selected target language.")
 
         let summaryPrompt = PromptTemplates.userPrompt(
             for: TaskRequest(task: .summarize, inputText: "Discuss launch follow-up."),

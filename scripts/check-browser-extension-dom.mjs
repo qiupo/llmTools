@@ -104,6 +104,7 @@ async function runBackgroundBatchCheck() {
     domainTranslationEngines: {}
   };
   let nativePendingIndicatorStyle = "flipText";
+  let nativeTargetLanguage = "zh-Hans";
   let nativeWebPageTranslationReady = true;
   let nativeWebPageTranslationEnabled = true;
   let nativeModelSetup = { textTasks: true, fastTranslation: true };
@@ -129,6 +130,7 @@ async function runBackgroundBatchCheck() {
           webPageTranslationEngine: "llm",
           webPageTranslationEngineID: "llm",
           webPageTranslationEngineModelID: "stub-model-id",
+          webPageTargetLanguage: nativeTargetLanguage,
           pendingIndicatorStyle: nativePendingIndicatorStyle,
           appLanguage: "en",
           autoTranslateDomains: nativeDomainRules.autoTranslateDomains,
@@ -189,6 +191,14 @@ async function runBackgroundBatchCheck() {
         payload: {
           pendingIndicatorStyle: nativePendingIndicatorStyle
         }
+      };
+    }
+    if (message.type === "setWebPageTargetLanguage") {
+      nativeTargetLanguage = message.payload.targetLanguage;
+      return {
+        requestID: message.requestID,
+        status: "ok",
+        payload: { targetLanguage: nativeTargetLanguage }
       };
     }
     if (message.type === "translateSegments") {
@@ -277,6 +287,7 @@ async function runBackgroundBatchCheck() {
             webPageTranslationEngine: "llm",
             webPageTranslationEngineID: "llm",
             webPageTranslationEngineModelID: "stub-model-id",
+            webPageTargetLanguage: nativeTargetLanguage,
             pendingIndicatorStyle: "flipText",
             appLanguage: "en",
             autoTranslateDomains: nativeDomainRules.autoTranslateDomains,
@@ -527,6 +538,7 @@ async function runBackgroundBatchCheck() {
 
   assert(nativeTranslatePayloads.length === 1, `expected one translateSegments call, got ${nativeTranslatePayloads.length}`);
   assert(nativeTranslatePayloads[0].sourceLanguage === "auto", `expected webpage translation to request automatic source language, got ${nativeTranslatePayloads[0].sourceLanguage}`);
+  assert(nativeTranslatePayloads[0].targetLanguage === "zh-Hans", `expected webpage translation to default to Simplified Chinese, got ${nativeTranslatePayloads[0].targetLanguage}`);
   assert(nativeTranslatePayloads[0].translationQuality === "natural", `expected default natural translation quality, got ${nativeTranslatePayloads[0].translationQuality}`);
   assert(nativeTranslatePayloads[0].segments.length === 2, "expected repeated text to be sent once per batch");
   assert(nativeTranslatePayloads[0].segments.some((segment) => segment.segmentID === "s1"), "expected first repeated segment to be translated");
@@ -721,6 +733,17 @@ async function runBackgroundBatchCheck() {
   const tabOverrideSyncedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(tabOverrideSyncedState.readingMode === "bilingual", "getPopupState should not overwrite a current-page reading-mode override");
 
+  const englishTargetState = await sendBackgroundMessage(backgroundListener, {
+    type: "setWebPageTargetLanguage",
+    tabID: 7,
+    targetLanguage: "en"
+  });
+  assert(englishTargetState.targetLanguage === "en", "background should update the webpage target language from popup selection");
+  assert(
+    nativeMessages.some((message) => message.type === "setWebPageTargetLanguage" && message.payload?.targetLanguage === "en"),
+    "background should persist target language changes through native messaging"
+  );
+
   const nativeCallsBeforeRetranslate = nativeTranslatePayloads.length;
   await sendBackgroundMessage(backgroundListener, {
     type: "retranslatePage",
@@ -729,6 +752,7 @@ async function runBackgroundBatchCheck() {
   });
   await waitUntil(() => appliedTranslations.length === 3, 2_000, "retranslate did not apply translations");
   assert(nativeTranslatePayloads.length === nativeCallsBeforeRetranslate + 1, "retranslate should clear page cache and call native translateSegments again");
+  assert(nativeTranslatePayloads.at(-1).targetLanguage === "en", "retranslate should use the saved English target language");
   assert(nativeTranslatePayloads.at(-1).translationQuality === "literal", `expected retranslate payload to use site default literal quality, got ${nativeTranslatePayloads.at(-1).translationQuality}`);
   const retranslatedState = await sendBackgroundMessage(backgroundListener, { type: "getPopupState", tabID: 7 });
   assert(retranslatedState.hasTranslations === true, "retranslate should leave translated state");
@@ -744,7 +768,7 @@ async function runBackgroundBatchCheck() {
   assert(clearedState.status === "idle", `expected idle state after clearing cache, got ${clearedState.status}`);
   assert(clearedState.hasTranslations === false, "clear cache should clear translated state");
   assert(clearedState.notice === true, "clear page cache should publish a notice state");
-  assert(clearedState.message.includes("Cleared 2 cached translations"), `unexpected clear cache message: ${clearedState.message}`);
+  assert(clearedState.message.includes("Cleared 6 cached translations"), `unexpected clear cache message: ${clearedState.message}`);
   assert(appliedTranslations.length === 0, "clear cache should restore page translations");
   assert(Object.keys(localStorageData.webPageTranslationCacheV2 || {}).length === 0, "clear cache should remove current page storage entries");
   await sendBackgroundMessage(backgroundListener, { type: "translatePage", tabID: 7 });
@@ -992,7 +1016,7 @@ async function runPopupPermissionCheck() {
       disabled: false,
       value: "ask",
       style: {},
-      options: [{}, {}, {}],
+      options: [{}, {}, {}, {}],
       listeners: {},
       addEventListener(type, listener) {
         this.listeners[type] = listener;
@@ -1009,6 +1033,7 @@ async function runPopupPermissionCheck() {
     "bar",
     "domain",
     "domainRule",
+    "targetLanguage",
     "diagnostics",
         "readingMode",
         "discoveryScope",
@@ -1057,10 +1082,11 @@ async function runPopupPermissionCheck() {
           webPageTranslationEnabled: webpageTranslationEnabled,
           done: 0,
           total: 0,
-          hasTranslations: false,
+          hasTranslations: message.type === "setWebPageTargetLanguage",
           canClearCache: true,
           domain: "example.test",
             domainRule: message.rule || "ask",
+            targetLanguage: message.targetLanguage || "zh-Hans",
             readingMode: message.readingMode || "replace",
             discoveryScope: message.discoveryScope || "visible",
             translationQuality: message.translationQuality || "natural",
@@ -1137,6 +1163,18 @@ async function runPopupPermissionCheck() {
   assert(
     runtimeMessages.some((message) => message.type === "setDomainRule" && message.rule === "alwaysTranslate"),
     "granted auto-translate permission should save alwaysTranslate rule"
+  );
+
+  runtimeMessages.length = 0;
+  elements.targetLanguage.value = "en";
+  await elements.targetLanguage.listeners.change();
+  assert(
+    runtimeMessages.some((message) => message.type === "setWebPageTargetLanguage" && message.targetLanguage === "en"),
+    "target language selector should save English"
+  );
+  assert(
+    runtimeMessages.some((message) => message.type === "retranslatePage" && message.discoveryScope === "visible"),
+    "changing target language should retranslate a page that already has translations"
   );
 
   runtimeMessages.length = 0;

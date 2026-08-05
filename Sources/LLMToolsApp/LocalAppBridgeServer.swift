@@ -155,6 +155,9 @@ final class LocalAppBridgeServer {
                         webPageTranslationEngine: appState.preferences.fastTranslation.engine(for: .webPageTranslate).rawValue,
                         webPageTranslationEngineID: webPageTranslationEngineID,
                         webPageTranslationEngineModelID: webPageTranslationEngineModelID,
+                        webPageTargetLanguage: LanguageCodeNormalizer.normalizedBCP47(
+                            appState.preferences.webPageTranslation.defaultTargetLanguage
+                        ) ?? "zh-Hans",
                         pendingIndicatorStyle: appState.preferences.webPageTranslation.pendingIndicatorStyle.rawValue,
                         autoTranslateDomains: appState.preferences.webPageTranslation.autoTranslateDomains,
                         disabledDomains: appState.preferences.webPageTranslation.disabledDomains,
@@ -255,6 +258,10 @@ final class LocalAppBridgeServer {
             case ("POST", "/setPendingIndicatorStyle"):
                 let payload = try decoder.decode(SetPendingIndicatorStylePayload.self, from: request.body)
                 let response = setPendingIndicatorStyle(payload.pendingIndicatorStyle)
+                sendResponse(connection: connection, statusCode: 200, payload: response)
+            case ("POST", "/setWebPageTargetLanguage"):
+                let payload = try decoder.decode(SetWebPageTargetLanguagePayload.self, from: request.body)
+                let response = setWebPageTargetLanguage(payload.targetLanguage)
                 sendResponse(connection: connection, statusCode: 200, payload: response)
             case ("POST", "/liveSubtitleSessions"):
                 let payload = try decoder.decode(CreateLiveSubtitleSessionPayload.self, from: request.body)
@@ -487,6 +494,15 @@ final class LocalAppBridgeServer {
         return PendingIndicatorStyleResponsePayload(pendingIndicatorStyle: style.rawValue)
     }
 
+    private func setWebPageTargetLanguage(_ rawLanguage: String) -> WebPageTargetLanguageResponsePayload {
+        // 原生偏好是唯一持久化来源；同时把别名收敛为缓存与翻译请求使用的 BCP-47 代码。
+        let language = LanguageCodeNormalizer.normalizedBCP47(rawLanguage) ?? "zh-Hans"
+        appState.updatePreferences { preferences in
+            preferences.webPageTranslation.defaultTargetLanguage = language
+        }
+        return WebPageTargetLanguageResponsePayload(targetLanguage: language)
+    }
+
     private var domainReadingModePayload: [String: String] {
         appState.preferences.webPageTranslation.domainReadingModes.reduce(into: [:]) { result, item in
             let domain = normalizedDomain(item.key)
@@ -653,6 +669,7 @@ private struct BridgeStatusPayload: Codable {
     var webPageTranslationEngine: String
     var webPageTranslationEngineID: String
     var webPageTranslationEngineModelID: String
+    var webPageTargetLanguage: String
     var pendingIndicatorStyle: String
     var autoTranslateDomains: [String]
     var disabledDomains: [String]
@@ -721,6 +738,10 @@ private struct SetPendingIndicatorStylePayload: Codable {
     var pendingIndicatorStyle: String
 }
 
+private struct SetWebPageTargetLanguagePayload: Codable {
+    var targetLanguage: String
+}
+
 private struct DomainRuleResponsePayload: Codable {
     var domain: String
     var rule: String
@@ -737,6 +758,10 @@ private struct DomainPageDefaultsResponsePayload: Codable {
 
 private struct PendingIndicatorStyleResponsePayload: Codable {
     var pendingIndicatorStyle: String
+}
+
+private struct WebPageTargetLanguageResponsePayload: Codable {
+    var targetLanguage: String
 }
 
 private enum BridgeHTTPError: Error {

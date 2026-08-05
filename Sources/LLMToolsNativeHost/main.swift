@@ -54,6 +54,8 @@ final class NativeMessagingHost: @unchecked Sendable {
                 return try bridgeResponse(for: request, path: "/setDomainPageDefaults")
             case "setPendingIndicatorStyle":
                 return try bridgeResponse(for: request, path: "/setPendingIndicatorStyle")
+            case "setWebPageTargetLanguage":
+                return try bridgeResponse(for: request, path: "/setWebPageTargetLanguage")
             case "createLiveSubtitleSession":
                 return try bridgeResponse(for: request, path: "/liveSubtitleSessions")
             case "appendLiveAudioChunk":
